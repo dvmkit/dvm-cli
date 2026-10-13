@@ -1,0 +1,67 @@
+name: Verify
+
+on:
+  pull_request: {}
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: verify
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.head.sha || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify outside-fork checkout
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - name: Use pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Install locked dependencies
+        run: node scripts/verify-ci.mjs --install
+      - name: Write pull request body for safety inspection
+        if: github.event_name == 'pull_request'
+        env:
+          PULL_REQUEST_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/verify-input"
+          printf '%s' "$PULL_REQUEST_BODY" > "$RUNNER_TEMP/verify-input/pull-request-body.txt"
+          echo "PUBLIC_SAFETY_PR_BODY_PATH=$RUNNER_TEMP/verify-input/pull-request-body.txt" >> "$GITHUB_ENV"
+      - name: Verify repository
+        run: node scripts/verify-ci.mjs
+      - name: Remove repository-local tool bootstrap
+        if: always()
+        run: |
+          rm -rf -- .tooling
+          if [ -n "${RUNNER_TEMP:-}" ]; then
+            rm -rf -- "$RUNNER_TEMP/verify-input"
+          fi
+      - name: Upload sanitized verification report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verify-report-${{ github.run_id }}
+          path: |
+            .artifacts/public-safety-report.json
+            .artifacts/public-safety-packed-report.json
+            .artifacts/verify-diagnostics.txt
+          if-no-files-found: ignore
+          retention-days: 1

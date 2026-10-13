@@ -1,0 +1,237 @@
+name: Release package
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing signed vX.Y.Z or vX.Y.Z-rc.N tag to build without publishing
+        required: true
+        type: string
+      github_release_recovery:
+        description: After an exact tag build, create or verify release notes and release pull request labels without publishing
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: verify signed release tag
+    runs-on: ubuntu-latest
+    outputs:
+      dist_tag: ${{ steps.release.outputs.dist_tag }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tag shape, package binding, and signature
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            release_tag="$INPUT_TAG"
+          else
+            release_tag="$REF_NAME"
+          fi
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "release tag must be vX.Y.Z or vX.Y.Z-rc.N" >&2
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$release_tag"; then
+            echo "requested tag was not fetched from origin" >&2
+            exit 1
+          fi
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-signers"
+          git verify-tag "$release_tag"
+          git checkout --detach "$release_tag^{commit}"
+          if [ "$(git rev-parse "$release_tag^{commit}")" != "$(git rev-parse HEAD)" ]; then
+            echo "checkout is not the requested tag commit" >&2
+            exit 1
+          fi
+          version="$(node --input-type=module -e 'import manifest from "./package.json" with { type: "json" }; process.stdout.write(manifest.version)')"
+          if [ "$release_tag" != "v$version" ]; then
+            echo "tag and package version differ" >&2
+            exit 1
+          fi
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            dist_tag=latest
+          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            dist_tag=next
+          else
+            echo "package version must be stable or rc" >&2
+            exit 1
+          fi
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build immutable package artifact
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.tag }}
+      - name: Use pinned Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.18.0
+          package-manager-cache: false
+      - name: Install locked dependencies
+        run: node scripts/pinned-npm.mjs ci --ignore-scripts
+      - name: Run full verification gate
+        run: node scripts/pinned-npm.mjs run verify
+      - name: Pack twice and bind the artifact digest
+        env:
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          artifact_root="$RUNNER_TEMP/dvm-cli-release"
+          first="$artifact_root/first"
+          second="$artifact_root/second"
+          output="$artifact_root/output"
+          mkdir -p "$first" "$second" "$output"
+          node scripts/pinned-npm.mjs pack --ignore-scripts --json --pack-destination "$first" > "$first/pack.json"
+          node scripts/pinned-npm.mjs pack --ignore-scripts --json --pack-destination "$second" > "$second/pack.json"
+          first_archive="$first/$(node --input-type=module -e 'import { readFileSync } from "node:fs"; process.stdout.write(JSON.parse(readFileSync(process.argv[1], "utf8"))[0].filename)' "$first/pack.json")"
+          second_archive="$second/$(node --input-type=module -e 'import { readFileSync } from "node:fs"; process.stdout.write(JSON.parse(readFileSync(process.argv[1], "utf8"))[0].filename)' "$second/pack.json")"
+          cp "$first_archive" "$output/$(basename "$first_archive")"
+          node scripts/release-artifact.mjs create --first "$first_archive" --second "$second_archive" --output "$output/release-digest.json" --tag "$TAG" --version "$VERSION" --dist-tag "$DIST_TAG"
+          rm -rf -- "$first" "$second"
+      - name: Upload immutable package artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dvm-cli-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/dvm-cli-release/output
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish immutable package artifact
+    if: github.event_name == 'push'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.tag }}
+      - name: Use release Node.js without caches
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.18.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Download immutable package artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: dvm-cli-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/dvm-cli-release/input
+      - name: Verify downloaded artifact binding
+        env:
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/release-artifact.mjs verify --directory "$RUNNER_TEMP/dvm-cli-release/input" --tag "$TAG" --version "$VERSION" --dist-tag "$DIST_TAG" > "$RUNNER_TEMP/dvm-cli-release/archive-path"
+      - name: Publish through npm trusted publishing or recover the exact release
+        env:
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+        run: |
+          set -euo pipefail
+          archive="$(cat "$RUNNER_TEMP/dvm-cli-release/archive-path")"
+          node scripts/publish-release.mjs --archive "$archive" --dist-tag "$DIST_TAG"
+      - name: Verify published package in a clean consumer directory
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/dvm-cli-release/consumer"
+          node scripts/install-published-release.mjs --version "$VERSION" --prefix "$consumer"
+          installed="$consumer/node_modules/@dvmkit/dvm-cli"
+          test "$(node "$installed/dist/dvm.js" --version)" = "$VERSION"
+          diff -r skills/dvm "$installed/skills/dvm"
+          node scripts/refund-recovery-smoke.mjs "$installed"
+
+  github-release:
+    name: create GitHub release notes
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'push' && needs.publish.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.github_release_recovery == true && needs.prepare.result == 'success' && needs.build.result == 'success')
+      )
+    needs: [prepare, build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Create or verify notes for the existing tag
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=()
+          expected_prerelease=false
+          if [[ "$TAG" == *-rc.* ]]; then
+            prerelease_flag=(--prerelease)
+            expected_prerelease=true
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --generate-notes "${prerelease_flag[@]}"
+          fi
+          test "$(gh release view "$TAG" --json tagName --jq .tagName)" = "$TAG"
+          test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = "$expected_prerelease"
+      - name: Mark the release pull request as tagged
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          pr_number="$(
+            gh api "repos/$REPOSITORY/commits/$TAG/pulls" \
+              --jq '[.[] | select(.merged_at != null and any(.labels[]?; .name == "autorelease: pending" or .name == "autorelease: tagged"))] | if length == 1 then .[0].number else error("expected exactly one merged release pull request") end'
+          )"
+          current_labels="$(gh api "repos/$REPOSITORY/issues/$pr_number" --jq '[.labels[].name] | join("\n")')"
+          if ! grep -Fxq 'autorelease: tagged' <<< "$current_labels"; then
+            gh api --method POST "repos/$REPOSITORY/issues/$pr_number/labels" --raw-field 'labels[]=autorelease: tagged' --silent
+          fi
+          if grep -Fxq 'autorelease: pending' <<< "$current_labels"; then
+            gh api --method DELETE "repos/$REPOSITORY/issues/$pr_number/labels/autorelease%3A%20pending" --silent
+          fi
+          gh api "repos/$REPOSITORY/issues/$pr_number" \
+            --jq '(.labels | map(.name)) as $labels | if (($labels | index("autorelease: tagged")) != null and ($labels | index("autorelease: pending")) == null) then true else error("release pull request labels are inconsistent") end' >/dev/null

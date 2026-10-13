@@ -1,0 +1,51 @@
+# This workflow uses pull_request_target so it can comment on and close a pull request
+# from a fork. It must never check out, build, or execute pull-request content.
+name: Close unsolicited pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: close-external-prs-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  close:
+    name: close
+    # Same-repository branches require write access. Author association exempts
+    # maintainers, collaborators, and organisation members who work from a fork.
+    if: >-
+      github.event.pull_request.head.repo.full_name != github.repository
+      && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Comment and close without executing pull request content
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          comment="$RUNNER_TEMP/close-comment.md"
+          cat > "$comment" <<'MARKDOWN'
+          Thanks for taking the time to investigate this project.
+
+          This repository does not accept unsolicited pull requests, including documentation and typo fixes, so this pull request is being closed automatically without maintainer review.
+
+          - **Bug:** open a [bug report](https://github.com/__REPOSITORY__/issues/new/choose) with your platform and versions, the exact command, expected and actual behaviour, and a minimal reproduction. A failing test is welcome as an attachment or gist, never as a pull request.
+          - **Feature or design question:** start a [discussion](https://github.com/__REPOSITORY__/discussions).
+          - **Documentation or typo:** open a [documentation report](https://github.com/__REPOSITORY__/issues/new/choose) and point at it; we will fix it.
+          - **Suspected vulnerability:** do not report it publicly. Use [private vulnerability reporting](https://github.com/__REPOSITORY__/security/advisories/new).
+
+          The full policy is in [CONTRIBUTING.md](https://github.com/__REPOSITORY__/blob/master/CONTRIBUTING.md).
+          MARKDOWN
+
+          sed -i "s|__REPOSITORY__|$REPOSITORY|g" "$comment"
+          gh pr comment "$NUMBER" --repo "$REPOSITORY" --body-file "$comment"
+          gh pr close "$NUMBER" --repo "$REPOSITORY"

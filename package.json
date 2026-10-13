@@ -1,0 +1,94 @@
+{
+  "name": "@dvmkit/dvm-cli",
+  "version": "0.7.0",
+  "description": "Command-line client and agent skill for Digital Vending Machines: pay-per-use HTTPS services AI agents can find, pay, and call with no account or API key",
+  "author": "DVM Technologies Ltd",
+  "keywords": [
+    "dvm",
+    "digital-vending-machine",
+    "cli",
+    "ai-agents",
+    "agent-skill",
+    "agent-payments",
+    "pay-per-use",
+    "x402",
+    "cashu",
+    "lightning",
+    "nostr-wallet-connect"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dvmkit/dvm-cli.git"
+  },
+  "homepage": "https://dvmkit.com/docs/dvm-cli",
+  "bugs": {
+    "url": "https://github.com/dvmkit/dvm-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "exports": {
+    "./skill": "./skills/dvm/SKILL.md",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dvm": "dist/dvm.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "packageManager": "npm@10.9.3",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsup --config tsup.config.ts",
+    "check:package": "node scripts/package-smoke.mjs",
+    "check:public-safety": "node scripts/public-safety.mjs",
+    "check:release": "node scripts/check-release.mjs",
+    "check:toolchain": "node scripts/check-toolchain.mjs",
+    "clean-install-smoke": "node scripts/clean-install-smoke.mjs",
+    "lint": "eslint . --max-warnings 0",
+    "release:tag": "node scripts/release-tag.mjs",
+    "test": "vitest run --config vitest.config.ts",
+    "test:contract": "vitest run --config vitest.config.ts test/contract",
+    "test:unit": "vitest run --config vitest.config.ts --exclude 'test/contract/**'",
+    "typecheck": "tsc --noEmit",
+    "verify": "node scripts/verify.mjs"
+  },
+  "dependencies": {
+    "@cashu/cashu-ts": "4.10.2",
+    "@dvmkit/sdk": "0.8.0",
+    "@x402/evm": "2.21.0",
+    "commander": "14.0.3",
+    "mppx": "0.8.15",
+    "nostr-tools": "2.23.3",
+    "proper-lockfile": "4.1.2",
+    "qrcode": "1.5.4",
+    "zod": "4.4.3"
+  },
+  "optionalDependencies": {
+    "viem": "2.55.11"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "25.3.4",
+    "@types/proper-lockfile": "4.1.4",
+    "@types/qrcode": "1.5.6",
+    "@types/ws": "8.18.1",
+    "eslint": "10.9.1",
+    "globals": "17.11.0",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.68.0",
+    "vitest": "4.1.10",
+    "ws": "8.21.0",
+    "yaml": "2.9.0"
+  }
+}

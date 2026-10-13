@@ -1,0 +1,30 @@
+name: Documentation problem
+description: Report documentation that is wrong, missing, or unclear. Typos included.
+title: "Docs: "
+labels:
+  - documentation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not open a pull request for a typo. Point at it here and we will fix it.
+  - type: input
+    id: location
+    attributes:
+      label: Where
+      description: Link to the documentation or name the file and section.
+      placeholder: https://dvmkit.com/docs/...
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or unclear
+      description: Quote the passage and say what it led you to expect.
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: What it should say
+      description: Optional. If you know the correct behaviour, explain how you established it.

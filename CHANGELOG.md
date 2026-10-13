@@ -1,0 +1,188 @@
+# Changelog
+
+## 0.7.0 (2026-10-11)
+
+
+### Features
+
+* give credit-funded paid submits a generated request id
+
+
+### Documentation
+
+* document promoting a release-candidate line to stable
+
+## 0.7.0-rc.3 (2026-10-11)
+
+
+### Features
+
+* verify provider job identity and never re-pay on an identity failure
+
+## 0.7.0-rc.2 (2026-10-04)
+
+
+### Bug Fixes
+
+* **deps:** align caller with testnet withdrawal SDK
+
+## 0.7.0-rc.1 (2026-10-03)
+
+
+### Bug Fixes
+
+* bind installed history fixture to shared ledger APIs
+
+
+### Code Refactoring
+
+* own caller orchestration and presentation
+
+## 0.6.0 (2026-10-02)
+
+
+### Features
+
+* **wallet:** preserve spending and completed recovery history
+
+## 0.5.0 (2026-10-02)
+
+
+### Features
+
+* report provider content expiry and availability
+
+## 0.4.2 (2026-10-01)
+
+- Update the SDK to 0.3.2-rc.10 so unresolved refund descriptors remain recoverable across credit rollovers without a count limit. Credit storage and recovery output remain compatible; previously evicted descriptors cannot be reconstructed by upgrading. Package and publication checks now exercise ten unresolved refunds through the installed caller.
+
+- Explain when automatic credit funding is skipped because the service does not publish Bitcoin pricing.
+
+## 0.4.1 (2026-09-28)
+
+
+### Bug Fixes
+
+* **skill:** load caller procedures on demand
+
+## 0.4.0 (2026-09-26)
+
+
+### Features
+
+* **discovery:** render trust and capability rows
+* **feedback:** submit receipt-backed job verdicts
+
+
+### Bug Fixes
+
+* **discovery:** accept unbounded trust history windows
+
+## 0.3.0 (2026-09-21)
+
+
+### Features
+
+* add network-aware Tempo test wallets
+
+
+### Bug Fixes
+
+* wait through npm release processing
+
+## 0.2.1 (2026-09-20)
+
+
+### Bug Fixes
+
+* bound capability expansion probes
+* keep pending wallet operations visible with clear retry guidance when their outcome is unknown
+* keep non-interactive JSON output free of progress messages while retaining interactive and human-mode notices
+* preserve saved providers during concurrent CLI use and report unreadable data without overwriting it
+* recover wallet funding and cash-out operations after interruptions, expired invoices, mint outages, and rate limits
+* **release:** retry consumer registry propagation
+* retain polling messages across repeated reads, including anonymous jobs
+* validate discovery numeric options
+
+
+### Maintenance
+
+* share search and browse job handling while preserving their distinct output formats
+* update the DVM SDK and Cashu dependencies and support Node.js 22 or newer
+
+## 0.2.0 (2026-09-13)
+
+
+### Features
+
+* add exact mid-job payment controls
+
+
+### Bug Fixes
+
+* **release:** retry registry propagation
+
+## 0.1.5 (2026-09-05)
+
+
+### Features
+
+* depend on the published SDK package and retire the vendored modules
+
+## 0.1.4 (2026-09-04)
+
+
+### Bug Fixes
+
+* publish the caller as @dvmkit/dvm-cli
+
+## 0.1.3 (2026-09-03)
+
+
+### Bug Fixes
+
+* compare Tempo dollar limits in native units
+
+## 0.1.2 (2026-09-03)
+
+
+### Bug Fixes
+
+* **cli:** await asynchronous command actions
+
+## 0.1.1 (2026-09-01)
+
+
+### Bug Fixes
+
+* **release:** recover release bookkeeping
+* restore inherited credit posture
+
+## 0.1.0 (2026-09-01)
+
+
+### Bug Fixes
+
+* preserve release candidate metadata
+
+
+### Miscellaneous Chores
+
+* **release:** prepare stable CLI release
+
+## 0.1.0-rc.1 (2026-08-31)
+
+
+### Features
+
+* add client compatibility and standalone verification
+
+
+### Bug Fixes
+
+* allow public GitHub squash identities
+
+
+### Continuous Integration
+
+* complete the release candidate lifecycle

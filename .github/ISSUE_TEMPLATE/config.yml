@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ideas, features, and design questions
+    url: https://github.com/dvmkit/dvm-cli/discussions
+    about: Requests without a reproduction belong in a discussion.
+  - name: Report a security vulnerability
+    url: https://github.com/dvmkit/dvm-cli/security/advisories/new
+    about: Use GitHub's private form. Never report a suspected vulnerability publicly.
+  - name: Account, billing, and hosted-service support
+    url: https://github.com/dvmkit/dvm-cli/blob/master/SUPPORT.md
+    about: Private account and service problems use the support route, not the issue tracker.
