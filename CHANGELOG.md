@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.0 (2026-10-14)
+
+This is the first stable-channel (`latest`) release from the new standalone repository. The CLI remains pre-1.0 alpha software: use small balances and review spending regularly.
+
+### Included
+
+- The `dvm` CLI discovers pay-per-use services, submits jobs, manages payments, and retrieves results. Commands return structured JSON by default; `--human` enables direct terminal reading.
+- The complete bundled `skills/dvm` directory provides calling, wallet, prepaid-credit, and recovery procedures for agents.
+
+### Compatibility and upgrade
+
+Requires Node.js 22 or later and uses exactly `@dvmkit/sdk` 0.8.0. The stable channel does not imply a 1.0 compatibility guarantee; breaking changes will be announced in these release notes.
+
+Update an existing global installation with `npm update --global @dvmkit/dvm-cli`. Then recopy the complete bundled `skills/dvm` directory, including its procedure files, into your agent's skill directory so the skill and CLI stay on the same package version. For a first installation, run `npm install --global @dvmkit/dvm-cli`, then `dvm init`; setup does not fund a wallet.
+
 ## 0.7.0 (2026-10-11)
 
 
