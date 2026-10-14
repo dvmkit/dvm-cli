@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/dvmkit/dvm-cli/compare/v0.7.0...v0.8.0) (2026-10-14)
+
+
+### Miscellaneous Chores
+
+* **release:** bind release-please to the initial snapshot ([3e42544](https://github.com/dvmkit/dvm-cli/commit/3e4254406a98d5e3c767a76760ceb1025e66d86b))
+
 ## 0.7.0 (2026-10-11)
 
 
