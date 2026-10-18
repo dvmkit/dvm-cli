@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/dvmkit/dvm-cli/compare/v0.8.0...v0.8.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* stop polling drains that require a timed exit ([#3](https://github.com/dvmkit/dvm-cli/issues/3)) ([9d6a088](https://github.com/dvmkit/dvm-cli/commit/9d6a0885ffd1b8a207b7926757b15757ea8eff40))
+
 ## 0.8.0 (2026-10-14)
 
 This is the first stable-channel (`latest`) release from the new standalone repository. The CLI remains pre-1.0 alpha software: use small balances and review spending regularly.
