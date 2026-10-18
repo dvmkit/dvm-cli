@@ -39,6 +39,7 @@ import {
   recordPendingDrain,
   refundX402BatchChannel,
   settleDrainEvidence,
+  shellQuoteArg,
   signDvmRequestData,
   signedRequestDomain,
   type StoredCredit,
@@ -119,10 +120,22 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
       "Run 'dvm credit balance <dvm>' to check the server, or pass --credit-id explicitly."
     );
   }
+  const exitCommand = [
+    "dvm wallet tempo-exit",
+    shellQuoteArg(endpoint),
+    "--credit-id",
+    shellQuoteArg(creditId),
+    ...("name" in signer.source ? ["--as", shellQuoteArg(signer.source.name)] : []),
+  ].join(" ");
   // Keyed by credit id, so it is the one signal that proves *this* credit has a
   // live session channel — read up here because the method default needs it as
   // well as `channelBacked` below.
   const tempoSession = !!loadTempoChannelAssociation(endpoint, signer.pubkey, creditId);
+  const exitRecovery: TempoExitRecovery = {
+    command: exitCommand,
+    hasLocalChannel: tempoSession,
+    envSigner: signer.source.kind === "env",
+  };
   // An x402 instrument stands in for a missing `rail`: the two are written and
   // cleared together (`adoptCreditId`), so an instrument with no rail beside it
   // is a credit whose binding was healed from a refusal rather than learned from
@@ -567,6 +580,11 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
       anchorRead = await fetchTrustAnchor(transport, { endpoint });
     }
   } catch (err) {
+    // Local retirement adds CLI text, so capture the provider's display first.
+    const originalDisplay = err instanceof DvmError
+      ? (typeof err.data?.display === "string" ? err.data.display : err.display)
+      : undefined;
+    let retirement: string | undefined;
     // The server has retired this drain id: the refund behind it was written
     // off, so re-posting it lands on the same terminal refusal forever while
     // the balance it was for stays right where it is, reclaimable under a
@@ -616,7 +634,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
       // Match the drain's full identity so sibling reclaims and all
       // signed evidence remain untouched.
       clearPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
-      const retirement = `The DVM confirmed drain ${drain.drainId} was never registered, so its stale local record was retired. No refund was created or paid.`;
+      retirement = `The DVM confirmed drain ${drain.drainId} was never registered, so its stale local record was retired. No refund was created or paid.`;
       // Both places a display can live. `buildStructuredError` parks the DVM's
       // own copy on `data.display`, and the CLI error boundary spreads `data`
       // *after* `err.display` — so writing only the latter left this sentence
@@ -641,6 +659,21 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
       // merely re-posted may still be the sole pointer to a parked payout.
       if (!stored) forgetCredit(endpoint, signer.pubkey, ...identityArg);
       else if (mintedThisRun) clearPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
+    }
+    if (err instanceof DvmError && err.code === "tempo_channel_exit_required") {
+      const local = tempoExitRequiredCopy(exitRecovery, err.data?.channel_id, err.data?.status);
+      const display = retirement ? `${local.display} ${retirement}` : local.display;
+      const providerDisplay = asProviderTextOpt(originalDisplay);
+      const providerHint = asProviderTextOpt(err.hint);
+      throw new DvmError(err.code, display, local.hint, {
+        ...err.data,
+        credit_id: creditId,
+        drain_id: drain.drainId,
+        retryable: err.data?.status === "pending",
+        ...(providerDisplay ? { provider_display: providerDisplay } : {}),
+        ...(providerHint ? { provider_hint: providerHint } : {}),
+        display,
+      });
     }
     throw err;
   } finally {
@@ -717,6 +750,9 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
     );
   }
 
+  // Unknown status strings require upgrade guidance rather than generic polling.
+  const local = localDrainCopy(wireDrain, drain, exitRecovery);
+
   // A parked token is locked to the wallet's own key — redeem on sight.
   let claimedSats: number | undefined;
   if (wireDrain.token && drain.method === "cashu") {
@@ -729,6 +765,8 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
     }
   }
 
+  // exit_required retains the registered drain: its debit was not restored,
+  // and the channel recovery record is still needed for the timed exit.
   const released = wireDrain.status === "released";
   const finished =
     wireDrain.status === "picked_up" || wireDrain.status === "sent" || claimedSats !== undefined;
@@ -810,7 +848,6 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
   // "the prose and the status can't disagree" structural rather than a promise.
   const providerDisplay = asProviderTextOpt(result.display);
   const providerHint = asProviderTextOpt(result.hint);
-  const local = localDrainCopy(wireDrain, drain);
   // A released Tempo drain leaves the channel open on-chain whatever the
   // vouchers say, and the exit is the only way back to the collateral. The
   // at-risk clause below can't carry that instruction on its own: it is gated
@@ -1234,12 +1271,13 @@ export async function runCreditReceipts(
  * *how* a given service fulfils a refund — that is the provider's own claim, and
  * it rides in `provider_display` / `provider_hint`.
  *
- * `status` is a bare string on the wire, so an unrecognised state falls through
- * to naming it rather than guessing at a meaning.
+ * `status` is a bare string on the wire; unknown states require an upgrade
+ * rather than an instruction to poll a potentially terminal refund.
  */
 function localDrainCopy(
   wire: DrainWire,
-  requested: PendingDrain
+  requested: PendingDrain,
+  exitRecovery: TempoExitRecovery
 ): { display: string; hint: string } {
   const amount = formatFiat(wire.amount_micro / 1_000_000, wire.currency);
   const poll = "Re-run this command to poll; the same drain id is request, poll, and pickup.";
@@ -1283,14 +1321,52 @@ function localDrainCopy(
         display: `The DVM reports ${amount} of refund was paid out to the destination this drain named.`,
         hint: "The settlement reference is in drain.sent. The drain receipts are your signed evidence of the reclaim.",
       };
+    case "exit_required":
+      return tempoExitRequiredCopy(exitRecovery, "channel_id" in wire ? wire.channel_id : undefined);
     case "released":
       return {
         display: `The refund could not complete, so the DVM restored ${amount} to the prepaid balance.`,
         hint: "This released drain is terminal — do not poll it again. The balance is spendable, or reclaimable on a fresh drain.",
       };
     default:
-      return { display: `Drain ${wire.status}.`, hint: poll };
+      throw new DvmError(
+        "unknown_drain_status",
+        `The DVM reported an unknown drain status: ${wire.status}. The refund outcome is not understood by this version of dvm.`,
+        "Upgrade dvm before continuing; do not poll this drain with this version. Keep the recovery records and signed receipts until the refund is confirmed.",
+        { status: wire.status, drain_id: wire.drain_id, credit_id: wire.credit_id },
+        `Unknown drain status '${wire.status}'; this version of dvm cannot determine the refund outcome.`
+      );
   }
+}
+
+interface TempoExitRecovery {
+  command: string;
+  hasLocalChannel: boolean;
+  envSigner: boolean;
+}
+
+function tempoExitRequiredCopy(
+  recovery: TempoExitRecovery,
+  channelId: unknown,
+  status?: unknown
+): { display: string; hint: string } {
+  const channel = typeof channelId === "string" ? ` Channel ID: ${channelId}.` : "";
+  const pending = status === "pending";
+  const nextStep = pending
+    ? "A retry of the same drain with a valid close credential (approval to close this deposit) may still work. The timed exit is the fallback."
+    : "Do not retry the direct refund; do not poll this drain again.";
+  const command = recovery.hasLocalChannel
+    ? `Run '${recovery.command}' to start or finish the timed exit. Keep the channel recovery record until the funds are returned.`
+    : `Run '${recovery.command}' from the wallet and machine that opened the channel; this machine has no channel recovery record for this credit.`;
+  const signer = recovery.envSigner
+    ? " Set the same DVM_IDENTITY_KEY used for this credit when running that command."
+    : "";
+  return {
+    display: pending
+      ? "The service cannot return this money directly with the current approval. A valid approval may still let it return the money, or the remaining funds come back through a timed exit after a delay."
+      : "The service cannot return this money directly. The remaining funds come back through a timed exit after a delay.",
+    hint: `${nextStep} ${command}${signer} The timed exit returns the remaining funds after its delay. The service can still collect payments you already approved, and chain fees apply.${channel}`,
+  };
 }
 
 /**

@@ -1385,6 +1385,9 @@ const CREDIT_CONTEXT_FIELDS = [
  */
 function withCreditErrorContext(err: DvmError, body: Record<string, unknown>): DvmError {
   const extra: Record<string, unknown> = {};
+  if (err.code === "tempo_channel_exit_required" && typeof body.status === "string") {
+    extra.status = body.status;
+  }
   for (const key of CREDIT_CONTEXT_FIELDS) {
     if (typeof body[key] === "number") extra[key] = body[key];
   }
@@ -1409,6 +1412,7 @@ function withCreditErrorContext(err: DvmError, body: Record<string, unknown>): D
     "credit_rail",
     "credit_instrument",
     "credit_channel_id",
+    "channel_id",
     "bound_credit_id",
     "rail",
     "settlement_drain_id",
