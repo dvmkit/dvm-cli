@@ -135,6 +135,39 @@ beforeAll(async () => {
           const drainId = typeof drain.drain_id === "string" ? drain.drain_id : "missing-drain";
           const attempt = (drainAttempts.get(drainId) ?? 0) + 1;
           drainAttempts.set(drainId, attempt);
+          if (drainId.startsWith("exit-refusal")) {
+            response.statusCode = 409;
+            response.end(JSON.stringify({
+              error: "tempo_channel_exit_required",
+              message: "Cooperative close unavailable.",
+              display: "Provider recovery advice.",
+              hint: "Provider retry advice.",
+              drain_registered: drainId !== "exit-refusal-unregistered",
+              ...(drainId !== "exit-refusal-no-channel" ? { channel_id: "channel-exit" } : {}),
+              ...(drainId !== "exit-refusal-unregistered" ? { drain_id: drainId, status: drainId === "exit-refusal-pending" ? "pending" : "exit_required" } : {}),
+            }));
+            return;
+          }
+          if (drainId.startsWith("exit-status") || drainId === "future-status") {
+            response.end(JSON.stringify({
+              op: "drain",
+              credit: creditWire(contractCreditId, 0, 2),
+              drain: {
+                drain_id: drainId,
+                credit_id: contractCreditId,
+                method: "tempo",
+                status: drainId === "future-status" ? "future_refund_state" : "exit_required",
+                // Hypothetical extension: SDK 0.9.0 drain records omit channel_id.
+                ...(drainId === "exit-status-hypothetical-channel" ? { channel_id: "channel-exit" } : {}),
+                amount_micro: 750_000,
+                currency: "usd",
+                ledger_seq: 2,
+                created_at: 1_700_000_000_000,
+                receipts: [],
+              },
+            }));
+            return;
+          }
           response.end(
             JSON.stringify({
               op: "drain",
@@ -804,6 +837,142 @@ describe("standalone caller contract", () => {
       expect(readJson(join(caller.root, "config.json"))).toEqual(expectedConfig);
     });
 
+    it.each([
+      ["exit-refusal-registered", true, false],
+      ["exit-refusal-unregistered", true, false],
+      ["exit-refusal-no-channel", false, false],
+      ["exit-refusal-local", true, true],
+      ["exit-status-hypothetical-channel", true, false],
+      ["exit-status-no-channel", false, false],
+    ] as const)("stops cooperative recovery and names the timed exit for %s", async (drainId, hasChannel, localChannel) => {
+      const caller = await initializedCaller();
+      await runCli(["credit", "balance", endpoint], {}, caller.root);
+      if (localChannel) seedTempoAssociation(caller.root, caller.pubkey);
+
+      const result = await runCliOutcome([
+        "credit", "drain", endpoint,
+        "--credit-id", contractCreditId,
+        "--drain-id", drainId,
+        "--method", "tempo",
+        ...(!localChannel ? ["--address", `0x${"12".repeat(20)}`] : []),
+        "--as", caller.identityName,
+      ], {}, caller.root);
+      const output = JSON.parse(result.stdout) as Record<string, unknown>;
+      const outcome = (output.error ?? output) as Record<string, unknown>;
+      const command = `dvm wallet tempo-exit ${endpoint} --credit-id ${contractCreditId} --as ${caller.identityName}`;
+
+      expect(result.code).toBe(drainId.startsWith("exit-refusal") ? 1 : 0);
+      expect(outcome.display).toEqual(expect.stringContaining("service cannot return this money directly"));
+      expect(outcome.display).toEqual(expect.stringContaining("timed exit"));
+      expect(outcome.display).not.toEqual(expect.stringContaining("channel-exit"));
+      expect(outcome.hint).toEqual(expect.stringContaining("timed exit"));
+      expect(outcome.hint).toEqual(expect.stringContaining("after its delay"));
+      expect(outcome.hint).toEqual(expect.stringContaining(command));
+      expect(outcome.hint).toEqual(expect.stringContaining("do not poll"));
+      expect(outcome.hint).not.toEqual(expect.stringContaining("Re-run this command"));
+      if (hasChannel) expect(outcome.hint).toEqual(expect.stringContaining("channel-exit"));
+      if (localChannel) {
+        expect(outcome.hint).toEqual(expect.stringContaining("Keep the channel recovery record"));
+        const channels = readJson(join(caller.root, "tempo-channels.json")) as { associations: unknown[] };
+        expect(channels.associations).toEqual([expect.objectContaining({ creditId: contractCreditId })]);
+      } else {
+        expect(outcome.hint).toEqual(expect.stringContaining("wallet and machine that opened the channel"));
+        expect(outcome.hint).not.toEqual(expect.stringContaining("Keep the channel recovery record"));
+      }
+      const credit = readCredit(caller.root);
+      expect(credit.status).toBe("active");
+      if (drainId === "exit-refusal-unregistered") {
+        expect(credit.pendingDrains).toBeUndefined();
+      } else {
+        expect(credit.pendingDrains).toEqual([
+          expect.objectContaining({ drainId, creditId: contractCreditId }),
+        ]);
+      }
+    });
+
+    it("keeps server and CLI text separate when an unregistered refusal retires the local marker", async () => {
+      const caller = await initializedCaller();
+      await runCli(["credit", "balance", endpoint], {}, caller.root);
+      const result = await runCliOutcome([
+        "credit", "drain", endpoint, "--credit-id", contractCreditId,
+        "--drain-id", "exit-refusal-unregistered", "--method", "tempo",
+        "--address", `0x${"12".repeat(20)}`,
+      ], {}, caller.root);
+      const { error } = JSON.parse(result.stdout) as { error: Record<string, unknown> };
+
+      expect(result.code).toBe(1);
+      expect(error.provider_display).toEqual({ _source: "provider", text: "Provider recovery advice." });
+      expect(error.display).toEqual(expect.stringContaining("The DVM confirmed drain exit-refusal-unregistered was never registered, so its stale local record was retired. No refund was created or paid."));
+      expect(error.local_drain_retired).toBe(true);
+      expect(readCredit(caller.root).pendingDrains).toBeUndefined();
+    });
+
+    it("requires the same environment signer on the machine that opened the channel", async () => {
+      const caller = await initializedCaller();
+      const key = "11".repeat(32);
+      const env = { DVM_IDENTITY_KEY: key };
+      await runCli(["credit", "balance", endpoint], env, caller.root);
+      const result = await runCliOutcome([
+        "credit", "drain", endpoint, "--credit-id", contractCreditId,
+        "--drain-id", "exit-refusal-registered", "--method", "tempo",
+        "--address", `0x${"12".repeat(20)}`,
+      ], env, caller.root);
+      const { error } = JSON.parse(result.stdout) as { error: Record<string, unknown> };
+
+      expect(result.code).toBe(1);
+      expect(error.hint).toEqual(expect.stringContaining("same DVM_IDENTITY_KEY"));
+      expect(error.hint).toEqual(expect.stringContaining("wallet and machine that opened the channel"));
+      expect(error.hint).not.toEqual(expect.stringContaining("--as"));
+      expect(error.hint).not.toEqual(expect.stringContaining("Keep the channel recovery record"));
+      expect(result.stdout + result.stderr).not.toContain(key);
+    });
+
+    it("preserves a pending close refusal and allows a valid credential retry before timed exit", async () => {
+      const caller = await initializedCaller();
+      await runCli(["credit", "balance", endpoint], {}, caller.root);
+      const result = await runCliOutcome([
+        "credit", "drain", endpoint, "--credit-id", contractCreditId,
+        "--drain-id", "exit-refusal-pending", "--method", "tempo",
+        "--address", `0x${"12".repeat(20)}`,
+      ], {}, caller.root);
+      const { error } = JSON.parse(result.stdout) as { error: Record<string, unknown> };
+
+      expect(result.code).toBe(1);
+      expect(error.status).toBe("pending");
+      expect(error.retryable).toBe(true);
+      expect(error.hint).toEqual(expect.stringContaining("same drain with a valid close credential"));
+      expect(error.hint).toEqual(expect.stringContaining("timed exit is the fallback"));
+      expect(error.hint).not.toEqual(expect.stringContaining("do not poll this drain again"));
+      expect(readCredit(caller.root).pendingDrains).toEqual([
+        expect.objectContaining({ drainId: "exit-refusal-pending", creditId: contractCreditId }),
+      ]);
+    });
+
+    it("rejects an unknown drain status with upgrade guidance and preserves recovery", async () => {
+      const caller = await initializedCaller();
+      await runCli(["credit", "balance", endpoint], {}, caller.root);
+      requests.length = 0;
+
+      const result = await runCliOutcome([
+        "credit", "drain", endpoint, "--credit-id", contractCreditId, "--drain-id", "future-status",
+        "--method", "tempo", "--address", `0x${"12".repeat(20)}`,
+      ], {}, caller.root);
+      const output = JSON.parse(result.stdout) as { error: Record<string, unknown> };
+
+      expect(result.code).toBe(1);
+      expect(output.error).toMatchObject({
+        code: "unknown_drain_status",
+        status: "future_refund_state",
+        display: expect.stringContaining("future_refund_state"),
+        hint: expect.stringContaining("Upgrade dvm"),
+      });
+      expect(output.error.hint).toEqual(expect.stringContaining("do not poll"));
+      expect(readCredit(caller.root)).toMatchObject({
+        status: "active",
+        pendingDrains: [expect.objectContaining({ drainId: "future-status" })],
+      });
+    });
+
     it("reuses a recoverable drain until the fixture confirms the refund was sent", async () => {
       const caller = await initializedCaller();
       const expectedConfig = pinCallerConfig(caller.root);
@@ -945,14 +1114,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-async function initializedCaller(): Promise<{ root: string; pubkey: string }> {
+async function initializedCaller(): Promise<{ root: string; pubkey: string; identityName: string }> {
   const root = mkdtempSync(join(tmpdir(), "dvm-cli-credit-contract-"));
   configRoots.add(root);
   const initialized = await runCli(["init"], {}, root);
-  const output = JSON.parse(initialized.stdout) as { identity?: { pubkey?: unknown } };
+  const output = JSON.parse(initialized.stdout) as { identity?: { pubkey?: unknown; name?: unknown } };
   const pubkey = output.identity?.pubkey;
   if (typeof pubkey !== "string") throw new Error("init did not provision a signing identity");
-  return { root, pubkey };
+  const identityName = output.identity?.name;
+  if (typeof identityName !== "string") throw new Error("init did not name its signing identity");
+  return { root, pubkey, identityName };
 }
 
 function pinCallerConfig(root: string): Record<string, unknown> {
@@ -993,6 +1164,32 @@ function seedPendingFunding(root: string, callerPubkey: string): void {
     fundingMenuSnapshots: [],
   };
   writeFileSync(join(root, "credits.json"), `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+}
+
+function seedTempoAssociation(root: string, callerPubkey: string): void {
+  const config = readJson(join(root, "config.json")) as Record<string, unknown>;
+  writeFileSync(join(root, "config.json"), JSON.stringify({
+    ...config,
+    tempo: { method: "tempo", apiKey: `0x${"22".repeat(32)}`, network: "moderato" },
+  }), { mode: 0o600 });
+  writeFileSync(join(root, "tempo-channels.json"), JSON.stringify({
+    version: 2,
+    values: {},
+    charges: [],
+    associations: [{
+      endpoint,
+      callerPubkey,
+      creditId: contractCreditId,
+      channelKey: "example-scope",
+      operator: `0x${"33".repeat(20)}`,
+      channelId: `0x${"44".repeat(32)}`,
+      cumulativeAmount: "250000",
+      deposit: "1000000",
+      chainId: 42431,
+      opened: true,
+      updatedAt: 1_700_000_000_000,
+    }],
+  }), { mode: 0o600 });
 }
 
 function pendingFundings(root: string): Array<Record<string, unknown>> {
