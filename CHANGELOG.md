@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/dvmkit/dvm-cli/compare/v0.8.1...v0.8.2) (2026-10-20)
+
+
+### Bug Fixes
+
+* sign authenticated discovery requests ([1e03168](https://github.com/dvmkit/dvm-cli/commit/1e031682d3b2b4cc1f2e16c26fb06258ec77ae63))
+
 ## [0.8.1](https://github.com/dvmkit/dvm-cli/compare/v0.8.0...v0.8.1) (2026-10-18)
 
 
