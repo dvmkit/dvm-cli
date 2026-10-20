@@ -1,3 +1,5 @@
+import { sameEndpoint } from "./job-access";
+import { bookedCreditPayment, sendCreditPayment, tryCreditPayment } from "./credit-payment";
 import { buildTempoCredential } from "./payment-rails/tempo-credential";
 import {
   DvmError,
@@ -40,7 +42,7 @@ import { assertTempoChallengeNetwork, resolveTempoNetworkSelection } from "./tem
 
 export interface PaidPaymentResult {
   status: "paid";
-  rail: "cashu_p2pk" | "x402" | "tempo";
+  rail: "cashu_p2pk" | "x402" | "tempo" | "credit";
   amountMsats: number;
   /** Exact signed x402 value in USDC microunits. */
   amountUsdcMicro?: string;
@@ -60,7 +62,7 @@ export async function handlePaymentRequest(
   provider: ProviderRef,
   // `jobToken` is the anonymous-flow per-job token threaded into
   // every `payment` `sendMessage`.
-  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number }
+  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number }
 ): Promise<PaymentResult> {
   const job = loadJob(jobId);
   const spent = job?.totalPaidMsats ?? 0;
@@ -73,6 +75,30 @@ export async function handlePaymentRequest(
   // thread the per-job token onto every `sendMessage` for this job
   // so anonymous callers' mid-job payments don't 404 at the SDK gate.
   const jobToken = opts?.jobToken ?? job?.jobToken;
+
+  const matchingEndpoint = !!job && !!provider.endpoint && sameEndpoint(job.endpoint, provider.endpoint);
+  if (!matchingEndpoint && job?.pendingCreditPayment)
+    throw new DvmError("credit_payment_endpoint_mismatch", "Recover this balance payment at its original endpoint.");
+  let balanceRefused = false;
+  const booked = matchingEndpoint ? bookedCreditPayment(jobId, opts?.requestSeq) : undefined;
+  if (booked && (booked.request.amount_msats !== request.amount_msats ||
+      booked.request.credit?.amount_micro !== request.credit?.amount_micro ||
+      booked.request.credit?.currency !== request.credit?.currency))
+    throw new DvmError("credit_payment_conflict", "The saved payment ask differs from this request.");
+  if (booked) return { status: "paid", rail: "credit", amountMsats: booked.amountMsats ?? booked.request.amount_msats };
+  if (job?.pendingCreditPayment) {
+    const pending = job.pendingCreditPayment;
+    const paid = await sendCreditPayment(jobId, pending, transport, provider, jobToken);
+    if (paid) {
+      if (pending.authorization.request_seq !== opts?.requestSeq)
+        throw new DvmError("credit_payment_recovered", "The prior balance payment was recovered; reload this job before paying another ask.");
+      return { status: "paid", rail: "credit", amountMsats: pending.amountMsats ?? pending.request.amount_msats };
+    }
+    balanceRefused = true;
+    // An old unresolved ask cannot authorize a rail spend for a different ask.
+    if (pending.authorization.request_seq !== opts?.requestSeq)
+      throw new DvmError("credit_payment_retry_required", "The prior balance payment was refused; reload this job's pending ask.");
+  }
 
   if (policy.maxIncrementMsats > 0 && request.amount_msats > policy.maxIncrementMsats) {
     return "over-budget";
@@ -96,14 +122,17 @@ export async function handlePaymentRequest(
       "Verify the original one-payment quote; do not authorize a fallback or replacement payment."
     );
 
-  // Check the global budget ledger — captures cross-job spending. Throws DvmError on overflow.
-  // Returns the BTC/USD rate to thread into the post-payment recordSpend so pre-check and debit
-  // use a single rate.
-  const btcRate = await enforceGlobalBudget({ plannedMsats: request.amount_msats });
+  if (request.amount_msats > policy.autoPayBelowMsats) return "needs-approval";
 
-  if (request.amount_msats > policy.autoPayBelowMsats) {
-    return "needs-approval";
+  if (matchingEndpoint && !balanceRefused && opts?.rail === undefined) {
+    const creditPaid = await tryCreditPayment({ jobId, request, policy,
+      requestSeq: opts?.requestSeq, transport, provider, jobToken });
+    if (creditPaid !== false) return { status: "paid", rail: "credit", amountMsats: creditPaid };
   }
+
+  // Deposits already entered the wallet-outflow ledger; only a new rail spend
+  // needs another global budget check and ledger entry.
+  const btcRate = await enforceGlobalBudget({ plannedMsats: request.amount_msats });
 
   const cashuPrincipalSats = Math.ceil(request.amount_msats / 1000);
   if (

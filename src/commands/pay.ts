@@ -83,7 +83,10 @@ async function payWithAccess(
   const { stored, ref, jobToken } = access;
 
   const msgs = loadMessages(jobId);
-  const paymentReq = findPendingPaymentRequest(msgs);
+  const pending = stored.pendingCreditPayment;
+  const paymentMessage = findPendingPaymentRequest(msgs);
+  const paymentReq = pending?.request ?? paymentMessage?.content;
+  const requestSeq = pending?.authorization.request_seq ?? paymentMessage?.seq;
   if (!paymentReq) {
     throw new DvmError(
       "no_payment_pending",
@@ -113,7 +116,9 @@ async function payWithAccess(
     );
   }
 
-  const payPolicy = { ...stored.policy, autoPayBelowMsats: paymentReq.amount_msats + 1 };
+  // Explicit pay approves this ask; the locally priced native debit must still
+  // fit the hard increment/total caps rather than the provider's msat proxy.
+  const payPolicy = { ...stored.policy, autoPayBelowMsats: stored.policy.maxTotalMsats };
 
   // No cost anchor: the caller reached `dvm pay` by deciding this charge was
   // worth it, so "fraction of a cent" here is noise rather than orientation.
@@ -126,6 +131,7 @@ async function payWithAccess(
     jobToken,
     rail,
     maxCashuPrincipalSats,
+    requestSeq,
   });
 
   if (result === "over-budget") {
@@ -152,7 +158,7 @@ async function payWithAccess(
 
   if (result === "needs-approval") {
     transport.close();
-    throw await buildNeedsApprovalError(paymentReq, rail);
+    throw await buildNeedsApprovalError(paymentReq, rail, !stored.creditBinding && !!paymentReq.credit);
   }
 
   const paid = paymentConfirmation(result, paymentReq.reason, paymentReq.fiat_amount);
@@ -265,7 +271,8 @@ function paymentConfirmation(
  */
 async function buildNeedsApprovalError(
   req: PaymentRequestContent,
-  forcedRail?: RailFlag
+  forcedRail?: RailFlag,
+  unknownCreditBinding = false
 ): Promise<DvmError> {
   // Raw keys in the machine fields, glossed wording in the prose: an agent
   // branches on `configured_rails` / `advertised_rails`, a human reads the
@@ -293,6 +300,7 @@ async function buildNeedsApprovalError(
       ? `No payment wallets configured locally; this service accepts: ${advertisedProse}.`
       : `No locally-configured rail could satisfy this payment-request. Configured: ${configuredProse}. This service accepts: ${advertisedProse}.`;
 
+  const bindingHint = unknownCreditBinding ? " This saved job has no known credit/draw binding, so its prepaid balance cannot safely pay this ask." : "";
   const hint =
     forcedRail
       ? `Check that the service advertises ${paymentRailLabel(forcedRail)} and that its local wallet has enough funds, or retry without --rail to allow fallback.`
@@ -302,7 +310,7 @@ async function buildNeedsApprovalError(
         ? "Run `dvm wallet balance` to check the x402 USDC balance, then fund the displayed wallet address with the exact USDC on the advertised network."
         : "The agent wallet may be short on the requested amount or locked to a different mint. Inspect with `dvm wallet show`, then top up or run with a higher `--auto-pay-below`.";
 
-  return new DvmError("payment_failed", display, hint, {
+  return new DvmError("payment_failed", display, hint + bindingHint, {
     anchor: "no_rail_matched",
     display,
     configured_rails: configured,
@@ -325,13 +333,13 @@ function parsePositiveCashuSats(raw: string | undefined): number | undefined {
 }
 
 function findPendingPaymentRequest(
-  msgs: { type: string; content: unknown }[]
-): PaymentRequestContent | undefined {
+  msgs: { type: string; content: unknown; seq: number }[]
+): { content: PaymentRequestContent; seq: number } | undefined {
   for (let i = msgs.length - 1; i >= 0; i--) {
     const msg = msgs[i];
     if (msg.type === "payment") return undefined; // Already paid
     if (msg.type === "payment-request") {
-      return msg.content as PaymentRequestContent;
+      return { content: msg.content as PaymentRequestContent, seq: msg.seq };
     }
   }
   return undefined;

@@ -501,7 +501,8 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     const requestId = drawn.body.request_id as string;
     expect(requestId).toMatch(/^[0-9a-f-]{36}$/);
     expect(intents.loadRequestIntent(requestId)?.body.data).toEqual(drawn.body);
-    expect(jobs.loadJob("job-a")).toMatchObject({ requestId, paymentMethod: "credit" });
+    expect(jobs.loadJob("job-a")).toMatchObject({ requestId, paymentMethod: "credit",
+      creditBinding: { creditId: "prepaid-credit", drawId: drawn.body.draw_id, callerPubkey: sdk.receiptPubkeyFromSecret(secret) } });
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 
@@ -553,6 +554,43 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     expect(jobs.loadJob("job-a")).toMatchObject({ requestId, jobToken: provider.token });
   });
 
+  it.each([
+    { recovery: "read-back", existing: false },
+    { recovery: "read-back", existing: true },
+    { recovery: "re-ship", existing: false },
+    { recovery: "re-ship", existing: true },
+  ])("retains the accepted draw on $recovery recovery (existing record: $existing) for a later balance ask", async ({ recovery, existing }) => {
+    writeConfig("auto");
+    seedCredit(0);
+    provider.bindsPaid = recovery === "read-back";
+    provider.paid = () => (response) => response.socket?.destroy();
+    await expect(paidRequest()).rejects.toBeInstanceOf(Error);
+    const original = provider.paidPosts()[0].body;
+    const publicId = original.request_id as string;
+    if (existing) jobs.saveJob({ id: "job-a", endpoint: provider.endpoint, status: "processing",
+      submittedAt: Date.now(), requestId: publicId, policy: { maxTotalMsats: 100000,
+        maxIncrementMsats: 100000, autoPayBelowMsats: 100000, maxPayments: 5 } });
+    provider.paid = (_post, accepted) => answer(200, { job_id: accepted, job_token: provider.token, status: "completed", summary: "Done" }, { [FIELD]: accepted });
+    const postsBefore = provider.jobPosts.length;
+    const result = await seams.realSweep!({ fetchImpl: globalThis.fetch });
+    expect(result.outcomes).toMatchObject([{ kind: "shipped", jobId: "job-a" }]);
+    expect(provider.jobPosts.length).toBe(postsBefore + (recovery === "re-ship" ? 1 : 0));
+    expect(jobs.loadJob("job-a")?.creditBinding).toEqual({ creditId: "prepaid-credit",
+      drawId: original.draw_id, callerPubkey: sdk.receiptPubkeyFromSecret(secret) });
+    expect(jobs.loadAllJobs().filter((job) => job.id === "job-a")).toHaveLength(1);
+    seedCredit(40000);
+    const before = budget.loadLedger();
+    const { handlePaymentRequest } = await import("../src/lib/payment-responder");
+    const { HttpsTransport } = await import("../src/lib/transport/https");
+    await expect(handlePaymentRequest("job-a", { amount_msats: 1500, reason: "Additional work",
+      credit: { amount_micro: 1500, currency: "usd" } }, jobs.loadJob("job-a")!.policy!,
+      new HttpsTransport(), { endpoint: provider.endpoint }, { requestSeq: 4 }))
+      .resolves.toMatchObject({ rail: "credit", amountMsats: 1500 });
+    expect(provider.balancePayments).toMatchObject([{ credit_id: "prepaid-credit", draw_id: original.draw_id,
+      pubkey: sdk.receiptPubkeyFromSecret(secret), request_seq: 4 }]);
+    expect(budget.loadLedger()).toEqual(before);
+  });
+
   it("reads a lost draw back through request-result with no second draw or payment", async () => {
     writeConfig("auto");
     seedCredit(40_000);
@@ -575,6 +613,26 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     expect(provider.jobPosts).toHaveLength(1);
     expect(jobs.loadJob("job-a")).toMatchObject({ requestId, endpoint: provider.endpoint, jobToken: provider.token });
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it("records a signed zero-upfront job as known unbound", async () => {
+    provider.unpaid = () => answer(200, { job_id: "job-a", status: "completed", summary: "Done" }, { [FIELD]: "job-a" });
+    await paidRequest();
+    expect(jobs.loadJob("job-a")?.creditBinding).toEqual({ unbound: true, callerPubkey: sdk.receiptPubkeyFromSecret(secret) });
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it("persists the accepted replacement draw after a draw conflict", async () => {
+    writeConfig("auto");
+    seedCredit(40_000);
+    provider.draw = (post, accepted) => provider.jobPosts.indexOf(post) === 0
+      ? answer(409, { error: "draw_conflict" })
+      : answer(200, { job_id: accepted, status: "completed", summary: "Done" }, { [FIELD]: accepted });
+    await paidRequest();
+    const [refused, replacement] = provider.jobPosts.map((post) => post.body);
+    expect(replacement.draw_id).not.toBe(refused.draw_id);
+    expect(jobs.loadJob("job-a")?.creditBinding).toEqual({ creditId: "prepaid-credit",
+      drawId: replacement.draw_id, callerPubkey: sdk.receiptPubkeyFromSecret(secret) });
   });
 
   it("records an identity failure on a draw-conflict resubmit under the ID that draw carried", async () => {
@@ -693,6 +751,7 @@ interface Provider {
   jobPosts: JobPost[];
   resultPosts: string[];
   resumePosts: string[];
+  balancePayments: Record<string, unknown>[];
   unpaid: (post: JobPost) => Reply;
   /** How a paid submit is answered once accepted as job `accepted`. */
   paid: (post: JobPost, accepted: string) => Reply;
@@ -734,6 +793,7 @@ async function startProvider(): Promise<Provider> {
     jobPosts: [],
     resultPosts: [],
     resumePosts: [],
+    balancePayments: [],
     unpaid: () => answer(402, {
       error: "payment_required",
       required_msats: 1_000,
@@ -837,6 +897,13 @@ async function startProvider(): Promise<Provider> {
       if (request.method === "GET" && path === "/v1/info") return answer(200, info(state))(response);
       const raw = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<string, unknown>;
       if (request.method === "POST" && path === "/v1/job") return onJob(request, response, raw);
+      if (request.method === "POST" && path === "/v1/job/job-a/messages") {
+        const authorization = (raw.content as { credit: Record<string, unknown> }).credit;
+        verifier.checkAuth(authorization, { audience, method: "POST", path, capability: null });
+        expect(request.headers["x-job-token"]).toBe(state.token);
+        state.balancePayments.push(authorization);
+        return answer(201, { seq: 5 })(response);
+      }
       const result = /^\/v1\/request-result\/([^/]+)$/.exec(path);
       if (request.method === "POST" && result) {
         return onRequestResult(request, response, raw, decodeURIComponent(result[1]));
@@ -866,7 +933,7 @@ function info(state: Provider): Record<string, unknown> {
     auth_audience: audience,
     capabilities: { echo: { description: "Echo" } },
     cashu: { mints: [mint], lock_pubkeys: [lockPubkey], min_locktime: 60, canonical_id: null },
-    credit: creditTerms,
+    credit: { ...creditTerms, balance_payment: true },
     ...(state.recovery ? { request_recovery: true } : {}),
     ...(state.x402
       ? { x402: { pay_to: `0x${"77".repeat(20)}`, network: "eip155:84532", asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" } }

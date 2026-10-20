@@ -922,15 +922,20 @@ async function shipEntry(
       }
       const identity = settleJobIdentity(response.jobIdentity ?? null, response.body);
       if (identity.kind === "unresolved") return unresolved(identity.observation);
-      if (entry.context) {
-        saveJob(
-          jobRecordFromEntry(
-            entry,
-            identity.jobId,
-            response.body,
-            identity.claimAllowed ? response.feedbackClaim : undefined
-          )
-        );
+      if (active.context) {
+        const record = jobRecordFromEntry(active, identity.jobId, response.body,
+          identity.claimAllowed ? response.feedbackClaim : undefined);
+        const existing = loadJob(identity.jobId);
+        if (existing) {
+          if (!sameEndpoint(existing.endpoint, active.endpoint) ||
+              (existing.requestId !== undefined && existing.requestId !== record.requestId))
+            return { kind: "still_pending", entry, reason: `recovery conflict: job ${identity.jobId} is already a different local job` };
+          updateJob(identity.jobId, {
+            ...recoveredCreditBinding(active),
+            ...(record.requestId ? { requestId: record.requestId } : {}),
+            ...(record.jobToken && !existing.jobToken ? { jobToken: record.jobToken } : {}),
+          });
+        } else saveJob(record);
       }
       await reconcileResumedJobCredit(active, response.body, httpPost);
       return { kind: "shipped", entry, jobId: identity.jobId };
@@ -1111,6 +1116,7 @@ function saveRecoveredJob(
     if (!sameEndpoint(existing.endpoint, entry.endpoint)) return "foreign_endpoint";
     if (existing.requestId !== undefined && existing.requestId !== requestId) return "other_request";
     updateJob(jobId, {
+      ...recoveredCreditBinding(entry),
       requestId,
       ...(jobToken && !existing.jobToken ? { jobToken } : {}),
     });
@@ -1389,6 +1395,16 @@ function isCreditWire(value: unknown): value is CreditWire {
   return typeof credit.credit_id === "string" && typeof credit.remaining_micro === "number";
 }
 
+/** Only the persisted signed submit can identify this accepted draw and its owner. */
+function recoveredCreditBinding(entry: PendingSubmission): Pick<JobRecord, "creditBinding"> {
+  const ctx = entry.context;
+  const data = ctx?.submit_body.data as Record<string, unknown> | undefined;
+  if (ctx?.route === "credit" || !ctx?.signing_pubkey ||
+      typeof data?.credit_id !== "string" || !data.credit_id ||
+      typeof data.draw_id !== "string" || !data.draw_id) return {};
+  return { creditBinding: { creditId: data.credit_id, drawId: data.draw_id, callerPubkey: ctx.signing_pubkey } };
+}
+
 function jobRecordFromEntry(
   entry: PendingSubmission,
   jobId: string,
@@ -1400,6 +1416,7 @@ function jobRecordFromEntry(
   return {
     id: jobId,
     endpoint: entry.endpoint,
+    ...recoveredCreditBinding(entry),
     ...(publicRequestId ? { requestId: publicRequestId } : {}),
     ...(ctx?.dvm_id ? { dvmId: ctx.dvm_id } : {}),
     ...(feedbackClaim ? { feedbackClaim } : {}),

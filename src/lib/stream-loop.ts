@@ -6,6 +6,7 @@ import {
   type JobPolicy,
   type Message,
   type MessagePollOptions,
+  type PaymentRequestContent,
   type ProviderRef,
   type ProviderText,
   type StreamOptions,
@@ -106,6 +107,24 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   // and the payment-rail helpers (payWithLightning / payWithCashu) reach the
   // token without manually threading it down four call levels.
   const jobToken = opts.jobToken ?? loadJob(jobId)?.jobToken;
+  function recordAutoPayment(result: PaidPaymentResult, request: PaymentRequestContent, seq: number): void {
+    autoPayments.push({
+      amount_msats: result.amountMsats,
+      rail: result.rail,
+      reason: asProviderText(request.reason),
+      ...(result.amountUsdcMicro !== undefined && { amount_usdc_microunits: result.amountUsdcMicro }),
+      display: paidConfirmationDisplay(result, request.fiat_amount),
+    });
+    autoPaidSeqs.add(seq);
+    justAutoPaid = true;
+  }
+  const pending = persistLocalState ? loadJob(jobId)?.pendingCreditPayment : undefined;
+  if (pending && policy) {
+    const result = await handlePaymentRequest(jobId, pending.request, policy, transport, provider, {
+      jobToken, requestSeq: pending.authorization.request_seq,
+    });
+    if (typeof result === "object") recordAutoPayment(result, pending.request, pending.authorization.request_seq);
+  }
   const deadline =
     opts.timeoutMs === undefined ? undefined : Date.now() + Math.max(0, opts.timeoutMs);
 
@@ -181,6 +200,10 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       justAutoPaid = false;
 
       const lastYield = findLastYield(batchMessages);
+      if (lastYield?.type === "payment-request" && autoPaidSeqs.has(lastYield.seq)) {
+        justAutoPaid = true;
+        break;
+      }
       if (lastYield?.type === "payment-request" && policy) {
         const req = lastYield.content;
         if (
@@ -189,19 +212,10 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
         ) {
           const result = await handlePaymentRequest(jobId, req, policy, transport, provider, {
             jobToken,
+            requestSeq: lastYield.seq,
           });
           if (typeof result === "object") {
-            autoPayments.push({
-              amount_msats: result.amountMsats,
-              rail: result.rail,
-              reason: asProviderText(req.reason),
-              ...(result.amountUsdcMicro !== undefined && {
-                amount_usdc_microunits: result.amountUsdcMicro,
-              }),
-              display: paidConfirmationDisplay(result, req.fiat_amount),
-            });
-            autoPaidSeqs.add(lastYield.seq);
-            justAutoPaid = true;
+            recordAutoPayment(result, req, lastYield.seq);
             continue;
           }
           if (result === "payment-cap-exceeded") {
