@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/dvmkit/dvm-cli/compare/v0.9.0...v0.9.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* **skill:** describe the dvm skill by the jobs it serves ([16cc632](https://github.com/dvmkit/dvm-cli/commit/16cc6321762b755394af7067d366794d06a004b6))
+
 ## [0.9.0](https://github.com/dvmkit/dvm-cli/compare/v0.9.0-rc.1...v0.9.0) (2026-10-20)
 
 
