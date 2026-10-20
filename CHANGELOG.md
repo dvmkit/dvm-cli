@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0-rc.1](https://github.com/dvmkit/dvm-cli/compare/v0.8.2...v0.9.0-rc.1) (2026-10-20)
+
+
+### Features
+
+* pay mid-job requests from prepaid balance ([bbe42c0](https://github.com/dvmkit/dvm-cli/commit/bbe42c05c89be58ebacf9731ccdfe1fc3688214d))
+
 ## [0.8.2](https://github.com/dvmkit/dvm-cli/compare/v0.8.1...v0.8.2) (2026-10-20)
 
 
