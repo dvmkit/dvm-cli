@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/dvmkit/dvm-cli/compare/v0.9.0-rc.1...v0.9.0) (2026-10-20)
+
+
+### Bug Fixes
+
+* **deps:** use the stable SDK runtime ([452f6e7](https://github.com/dvmkit/dvm-cli/commit/452f6e74e132a16b83d6471eabe78bf50c5bd328))
+
 ## [0.9.0-rc.1](https://github.com/dvmkit/dvm-cli/compare/v0.8.2...v0.9.0-rc.1) (2026-10-20)
 
 
