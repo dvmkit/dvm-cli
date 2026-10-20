@@ -10,7 +10,7 @@ const seams = vi.hoisted(() => ({
 vi.mock("../src/lib/transport", () => ({
   createDvmTransport: () => {
     seams.createTransport();
-    return { close: seams.close, submit: seams.submit };
+    return { close: seams.close, describe: async () => ({}), submit: seams.submit };
   },
 }));
 
