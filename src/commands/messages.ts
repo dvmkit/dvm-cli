@@ -195,6 +195,17 @@ async function messagesWithAccess(
   }
 }
 
+function paymentAmount(msg: Extract<Message, { type: "payment" }>): string {
+  if (msg.from === "requester" && msg.content.credit) {
+    const credit = msg.content.credit;
+    const digits = String(credit.amount_micro).padStart(7, "0");
+    const fraction = digits.slice(-6).replace(/0+$/, "");
+    const amount = digits.slice(0, -6) + (fraction ? `.${fraction}` : "");
+    return `${amount} ${credit.currency.toUpperCase()} from prepaid balance`;
+  }
+  return formatAmountBestEffort(msg.content.amount_msats);
+}
+
 export function formatMessageHuman(
   msg: Message,
   jobId?: string,
@@ -238,7 +249,7 @@ export function formatMessageHuman(
       );
       break;
     case "payment": {
-      const amount = formatAmountBestEffort(msg.content.amount_msats);
+      const amount = paymentAmount(msg);
       if (msg.from === "provider") {
         const noun = msg.content.reason === "change" ? "change" : "refund";
         info(`[${msg.seq}] ${prefix} sent ${noun}: ${amount}`);
@@ -320,9 +331,8 @@ function serialize(msg: Message): Record<string, unknown> {
       };
     }
     case "payment": {
-      // `reason` is only ever set by the provider; a requester `payment` is the
-      // caller spending sats, so it must not borrow refund/change wording.
-      const amount = formatAmountBestEffort(msg.content.amount_msats);
+      // Requester payments must not borrow provider refund/change wording.
+      const amount = paymentAmount(msg);
       const display = fromProvider
         ? `${msg.content.reason === "change" ? "Change" : "Refund"} sent: ${amount}`
         : `Paid: ${amount}`;

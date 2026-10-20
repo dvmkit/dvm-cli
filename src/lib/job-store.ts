@@ -1,6 +1,10 @@
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, fsyncSync } from "fs";
 
 import { JOBS_FILE } from "@dvmkit/sdk/internal";
+import { dirname } from "node:path";
+import lockfile from "proper-lockfile";
+import type { PaymentContent } from "@dvmkit/sdk";
+import type { PaymentRequestContent } from "@dvmkit/sdk/internal";
 import type { JobCompletion } from "./completion-hints";
 import { ensureConfigDir } from "@dvmkit/sdk/internal";
 import type { TerminalJobStatus } from "./next-action";
@@ -8,7 +12,20 @@ import type { JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
 import type { ReceiptTrustAnchor } from "@dvmkit/sdk/internal";
 import type { ProviderRef, ReceiptParseError } from "@dvmkit/sdk/internal";
 
+export interface CreditPaymentIntent {
+  authorization: NonNullable<PaymentContent["credit"]>;
+  request: PaymentRequestContent;
+  /** Caller-priced consumption, pinned before send for replay after rate changes. */
+  amountMsats?: number;
+  /** This pair was selected for a job with no server-bound draw yet. */
+  selectedUnbound?: true;
+}
+
 export interface JobRecord {
+  /** Absent on legacy jobs: their existing draw must never be guessed. */
+  creditBinding?: { creditId: string; drawId: string; callerPubkey: string } | { unbound: true; callerPubkey: string };
+  pendingCreditPayment?: CreditPaymentIntent;
+  bookedCreditPayments?: CreditPaymentIntent[];
   id: string;
   endpoint: string;
   /** Canonical DVM name. Optional for older job records. */
@@ -126,18 +143,15 @@ export interface ArtifactRef {
 }
 
 export function saveJob(job: JobRecord): void {
-  const jobs = loadAllJobs();
-  jobs.push(job);
-  writeJobs(jobs);
+  mutateJobs((jobs) => { jobs.push(job); });
 }
 
 /** Merge a partial update into an existing job record. No-op if job not found. */
 export function updateJob(id: string, update: Partial<Omit<JobRecord, "id">>): void {
-  const jobs = loadAllJobs();
-  const idx = jobs.findIndex((j) => j.id === id);
-  if (idx === -1) return;
-  jobs[idx] = { ...jobs[idx], ...update };
-  writeJobs(jobs);
+  mutateJobs((jobs) => {
+    const idx = jobs.findIndex((j) => j.id === id);
+    if (idx !== -1) jobs[idx] = { ...jobs[idx], ...update };
+  });
 }
 
 /** Persist status and completion together for offline replay. Empty completion is allowed.
@@ -175,11 +189,14 @@ export function loadAllJobs(): JobRecord[] {
 
 /** Add a payment to a job's running total and increment its honoured-payment count. No-op if job not found. */
 export function addPayment(jobId: string, amountMsats: number): void {
-  const job = loadJob(jobId);
-  if (!job) return;
-  updateJob(jobId, {
-    totalPaidMsats: (job.totalPaidMsats ?? 0) + amountMsats,
-    paymentsHonoured: (job.paymentsHonoured ?? 0) + 1,
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (!job) return;
+    job.totalPaidMsats = (job.totalPaidMsats ?? 0) + amountMsats;
+    job.paymentsHonoured = (job.paymentsHonoured ?? 0) + 1;
+    // A rail may bind a previously free job to an implicit credit whose IDs
+    // this message response does not expose. Future balance payments must not guess.
+    if (job.creditBinding && "unbound" in job.creditBinding) delete job.creditBinding;
   });
 }
 
@@ -189,5 +206,47 @@ export function refFromJob(job: JobRecord): ProviderRef {
 
 function writeJobs(jobs: JobRecord[]): void {
   ensureConfigDir();
-  writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2) + "\n");
+  const temporary = `${JOBS_FILE}.${process.pid}.tmp`;
+  const fd = openSync(temporary, "w", 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(jobs, null, 2) + "\n");
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  renameSync(temporary, JOBS_FILE);
+  const directory = openSync(dirname(JOBS_FILE), "r");
+  try { fsyncSync(directory); } finally { closeSync(directory); }
+}
+
+/** Serialize intent creation and consumption booking, including concurrent pay processes. */
+function mutateJobs<T>(change: (jobs: JobRecord[]) => T): T {
+  ensureConfigDir();
+  const release = lockfile.lockSync(JOBS_FILE, { realpath: false });
+  try {
+    const jobs = loadAllJobs();
+    const before = JSON.stringify(jobs);
+    const result = change(jobs);
+    if (JSON.stringify(jobs) !== before) writeJobs(jobs);
+    return result;
+  } finally { release(); }
+}
+
+export function mutateCreditPayment<T>(jobId: string, change: (job: JobRecord) => T): T {
+  return mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (!job) throw new Error("Cannot persist a balance payment for an unknown job.");
+    return change(job);
+  });
+}
+
+export function bookCreditPayment(jobId: string, intent: CreditPaymentIntent): void {
+  mutateCreditPayment(jobId, (job) => {
+    if (!job.bookedCreditPayments?.some((entry) =>
+      entry.authorization.payment_id === intent.authorization.payment_id)) {
+      job.totalPaidMsats = (job.totalPaidMsats ?? 0) + (intent.amountMsats ?? intent.request.amount_msats);
+      job.paymentsHonoured = (job.paymentsHonoured ?? 0) + 1;
+      (job.bookedCreditPayments ??= []).push(intent);
+    }
+    if (job.pendingCreditPayment?.authorization.payment_id === intent.authorization.payment_id)
+      delete job.pendingCreditPayment;
+  });
 }

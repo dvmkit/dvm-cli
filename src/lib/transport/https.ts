@@ -765,7 +765,9 @@ export class HttpsTransport implements Transport {
       } catch {
         throw new DvmError("payment_insufficient", "Payment required (unparseable response).");
       }
-      throw buildPaymentError(errorBody);
+      const error = withCreditErrorContext(buildPaymentError(errorBody), errorBody);
+      error.data = { ...error.data, http_status: 402 };
+      throw error;
     }
 
     if (res.status === 409) {
@@ -774,7 +776,9 @@ export class HttpsTransport implements Transport {
       // 409 while the job is still live and still waiting to be paid. Mapping
       // that to `job_terminal` told the agent to walk away from a running job —
       // surface the DVM's own code and copy instead.
-      if (body?.error === "replay_rejected") throw buildPaymentError(body);
+      if (body && (body.error === "replay_rejected" ||
+          (message.type === "payment" && message.content.credit && typeof body.error === "string")))
+        throw withCreditErrorContext(buildPaymentError(body), body);
       // the job went terminal (completed/cancelled) before this POST
       // landed — the mid-job-payment race. Map it to a structured error with a
       // hint so an agent following a stale next_action self-recovers in one
@@ -789,8 +793,13 @@ export class HttpsTransport implements Transport {
     if (!res.ok) {
       const text = await res.text();
       const structured = parseStructuredError(text);
-      if (structured) throw structured;
+      if (structured) throw withCreditErrorContext(structured, parseJsonObject(text) ?? {});
       throw providerResponseError("provider_error", `sendMessage failed (${res.status}): ${text}`);
+    }
+    if (message.type === "payment" && message.content.credit) {
+      const body = parseJsonObject(await res.text());
+      if (res.status !== 201 || !Number.isSafeInteger(body?.seq) || Number(body?.seq) < 0)
+        throw new DvmError("invalid_credit_payment_response", "The balance payment outcome is unknown; replay the saved payment.");
     }
   }
 
@@ -1389,7 +1398,7 @@ function withCreditErrorContext(err: DvmError, body: Record<string, unknown>): D
     extra.status = body.status;
   }
   for (const key of CREDIT_CONTEXT_FIELDS) {
-    if (typeof body[key] === "number") extra[key] = body[key];
+    if (Number.isSafeInteger(body[key]) && Number(body[key]) >= 0) extra[key] = body[key];
   }
   const menu = parseCreditMenu(body.credit);
   if (menu) extra.credit = menu;

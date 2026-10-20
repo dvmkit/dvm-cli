@@ -79,6 +79,7 @@ describe("mid-job payment rail selection", () => {
       throw new Error("Network disabled for this unit test");
     }));
     sdk.loadJob.mockReturnValue({
+      endpoint: provider.endpoint,
       totalPaidMsats: 0,
       paymentsHonoured: 0,
       jobToken: "job-token",

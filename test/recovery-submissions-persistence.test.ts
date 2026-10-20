@@ -107,6 +107,7 @@ describe("pending-submission sweep", () => {
     );
     expect(JSON.parse(String(calls[0].init?.body))).toEqual(SUBMIT_BODY);
     expect(result.outcomes.map((outcome) => outcome.kind)).toEqual(["shipped"]);
+    expect(loadJob("job-1")).not.toHaveProperty("creditBinding");
     expect(loadAgentWallet()?.pending_submissions).toEqual([]);
   });
 

@@ -130,7 +130,12 @@ export async function requestResult(
       }
     );
   }
+  const originalData = intent.body.data as Record<string, unknown> | undefined;
+  const creditBinding = typeof originalData?.credit_id === "string" && typeof originalData.draw_id === "string"
+    ? { creditId: originalData.credit_id, drawId: originalData.draw_id, callerPubkey: intent.callerPubkey }
+    : undefined;
   const restored = {
+    ...(creditBinding ? { creditBinding } : {}),
     requestId,
     transactionHash: receipt.transactionHash,
     jobToken: receipt.jobToken,

@@ -41,8 +41,10 @@ export function fundingRailLabel(rail: CreditFundRail): string {
 }
 
 /** {@link fundingRailLabel}'s twin for the per-call payment rails. */
-export function paymentRailLabel(rail: PaymentRailKey): string {
+export function paymentRailLabel(rail: PaymentRailKey | "credit"): string {
   switch (rail) {
+    case "credit":
+      return "prepaid balance";
     case "cashu":
     case "cashu_p2pk":
       return "ecash";

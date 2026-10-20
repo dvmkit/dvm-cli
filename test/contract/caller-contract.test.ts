@@ -13,7 +13,8 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { computeResultHash, receiptPubkeyFromSecret, signReceipt } from "@dvmkit/sdk/internal";
+import { createSignedRequestVerifier } from "@dvmkit/sdk";
+import { computeResultHash, receiptPubkeyFromSecret, signReceipt, signDvmRequestData } from "@dvmkit/sdk/internal";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const repositoryRoot = resolve(import.meta.dirname, "../..");
@@ -28,6 +29,11 @@ const contractCreditId = "contract-credit";
 const resumedCreditId = "resumed-credit";
 const resumedFundId = "resumed-funding";
 let resumedFundAttempts = 0;
+let balanceAttempts = 0;
+const balanceAccepted = new Set<string>();
+const balanceAudience = { dvm_id: "contract-provider", builder_pubkey: "00".repeat(32) };
+const balanceVerifier = createSignedRequestVerifier({ _zod: {}, parse: (data: unknown) => data,
+  safeParse: (data: unknown) => ({ success: true as const, data }) }, { replayStore: null });
 const drainAttempts = new Map<string, number>();
 
 beforeAll(async () => {
@@ -44,6 +50,20 @@ beforeAll(async () => {
         ...(typeof jobToken === "string" ? { jobToken } : {}),
       });
       response.setHeader("content-type", "application/json");
+      if (request.method === "POST" && request.url === "/v1/job/balance-restart/messages") {
+        const payment = JSON.parse(text) as { type: string; content: { credit: Record<string, unknown> } };
+        balanceVerifier.checkAuth(payment.content.credit, { audience: balanceAudience, method: "POST",
+          path: "/v1/job/balance-restart/messages", capability: null });
+        balanceAccepted.add(String(payment.content.credit.payment_id));
+        if (++balanceAttempts === 1) response.destroy();
+        else { response.statusCode = 201; response.end('{"seq":5}'); }
+        return;
+      }
+      if (request.method === "GET" && request.url?.startsWith("/v1/job/balance-restart/messages")) {
+        response.end(JSON.stringify({ messages: [{ seq: 6, from: "provider", timestamp: "2026-01-01T00:00:00Z",
+          type: "complete", content: { status: "success", summary: "Done" } }] }));
+        return;
+      }
       if (request.method === "GET" && request.url === "/v1/info") {
         response.end(
           JSON.stringify({
@@ -202,6 +222,25 @@ beforeAll(async () => {
         );
         return;
       }
+      if (request.method === "GET" && /^\/v1\/job\/history-(usd|eur|large-usd|micro-usd|whole-usd|whole-micro-usd)\/messages\?/.test(request.url ?? "")) {
+        const currency = request.url!.includes("history-eur") ? "eur" : "usd";
+        const amountMicro = request.url!.includes("history-large-usd") ? 9007199254740991
+          : request.url!.includes("history-micro-usd") ? 1
+          : request.url!.includes("history-whole-usd") ? 1000000
+          : request.url!.includes("history-whole-micro-usd") ? 1000001
+          : currency === "eur" ? 1350 : 1000;
+        const timestamp = "2026-01-01T00:00:00Z";
+        response.end(JSON.stringify({ messages: [
+          { seq: 2, from: "requester", timestamp, type: "payment", content: { credit: {
+            credit_id: "history-credit", draw_id: "history-draw", payment_id: "history-payment",
+            request_seq: 1, amount_micro: amountMicro, currency,
+          } } },
+          { seq: 3, from: "requester", timestamp, type: "payment", content: { amount_msats: 5000 } },
+          { seq: 4, from: "provider", timestamp, type: "payment", content: { amount_msats: 2000, reason: "refund" } },
+          { seq: 5, from: "provider", timestamp, type: "payment", content: { amount_msats: 1000, reason: "change" } },
+        ] }));
+        return;
+      }
       if (
         request.method === "GET" &&
         request.url?.startsWith("/v1/job/override-state/messages")
@@ -319,6 +358,42 @@ describe("standalone caller contract", () => {
     if (process.platform !== "win32") expect(statSync(root).mode & 0o777).toBe(0o700);
   });
 
+  it("recovers the exact saved balance payment in a new process after acceptance and response loss", async () => {
+    const root = mkdtempSync(join(tmpdir(), "caller-balance-restart-"));
+    configRoots.add(root);
+    const secret = "01".repeat(32);
+    const pubkey = receiptPubkeyFromSecret(secret);
+    const authorization = signDvmRequestData(secret, { credit_id: "held-credit", draw_id: "accepted-draw",
+      payment_id: "durable-payment", request_seq: 4, amount_micro: 1500, currency: "usd" },
+      { audience: balanceAudience, method: "POST", path: "/v1/job/balance-restart/messages", capability: null });
+    writeFileSync(join(root, "jobs.json"), JSON.stringify([{ id: "balance-restart", endpoint,
+      status: "processing", submittedAt: 1700000000000, jobToken: portableToken,
+      policy: { maxTotalMsats: 1500, maxIncrementMsats: 1500, autoPayBelowMsats: 1500, maxPayments: 1 },
+      creditBinding: { creditId: "held-credit", drawId: "accepted-draw", callerPubkey: pubkey },
+      pendingCreditPayment: { authorization, request: { amount_msats: 1500, reason: "Additional work",
+        credit: { amount_micro: 1500, currency: "usd" } } } }]));
+    balanceAttempts = 0;
+    balanceAccepted.clear();
+    requests.length = 0;
+    const interrupted = await runCliOutcome(["pay", "balance-restart"], { DVM_IDENTITY_KEY: secret }, root);
+    expect(interrupted.code).toBe(1);
+    const saved = readJson(join(root, "jobs.json")) as Array<Record<string, unknown>>;
+    expect(saved[0].pendingCreditPayment).toMatchObject({ authorization });
+    expect(saved[0].paymentsHonoured).toBeUndefined();
+    // The server is terminal now and the message journal was never written.
+    const recovered = await runCli(["pay", "balance-restart"], { DVM_IDENTITY_KEY: secret }, root);
+    expect(JSON.parse(recovered.stdout)).toMatchObject({ paid: { rail: "credit" } });
+    const posts = requests.filter((request) => request.method === "POST" && request.path.endsWith("balance-restart/messages"));
+    expect(posts).toHaveLength(2);
+    expect(posts[1].body).toEqual(posts[0].body);
+    expect(posts[1].jobToken).toBe(portableToken);
+    expect(balanceAccepted.size).toBe(1);
+    const jobs = readJson(join(root, "jobs.json")) as Array<Record<string, unknown>>;
+    expect(jobs[0]).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1, status: "completed" });
+    expect(jobs[0].pendingCreditPayment).toBeUndefined();
+    expect(existsSync(join(root, "budget.json"))).toBe(false);
+  });
+
   it("reads provider metadata over the public HTTP contract", async () => {
     const result = await runCli(["describe", endpoint]);
     const output = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -371,6 +446,35 @@ describe("standalone caller contract", () => {
     expect(requests[1]?.body).toEqual(
       expect.objectContaining({ capability: "echo", input: "hello" })
     );
+  });
+
+  describe.each([
+    ["usd", "usd", 1000, "0.001 USD"],
+    ["eur", "eur", 1350, "0.00135 EUR"],
+    ["large-usd", "usd", 9007199254740991, "9007199254.740991 USD"],
+    ["micro-usd", "usd", 1, "0.000001 USD"],
+    ["whole-usd", "usd", 1000000, "1 USD"],
+    ["whole-micro-usd", "usd", 1000001, "1.000001 USD"],
+  ] as const)("%s prepaid history", (historyId, currency, amountMicro, nativeAmount) => {
+    const args = () => ["messages", `history-${historyId}`, "--no-stream", "--endpoint", endpoint, "--job-token", portableToken];
+    it("preserves the exact native credit amount in JSON without repricing", async () => {
+      const result = await runCli(args());
+      const history = JSON.parse(result.stdout).messages;
+      expect(history[0]).toEqual({ seq: 2, from: "requester", timestamp: "2026-01-01T00:00:00Z", type: "payment",
+        content: { credit: { credit_id: "history-credit", draw_id: "history-draw", payment_id: "history-payment",
+          request_seq: 1, amount_micro: amountMicro, currency } },
+        display: `Paid: ${nativeAmount} from prepaid balance` });
+      expect(history.slice(1).map((message: { display: string }) => message.display)).toEqual([
+        "Paid: 5 sats", "Refund sent: 2 sats", "Change sent: 1 sats",
+      ]);
+    });
+    it("shows the exact native amount and prepaid method with --human", async () => {
+      const human = await runCli([...args(), "--human"]);
+      expect(human.stderr).toContain(`[2] You paid: ${nativeAmount} from prepaid balance\n`);
+      expect(human.stderr).toContain("[3] You paid: 5 sats\n");
+      expect(human.stderr).toContain("[4] Provider sent refund: 2 sats\n");
+      expect(human.stderr).toContain("[5] Provider sent change: 1 sats\n");
+    });
   });
 
   it("uses portable credentials for every stateless read and control verb", async () => {

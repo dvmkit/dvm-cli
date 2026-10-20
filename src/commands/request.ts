@@ -866,6 +866,9 @@ export async function request(opts: RequestOptions): Promise<void> {
     // the job cleared by drawing on a prepaid credit — no payment
     // attach, no budget-ledger entry (the funding already counted).
     ...(probePlan.mode === "draw" ? { paymentMethod: "credit" as const } : {}),
+    ...(signing ? { creditBinding: probePlan.mode === "draw"
+      ? { creditId: probePlan.creditId, drawId: probePlan.drawId, callerPubkey: signing.pubkey }
+      : { unbound: true as const, callerPubkey: signing.pubkey } } : {}),
     // persist the anonymous-flow per-job token so subsequent
     // status/messages/pay/cancel commands can present it as `X-Job-Token`.
     jobToken: receipt.jobToken,
@@ -3338,6 +3341,9 @@ async function payWithAgentWallet(
       feedbackClaim: receipt.feedbackClaim,
       capability: identity.capability,
       requestId: publicRequestId,
+      ...(fundPlan && signing ? { creditBinding: {
+        creditId: fundPlan.creditId, drawId: fundPlan.drawId, callerPubkey: signing.pubkey,
+      } } : {}),
       status: "submitted",
       submittedAt: Date.now(),
       policy,
