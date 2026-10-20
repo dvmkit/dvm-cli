@@ -1,10 +1,14 @@
 ---
 name: dvm
 description: >-
-  Discover and use Digital Vending Machines with the dvm CLI.
-  Use when asked to find a service for a task, call a capability,
-  pay for a job, retrieve results, manage a wallet or prepaid credit,
-  or recover a failed payment or request.
+  Finds and pays for services the agent cannot provide itself, one job
+  at a time, with no account or API key: any paid capability such as
+  processing audio or video, generating media, fetching web data, or
+  running compute. Use when a task needs a tool, API, or service the
+  agent lacks, when the user mentions a DVM, dvmkit, or the dvm CLI,
+  or when asked to fund or manage the agent's wallet or prepaid credit,
+  check a job's price before paying, retrieve results, or recover a
+  failed payment or request.
 compatibility: >-
   Requires the dvm CLI on PATH and network access.
   Installation: https://dvmkit.com/docs/quickstart
