@@ -97,6 +97,7 @@ function complete(seq: number, summary: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  seams.describe.mockResolvedValue({});
 });
 
 describe.each(commands)("$name discovery lifecycle", (fixture) => {
@@ -358,7 +359,7 @@ describe.each(commands)("$name discover trust rows", (fixture) => {
 
     await fixture.invoke();
 
-    expect(seams.describe).not.toHaveBeenCalled();
+    expect(seams.describe).toHaveBeenCalledExactlyOnceWith(expect.anything());
     expect(network).not.toHaveBeenCalled();
     const output = seams.json.mock.calls[0][0];
     const rows = fixture.name === "search" ? output.results : output.entries;
@@ -427,7 +428,7 @@ describe.each(commands)("$name discover trust rows", (fixture) => {
     expect(text).not.toContain("Reliability:");
     expect(text).not.toContain("Speed: null");
     expect(text).not.toContain("Owner: null");
-    expect(seams.describe).not.toHaveBeenCalled();
+    expect(seams.describe).toHaveBeenCalledExactlyOnceWith(expect.anything());
     if (fixture.name === "browse") expect(text).toContain("dvm browse --offset 13");
   });
 });
