@@ -505,12 +505,13 @@ async function sendRailPayment(
   provider: ProviderRef,
   options?: SendMessageOptions
 ): Promise<void> {
-  const capture = (evidence: { drawFundingReceipt?: unknown; drawFundingReceiptParseError?: unknown; seq?: number }) => {
+  // The acknowledgement's seq is a post-dispatch cursor, not the inbound
+  // payment sequence signed by the provider.
+  const capture = (evidence: { drawFundingReceipt?: unknown; drawFundingReceiptParseError?: unknown }) => {
     if (evidence.drawFundingReceiptParseError) info("Warning: mid-job funding evidence has an invalid shape.");
     if (evidence.drawFundingReceipt) captureDrawFundingReceipts(jobId, [evidence.drawFundingReceipt], {
       endpoint: provider.endpoint,
       ...(typeof message.content.cashu_request_id === "string" ? { fundId: message.content.cashu_request_id } : {}),
-      paymentSeq: evidence.seq,
     });
   };
   try {

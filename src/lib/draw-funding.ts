@@ -21,7 +21,7 @@ function verifiedFunding(job: JobRecord, receipt: unknown, fundId?: string): Dra
 export function captureDrawFundingReceipts(
   jobId: string,
   receipts: unknown[] | undefined,
-  opts?: { endpoint?: string; fundId?: string; paymentSeq?: number }
+  opts?: { endpoint?: string; fundId?: string }
 ): void {
   if (!receipts?.length || !loadJob(jobId)) return;
   try {
@@ -31,8 +31,7 @@ export function captureDrawFundingReceipts(
       if (opts?.endpoint && !sameEndpoint(job.endpoint, opts.endpoint)) return;
       for (const raw of receipts) {
         const receipt = verifiedFunding(job, raw, opts?.fundId);
-        if (!receipt || (opts?.paymentSeq !== undefined && receipt.payment_seq !== undefined &&
-            receipt.payment_seq !== opts.paymentSeq)) {
+        if (!receipt) {
           info("Warning: mid-job funding evidence did not verify; credit comparisons remain unchanged.");
           continue;
         }

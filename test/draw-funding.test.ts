@@ -50,11 +50,11 @@ beforeEach(() => {
 const ask = { amount_msats: 50_000, reason: "Additional work", lock_pubkey: "02" + "01".repeat(32), mints: ["https://mint.invalid"] };
 const policy = { maxTotalMsats: 1_000_000, maxIncrementMsats: 1_000_000, autoPayBelowMsats: 1_000_000, maxPayments: 3 };
 
-function wire(receipt: unknown = funding(), code = 201, error?: string) {
+function wire(receipt: unknown = funding(), code = 201, error?: string, seq = 8) {
   const observed = response();
   const fetch = vi.fn(async (url: string | URL | Request) => {
     if (String(url).endsWith("/v1/info")) return Response.json({ builder: dvm.anchor });
-    if (String(url).endsWith("/messages")) return Response.json({ seq: 8, draw_funding_receipt: receipt,
+    if (String(url).endsWith("/messages")) return Response.json({ seq, draw_funding_receipt: receipt,
       ...(error ? { error } : {}) }, { status: code });
     if (String(url) === `${endpoint}/v1/job/${jobId}`) return Response.json({ status: "completed",
       receipt: observed.receipt, draw_funding_receipts: [funding()] });
@@ -67,6 +67,20 @@ function wire(receipt: unknown = funding(), code = 201, error?: string) {
 const pay = () => handlePaymentRequest(jobId, ask, policy, new HttpsTransport(), { endpoint }, { rail: "cashu", requestSeq: 4 });
 
 describe("payment acknowledgement funding evidence", () => {
+  it("retains funding when the acknowledgement cursor advances beyond the inbound payment", async () => {
+    seed();
+    const receipt = funding({ payment_seq: 8 });
+    const fetch = wire(receipt, 201, undefined, 9);
+    await expect(pay()).resolves.toMatchObject({ status: "paid", rail: "cashu_p2pk" });
+    expect(loadJob(jobId)?.drawFundingReceipts).toEqual([receipt]);
+    fetch.mockClear();
+    // No recovery evidence: reconciliation must use the durable acknowledgement.
+    await settle(response());
+    expect(loadCredit(endpoint, signing.pubkey, identity)).toMatchObject({ remainingMicro: 400_000, ledgerSeq: 6 });
+    expect(warnings()).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it.each([100_000, 200_000])("uses signed native funding when the caller's BTC rate is %s", async (rate) => {
     seed();
     market.rate = rate;
@@ -126,10 +140,10 @@ describe("payment acknowledgement funding evidence", () => {
     expect(loadCredit(endpoint, signing.pubkey, identity)?.remainingMicro).toBe(400_000);
   });
 
-  it.each(["shape", "fund", "payment-sequence"])("does not admit %s-mismatched acknowledgements", async (kind) => {
+  it.each(["shape", "fund"])("does not admit %s-mismatched acknowledgements", async (kind) => {
     seed();
     const receipt = kind === "shape" ? { kind: "credit_draw_funding" }
-      : funding(kind === "fund" ? { fund_id: "other-payment" } : { payment_seq: 9 });
+      : funding({ fund_id: "other-payment" });
     const fetch = wire(receipt);
     await pay();
     expect(loadJob(jobId)?.drawFundingReceipts).toBeUndefined();
