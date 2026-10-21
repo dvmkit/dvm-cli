@@ -34,6 +34,7 @@ import {
 
 import { type ContentStatus, jobContentFields } from "../lib/job-content";
 import { takeCreditNoticeFields } from "../lib/credit-notice";
+import { settleCreditAfterRead } from "../lib/credit-topup";
 import { formatIdentifier } from "../lib/dvm-identifier";
 import { takeFeedbackNoticeFields } from "../lib/feedback-notice";
 import { noteFeedbackAfterTerminal } from "../lib/feedback-nudges";
@@ -82,13 +83,13 @@ async function statusWithAccess(
     // re-verify the snapshotted receipt rather than replaying a
     // cached verdict — a tampered `jobs.json` must answer `invalid`.
     let receipt = replayStoredReceipt(stored);
+    const transport = createDvmTransport();
 
     // a terminal snapshot can predate the receipt that the DVM now
     // serves. Spend one best-effort read only when the DVM advertised receipts
     // and the local record has none; the saved completion remains authoritative
     // even when that read fails or returns no proof.
     if (stored.receiptsSupported && receipt.status === "absent") {
-      const transport = createDvmTransport();
       const fetched = await fetchMissingJobReceipt(jobId, transport, ref);
       if (fetched.receipt || fetched.receiptParseError) {
         if (fetched.receipt && !stored.builderAnchor) {
@@ -96,8 +97,9 @@ async function statusWithAccess(
         }
         receipt = captureTransportReceipt(jobId, fetched);
       }
-      transport.close();
     }
+    await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
+    transport.close();
 
     renderStatus(jobId, stored, stored.status, stored.completion, "local", null, opts, {
       receipt,
@@ -160,6 +162,9 @@ async function statusWithAccess(
       stored && !access.endpointOverridden
         ? captureTransportReceipt(jobId, result)
         : transientReceiptCapture(jobId, result);
+    if (stored && !access.endpointOverridden) {
+      await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
+    }
     // this wire read is where a `--no-stream` job's terminal is
     // learned, so it is the arc's one nudge moment — gated on the stored
     // record not being terminal yet, because a re-read of a finished job (the

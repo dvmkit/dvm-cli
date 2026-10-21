@@ -80,6 +80,7 @@ import {
 } from "./credit-notice";
 import { providerDvmIdentity } from "./credit-per-dvm";
 import { type AdoptedWedgedDrain, adoptWedgedChannelDrain, reclaimCommand } from "./credit-reclaim";
+import { type JobRecord, loadJob } from "./job-store";
 
 export interface SettleCreditArgs {
   capture: ReceiptCapture | undefined;
@@ -98,8 +99,10 @@ export interface SettleCreditArgs {
   dvmId?: string;
   /** `/v1/info` as read at warmup — carries the Cashu offer a top-up spends against. */
   providerInfo?: ProviderInfo;
-  /** The signing identity that owns the credit. Absent → projection update only. */
+  /** The signing identity that owns the credit and may authorize a refill. */
   signing?: { privkey: string; pubkey: string };
+  /** Original caller for projection-only recovery; does not authorize funding. */
+  callerPubkey?: string;
   /** Set false at degraded moments (e.g. SSE-drop recovery) to skip the refill. */
   allowTopup?: boolean;
   human?: boolean;
@@ -154,6 +157,39 @@ export async function settleCreditAfterJob(args: SettleCreditArgs): Promise<void
   }
 }
 
+/** Read recovery may update an existing draw, but never opens or refills credit. */
+export async function settleCreditAfterRead(args: {
+  job: JobRecord;
+  capture: ReceiptCapture;
+  transport: Transport;
+  human?: boolean;
+}): Promise<void> {
+  const { job, capture } = args;
+  const binding = job.creditBinding;
+  const receipt = capture.receipt;
+  if (
+    job.strictPerCall || !binding || "unbound" in binding ||
+    !receipt?.credit || receipt.job_id !== job.id ||
+    receipt.requester_pubkey !== binding.callerPubkey ||
+    receipt.credit.credit_id !== binding.creditId || receipt.credit.draw_id !== binding.drawId ||
+    receipt.credit.credit_id.startsWith("imp:")
+  ) return;
+
+  // A status read may just have backfilled this anchor. Keep identity pooling
+  // offline, using the same anchor that verified the collected receipt.
+  const builder = loadJob(job.id)?.builderAnchor ?? job.builderAnchor;
+  await settleCreditAfterJob({
+    capture,
+    transport: args.transport,
+    ref: { endpoint: job.endpoint },
+    dvmId: job.dvmId,
+    providerInfo: builder ? { builder } : undefined,
+    callerPubkey: binding.callerPubkey,
+    allowTopup: false,
+    human: args.human,
+  });
+}
+
 
 /**
  * The identity this DVM attested on the `/v1/info` this settlement already
@@ -197,22 +233,18 @@ function noticeDvm(args: SettleCreditArgs): string {
 async function settle(args: SettleCreditArgs): Promise<void> {
   const receipt = args.capture?.receipt;
   const credit = receipt?.credit;
-  if (!receipt || !credit || !args.signing) return;
+  const callerPubkey = args.signing?.pubkey ?? args.callerPubkey;
+  // Invalid proof remains visible evidence, never authority to change a balance.
+  if (
+    !receipt || !credit || !callerPubkey ||
+    (args.capture?.status !== "verified" && args.capture?.status !== "verified_unattested") ||
+    receipt.requester_pubkey !== callerPubkey
+  ) return;
   if (credit.credit_id.startsWith("imp:")) {
-    // The spend authority is the signed caller identity, so never adopt an
-    // anonymous or differently-owned balance merely because its receipt was
-    // delivered on this process. The signature itself must also have passed:
-    // an invalid receipt is visible evidence, not state worth spending from.
-    if (
-      (args.capture?.status !== "verified" && args.capture?.status !== "verified_unattested") ||
-      receipt.requester_pubkey !== args.signing.pubkey
-    ) {
-      return;
-    }
     const applied = applyImplicitReceiptCredit({
       endpoint: args.ref.endpoint,
       ...settleIdentityArgs(args),
-      callerPubkey: args.signing.pubkey,
+      callerPubkey,
       jobId: receipt.job_id,
       outcome: receipt.outcome,
       credit,
@@ -228,7 +260,7 @@ async function settle(args: SettleCreditArgs): Promise<void> {
   const applied = applyReceiptCredit({
     endpoint: args.ref.endpoint,
     ...settleIdentityArgs(args),
-    callerPubkey: args.signing.pubkey,
+    callerPubkey,
     jobId: receipt.job_id,
     outcome: receipt.outcome,
     credit,
@@ -239,7 +271,7 @@ async function settle(args: SettleCreditArgs): Promise<void> {
     renderBalanceMismatch(args.ref.endpoint, applied.mismatch);
   }
 
-  if (args.allowTopup === false) return;
+  if (args.allowTopup === false || !args.signing) return;
   if (receipt.outcome !== "completed") return;
   const record = applied.credit;
   if (record.status !== "active") return;

@@ -35,6 +35,7 @@ import { requestRecoveryPath } from "../lib/request-recovery-path";
 import { recordLocalJobCollision, recordSubmissionEvidence } from "../lib/submission-evidence";
 import { bookRecoveredSubmissions } from "../lib/wallet-agent/recovery-submissions";
 import { createDvmTransport } from "../lib/transport";
+import { settleCreditAfterRead } from "../lib/credit-topup";
 import { dvmIdentity } from "./dvm-identity";
 
 export interface RequestResultOptions {
@@ -183,6 +184,10 @@ export async function requestResult(
     });
   }
   const captured = captureTransportReceipt(receipt.jobId, receipt);
+  const recovered = loadJob(receipt.jobId);
+  if (recovered && (receipt.status === "completed" || receipt.status === "failed" || receipt.status === "cancelled")) {
+    await settleCreditAfterRead({ job: recovered, capture: captured, transport, human: opts.human });
+  }
   // A Cashu payment held for this request is confirmed by the job the provider
   // named; booking it stops the wallet holding it as unconfirmed.
   const confirmed = await bookRecoveredSubmissions({
