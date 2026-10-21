@@ -945,6 +945,39 @@ describe("commitAgentSpend", () => {
 });
 
 describe("abandonPendingSubmission", () => {
+  it("keeps refused swap outputs reclaimable without replaying the refused funding", async () => {
+    const { privkey, pubkey } = generateAgentKeypair();
+    const output = proof("refused-output", 5);
+    const entry = {
+      endpoint: ENDPOINT,
+      request_id: FIXED_UUID,
+      intended_lock_pubkey: "02" + "ee".repeat(32),
+      mint: "https://mint.example",
+      amount_sats: 5,
+      output_proofs: [output],
+      cashu_token: "retained-token",
+      canonical_id: "42",
+      refund_pubkey: pubkey,
+      t_expire: FIXED_NOW + 86_400_000,
+      max_cashu_fee_sats: 3,
+      initial_cashu_fee_sats: 1,
+      created_at: "2026-05-09T00:00:00.000Z",
+      context: { submit_body: { input: "refused request" } },
+    };
+    vi.mocked(loadAgentWallet).mockReturnValue({
+      ...baseWallet(privkey, pubkey),
+      pending_submissions: [entry],
+    });
+
+    const refusal = { requestId: FIXED_UUID, preserveRecovery: true };
+    await abandonPendingSubmission(refusal);
+
+    const saved = lastSavedWallet();
+    expect(saved.pending_submissions).toHaveLength(1);
+    expect(saved.pending_submissions[0]).toEqual({ ...entry, context: undefined });
+    expect(saved.recent_spends).toHaveLength(0);
+  });
+
   it("removes the entry without appending a recent_spend", async () => {
     const { privkey, pubkey } = generateAgentKeypair();
     const w: AgentWallet = {

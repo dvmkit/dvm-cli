@@ -499,7 +499,7 @@ describe("sweepPendingSubmissions (crash-resume)", () => {
     expect(saveJob).not.toHaveBeenCalled();
   });
 
-  it("abandons the submission on wrong_lock_pubkey (rotation aged out the swap target)", async () => {
+  it("retires replay after lock-key rotation while keeping the swapped proofs", async () => {
     vi.mocked(loadAgentWallet).mockReturnValue(baseWallet([submission()]));
     const httpPost = vi
       .fn()
@@ -509,7 +509,8 @@ describe("sweepPendingSubmissions (crash-resume)", () => {
 
     expect(result.outcomes[0].kind).toBe("abandoned");
     const saved = vi.mocked(saveAgentWallet).mock.calls.at(-1)?.[0];
-    expect(saved?.pending_submissions).toHaveLength(0);
+    expect(saved?.pending_submissions).toHaveLength(1);
+    expect(saved?.pending_submissions[0].context).toBeUndefined();
     expect(saved?.recent_spends).toHaveLength(0);
   });
 
@@ -827,7 +828,7 @@ describe("sweepPendingSubmissions — credit entries", () => {
     expect(saveAgentWallet).not.toHaveBeenCalled();
   });
 
-  it("abandons on a permanent credit refusal", async () => {
+  it("retires a permanent credit refusal without deleting or replaying its proofs", async () => {
     vi.mocked(findSigningIdentityByPubkey).mockReturnValue({
       privkey: "aa".repeat(32),
       pubkey: "bb".repeat(32),
@@ -844,6 +845,14 @@ describe("sweepPendingSubmissions — credit entries", () => {
       kind: "abandoned",
       reason: "credit_id_unavailable",
     });
+    const saved = vi.mocked(saveAgentWallet).mock.calls.at(-1)?.[0];
+    expect(saved?.pending_submissions).toHaveLength(1);
+    expect(saved?.pending_submissions[0].output_proofs).toEqual(submission().output_proofs);
+    expect(saved?.pending_submissions[0].context).toBeUndefined();
+    vi.mocked(loadAgentWallet).mockReturnValue(saved!);
+    const retry = await sweepPendingSubmissions({ httpPost, now });
+    expect(retry.outcomes[0].kind).toBe("unresumable");
+    expect(httpPost).toHaveBeenCalledTimes(1);
   });
 
   it("abandons a credit-route fund-amount mismatch — that route checks the hash only", async () => {

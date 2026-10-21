@@ -191,6 +191,14 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
   // no flag, the pin forces; with none of the three, the amount rule decides.
   const configPin = effectiveFundingRail(config?.credit, endpoint, attestedIdentity);
   const boundRail = pinnedRail(stored, opts.creditId);
+  if (!pending && !signedPending && flagRail && boundRail && flagRail !== boundRail) {
+    throw new DvmError(
+      "credit_rail_conflict",
+      `This credit was opened over ${boundRail}, so it cannot be topped up over ${flagRail}. Nothing was paid.`,
+      `Use --rail ${boundRail} for this credit, or supply a new --credit-id to open a separate credit over ${flagRail}.`,
+      { credit_id: stored?.creditId, credit_rail: boundRail, requested_rail: flagRail }
+    );
+  }
   const railSource: CreditRailSource | undefined = flagRail
     ? "flag"
     : boundRail

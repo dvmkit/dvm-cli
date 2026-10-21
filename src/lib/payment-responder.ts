@@ -430,7 +430,7 @@ async function tryAgentWalletMidJobPayment(args: {
     // `mint_unreachable` retries, 5xx, and network errors — leaves the
     // `pending_submission` on disk so the locked capital remains recoverable.
     if (err instanceof DvmError && err.code === "payment_invalid") {
-      await abandonPendingSubmission({ requestId: prepared.requestId });
+      await abandonPendingSubmission({ requestId: prepared.requestId, preserveRecovery: true });
     }
     throw err;
   }

@@ -2639,7 +2639,7 @@ describe("fundCredit rail selection", () => {
     expect(fundViaFloat).not.toHaveBeenCalled();
   });
 
-  it("retries on the rail a credit is bound to, and drops the doomed spend", async () => {
+  it("retries on the bound rail while preserving the refused ecash for recovery", async () => {
     vi.mocked(prepareAgentSpend).mockImplementation(preparedSpend() as never);
 
     mockCreditOp
@@ -2658,6 +2658,7 @@ describe("fundCredit rail selection", () => {
 
     expect(abandonPendingSubmission).toHaveBeenCalledWith({
       requestId: "44444444-4444-4444-8444-444444444444",
+      preserveRecovery: true,
     });
   });
 
