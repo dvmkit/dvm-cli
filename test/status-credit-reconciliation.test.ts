@@ -3,13 +3,14 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendReceipt, CREDITS_FILE, loadCredit, receiptPubkeyFromSecret, type Transport, type UnsignedJobReceipt } from "@dvmkit/sdk/internal";
 import { attestedDvm, CALLER_B } from "../src/lib/__tests__/fixtures/receipt-fixture";
-import { loadJob, saveJob, updateJob, type JobRecord } from "../src/lib/job-store";
+import { loadJob, saveJob, type JobRecord } from "../src/lib/job-store";
 import { status } from "../src/commands/status";
 import { creditList } from "../src/commands/credit";
 import { receiptsShow, receiptsVerify } from "../src/commands/receipts";
 import { settleCreditAfterJob } from "../src/lib/credit-topup";
 import { requestResult } from "../src/commands/request-result";
 import { saveRequestIntent } from "../src/lib/request-intent-store";
+import { planProbeDraw } from "../src/lib/credit-policy";
 
 const wire = vi.hoisted(() => ({
   status: vi.fn(), describe: vi.fn(), getMessages: vi.fn(), credit: vi.fn(),
@@ -115,15 +116,25 @@ describe("credit settlement on receipt reads", () => {
     expect(wire.credit).not.toHaveBeenCalled();
   });
 
-  it("does not roll a newer signed balance back when an old receipt is replayed", async () => {
+  it("preserves newer credit metadata and the draw ceiling when an older job is read again", async () => {
     seed({ receipt: receipt() });
     await status(jobId, {});
-    const newer = receipt({ credit: { ...receipt().credit!, amount: 100_000, balance_after: 250_000, ledger_seq: 3 } });
-    updateJob(jobId, { receipt: newer });
+    const newerJobId = "newer-job";
+    const newer = receipt({ job_id: newerJobId, credit: { ...receipt().credit!, draw_id: "newer-draw",
+      amount: 200_000, balance_after: 150_000, ledger_seq: 3 } });
+    saveJob({ ...loadJob(jobId)!, id: newerJobId, receipt: newer,
+      creditBinding: { ...bound, drawId: "newer-draw" } });
+    await status(newerJobId, {});
+    const before = loadCredit(endpoint, CALLER_A);
+    expect(before).toMatchObject({ remainingMicro: 150_000, ledgerSeq: 3,
+      lastPriceMicro: 200_000, lastReceiptJobId: newerJobId });
     await status(jobId, {});
-    updateJob(jobId, { receipt: receipt() });
-    await status(jobId, {});
-    expect(loadCredit(endpoint, CALLER_A)).toMatchObject({ remainingMicro: 250_000, ledgerSeq: 3 });
+    const replayed = loadCredit(endpoint, CALLER_A);
+    expect(replayed).toEqual(before);
+    expect(planProbeDraw({ stored: replayed, drawCeilingMsats: 175_000,
+      drawCeilingSource: "budget", btcRate: 100_000, config: { posture: "auto" } })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 200_000, ceilingMicro: 175_000 },
+    });
   });
 
   it.each([

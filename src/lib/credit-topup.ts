@@ -33,6 +33,7 @@ import {
   type CreditMenu,
   formatUsd,
   isCreditFundRail,
+  loadCredit,
   markRefillDrainNoticed,
   markRefillRailUnavailable,
   type PendingDrain,
@@ -257,6 +258,10 @@ async function settle(args: SettleCreditArgs): Promise<void> {
     // balance is kept for the next draw; a zero has already been pruned.
     return;
   }
+  // The SDK preserves balances by sequence but still overwrites price and
+  // receipt attribution on stale receipts. Keep the newer draw's metadata.
+  const stored = loadCredit(args.ref.endpoint, callerPubkey, settleIdentity(args));
+  if (stored?.creditId === credit.credit_id && credit.ledger_seq < stored.ledgerSeq) return;
   const applied = applyReceiptCredit({
     endpoint: args.ref.endpoint,
     ...settleIdentityArgs(args),
