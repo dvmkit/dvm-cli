@@ -863,10 +863,9 @@ export async function correctPendingFundAmount(args: {
 }
 
 /**
- * Abandon a pending submission whose DVM has hard-rejected it (e.g.
- * `payment_invalid`, or `wrong_lock_pubkey` where rotation has aged out the
- * lock target). Removes the entry; the output proofs are dead capital
- * locked to the DVM's pubkey.
+ * Explicitly forget a submission, or retire its replay after an automatic refusal.
+ * Automatic refusals preserve swapped outputs: deleting them would also delete
+ * the only proof secrets needed to reclaim them after their refund lock expires.
  *
  * Distinct from {@link commitAgentSpend} in that no `recent_spend` is
  * appended — the call failed, no service was rendered.
@@ -876,25 +875,39 @@ export async function correctPendingFundAmount(args: {
  * can refund them post-`t_expire` via `dvm wallet release`. The swap path
  * has no such proofs in the wallet, so this is a no-op for it.
  */
-export async function abandonPendingSubmission(args: { requestId: string }): Promise<void> {
+export async function abandonPendingSubmission(args: {
+  requestId: string;
+  preserveRecovery?: boolean;
+}): Promise<void> {
   await withWalletLock(() => {
     const wallet = loadAgentWallet();
     if (!wallet) return;
-    const submission = wallet.pending_submissions.find((s) => s.request_id === args.requestId);
-    const shippedKeys = new Set(submission?.output_proofs.map((p) => `${p.secret}:${p.C}`) ?? []);
-    const next: AgentWallet = {
-      ...wallet,
-      proofs: wallet.proofs.map((p) =>
-        shippedKeys.has(`${p.secret}:${p.C}`) && p.status === "in_flight"
-          ? { ...p, status: "valid" as const, in_flight_until_ms: undefined }
-          : p
-      ),
-      pending_submissions: wallet.pending_submissions.filter(
-        (s) => s.request_id !== args.requestId
-      ),
-    };
-    saveAgentWallet(next);
+    saveAgentWallet(abandonSubmissionInWallet(wallet, args));
   });
+}
+
+/** Reuse the refusal transition while a recovery sweep already holds wallet state. */
+export function abandonSubmissionInWallet(
+  wallet: AgentWallet,
+  args: { requestId: string; preserveRecovery?: boolean }
+): AgentWallet {
+  const submission = wallet.pending_submissions.find((s) => s.request_id === args.requestId);
+  const shippedKeys = new Set(submission?.output_proofs.map((p) => `${p.secret}:${p.C}`) ?? []);
+  const walletKeys = new Set(wallet.proofs.map((p) => `${p.secret}:${p.C}`));
+  const retain = args.preserveRecovery && [...shippedKeys].some((key) => !walletKeys.has(key));
+  return {
+    ...wallet,
+    proofs: wallet.proofs.map((p) =>
+      shippedKeys.has(`${p.secret}:${p.C}`) && p.status === "in_flight"
+        ? { ...p, status: "valid" as const, in_flight_until_ms: undefined }
+        : p
+    ),
+    pending_submissions: retain
+      ? wallet.pending_submissions.map((s) =>
+          s.request_id === args.requestId ? { ...s, context: undefined } : s
+        )
+      : wallet.pending_submissions.filter((s) => s.request_id !== args.requestId),
+  };
 }
 
 /**

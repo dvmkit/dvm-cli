@@ -2365,26 +2365,25 @@ async function fundOverCashu(args: FundCreditArgs, fundId: string): Promise<Cred
     });
     return settled(args, base, result, prepared.totalSats);
   } catch (err) {
-    // Bound to another rail. Not transient, so the prepared spend must be
-    // dropped rather than left replaying forever against a credit that will
-    // refuse it every time — and the named rail is worth trying instead.
+    // A permanent refusal must stop replay without deleting the proof secrets
+    // that let the caller reclaim value the provider never accepted.
     const required = boundRail(err);
     if (required) {
-      await abandonPendingSubmission({ requestId: prepared.requestId }).catch(() => undefined);
+      await abandonPendingSubmission({ requestId: prepared.requestId, preserveRecovery: true });
       return {
         ...base,
         status: "unavailable",
         requiredRail: required,
-        display: `This credit was opened over ${required}, so an ecash top-up can't be added to it.`,
+        display: `This credit was opened over ${required}, so an ecash top-up can't be added to it. The prepared ecash remains tracked for recovery.`,
       };
     }
     if (err instanceof DvmError && CREDIT_PERMANENT_REFUSALS.has(err.code)) {
-      await abandonPendingSubmission({ requestId: prepared.requestId }).catch(() => undefined);
+      await abandonPendingSubmission({ requestId: prepared.requestId, preserveRecovery: true });
       return {
         ...base,
         status: "refused",
         error: err,
-        display: `The DVM refused the funding (${err.code}) — the ${String(prepared.totalSats)} sats spend was dropped. ${err.message}`,
+        display: `The DVM refused the funding (${err.code}). The ${String(prepared.totalSats)} sats of prepared ecash remain tracked for recovery. ${err.message}`,
         hint: err.hint,
       };
     }

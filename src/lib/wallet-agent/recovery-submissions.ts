@@ -50,6 +50,7 @@ import { inFlightTimeoutSeconds, proofKey, revertInFlight } from "./inflight";
 import { rehydrateOutputData } from "@dvmkit/sdk/internal";
 import { toAgentProof, toCashuProofs } from "@dvmkit/sdk/internal";
 import {
+  abandonSubmissionInWallet,
   correctPendingFundAmount,
   markPendingSubmissionUnresolved,
   withAcceptedUnresolved,
@@ -1480,7 +1481,13 @@ function applyOutcome(
       recent_spends: [...dropped.recent_spends, recentSpend].slice(-RECENT_SPENDS_CAP),
     };
   }
-  if (outcome.kind === "abandoned" || outcome.kind === "pruned") {
+  if (outcome.kind === "abandoned") {
+    return abandonSubmissionInWallet(wallet, {
+      requestId: outcome.entry.request_id,
+      preserveRecovery: true,
+    });
+  }
+  if (outcome.kind === "pruned") {
     return drop();
   }
   if (outcome.kind === "swap_restored") {
