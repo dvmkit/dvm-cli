@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/dvmkit/dvm-cli/compare/v0.9.1...v0.9.2) (2026-10-21)
+
+
+### Bug Fixes
+
+* preserve refused ecash funding for recovery ([3129ba9](https://github.com/dvmkit/dvm-cli/commit/3129ba9d7ab8a34556d7cf191c89dc63e2f063ff))
+
 ## [0.9.1](https://github.com/dvmkit/dvm-cli/compare/v0.9.0...v0.9.1) (2026-10-20)
 
 
