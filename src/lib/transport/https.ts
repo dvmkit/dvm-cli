@@ -6,6 +6,7 @@ import {
   DvmError,
   fetchBtcUsdRate,
   type FundingReceipt,
+  isDrawFundingReceipt,
   isAbortError,
   isFundingReceipt,
   isSignedJobReceipt,
@@ -31,6 +32,7 @@ import {
   type ReceiptParseError,
   ROUTER_FEEDBACK_CLAIM_HEADER,
   type SendMessageOptions,
+  type SendMessageResult,
   type JobReceipt as SignedJobReceipt,
   type StatusOptions,
   type StreamOptions,
@@ -731,7 +733,7 @@ export class HttpsTransport implements Transport {
     message: OutboundMessage,
     provider?: ProviderRef,
     options?: SendMessageOptions
-  ): Promise<void> {
+  ): Promise<void | SendMessageResult> {
     const endpoint = provider?.endpoint;
     if (!endpoint) {
       throw new DvmError(
@@ -765,7 +767,7 @@ export class HttpsTransport implements Transport {
       } catch {
         throw new DvmError("payment_insufficient", "Payment required (unparseable response).");
       }
-      const error = withCreditErrorContext(buildPaymentError(errorBody), errorBody);
+      const error = withDrawFunding(withCreditErrorContext(buildPaymentError(errorBody), errorBody), errorBody);
       error.data = { ...error.data, http_status: 402 };
       throw error;
     }
@@ -778,7 +780,7 @@ export class HttpsTransport implements Transport {
       // surface the DVM's own code and copy instead.
       if (body && (body.error === "replay_rejected" ||
           (message.type === "payment" && message.content.credit && typeof body.error === "string")))
-        throw withCreditErrorContext(buildPaymentError(body), body);
+        throw withDrawFunding(withCreditErrorContext(buildPaymentError(body), body), body);
       // the job went terminal (completed/cancelled) before this POST
       // landed — the mid-job-payment race. Map it to a structured error with a
       // hint so an agent following a stale next_action self-recovers in one
@@ -793,13 +795,20 @@ export class HttpsTransport implements Transport {
     if (!res.ok) {
       const text = await res.text();
       const structured = parseStructuredError(text);
-      if (structured) throw withCreditErrorContext(structured, parseJsonObject(text) ?? {});
+      if (structured) {
+        const body = parseJsonObject(text) ?? {};
+        throw withDrawFunding(withCreditErrorContext(structured, body), body);
+      }
       throw providerResponseError("provider_error", `sendMessage failed (${res.status}): ${text}`);
     }
+    if (message.type !== "payment") return;
+    const acknowledgement = parseJsonObject(await res.text());
     if (message.type === "payment" && message.content.credit) {
-      const body = parseJsonObject(await res.text());
-      if (res.status !== 201 || !Number.isSafeInteger(body?.seq) || Number(body?.seq) < 0)
+      if (res.status !== 201 || !Number.isSafeInteger(acknowledgement?.seq) || Number(acknowledgement?.seq) < 0)
         throw new DvmError("invalid_credit_payment_response", "The balance payment outcome is unknown; replay the saved payment.");
+    }
+    if (acknowledgement && Number.isSafeInteger(acknowledgement.seq) && Number(acknowledgement.seq) >= 0) {
+      return { seq: Number(acknowledgement.seq), ...parseDrawFundingReceipt(acknowledgement.draw_funding_receipt) };
     }
   }
 
@@ -951,14 +960,32 @@ function parseFundingReceipt(value: unknown): {
 
 function parseFundingResponse(
   data: Record<string, unknown>
-): Pick<JobReceipt, "fundingReceipt" | "fundingReceiptParseError" | "fundedMicro" | "credit"> {
+): Pick<JobReceipt, "fundingReceipt" | "fundingReceiptParseError" | "fundedMicro" | "credit"> &
+  Pick<JobStatus, "drawFundingReceipts" | "drawFundingReceiptParseError"> {
+  const raw = data.draw_funding_receipts;
   return {
     ...parseFundingReceipt(data.funding_receipt),
     ...(typeof data.funded_micro === "number" ? { fundedMicro: data.funded_micro } : {}),
     ...(data.credit && typeof data.credit === "object" && !Array.isArray(data.credit)
       ? { credit: data.credit as JobReceipt["credit"] }
       : {}),
+    ...(Array.isArray(raw) ? { drawFundingReceipts: raw.filter(isDrawFundingReceipt) } : {}),
+    ...(raw !== undefined && (!Array.isArray(raw) || !raw.every(isDrawFundingReceipt))
+      ? { drawFundingReceiptParseError: "shape_invalid" as const } : {}),
   };
+}
+
+function parseDrawFundingReceipt(value: unknown): Pick<SendMessageResult, "drawFundingReceipt" | "drawFundingReceiptParseError"> {
+  if (value === undefined) return {};
+  return isDrawFundingReceipt(value)
+    ? { drawFundingReceipt: value }
+    : { drawFundingReceiptParseError: "shape_invalid" };
+}
+
+function withDrawFunding(error: DvmError, body: Record<string, unknown>): DvmError {
+  const evidence = parseDrawFundingReceipt(body.draw_funding_receipt);
+  if (Object.keys(evidence).length) error.data = { ...error.data, ...evidence };
+  return error;
 }
 
 function parseRequestResultResponse(

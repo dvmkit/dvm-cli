@@ -11,6 +11,8 @@ import {
   type ProviderInfo,
   type ProviderRef,
   type RailFlag,
+  type OutboundMessage,
+  type SendMessageOptions,
   tempoCredentialAmountMicro,
   type Transport,
   usdcToMsats,
@@ -39,6 +41,7 @@ import { withAgentWalletPaymentRetry } from "./agent-wallet-retry";
 import { dvmFetch } from "./http";
 import { applyMintPin } from "./mint-pin";
 import { assertTempoChallengeNetwork, resolveTempoNetworkSelection } from "./tempo-network";
+import { captureDrawFundingReceipts } from "./draw-funding";
 
 export interface PaidPaymentResult {
   status: "paid";
@@ -215,7 +218,7 @@ export async function handlePaymentRequest(
         // which may be slightly higher than the msat quote at the caller's
         // contemporaneous BTC/USD rate.
         await enforceGlobalBudget({ plannedMsats: proof.amountMsats, btcRate: proof.btcRate });
-        await transport.sendMessage(
+        await sendRailPayment(transport,
           jobId,
           {
             type: "payment",
@@ -259,7 +262,7 @@ export async function handlePaymentRequest(
       // branch above does.
       const paidMsats = usdcToMsats(Number(tempoCredentialAmountMicro(cred)) / 1e6, tempoRate);
       await enforceGlobalBudget({ plannedMsats: paidMsats, btcRate: tempoRate });
-      await transport.sendMessage(
+      await sendRailPayment(transport,
         jobId,
         {
           type: "payment",
@@ -475,7 +478,7 @@ async function sendMidJobPaymentWithRetry(args: {
   const { jobId, amountMsats, prepared, transport, provider, jobToken } = args;
   await withAgentWalletPaymentRetry({
     attempt: () =>
-      transport.sendMessage(
+      sendRailPayment(transport,
         jobId,
         {
           type: "payment",
@@ -493,6 +496,32 @@ async function sendMidJobPaymentWithRetry(args: {
     refetchInfo: () => transport.describe(provider),
     sleep: args.sleep,
   });
+}
+
+async function sendRailPayment(
+  transport: Transport,
+  jobId: string,
+  message: OutboundMessage,
+  provider: ProviderRef,
+  options?: SendMessageOptions
+): Promise<void> {
+  const capture = (evidence: { drawFundingReceipt?: unknown; drawFundingReceiptParseError?: unknown; seq?: number }) => {
+    if (evidence.drawFundingReceiptParseError) info("Warning: mid-job funding evidence has an invalid shape.");
+    if (evidence.drawFundingReceipt) captureDrawFundingReceipts(jobId, [evidence.drawFundingReceipt], {
+      endpoint: provider.endpoint,
+      ...(typeof message.content.cashu_request_id === "string" ? { fundId: message.content.cashu_request_id } : {}),
+      paymentSeq: evidence.seq,
+    });
+  };
+  try {
+    const result = await transport.sendMessage(jobId, message, provider, options);
+    if (result) capture(result);
+  } catch (error) {
+    // The provider may have committed the deposit before a snapshot failure or
+    // replay refusal. Retain its signed fact without changing payment recovery.
+    if (error instanceof DvmError && error.data) capture(error.data);
+    throw error;
+  }
 }
 
 /**

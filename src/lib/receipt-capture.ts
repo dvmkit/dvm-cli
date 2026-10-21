@@ -13,6 +13,7 @@ import { appendFundingReceipt, appendReceipt } from "@dvmkit/sdk/internal";
 import { receiptDisplay, receiptFailureDetail, receiptHint } from "./receipt-verify";
 import { type ReceiptTrustAnchor, type ReceiptVerification, type ReceiptVerifyResult, verifyFundingReceiptChain, verifyJobReceipt } from "@dvmkit/sdk/internal";
 import type { JobStatus, ProviderInfo, ProviderRef, ReceiptParseError, Transport } from "@dvmkit/sdk/internal";
+import { captureDrawFundingReceipts } from "./draw-funding";
 
 /** Verify and persist a funding receipt; callers may anchor state only on a sound verdict. */
 export function captureFundingReceipt(args: {
@@ -115,8 +116,10 @@ export function captureJobReceipt(
 
 export function captureTransportReceipt(
   jobId: string,
-  response: Pick<JobStatus, "receipt" | "receiptParseError">
+  response: Pick<JobStatus, "receipt" | "receiptParseError" | "drawFundingReceipts" | "drawFundingReceiptParseError">
 ): ReceiptCapture {
+  captureDrawFundingReceipts(jobId, response.drawFundingReceipts);
+  if (response.drawFundingReceiptParseError) info("Warning: mid-job funding evidence has an invalid shape.");
   return captureJobReceipt(jobId, response.receipt, response.receiptParseError);
 }
 
@@ -191,7 +194,7 @@ export async function fetchMissingJobReceipt(
   jobId: string,
   transport: Transport,
   ref: ProviderRef
-): Promise<{ receipt?: SignedJobReceipt; receiptParseError?: ReceiptParseError }> {
+): Promise<Pick<JobStatus, "receipt" | "receiptParseError" | "drawFundingReceipts" | "drawFundingReceiptParseError">> {
   const job = loadJob(jobId);
   if (!job?.receiptsSupported) return {};
   // Already collected (a resumed stream, a prior `dvm status`): skip the GET
@@ -201,9 +204,12 @@ export async function fetchMissingJobReceipt(
   if (held) return { receipt: held };
   try {
     const status = await transport.status(jobId, ref, { jobToken: job.jobToken });
+    captureDrawFundingReceipts(jobId, status.drawFundingReceipts, { endpoint: ref.endpoint });
     return {
       ...(status.receipt ? { receipt: status.receipt } : {}),
       ...(status.receiptParseError ? { receiptParseError: status.receiptParseError } : {}),
+      ...(status.drawFundingReceipts ? { drawFundingReceipts: status.drawFundingReceipts } : {}),
+      ...(status.drawFundingReceiptParseError ? { drawFundingReceiptParseError: status.drawFundingReceiptParseError } : {}),
     };
   } catch {
     return {};

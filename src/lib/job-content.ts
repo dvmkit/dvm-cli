@@ -1,5 +1,6 @@
 import { type JobStatus, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
 import { type JobContentMetadata } from "@dvmkit/sdk/server";
+import { captureDrawFundingReceipts } from "./draw-funding";
 
 // The transport's shared status type predates these optional wire fields.
 export type ContentStatus = JobStatus & Partial<JobContentMetadata>;
@@ -59,6 +60,7 @@ export async function observeJobContent(
       ...options,
       timeoutMs: options.timeoutMs > 0 ? Math.min(options.timeoutMs, 5000) : 5000,
     });
+    captureDrawFundingReceipts(jobId, status.drawFundingReceipts, { endpoint: ref.endpoint });
     return parseJobContent(status as unknown as Record<string, unknown>);
   } catch {
     return undefined;

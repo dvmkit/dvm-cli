@@ -9,6 +9,7 @@ import type { JobCompletion } from "./completion-hints";
 import { ensureConfigDir } from "@dvmkit/sdk/internal";
 import type { TerminalJobStatus } from "./next-action";
 import type { JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
+import type { DrawFundingReceipt } from "@dvmkit/sdk/internal";
 import type { ReceiptTrustAnchor } from "@dvmkit/sdk/internal";
 import type { ProviderRef, ReceiptParseError } from "@dvmkit/sdk/internal";
 
@@ -26,6 +27,8 @@ export interface JobRecord {
   creditBinding?: { creditId: string; drawId: string; callerPubkey: string } | { unbound: true; callerPubkey: string };
   pendingCreditPayment?: CreditPaymentIntent;
   bookedCreditPayments?: CreditPaymentIntent[];
+  /** Signed external funding facts retained for offline terminal reconciliation. */
+  drawFundingReceipts?: DrawFundingReceipt[];
   id: string;
   endpoint: string;
   /** Canonical DVM name. Optional for older job records. */
