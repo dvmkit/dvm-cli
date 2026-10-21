@@ -130,6 +130,8 @@ export function receiptFailureDetail(reason: ReceiptInvalidReason): string {
       return "The receipt names a different job than the one it was collected for — it is not proof of this job, whoever signed it.";
     case "drain_id_mismatch":
       return "The receipt names a different reclaim than the one it is filed under — it is not evidence of this drain, whoever signed it.";
+    case "draw_id_mismatch":
+      return "The funding receipt names a different draw than the job's accepted credit draw.";
     case "credit_id_mismatch":
       return "The receipt names a different credit than the one this reclaim was against — it is not evidence of this refund, whoever signed it.";
     case "fund_id_mismatch":
@@ -140,6 +142,8 @@ export function receiptFailureDetail(reason: ReceiptInvalidReason): string {
       return "The signed post-funding balance differs from the provider's fresh balance response.";
     case "funding_ledger_seq_mismatch":
       return "The signed funding sequence differs from the provider's fresh balance response.";
+    case "funding_currency_mismatch":
+      return "The signed funding currency differs from the credit's native currency.";
     case "caller_pubkey_mismatch":
       return "The funding receipt names a different caller than the key that submitted the funding.";
     case "signature_invalid":

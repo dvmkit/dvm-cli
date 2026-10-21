@@ -1,5 +1,7 @@
-import { readdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendReceipt, CREDITS_FILE, loadCredit, receiptPubkeyFromSecret, type Transport, type UnsignedJobReceipt } from "@dvmkit/sdk/internal";
 import { attestedDvm, CALLER_B } from "../src/lib/__tests__/fixtures/receipt-fixture";
@@ -135,6 +137,48 @@ describe("credit settlement on receipt reads", () => {
       drawCeilingSource: "budget", btcRate: 100_000, config: { posture: "auto" } })).toMatchObject({
       mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 200_000, ceilingMicro: 175_000 },
     });
+  });
+
+  it("preserves a newer settlement from another process while an older status read is paused", async () => {
+    const older = receipt();
+    seed({ receipt: older });
+    await status(jobId, {});
+    const newer = receipt({ job_id: "concurrent-job", credit: { ...older.credit!, draw_id: "concurrent-draw",
+      amount: 200_000, balance_after: 150_000, ledger_seq: 3 } });
+    let settledBytes: string | undefined;
+    wire.status.mockImplementationOnce(async () => {
+      // The older read has observed sequence 2 before the other process settles
+      // sequence 3. Returning its old receipt resumes recovery after that write.
+      expect(loadCredit(endpoint, CALLER_A)).toMatchObject({ ledgerSeq: 2, lastPriceMicro: 150_000 });
+      await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `
+        import assert from "node:assert/strict";
+        import { applyReceiptCredit, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
+        const { endpoint, receipt, builder } = JSON.parse(process.argv[1]);
+        assert.equal(verifyJobReceipt({ receipt, builder, expectedJobId: "concurrent-job" }).status, "verified");
+        applyReceiptCredit({ endpoint, identity: attestedDvmIdentity(builder), callerPubkey: receipt.requester_pubkey,
+          jobId: receipt.job_id, outcome: receipt.outcome, credit: receipt.credit });
+      `, JSON.stringify({ endpoint, receipt: newer, builder: dvm.anchor })], {
+        env: { ...process.env, DVM_CONFIG_DIR: root }, timeout: 10_000,
+      });
+      expect(loadCredit(endpoint, CALLER_A)).toMatchObject({ remainingMicro: 150_000, ledgerSeq: 3,
+        lastPriceMicro: 200_000, lastReceiptJobId: "concurrent-job" });
+      settledBytes = readFileSync(CREDITS_FILE, "utf8");
+      return { jobId, status: "completed", summary: "Done", receipt: older };
+    });
+
+    await status(jobId, { messages: true });
+
+    expect(wire.json).toHaveBeenLastCalledWith(expect.objectContaining({ receipt_verified: "verified" }));
+    expect(readFileSync(CREDITS_FILE, "utf8")).toBe(settledBytes);
+    const stored = loadCredit(endpoint, CALLER_A);
+    expect(stored).toMatchObject({ remainingMicro: 150_000, ledgerSeq: 3,
+      lastPriceMicro: 200_000, lastReceiptJobId: "concurrent-job" });
+    expect(planProbeDraw({ stored, drawCeilingMsats: 175_000, drawCeilingSource: "budget",
+      btcRate: 100_000, config: { posture: "auto" } })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 200_000, ceilingMicro: 175_000 },
+    });
+    expect(loadJob(jobId)).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1 });
+    expect(wire.credit).not.toHaveBeenCalled();
   });
 
   it.each([
