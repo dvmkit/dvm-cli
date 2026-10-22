@@ -31,7 +31,7 @@ import { pay } from "../src/commands/pay";
 import { message } from "../src/commands/message";
 import { streamLoop } from "../src/lib/stream-loop";
 import { appendMessages } from "../src/lib/messages";
-import { loadJob, saveJob, bookCreditPayment } from "../src/lib/job-store";
+import { loadJob, saveJob, bookCreditPayment, markPaymentRequestInFlight } from "../src/lib/job-store";
 const provider = { endpoint: "https://dvm.example" };
 const policy: JobPolicy = { maxTotalMsats: 100_000, autoPayBelowMsats: 2000, maxIncrementMsats: 0, maxPayments: 5 };
 function msg(seq: number, type: string, content: unknown = {}): Message {
@@ -76,6 +76,22 @@ describe("messages wait", () => {
     expect(seams.pay).toHaveBeenCalledTimes(3);
     expect(seams.pay.mock.calls.every((call) => call[2] === policy)).toBe(true);
     expect(stream.mock.calls.at(-1)?.[1]).toBe(5);
+  });
+
+  it.each([false, true])("returns a JSON cursor behind an unresolved payment with a newer prompt (explicit after=%s)", async (explicit) => {
+    const jobId = `wait-unresolved-cursor-${explicit}`;
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "awaiting-input", submittedAt: 0, messageCursor: 4, policy });
+    markPaymentRequestInFlight(jobId, 5);
+    const history = [msg(5, "payment-request", { amount_msats: 1000, reason: "Continue" }),
+      msg(6, "text", { text: "Still working" }), msg(7, "prompt", { id: "choice", text: "Continue?" })];
+    const stream = transport([], "awaiting-input");
+    stream.mockImplementation(async (_job, after) => ({ messages: history.filter((message) => message.seq > after) }));
+    vi.mocked(seams.transport.getMessages).mockResolvedValue(history);
+    await messages(jobId, { wait: true, ...(explicit ? { after: "4" } : {}) });
+    expect(output().cursor).toBe(4);
+    expect(output().messages.map((message: Message) => message.seq)).toEqual([5, 6, 7]);
+    expect(output().next_action).toMatchObject({ type: "respond", prompt_id: "choice" });
+    expect(seams.pay).not.toHaveBeenCalled();
   });
 
   it("keeps the HTTP message stream attached across provider disconnects", async () => {

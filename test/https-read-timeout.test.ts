@@ -1,6 +1,6 @@
 import { DvmError } from "@dvmkit/sdk/internal";
 import { createServer, type Server } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HttpsTransport } from "../src/lib/transport/https";
 
@@ -86,6 +86,26 @@ describe.each(reads)("HTTPS $name deadlines", (read) => {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
     release?.();
     await expect(result).resolves.toEqual(read.expected);
+  });
+});
+
+describe("HTTPS payment send deadlines", () => {
+  it.each([undefined, 201, 402])("bounds a payment send including its response body (HTTP %s)", async (status) => {
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => timeout(300));
+    let closed = 0;
+    const endpoint = await listen(createServer((_request, response) => {
+      response.once("close", () => { closed += 1; });
+      if (status) {
+        response.writeHead(status, { "Content-Type": "application/json" });
+        response.write(status === 402 ? '{"error":' : '{"seq":');
+      }
+    }));
+    await expect(new HttpsTransport().sendMessage("job-1", {
+      type: "payment", content: { amount_msats: 10_000 },
+    }, { endpoint })).rejects.toMatchObject({ code: "timeout", message: "Payment send timed out." });
+    expect(timeoutSpy).toHaveBeenCalledWith(60_000);
+    await expect.poll(() => closed).toBe(1);
   });
 });
 

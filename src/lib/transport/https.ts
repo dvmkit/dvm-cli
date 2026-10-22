@@ -734,6 +734,20 @@ export class HttpsTransport implements Transport {
     provider?: ProviderRef,
     options?: SendMessageOptions
   ): Promise<void | SendMessageResult> {
+    try {
+      return await this.sendMessageWithSignal(jobId, message, provider, options,
+        message.type === "payment" ? AbortSignal.timeout(60_000) : undefined);
+    } catch (error) {
+      if (isAbortError(error) && message.type === "payment")
+        throw new DvmError("timeout", "Payment send timed out.");
+      throw error;
+    }
+  }
+
+  private async sendMessageWithSignal(
+    jobId: string, message: OutboundMessage, provider?: ProviderRef,
+    options?: SendMessageOptions, signal?: AbortSignal
+  ): Promise<void | SendMessageResult> {
     const endpoint = provider?.endpoint;
     if (!endpoint) {
       throw new DvmError(
@@ -743,19 +757,11 @@ export class HttpsTransport implements Transport {
     }
     const url = `${endpoint}/v1/job/${jobId}/messages`;
     const body = JSON.stringify({ type: message.type, content: message.content });
-    let res: Response;
-    try {
-      res = await dvmFetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...jobTokenHeader(options?.jobToken) },
-        body,
-      });
-    } catch (err) {
-      if (isAbortError(err)) {
-        throw new DvmError("timeout", "sendMessage timed out.");
-      }
-      throw err;
-    }
+    const res = await dvmFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...jobTokenHeader(options?.jobToken) },
+      body, signal,
+    });
 
     if (res.status === 402) {
       // Parse the structured 402 body so the agent-wallet retry policy
@@ -764,7 +770,8 @@ export class HttpsTransport implements Transport {
       let errorBody: Record<string, unknown>;
       try {
         errorBody = (await res.json()) as Record<string, unknown>;
-      } catch {
+      } catch (error) {
+        if (isAbortError(error)) throw error;
         throw new DvmError("payment_insufficient", "Payment required (unparseable response).");
       }
       const error = withDrawFunding(withCreditErrorContext(buildPaymentError(errorBody), errorBody), errorBody);
