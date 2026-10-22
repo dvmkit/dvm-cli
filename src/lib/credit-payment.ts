@@ -26,6 +26,7 @@ import {
   loadJob,
   mutateCreditPayment,
   type CreditPaymentIntent,
+  type PaymentApproval,
 } from "./job-store";
 
 type Authorization = NonNullable<PaymentContent["credit"]>;
@@ -119,6 +120,7 @@ export async function tryCreditPayment(args: {
   jobId: string;
   request: PaymentRequestContent;
   requestSeq?: number;
+  approval?: PaymentApproval;
   transport: Transport;
   provider: ProviderRef;
   jobToken?: string;
@@ -193,7 +195,7 @@ export async function tryCreditPayment(args: {
     if ((current.totalPaidMsats ?? 0) + amountMsats > args.policy.maxTotalMsats)
       throw new DvmError("over_budget", "The exact balance charge would exceed this job's budget.");
     current.creditBinding = selectedBinding;
-    current.pendingCreditPayment = { authorization, request, amountMsats,
+    current.pendingCreditPayment = { authorization, request, amountMsats, approval: args.approval,
       ...("unbound" in job.creditBinding! ? { selectedUnbound: true as const } : {}) };
     return current.pendingCreditPayment;
   });

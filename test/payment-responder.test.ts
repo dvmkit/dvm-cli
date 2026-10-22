@@ -92,7 +92,7 @@ describe("mid-job payment rail selection", () => {
     sdk.usdcToMsats.mockReturnValue(12_000);
   });
 
-  it("forces x402 without inspecting or falling through to Cashu", async () => {
+  it.each(["auto", "explicit"] as const)("records %s approval on a successful forced x402 payment", async (approval) => {
     sdk.tryX402Payment.mockResolvedValue({
       paymentHeader: "x402-proof",
       amountMsats: 12_000,
@@ -109,10 +109,11 @@ describe("mid-job payment rail selection", () => {
       policy,
       transport,
       provider,
-      { rail: "x402" }
+      { rail: "x402", requestSeq: 3, approval }
     );
 
     expect(result).toMatchObject({ status: "paid", rail: "x402" });
+    expect(sdk.addPayment).toHaveBeenCalledWith("job-1", 12_000, { requestSeq: 3, approval });
     expect(sdk.loadAgentWallet).not.toHaveBeenCalled();
     expect(sdk.buildTempoCredential).not.toHaveBeenCalled();
     expect(transport.sendMessage).toHaveBeenCalledWith(

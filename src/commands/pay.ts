@@ -132,6 +132,7 @@ async function payWithAccess(
     rail,
     maxCashuPrincipalSats,
     requestSeq,
+    approval: "explicit",
   });
 
   if (result === "over-budget") {

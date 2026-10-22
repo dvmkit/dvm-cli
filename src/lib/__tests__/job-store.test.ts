@@ -3,7 +3,7 @@ import { JOBS_FILE } from "@dvmkit/sdk/internal";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { JobRecord } from "../job-store";
-import { loadAllJobs, loadJob, markJobTerminal, refFromJob, saveJob, updateJob } from "../job-store";
+import { addPayment, loadAllJobs, loadJob, markJobTerminal, refFromJob, saveJob, updateJob } from "../job-store";
 
 beforeEach(() => rmSync(JOBS_FILE, { force: true }));
 
@@ -135,4 +135,15 @@ describe("markJobTerminal", () => {
     expect(statSync(JOBS_FILE).ino).toBe(identity);
     expect(existsSync(`${JOBS_FILE}.lock`)).toBe(false);
   });
+});
+
+it("persists each payment approval with its total without changing older jobs", () => {
+  seedJobs([makeJob(), makeJob({ id: "legacy" })]);
+  addPayment("job1", 1000, { requestSeq: 1, approval: "auto" });
+  addPayment("job1", 2000, { requestSeq: 3, approval: "explicit" });
+  addPayment("legacy", 500);
+  expect(loadJob("job1")).toMatchObject({ totalPaidMsats: 3000, paymentsHonoured: 2,
+    paymentApprovals: [{ requestSeq: 1, approval: "auto" }, { requestSeq: 3, approval: "explicit" }] });
+  expect(loadJob("legacy")).toMatchObject({ totalPaidMsats: 500, paymentsHonoured: 1 });
+  expect(loadJob("legacy")?.paymentApprovals).toBeUndefined();
 });

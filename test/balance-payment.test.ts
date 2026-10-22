@@ -116,7 +116,8 @@ describe("balance-backed mid-job payments", () => {
     expect(received[0].draw_id).toBe("accepted-draw");
     await expect(respond()).resolves.toMatchObject({ rail: "credit" });
     expect(received).toHaveLength(1);
-    expect(loadJob("job-a")).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1 });
+    expect(loadJob("job-a")).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1,
+      paymentApprovals: [{ requestSeq: 4, approval: "auto" }] });
     expect(budget.enforce).not.toHaveBeenCalled();
     expect(budget.record).not.toHaveBeenCalled();
   });
@@ -183,6 +184,7 @@ describe("balance-backed mid-job payments", () => {
     const booked = loadJob("job-a")!.bookedCreditPayments![0];
     updateJob("job-a", { pendingCreditPayment: booked });
     bookCreditPayment("job-a", booked);
+    expect(loadJob("job-a")?.paymentApprovals).toEqual([{ requestSeq: 4, approval: "auto" }]);
     expect(loadJob("job-a")).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1 });
     expect(loadJob("job-a")?.pendingCreditPayment).toBeUndefined();
   });
