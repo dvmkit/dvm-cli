@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.0](https://github.com/dvmkit/dvm-cli/compare/v0.9.2...v0.10.0) (2026-10-22)
+
+
+### Features
+
+* relay prompt choices in respond actions ([#21](https://github.com/dvmkit/dvm-cli/issues/21)) ([031afcf](https://github.com/dvmkit/dvm-cli/commit/031afcf8810446360f7814e26993674caddb7090))
+
+
+### Bug Fixes
+
+* **credit:** reconcile delayed receipts during job reads ([#14](https://github.com/dvmkit/dvm-cli/issues/14)) ([b56eea0](https://github.com/dvmkit/dvm-cli/commit/b56eea0e9f7f38042b3b18d0d7779b11dbc40b08))
+* **credit:** reconcile signed mid-job funding ([48b56d3](https://github.com/dvmkit/dvm-cli/commit/48b56d3a4a1d5bde1ad07864a1b32853b01f1762))
+* preserve caller state on Windows and verify runtime compatibility ([6368bee](https://github.com/dvmkit/dvm-cli/commit/6368beed5f0aade62a9887e1f8e8ab9f4851a837))
+
 ## [0.9.2](https://github.com/dvmkit/dvm-cli/compare/v0.9.1...v0.9.2) (2026-10-21)
 
 
