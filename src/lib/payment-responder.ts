@@ -1,3 +1,4 @@
+import { withJobPaymentLock } from "./payment-lock";
 import { loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest } from "./yield-state";
 import { sameEndpoint } from "./job-access";
 import { bookedCreditPayment, sendCreditPayment, tryCreditPayment } from "./credit-payment";
@@ -71,6 +72,30 @@ export async function handlePaymentRequest(
   provider: ProviderRef,
   // `jobToken` is the anonymous-flow per-job token threaded into
   // every `payment` `sendMessage`.
+  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval }
+): Promise<PaymentResult> {
+  return withJobPaymentLock(jobId, (assertOwned) => {
+    // Guard every rail, balance recovery, and retry at the dispatch boundary.
+    const guardedTransport = new Proxy(transport, {
+      get(target, key) {
+        if (key === "sendMessage") return async (...args: Parameters<Transport["sendMessage"]>) => {
+          assertOwned();
+          return target.sendMessage(...args);
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    return handleLockedPaymentRequest(jobId, request, policy, guardedTransport, provider, opts);
+  });
+}
+
+async function handleLockedPaymentRequest(
+  jobId: string,
+  request: PaymentRequestContent,
+  policy: JobPolicy,
+  transport: Transport,
+  provider: ProviderRef,
   opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval }
 ): Promise<PaymentResult> {
   const approval: { requestSeq: number; approval: PaymentApproval } | undefined = opts?.requestSeq === undefined ? undefined : {
@@ -556,6 +581,7 @@ async function sendRailPayment(
     if (requestSeq !== undefined) {
       if (error instanceof DvmError && error.code === "replay_rejected") markPaymentRequestPaid(jobId, requestSeq);
       else if (definitelyNotAccepted(error)) clearPaymentRequestInFlight(jobId, requestSeq);
+      else markPaymentRequestInFlight(jobId, requestSeq);
     }
     if (error instanceof DvmError && error.data) capture(error.data);
     if (error instanceof DvmError && error.code === "replay_rejected") return;

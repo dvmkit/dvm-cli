@@ -1,3 +1,4 @@
+import { withJobPaymentLock } from "./payment-lock";
 import { computeNextAction, paymentInFlightHint, pollNextAction, type NextAction } from "./next-action";
 import {
   asProviderText,
@@ -24,9 +25,9 @@ import {
   maxSeq,
   type MessageAppendSession,
 } from "./messages";
-import { answeredYieldSeqs, loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest } from "./yield-state";
+import { answeredYieldSeqs, loadAnsweredYieldSeqs, pendingPaymentRequest, reconcileInFlightPaymentRequest } from "./yield-state";
 import { paidConfirmationDisplay } from "./payment-copy";
-import { handlePaymentRequest, type PaidPaymentResult } from "./payment-responder";
+import { handlePaymentRequest, type PaymentResult, type PaidPaymentResult } from "./payment-responder";
 import { claimInboundPayments, type RefundClaim, withRefundNextAction } from "./refund-claim";
 
 export interface StreamLoopOptions {
@@ -104,7 +105,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   // that batch's follow-up poll comes back empty (the completion raced the poll
   // across machines), this gates a final re-check before computing next_action.
   let justAutoPaid = false;
-  let historyTimedOut = false;
+  let paymentUnresolved = false;
   let cursor = opts.afterSeq;
   let messageAppendSession = opts.messageAppendSession;
   // when the caller didn't pass an explicit jobToken, fall back to
@@ -127,9 +128,16 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   let pendingAction: NextAction = null;
   const pending = persistLocalState ? loadJob(jobId)?.pendingCreditPayment : undefined;
   if (pending && policy) {
-    const result = await handlePaymentRequest(jobId, pending.request, policy, transport, provider, {
-      jobToken, requestSeq: pending.authorization.request_seq,
-    });
+    let result: PaymentResult;
+    try {
+      result = await handlePaymentRequest(jobId, pending.request, policy, transport, provider, {
+        jobToken, requestSeq: pending.authorization.request_seq,
+      });
+    } catch (error) {
+      if (error instanceof DvmError && error.code === "payment_settling")
+        return { messages: [], autoPayments, refunds, cursor, nextAction: pollNextAction(jobId, paymentInFlightHint(jobId)) };
+      throw error;
+    }
     if (typeof result === "object") recordAutoPayment(result, pending.request, pending.authorization.request_seq);
     else pendingAction = computeNextAction(jobId, [{
       seq: pending.authorization.request_seq, from: "provider", timestamp: 0,
@@ -213,7 +221,10 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
 
       if (persistLocalState) for (const seq of loadAnsweredYieldSeqs(jobId)) answeredSeqs.add(seq);
       for (const seq of answeredYieldSeqs(batchMessages)) answeredSeqs.add(seq);
-      const lastYield = findLastYield(batchMessages);
+      const pendingPayment = pendingPaymentRequest(batchMessages, answeredSeqs);
+      const lastYield = findLastYield(batchMessages.filter((message) => !answeredSeqs.has(message.seq) &&
+        (message.type !== "payment-request" || message.seq === pendingPayment?.seq)))
+        ?? findLastYield(batchMessages);
       if (lastYield?.type === "payment-request" && answeredSeqs.has(lastYield.seq)) {
         if (persistLocalState) markPaymentRequestPaid(jobId, lastYield.seq);
         break;
@@ -222,31 +233,44 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           loadJob(jobId)?.inFlightPaymentRequestSeqs?.includes(lastYield.seq)) {
         const pollOptions = nextPollOptions();
         try {
-          if (!pollOptions) historyTimedOut = true;
-          else if (await reconcileInFlightPaymentRequest(jobId, lastYield.seq, transport, provider, pollOptions)) {
+          if (!pollOptions) paymentUnresolved = true;
+          else if (await withJobPaymentLock(jobId, () => reconcileInFlightPaymentRequest(jobId, lastYield.seq, transport, provider, pollOptions))) {
             answeredSeqs.add(lastYield.seq);
             break;
           }
         } catch (error) {
-          if (!isMessagePollTimeout(error)) throw error;
-          historyTimedOut = true;
+          if (!isMessagePollTimeout(error) && !(error instanceof DvmError &&
+              ["payment_settling", "payment_request_not_pending"].includes(error.code))) throw error;
+          paymentUnresolved = true;
         }
-        if (historyTimedOut) {
+        if (paymentUnresolved) {
           // Retry the read on reconnect, without retrying a payment POST.
           cursor = lastYield.seq - 1;
           break;
         }
       }
-      if (lastYield?.type === "payment-request" && policy) {
+      if (lastYield?.type === "payment-request" && lastYield.seq === pendingPayment?.seq && policy) {
         const req = lastYield.content;
         if (
           req.amount_msats <= policy.autoPayBelowMsats &&
           (policy.maxIncrementMsats === 0 || req.amount_msats <= policy.maxIncrementMsats)
         ) {
-          const result = await handlePaymentRequest(jobId, req, policy, transport, provider, {
-            jobToken,
-            requestSeq: lastYield.seq,
-          });
+          let result: PaymentResult;
+          try {
+            result = await handlePaymentRequest(jobId, req, policy, transport, provider, {
+              jobToken, requestSeq: lastYield.seq,
+            });
+          } catch (error) {
+            if (error instanceof DvmError && error.code === "payment_settling") {
+              paymentUnresolved = true;
+              break;
+            }
+            if (error instanceof DvmError && error.code === "payment_already_sent") {
+              answeredSeqs.add(lastYield.seq);
+              break;
+            }
+            throw error;
+          }
           if (typeof result === "object") {
             recordAutoPayment(result, req, lastYield.seq);
             continue;
@@ -328,7 +352,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     }
   }
 
-  if (historyTimedOut) nextAction = pollNextAction(jobId, paymentInFlightHint(jobId));
+  if (paymentUnresolved) nextAction = pollNextAction(jobId, paymentInFlightHint(jobId));
   return { messages: allMessages, autoPayments, refunds, nextAction, cursor };
 }
 

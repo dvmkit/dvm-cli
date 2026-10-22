@@ -88,8 +88,10 @@ export interface JobRecord {
    * and prevents double-claim on replay/re-poll.
    */
   claimedPaymentSeqs?: number[];
-  /** Rail sends started without a confirmed acknowledgement; never create a replacement spend. */
+  /** Rail sends started without a confirmed acknowledgement; reconcile before spending again. */
   inFlightPaymentRequestSeqs?: number[];
+  /** Latest dispatch or uncertain-outcome times (Unix milliseconds), keyed by request seq. Missing on older records, which skip the settle delay. */
+  inFlightPaymentRequestStartedAtMs?: Record<string, number>;
   /** Sequence numbers of settled payment requests, retained across restarts. */
   paidPaymentRequestSeqs?: number[];
   /** Last seen message sequence number for cursor-based polling */
@@ -216,8 +218,11 @@ export function addPayment(jobId: string, amountMsats: number, approval?: { requ
 export function markPaymentRequestInFlight(jobId: string, requestSeq: number): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
-    if (job && !job.inFlightPaymentRequestSeqs?.includes(requestSeq))
-      (job.inFlightPaymentRequestSeqs ??= []).push(requestSeq);
+    if (job) {
+      if (!job.inFlightPaymentRequestSeqs?.includes(requestSeq))
+        (job.inFlightPaymentRequestSeqs ??= []).push(requestSeq);
+      (job.inFlightPaymentRequestStartedAtMs ??= {})[requestSeq] = Date.now();
+    }
   });
 }
 
@@ -227,6 +232,7 @@ export function clearPaymentRequestInFlight(jobId: string, requestSeq: number): 
     if (!job?.inFlightPaymentRequestSeqs) return;
     job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs.filter((seq) => seq !== requestSeq);
     if (!job.inFlightPaymentRequestSeqs.length) delete job.inFlightPaymentRequestSeqs;
+    clearPaymentRequestStartTime(job, requestSeq);
   });
 }
 
@@ -240,7 +246,14 @@ export function markPaymentRequestPaid(jobId: string, requestSeq: number): void 
       job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs.filter((seq) => seq !== requestSeq);
       if (!job.inFlightPaymentRequestSeqs.length) delete job.inFlightPaymentRequestSeqs;
     }
+    clearPaymentRequestStartTime(job, requestSeq);
   });
+}
+
+function clearPaymentRequestStartTime(job: JobRecord, requestSeq: number): void {
+  if (!job.inFlightPaymentRequestStartedAtMs) return;
+  delete job.inFlightPaymentRequestStartedAtMs[requestSeq];
+  if (!Object.keys(job.inFlightPaymentRequestStartedAtMs).length) delete job.inFlightPaymentRequestStartedAtMs;
 }
 
 export function refFromJob(job: JobRecord): ProviderRef {
