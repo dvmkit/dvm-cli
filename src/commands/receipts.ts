@@ -17,6 +17,11 @@
  * the bundle without asking us for anything.
  */
 
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { open, stat } from "node:fs/promises";
+import type { ArtifactContent } from "@dvmkit/sdk";
+
 import {
   asProviderText,
   type DeliveredResult,
@@ -74,6 +79,8 @@ export interface ReceiptsShowOptions {
 }
 
 export interface ReceiptsVerifyOptions {
+  file?: string[];
+  artifact?: string;
   /** Re-fetch `/v1/info` from this endpoint (or `@alias`) instead of using the stored anchor. */
   endpoint?: string;
   human?: boolean;
@@ -153,6 +160,9 @@ export function receiptsShow(jobId: string, opts: ReceiptsShowOptions): void {
  * runs when the log is provably complete — see {@link deliveredFromMessages}.
  */
 export async function receiptsVerify(jobId: string, opts: ReceiptsVerifyOptions): Promise<void> {
+  if (opts.artifact !== undefined && !opts.file?.length) {
+    throw new DvmError("invalid_argument", "--artifact requires --file.", "Pass --file <path> with --artifact to select the file artifact to check.");
+  }
   const entry = requireStored(jobId);
   const builder = opts.endpoint
     ? await refetchAnchor(opts.endpoint)
@@ -165,10 +175,16 @@ export async function receiptsVerify(jobId: string, opts: ReceiptsVerifyOptions)
     expectedJobId: jobId,
     delivered,
   });
+  const files = await verifyFiles(jobId, opts, delivered, result);
+  if (files.some((file) => !["match", "no_signed_digest", "unverifiable"].includes(file.status))) process.exitCode = 1;
   const rate = getLastKnownBtcRate()?.rate ?? 0;
 
   if (opts.human) {
     renderVerdictHuman(entry, result, rate);
+    for (const file of files) {
+      info(`${file.path}: ${file.display}`);
+      info(`  ${file.hint}`);
+    }
     info(`\nSignature:   ${result.checks.signature ? "valid" : "INVALID"}`);
     info(`Attestation: ${result.checks.attestation}`);
     info(`Result hash: ${result.checks.result_hash}`);
@@ -178,9 +194,94 @@ export async function receiptsVerify(jobId: string, opts: ReceiptsVerifyOptions)
 
   json({
     ...storedReceiptJson(entry, result, rate),
+    ...(opts.file?.length ? { files } : {}),
     anchor_source: opts.endpoint ? "refetched" : "stored",
     hint: receiptHint(result.status, jobId),
   });
+}
+
+interface FileVerdict {
+  path: string;
+  sha256: string | null;
+  matched_artifact: { name: ReturnType<typeof asProviderText> | null; index: number } | null;
+  status: "match" | "mismatch" | "no_signed_digest" | "unverifiable" | "unreadable";
+  display: string;
+  hint: string;
+}
+
+async function verifyFiles(
+  jobId: string,
+  opts: ReceiptsVerifyOptions,
+  delivered: DeliveredResult | undefined,
+  result: ReceiptVerifyResult
+): Promise<FileVerdict[]> {
+  if (!opts.file?.length) return [];
+  const artifacts = (result.checks.result_hash === "ok" ? delivered?.artifactContents ?? [] : []).map((content, index) => ({
+    content: content as unknown as ArtifactContent,
+    index: index + 1,
+  }));
+  const selected = opts.artifact === undefined ? artifacts : artifacts.filter(({ content, index }) =>
+    /^[1-9]\d*$/.test(opts.artifact!) ? String(index) === opts.artifact : content.name === opts.artifact
+  );
+  if (opts.artifact !== undefined && result.checks.result_hash === "ok" && selected.length === 0) {
+    throw new DvmError("artifact_not_found", "No artifact matches --artifact.",
+      artifacts.length ? "Select an artifact by its 1-based index, or by its exact name as shown in `dvm messages <job-id>`. JSON output lists them in available_artifacts." : "This receipt has no delivered artifacts to select. Omit --artifact.",
+      { available_artifacts: artifacts.map(({ content, index }) => ({ index, name: content.name === undefined ? null : asProviderText(content.name) })) });
+  }
+  if (opts.artifact !== undefined && selected.length > 1) {
+    throw new DvmError("ambiguous_artifact", "More than one artifact matches --artifact.", "Select its unique 1-based artifact index instead.");
+  }
+  const candidates = selected.filter(({ content }) =>
+    typeof content.url === "string" && content.url.length > 0 &&
+    typeof content.sha256 === "string" && /^[a-f0-9]{64}$/i.test(content.sha256)
+  );
+  const files: FileVerdict[] = [];
+  for (const path of opts.file ?? []) {
+    const base = { path, sha256: null, matched_artifact: null };
+    try {
+      // Check the type before opening: opening a named pipe with no writer blocks forever.
+      if (!(await stat(path)).isFile()) throw new Error("Not a regular file");
+      const file = await open(path, "r");
+      try {
+        if (!(await file.stat()).isFile()) throw new Error("Not a regular file");
+      } finally {
+        await file.close();
+      }
+      if (result.checks.result_hash !== "ok" || result.status === "invalid") {
+        files.push({ ...base, status: "unverifiable",
+          display: "The file cannot be checked against signed evidence.",
+          hint: `The receipt could not be checked, so the file cannot be checked against it. Run 'dvm receipts verify ${jobId}' without --file to see why.` });
+        continue;
+      }
+      if (candidates.length === 0) {
+        files.push({ ...base, status: "no_signed_digest",
+          display: "No signed file fingerprint is available for this selection.",
+          hint: "The DVM did not sign a usable SHA-256 fingerprint for a URL artifact in this selection. Check --artifact if supplied." });
+        continue;
+      }
+      const hash = createHash("sha256");
+      let size = 0;
+      for await (const chunk of createReadStream(path)) {
+        size += chunk.length;
+        hash.update(chunk);
+      }
+      const sha256 = hash.digest("hex");
+      const match = candidates.find(({ content }) => content.sha256!.toLowerCase() === sha256 &&
+        (typeof content.size_bytes !== "number" || content.size_bytes === size));
+      files.push({ path, sha256,
+        matched_artifact: match ? { name: match.content.name === undefined ? null : asProviderText(match.content.name), index: match.index } : null,
+        status: match ? "match" : "mismatch",
+        display: match ? "The file matches the fingerprint the DVM signed in its receipt."
+          : `The file does not match the fingerprint${candidates.some(({ content }) => typeof content.size_bytes === "number") ? " or size" : ""} the DVM signed in its receipt.`,
+        hint: match ? "The file's bytes match signed evidence; this does not assess the quality of the result."
+          : "Check that you selected the intended file and artifact. Do not rely on this file as the signed result." });
+    } catch {
+      files.push({ ...base, status: "unreadable",
+        display: "The local file could not be read.",
+        hint: "Check that the path names an existing, readable file, not a directory, and try again." });
+    }
+  }
+  return files;
 }
 
 /**

@@ -465,6 +465,8 @@ export function buildProgram(): Command {
   receipts
     .command("verify <job-id>")
     .description("Re-verify a stored receipt offline (signature, attestation, result hash)")
+    .option("--file <path>", "Check a downloaded file against signed URL artifact fingerprints (repeatable)", collectOption, [] as string[])
+    .option("--artifact <name-or-index>", "Select an artifact by exact name or 1-based index for --file")
     .option("--endpoint <url>", "Re-fetch the DVM's /v1/info instead of using the stored anchor")
     .option("--human", "Human-readable output instead of JSON")
     .action((jobId: string, opts: ReceiptsVerifyOptions) => {
