@@ -1,8 +1,9 @@
-import { computeNextAction, type NextAction } from "./next-action";
+import { computeNextAction, paymentInFlightHint, pollNextAction, type NextAction } from "./next-action";
 import {
   asProviderText,
   DvmError,
   isAbortError,
+  shellQuoteArg,
   type JobPolicy,
   type Message,
   type MessagePollOptions,
@@ -15,6 +16,7 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   loadJob,
+  markPaymentRequestPaid,
 } from "./job-store";
 
 import {
@@ -22,9 +24,10 @@ import {
   maxSeq,
   type MessageAppendSession,
 } from "./messages";
+import { answeredYieldSeqs, loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest } from "./yield-state";
 import { paidConfirmationDisplay } from "./payment-copy";
 import { handlePaymentRequest, type PaidPaymentResult } from "./payment-responder";
-import { claimInboundPayments, type RefundClaim, refundNextAction } from "./refund-claim";
+import { claimInboundPayments, type RefundClaim, withRefundNextAction } from "./refund-claim";
 
 export interface StreamLoopOptions {
   jobId: string;
@@ -32,6 +35,8 @@ export interface StreamLoopOptions {
   provider: ProviderRef;
   policy?: JobPolicy;
   afterSeq: number;
+  /** An explicit caller cursor must never be rewound to an older yield. */
+  afterSeqExplicit?: boolean;
   onMessage?: (msg: Message) => void;
   /** Timeout in milliseconds. If exceeded, returns whatever has been collected. */
   timeoutMs?: number;
@@ -93,13 +98,13 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   const allMessages: Message[] = [];
   const autoPayments: AutoPayment[] = [];
   const refunds: RefundClaim[] = [];
-  // seqs of payment-requests this stream auto-paid. Used after the
-  // loop to guarantee we never re-surface `pay` for a request already settled.
-  const autoPaidSeqs = new Set<number>();
+  // Include durable answers so reconnects and fresh processes cannot re-pay.
+  const answeredSeqs = persistLocalState ? loadAnsweredYieldSeqs(jobId) : new Set<number>();
   // True iff the last non-empty batch ended in a successful auto-payment. When
   // that batch's follow-up poll comes back empty (the completion raced the poll
   // across machines), this gates a final re-check before computing next_action.
   let justAutoPaid = false;
+  let historyTimedOut = false;
   let cursor = opts.afterSeq;
   let messageAppendSession = opts.messageAppendSession;
   // when the caller didn't pass an explicit jobToken, fall back to
@@ -115,15 +120,21 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       ...(result.amountUsdcMicro !== undefined && { amount_usdc_microunits: result.amountUsdcMicro }),
       display: paidConfirmationDisplay(result, request.fiat_amount),
     });
-    autoPaidSeqs.add(seq);
+    if (persistLocalState) markPaymentRequestPaid(jobId, seq);
+    answeredSeqs.add(seq);
     justAutoPaid = true;
   }
+  let pendingAction: NextAction = null;
   const pending = persistLocalState ? loadJob(jobId)?.pendingCreditPayment : undefined;
   if (pending && policy) {
     const result = await handlePaymentRequest(jobId, pending.request, policy, transport, provider, {
       jobToken, requestSeq: pending.authorization.request_seq,
     });
     if (typeof result === "object") recordAutoPayment(result, pending.request, pending.authorization.request_seq);
+    else pendingAction = computeNextAction(jobId, [{
+      seq: pending.authorization.request_seq, from: "provider", timestamp: 0,
+      type: "payment-request", content: pending.request,
+    }]);
   }
   const deadline =
     opts.timeoutMs === undefined ? undefined : Date.now() + Math.max(0, opts.timeoutMs);
@@ -152,7 +163,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
 
       if (streamFn) {
         const streamOpts: StreamOptions = {
-          onMessage: opts.onMessage,
+          onMessage: (message) => { if (message.seq > cursor) opts.onMessage?.(message); },
           signal: controller?.signal,
           jobToken,
         };
@@ -167,12 +178,13 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           if (isAbortError(err) || (deadline !== undefined && isMessagePollTimeout(err))) break;
           throw err;
         }
-        batchMessages = result.messages;
+        batchMessages = result.messages.filter((message) => message.seq > cursor);
       } else {
         const pollOptions = nextPollOptions();
         if (!pollOptions) break;
         try {
-          batchMessages = await transport.getMessages(jobId, cursor, provider, pollOptions);
+          batchMessages = (await transport.getMessages(jobId, cursor, provider, pollOptions))
+            .filter((message) => message.seq > cursor);
         } catch (err) {
           if (deadline !== undefined && isMessagePollTimeout(err)) break;
           throw err;
@@ -199,10 +211,31 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
 
       justAutoPaid = false;
 
+      if (persistLocalState) for (const seq of loadAnsweredYieldSeqs(jobId)) answeredSeqs.add(seq);
+      for (const seq of answeredYieldSeqs(batchMessages)) answeredSeqs.add(seq);
       const lastYield = findLastYield(batchMessages);
-      if (lastYield?.type === "payment-request" && autoPaidSeqs.has(lastYield.seq)) {
-        justAutoPaid = true;
+      if (lastYield?.type === "payment-request" && answeredSeqs.has(lastYield.seq)) {
+        if (persistLocalState) markPaymentRequestPaid(jobId, lastYield.seq);
         break;
+      }
+      if (lastYield?.type === "payment-request" && persistLocalState &&
+          loadJob(jobId)?.inFlightPaymentRequestSeqs?.includes(lastYield.seq)) {
+        const pollOptions = nextPollOptions();
+        try {
+          if (!pollOptions) historyTimedOut = true;
+          else if (await reconcileInFlightPaymentRequest(jobId, lastYield.seq, transport, provider, pollOptions)) {
+            answeredSeqs.add(lastYield.seq);
+            break;
+          }
+        } catch (error) {
+          if (!isMessagePollTimeout(error)) throw error;
+          historyTimedOut = true;
+        }
+        if (historyTimedOut) {
+          // Retry the read on reconnect, without retrying a payment POST.
+          cursor = lastYield.seq - 1;
+          break;
+        }
       }
       if (lastYield?.type === "payment-request" && policy) {
         const req = lastYield.content;
@@ -254,7 +287,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     let recheck: Message[] = [];
     try {
       if (pollOptions) {
-        recheck = await transport.getMessages(jobId, cursor, provider, pollOptions);
+        recheck = (await transport.getMessages(jobId, cursor, provider, pollOptions))
+          .filter((message) => message.seq > cursor);
       }
     } catch (err) {
       if (deadline === undefined || !isMessagePollTimeout(err)) throw err;
@@ -271,26 +305,30 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     }
   }
 
-  let nextAction = refundNextAction(jobId, refunds) ?? computeNextAction(jobId, allMessages);
+  if (persistLocalState) for (const seq of loadAnsweredYieldSeqs(jobId)) answeredSeqs.add(seq);
+  for (const seq of answeredYieldSeqs(allMessages)) answeredSeqs.add(seq);
+  const terminal = allMessages.some((msg) => msg.type === "complete" || msg.type === "cancel");
+  const yieldAction = computeNextAction(jobId, allMessages.filter((message) => !answeredSeqs.has(message.seq)))
+    ?? (terminal ? null : pendingAction);
+  let nextAction = withRefundNextAction(jobId, yieldAction ?? (terminal ? null : pollNextAction(jobId)), refunds);
 
-  // never tell the caller to pay a request this stream already
-  // auto-paid. If next_action still resolves to `pay` for an auto-paid
-  // payment-request (the re-check above also raced the completion), surface a
-  // poll instead so an agent following next_action verbatim never re-pays a
-  // completed job into a 409. A *new, distinct* request (e.g. a second surcharge
-  // above the auto-pay threshold) has a seq outside `autoPaidSeqs`, so its `pay`
-  // is left untouched.
-  if (nextAction?.type === "pay") {
-    const lastYield = findLastYield(allMessages);
-    if (lastYield?.type === "payment-request" && autoPaidSeqs.has(lastYield.seq)) {
+  const lastYield = findLastYield(allMessages);
+  if (nextAction?.type === "pay" && lastYield?.type === "payment-request" && persistLocalState &&
+      loadJob(jobId)?.inFlightPaymentRequestSeqs?.includes(lastYield.seq))
+    nextAction = { ...nextAction, hint: paymentInFlightHint(jobId) };
+
+  // A paid request can remain the last yield while the provider catches up.
+  if (nextAction?.type === "pay" || (nextAction?.type === "poll" && !terminal)) {
+    if (lastYield?.type === "payment-request" && answeredSeqs.has(lastYield.seq)) {
       nextAction = {
         type: "poll",
         job_id: jobId,
-        hint: `Payment already sent for this request; the provider is finalising. Poll the result with 'dvm messages ${jobId}' — do not pay again.`,
+        hint: `Payment already sent for this request; the provider is finalising. Keep watching with \`dvm messages ${shellQuoteArg(jobId)} --wait\` — do not pay again.`,
       };
     }
   }
 
+  if (historyTimedOut) nextAction = pollNextAction(jobId, paymentInFlightHint(jobId));
   return { messages: allMessages, autoPayments, refunds, nextAction, cursor };
 }
 

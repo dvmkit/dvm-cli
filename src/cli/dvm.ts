@@ -650,7 +650,9 @@ export function buildProgram(): Command {
     .option("--after <seq>", "Only show messages with seq > N")
     .option("--no-stream", "Non-blocking snapshot instead of streaming until yield")
     .option("--human", "Human-readable output instead of JSON")
-    .option("--timeout <sec>", "Override default timeout")
+    .option("--wait", "Stay attached until the job needs input or ends")
+    .option("--until <duration>", "Wait limit with --wait (default: 12h; e.g. 30s, 5m, 12h)")
+    .option("--timeout <sec>", "Read timeout (default: 5s, or 60s with --wait)")
     .action((jobId: string, opts: MessagesOptions) => {
       return catchErrors(() => messages(jobId, opts), opts.human);
     });

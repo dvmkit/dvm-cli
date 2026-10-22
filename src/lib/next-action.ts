@@ -1,3 +1,4 @@
+import { answeredYieldSeqs } from "./yield-state";
 import { formatPaymentAmount } from "./currency";
 import type { Message } from "@dvmkit/sdk/internal";
 import { asProviderText, shellQuoteArg, type ProviderText } from "@dvmkit/sdk/internal";
@@ -100,8 +101,12 @@ export function pollNextAction(jobId: string, hint?: string): NextActionPoll {
   return {
     type: "poll",
     job_id: jobId,
-    hint: hint ?? "Provider is working, check back later",
+    hint: hint ?? `Provider is still working. Keep the job moving unattended with \`dvm messages ${shellQuoteArg(jobId)} --wait\`.`,
   };
+}
+
+export function paymentInFlightHint(jobId: string): string {
+  return `A payment may already have been sent for this request. Resolve it with \`dvm pay ${shellQuoteArg(jobId)}\`; it checks provider history before paying again.`;
 }
 
 /** Message types that signal the end of a provider's turn. */
@@ -120,9 +125,10 @@ const TERMINAL_STATUSES: ReadonlySet<string> = new Set<TerminalJobStatus>([
  * or no yield message is found.
  */
 export function computeNextAction(jobId: string, messages: Message[]): NextAction {
+  const answered = answeredYieldSeqs(messages);
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (!YIELD_TYPES.has(msg.type)) continue;
+    if (!YIELD_TYPES.has(msg.type) || answered.has(msg.seq)) continue;
 
     switch (msg.type) {
       case "complete":
@@ -172,7 +178,7 @@ export function computeNextAction(jobId: string, messages: Message[]): NextActio
           job_id: jobId,
           estimate_seconds: c.estimate_seconds,
           hint:
-            c.hint !== undefined ? asProviderText(c.hint) : "Provider is working, check back later",
+            c.hint !== undefined ? asProviderText(c.hint) : pollNextAction(jobId).hint,
         };
       }
     }

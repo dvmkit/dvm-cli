@@ -1,5 +1,5 @@
 import { shellQuoteArg } from "@dvmkit/sdk/internal";
-import type { NextAction } from "./next-action";
+import { pollNextAction, type NextAction } from "./next-action";
 import { type RefundClaim, refundSummaryHuman } from "./refund-claim";
 import { info } from "./output";
 
@@ -17,7 +17,7 @@ export function nextActionHuman(action: NextAction): string | null {
     }
     case "poll": {
       const hint = typeof action.hint === "string" ? action.hint : action.hint.text;
-      const detail = hint === "Provider is working, check back later" || hint === "Job submitted, check back for updates"
+      const detail = hint === pollNextAction(action.job_id).hint || hint === "Job submitted, check back for updates"
         ? "" : hint.trim();
       const sentence = detail
         ? `Provider is still working: ${detail}${/[.!?]$/.test(detail) ? "" : "."}`

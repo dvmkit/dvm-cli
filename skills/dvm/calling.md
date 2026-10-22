@@ -27,7 +27,9 @@ Check the existing mapping before replacing an alias. Reuse it with `dvm request
 
 Submit once with `dvm request`, preserving the approved input and spending limits. Save the returned request and job identifiers. A long job can use `--no-stream` and be followed through its recorded job.
 
-Follow the returned action: respond to a provider question only with authorized information; pay an existing job only within consent; poll when still processing. After `dvm pay <job-id>`, continue with `dvm messages <job-id>`, not a new request. For an uncertain outcome, enter [recovery](recovery.md).
+For long jobs, run `dvm messages <job-id> --wait` in the background (default limit `12h`, override with `--until 30m`) and act on its `next_action`; it keeps paying charges authorised by the stored policy while attached. Silent stream reads reconnect after 60 seconds by default; use `--timeout <seconds>` to change that interval.
+
+Follow the returned action: respond to a provider question only with authorized information; pay an existing job only within consent; poll when still processing. After `dvm pay <job-id>`, continue with `dvm messages <job-id>`, not a new request. If a `pay` action warns that a payment may already have been sent, run `dvm pay <job-id>` to resolve it: the command checks fresh provider history and pays only if no requester payment answers that charge. Automatic payment under `--wait` checks the same history. If history cannot be read, retry once the provider is reachable or enter [recovery](recovery.md).
 
 Answer with `dvm message <job-id> "<answer>" --type response --prompt-id <prompt-id>` (use `--json '<object matching schema>'` in place of `"<answer>"` for structured prompts); relay `next_action.display` and use exactly one of `next_action.options` unless the human chose otherwise.
 

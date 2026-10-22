@@ -3773,26 +3773,6 @@ async function streamToCompletion(
   const allAutoPayments = [...result.autoPayments];
   const allRefunds = [...result.refunds];
 
-  // Initial streamLoop is bounded by the deadline. If the provider takes
-  // longer than --timeout to emit its first message, the SSE connection
-  // aborts mid-stream and streamLoop returns {messages: [], nextAction: null}.
-  // That's indistinguishable from "job finished with nothing to say" — but in
-  // practice the provider is still working, so synthesize a poll action so
-  // an agent can resume via `dvm status` instead of thinking the job is done.
-  if (result.messages.length === 0 && result.nextAction === null) {
-    return {
-      messages: allMessages,
-      autoPayments: allAutoPayments,
-      refunds: allRefunds,
-      nextAction: {
-        type: "poll",
-        job_id: baseOpts.jobId,
-        hint: "Provider hasn't yielded yet, check back later",
-      },
-      cursor: result.cursor,
-    };
-  }
-
   while (result.nextAction?.type === "poll") {
     if (Date.now() >= deadlineMs) break;
     const waitMs = Math.min(
@@ -3955,7 +3935,7 @@ async function streamAfterPayment(args: {
 
     const nextAction = pollNextAction(
       jobId,
-      "Payment sent but the result stream timed out. The job is still running — check back with 'dvm status'."
+      `Payment sent but the result stream timed out. ${pollNextAction(jobId).hint}`
     );
     if (human) {
       info(paidTimeoutMessage);
