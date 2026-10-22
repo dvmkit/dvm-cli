@@ -26,6 +26,7 @@ vi.mock("../src/lib/wallet-agent/spend", () => ({
   prepareAgentSpend: vi.fn(async () => ({ cashuToken: "mint-fixture", requestId: "fund-1",
     mint: "https://mint.invalid", totalSats: 50, intendedLockPubkey: "02" + "01".repeat(32) })),
   commitAgentSpend: vi.fn(async () => undefined),
+  abandonPendingSubmission: vi.fn(async () => undefined),
 }));
 vi.mock("../src/lib/wallet-agent/recovery-submissions", () => ({ sweepPendingSubmissions: async () => undefined }));
 
@@ -67,6 +68,18 @@ function wire(receipt: unknown = funding(), code = 201, error?: string, seq = 8)
 const pay = () => handlePaymentRequest(jobId, ask, policy, new HttpsTransport(), { endpoint }, { rail: "cashu", requestSeq: 4 });
 
 describe("payment acknowledgement funding evidence", () => {
+  it("retains an accepted Cashu request before wallet commit failure and refuses a second spend", async () => {
+    seed();
+    wire();
+    const failure = new Error("Wallet commit unavailable");
+    vi.mocked(commitAgentSpend).mockRejectedValueOnce(failure);
+    await expect(pay()).rejects.toBe(failure);
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4]);
+    await expect(pay()).rejects.toMatchObject({ code: "payment_already_sent" });
+    expect(prepareAgentSpend).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith("/messages"))).toHaveLength(1);
+  });
+
   it("retains funding when the acknowledgement cursor advances beyond the inbound payment", async () => {
     seed();
     const receipt = funding({ payment_seq: 8 });
@@ -100,7 +113,7 @@ describe("payment acknowledgement funding evidence", () => {
   });
 
   it.each([
-    [503, "job_snapshot_unavailable"], [500, "payment_unapplied"], [409, "replay_rejected"],
+    [503, "job_snapshot_unavailable"], [500, "payment_unapplied"],
   ])("retains committed funding on HTTP %s without treating the failed payment as success", async (status, code) => {
     seed();
     const fetch = wire(funding(), status, code);
@@ -112,6 +125,41 @@ describe("payment acknowledgement funding evidence", () => {
     await settle(response());
     expect(warnings()).toEqual([]);
     expect(loadCredit(endpoint, signing.pubkey, identity)?.remainingMicro).toBe(400_000);
+  });
+
+  it("books a replay refusal as paid and retains its signed funding", async () => {
+    seed();
+    const fetch = wire(funding(), 409, "replay_rejected");
+    await expect(pay()).resolves.toMatchObject({ status: "paid", rail: "cashu_p2pk" });
+    expect(loadJob(jobId)?.drawFundingReceipts).toHaveLength(1);
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4]);
+    expect(loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
+    expect(loadJob(jobId)?.paymentsHonoured).toBe(1);
+    expect(commitAgentSpend).toHaveBeenCalledTimes(1);
+    fetch.mockClear();
+    await settle(response());
+    expect(warnings()).toEqual([]);
+    expect(loadCredit(endpoint, signing.pubkey, identity)?.remainingMicro).toBe(400_000);
+  });
+
+  it.each(["payment_invalid", "payment_insufficient"])("clears a structured Cashu %s refusal for retry", async (code) => {
+    seed();
+    wire(undefined, 402, code);
+    await expect(pay()).rejects.toMatchObject({ code });
+    expect(loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
+    wire();
+    await expect(pay()).resolves.toMatchObject({ status: "paid" });
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4]);
+  });
+
+  it("keeps an unparseable payment refusal uncertain", async () => {
+    seed();
+    const fetch = wire();
+    fetch.mockImplementationOnce(async () => Response.json({ builder: dvm.anchor }));
+    fetch.mockImplementationOnce(async () => new Response("Invalid reply", { status: 402 }));
+    await expect(pay()).rejects.toMatchObject({ code: "payment_insufficient" });
+    expect(loadJob(jobId)?.inFlightPaymentRequestSeqs).toEqual([4]);
+    expect(commitAgentSpend).not.toHaveBeenCalled();
   });
 
   it("recovers a lost acknowledgement from the provider's job read", async () => {

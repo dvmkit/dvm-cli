@@ -1,4 +1,4 @@
-import { type NextActionRefund } from "./next-action";
+import { type NextAction, type NextActionRefund } from "./next-action";
 import { formatAmountBestEffort, monetaryJson } from "./currency";
 import {
   fetchBtcUsdRate,
@@ -181,4 +181,9 @@ export function printRefundSummaryHuman(claims: RefundClaim[]): void {
 
 function cap(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+export function withRefundNextAction(jobId: string, action: NextAction, claims: RefundClaim[]): NextAction {
+  if (action?.type === "respond" || action?.type === "pay") return action;
+  return refundNextAction(jobId, claims) ?? action;
 }

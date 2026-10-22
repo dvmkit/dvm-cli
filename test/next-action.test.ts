@@ -232,7 +232,7 @@ describe("computeNextAction", () => {
     expect(result).toEqual({
       type: "poll",
       job_id: "job-1",
-      hint: "Provider is working, check back later",
+      hint: "Provider is still working. Keep the job moving unattended with `dvm messages job-1 --wait`.",
     });
   });
 
@@ -263,11 +263,15 @@ describe("isTerminalJobStatus", () => {
 });
 
 describe("pollNextAction", () => {
+  it("shell-quotes the job id in the unattended wait command", () => {
+    expect(pollNextAction("job's").hint).toContain("dvm messages 'job'\\''s' --wait");
+  });
+
   it("defaults to the CLI-owned working hint", () => {
     expect(pollNextAction("job-1")).toEqual({
       type: "poll",
       job_id: "job-1",
-      hint: "Provider is working, check back later",
+      hint: "Provider is still working. Keep the job moving unattended with `dvm messages job-1 --wait`.",
     });
   });
 

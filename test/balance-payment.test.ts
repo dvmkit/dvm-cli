@@ -2,11 +2,12 @@ import { createServer, type Server } from "node:http";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createSignedRequestVerifier, type PaymentContent } from "@dvmkit/sdk";
-import { CREDITS_FILE, DvmError, JOBS_FILE, receiptPubkeyFromSecret, signDvmRequestData, type PaymentRequestContent } from "@dvmkit/sdk/internal";
+import { CREDITS_FILE, DvmError, JOBS_FILE, receiptPubkeyFromSecret, signDvmRequestData, type PaymentRequestContent, type Transport } from "@dvmkit/sdk/internal";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handlePaymentRequest } from "../src/lib/payment-responder";
 import { bookCreditPayment, loadJob, saveJob, updateJob } from "../src/lib/job-store";
 import { HttpsTransport } from "../src/lib/transport/https";
+import { waitForJob } from "../src/lib/wait-for-job";
 import { streamLoop } from "../src/lib/stream-loop";
 import { appendMessage } from "../src/lib/messages";
 import { pay } from "../src/commands/pay";
@@ -31,6 +32,7 @@ let server: Server;
 let endpoint: string;
 let advertisement = true;
 let expectedMicro = 1500;
+let expectedSeq = 4;
 let expectedCurrency = "usd";
 let reply: "ok" | "drop" | "insufficient" | "conflict" | "malformed" | "unavailable" | "fake-insufficient" | "invalid-insufficient" = "ok";
 let accepted = false;
@@ -46,6 +48,7 @@ beforeEach(async () => {
   reply = "ok";
   advertisement = true;
   expectedMicro = 1500;
+  expectedSeq = 4;
   expectedCurrency = "usd";
   budget.rate = 100000;
   budget.enforce.mockRejectedValue(new DvmError("global_budget_exceeded", "Wallet outflow budget exhausted."));
@@ -74,7 +77,7 @@ beforeEach(async () => {
       expect(body).toEqual({ type: "payment", content: { credit: authorization } });
       verifier.checkAuth(authorization, { audience, method: "POST", path: messagesPath, capability: null });
       expect(authorization).toMatchObject({ credit_id: "held-credit", draw_id: expect.any(String),
-        request_seq: 4, amount_micro: expectedMicro, currency: expectedCurrency, pubkey });
+        request_seq: expectedSeq, amount_micro: expectedMicro, currency: expectedCurrency, pubkey });
       if (reply === "insufficient" || reply === "fake-insufficient" || reply === "invalid-insufficient") {
         response.statusCode = reply === "fake-insufficient" ? 503 : 402;
         response.end(JSON.stringify({ error: "insufficient_credit", remaining_micro: reply === "invalid-insufficient" ? -1 : 1000, shortfall_micro: 500 }));
@@ -177,6 +180,33 @@ describe("balance-backed mid-job payments", () => {
     expect(received[1]).toEqual(saved.authorization);
     expect(charged.size).toBe(1);
     expect(loadJob("job-a")).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1 });
+  });
+
+  it("books an echoed pending payment before paying the next charge during wait", async () => {
+    const jobs = await import("../src/lib/job-store");
+    const booking = vi.spyOn(jobs, "bookCreditPayment").mockImplementationOnce(() => { throw new Error("Interrupted before local booking"); });
+    await expect(respond()).rejects.toThrow("Interrupted before local booking");
+    booking.mockRestore();
+    const saved = loadJob("job-a")!.pendingCreditPayment!;
+    appendMessage("job-a", { seq: 4, from: "provider", timestamp: 0, type: "payment-request", content: ask });
+    appendMessage("job-a", { seq: 5, from: "requester", timestamp: 0, type: "payment", content: { credit: saved.authorization } });
+    const http = new HttpsTransport();
+    const stream = vi.fn().mockImplementationOnce(async () => {
+      // Recovery must finish before the new ask is processed.
+      expect(loadJob("job-a")).toMatchObject({ paymentsHonoured: 1, totalPaidMsats: 1500 });
+      expectedSeq = 7;
+      return { messages: [{ seq: 7, from: "provider", timestamp: 0, type: "payment-request", content: ask }] };
+    }).mockResolvedValueOnce({ messages: [{ seq: 9, from: "provider", timestamp: 0, type: "prompt", content: { id: "continue", text: "Continue?" } }] });
+    const transport = { stream, status: async () => ({ status: "processing" }),
+      sendMessage: http.sendMessage.bind(http), describe: http.describe.bind(http) } as unknown as Transport;
+    const result = await waitForJob({ jobId: "job-a", provider: { endpoint }, transport, policy, afterSeq: 5 }, 3000);
+    expect(result.nextAction).toMatchObject({ type: "respond", prompt_id: "continue" });
+    expect(received).toHaveLength(3);
+    expect(received[1]).toEqual(saved.authorization);
+    expect(charged.size).toBe(2);
+    expect(loadJob("job-a")).toMatchObject({ totalPaidMsats: 3000, paymentsHonoured: 2 });
+    expect(loadJob("job-a")?.pendingCreditPayment).toBeUndefined();
+    expect(budget.enforce).not.toHaveBeenCalled();
   });
 
   it("books a recovered server acceptance idempotently even after local booking already completed", async () => {

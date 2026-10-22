@@ -2,7 +2,7 @@ export { formatMessageHuman } from "../lib/message-human";
 import { formatMessageHuman, paymentAmount } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
 import { formatPaymentAmount } from "../lib/currency";
-import { computeNextAction, isTerminalJobStatus, pollNextAction, type NextAction } from "../lib/next-action";
+import { computeNextAction, isTerminalJobStatus, paymentInFlightHint, pollNextAction, type NextAction } from "../lib/next-action";
 import {
   asProviderText,
   DvmError,
@@ -26,17 +26,22 @@ import { progressNotice } from "../lib/progress-notice";
 import {
   claimInboundPayments,
   refundJsonField,
-  refundNextAction,
+  withRefundNextAction,
 } from "../lib/refund-claim";
 import {
   createArtifactSaveSession,
 } from "../lib/save-artifact";
+import { parseDurationMs } from "../lib/duration";
+import { loadAnsweredYieldSeqs } from "../lib/yield-state";
+import { waitForJob } from "../lib/wait-for-job";
 import { streamLoop } from "../lib/stream-loop";
 import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
 import { createDvmTransport } from "../lib/transport";
 
 export interface MessagesOptions extends JobAccessOptions {
   after?: string;
+  wait?: boolean;
+  until?: string;
   /** Whether to stream (default: true). Set to false by --no-stream. */
   stream?: boolean;
   human?: boolean;
@@ -45,6 +50,9 @@ export interface MessagesOptions extends JobAccessOptions {
 }
 
 export async function messages(jobId: string, opts: MessagesOptions): Promise<void> {
+  if ((opts.until !== undefined && !opts.wait) || (opts.wait && opts.stream === false)) {
+    throw new DvmError("invalid_arguments", "Use --until with --wait, and --wait with streaming enabled.");
+  }
   const access = resolveJobAccess(jobId, opts);
   return withJobTokenRedaction(access.jobToken, () => messagesWithAccess(jobId, opts, access));
 }
@@ -54,31 +62,44 @@ async function messagesWithAccess(
   opts: MessagesOptions,
   access: ResolvedJobAccess
 ): Promise<void> {
+  const waitDuration = opts.wait ? parseDurationMs(opts.until ?? "12h") : undefined;
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
 
-  async function humanNextAction(action: NextAction, messages: Message[]): Promise<NextAction> {
-    if (!opts.human) return action;
+  function actionFromMessages(batch: Message[]): NextAction {
+    const answered = access.endpointOverridden ? new Set<number>() : loadAnsweredYieldSeqs(jobId);
+    const action = computeNextAction(jobId, batch.filter((message) => !answered.has(message.seq)));
+    const request = batch.findLast((message) => message.type === "payment-request");
+    if (action?.type === "pay" && request && !access.endpointOverridden &&
+        stored?.inFlightPaymentRequestSeqs?.includes(request.seq))
+      return { ...action, hint: paymentInFlightHint(jobId) };
+    return action;
+  }
+
+  async function resolveNextAction(action: NextAction, messages: Message[]): Promise<NextAction> {
+    if (action?.type === "refund") return action;
     if (streamTerminalStatus(messages) || (!access.endpointOverridden && stored && isTerminalJobStatus(stored.status))) return null;
+    if (!opts.human) return action;
     // Terminal status takes precedence over actions from an older message.
     // Empty incremental batches can still have a pending question in history.
     try {
       const readOptions = { jobToken, timeoutMs: opts.timeout ? Number(opts.timeout) * 1000 : 5000 };
       const snapshot = await transport.status(jobId, ref, readOptions);
       if (isTerminalJobStatus(snapshot.status)) return null;
-      if (action) return action;
+      if (action && (action.type !== "poll" ||
+        messages.some((message) => ["prompt", "payment-request", "working"].includes(message.type)))) return action;
       if (snapshot.status === "awaiting-input") {
         const history = await transport.getMessages(jobId, 0, ref, readOptions);
-        return computeNextAction(jobId, history) ?? pollNextAction(jobId);
+        return actionFromMessages(history) ?? pollNextAction(jobId);
       }
-      return pollNextAction(jobId);
+      return action ?? pollNextAction(jobId);
     } catch {
-      return action;
+      return action ?? pollNextAction(jobId);
     }
   }
   const transport = createDvmTransport();
 
-  const isTerminal = stored?.status === "completed" || stored?.status === "failed";
+  const isTerminal = !access.endpointOverridden && !!stored && isTerminalJobStatus(stored.status);
   const after =
     opts.after !== undefined
       ? Number(opts.after)
@@ -123,12 +144,13 @@ async function messagesWithAccess(
 
     // Auto-claim inbound Cashu payments (refund/change) into the local wallet.
     const refunds = access.endpointOverridden ? [] : await claimInboundPayments(jobId, msgs);
-    const nextAction = refundNextAction(jobId, refunds) ?? computeNextAction(jobId, msgs);
+    const nextAction = withRefundNextAction(jobId, actionFromMessages(msgs) ??
+      (streamTerminalStatus(msgs) || isTerminal ? null : pollNextAction(jobId)), refunds);
     const content = jobContentFields(
       jobId,
       await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken })
     );
-    const humanAction = await humanNextAction(nextAction, msgs);
+    const resolvedAction = await resolveNextAction(nextAction, msgs);
     transport.close();
 
     if (opts.human) {
@@ -141,14 +163,14 @@ async function messagesWithAccess(
         }
         finalizeProgressLine();
       }
-      printNextActionHuman(humanAction, { refunds });
+      printNextActionHuman(resolvedAction, { refunds });
     } else {
       json({
         jobId,
         ...content,
         messages: msgs.map(serialize),
         cursor: newCursor,
-        next_action: nextAction,
+        next_action: resolvedAction,
         ...(await refundJsonField(refunds)),
       });
     }
@@ -159,20 +181,32 @@ async function messagesWithAccess(
   // Render `progress` heartbeats live in --human mode so multi-minute jobs
   // give the operator continuous feedback. Other types are batch-rendered
   // after the stream returns; progress is skipped there to avoid duplication.
-  const result = await streamLoop({
+  const streamOptions = {
     jobId,
     transport,
     provider: ref,
     policy: stored?.policy ?? undefined,
     afterSeq: after,
+    afterSeqExplicit: opts.after !== undefined,
     jobToken,
     persistLocalState: !access.endpointOverridden,
+    timeoutMs: opts.timeout ? Number(opts.timeout) * 1000 : (opts.wait ? 60_000 : 5000),
     ...(opts.human && {
       onMessage: (msg: Message) => {
         if (msg.type === "progress") formatMessageHuman(msg);
       },
     }),
-  });
+  };
+  const waitDeadline = waitDuration === undefined ? undefined : Date.now() + waitDuration;
+  let result;
+  try {
+    result = opts.wait
+      ? await waitForJob(streamOptions, waitDuration!)
+      : await streamLoop(streamOptions);
+  } catch (err) {
+    transport.close();
+    throw err;
+  }
 
   if (!access.endpointOverridden) {
     persistStreamOutcome({
@@ -184,12 +218,14 @@ async function messagesWithAccess(
   }
   const content = jobContentFields(
     jobId,
-    await observeJobContent(jobId, transport, ref, {
-      timeoutMs: opts.timeout ? Number(opts.timeout) * 1000 : 5000,
-      jobToken,
-    })
+    waitDeadline !== undefined && Date.now() >= waitDeadline ? undefined
+      : await observeJobContent(jobId, transport, ref, {
+        timeoutMs: waitDeadline === undefined ? (opts.timeout ? Number(opts.timeout) * 1000 : 5000)
+          : Math.max(1, Math.min(streamOptions.timeoutMs, waitDeadline - Date.now())),
+        jobToken,
+      })
   );
-  const humanAction = await humanNextAction(result.nextAction, result.messages);
+  const resolvedAction = opts.wait ? result.nextAction : await resolveNextAction(result.nextAction, result.messages);
   transport.close();
 
   if (opts.human) {
@@ -203,14 +239,14 @@ async function messagesWithAccess(
       }
       finalizeProgressLine();
     }
-    printNextActionHuman(humanAction, { refunds: result.refunds });
+    printNextActionHuman(resolvedAction, { refunds: result.refunds });
   } else {
     json({
       jobId,
       ...content,
       messages: result.messages.map(serialize),
       cursor: result.cursor,
-      next_action: result.nextAction,
+      next_action: resolvedAction,
       ...(result.autoPayments.length > 0 ? { auto_payments: result.autoPayments } : {}),
       ...(await refundJsonField(result.refunds)),
     });

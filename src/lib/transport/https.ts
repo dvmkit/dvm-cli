@@ -779,8 +779,11 @@ export class HttpsTransport implements Transport {
       // that to `job_terminal` told the agent to walk away from a running job —
       // surface the DVM's own code and copy instead.
       if (body && (body.error === "replay_rejected" ||
-          (message.type === "payment" && message.content.credit && typeof body.error === "string")))
-        throw withDrawFunding(withCreditErrorContext(buildPaymentError(body), body), body);
+          (message.type === "payment" && message.content.credit && typeof body.error === "string"))) {
+        const error = withDrawFunding(withCreditErrorContext(buildPaymentError(body), body), body);
+        error.data = { ...error.data, http_status: res.status };
+        throw error;
+      }
       // the job went terminal (completed/cancelled) before this POST
       // landed — the mid-job-payment race. Map it to a structured error with a
       // hint so an agent following a stale next_action self-recovers in one
@@ -797,7 +800,9 @@ export class HttpsTransport implements Transport {
       const structured = parseStructuredError(text);
       if (structured) {
         const body = parseJsonObject(text) ?? {};
-        throw withDrawFunding(withCreditErrorContext(structured, body), body);
+        const error = withDrawFunding(withCreditErrorContext(structured, body), body);
+        error.data = { ...error.data, http_status: res.status };
+        throw error;
       }
       throw providerResponseError("provider_error", `sendMessage failed (${res.status}): ${text}`);
     }

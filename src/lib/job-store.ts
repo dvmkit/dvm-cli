@@ -88,6 +88,10 @@ export interface JobRecord {
    * and prevents double-claim on replay/re-poll.
    */
   claimedPaymentSeqs?: number[];
+  /** Rail sends started without a confirmed acknowledgement; never create a replacement spend. */
+  inFlightPaymentRequestSeqs?: number[];
+  /** Sequence numbers of settled payment requests, retained across restarts. */
+  paidPaymentRequestSeqs?: number[];
   /** Last seen message sequence number for cursor-based polling */
   messageCursor?: number;
   /** Running total of payments sent (millisatoshis) */
@@ -206,6 +210,36 @@ export function addPayment(jobId: string, amountMsats: number, approval?: { requ
     // A rail may bind a previously free job to an implicit credit whose IDs
     // this message response does not expose. Future balance payments must not guess.
     if (job.creditBinding && "unbound" in job.creditBinding) delete job.creditBinding;
+  });
+}
+
+export function markPaymentRequestInFlight(jobId: string, requestSeq: number): void {
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (job && !job.inFlightPaymentRequestSeqs?.includes(requestSeq))
+      (job.inFlightPaymentRequestSeqs ??= []).push(requestSeq);
+  });
+}
+
+export function clearPaymentRequestInFlight(jobId: string, requestSeq: number): void {
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (!job?.inFlightPaymentRequestSeqs) return;
+    job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs.filter((seq) => seq !== requestSeq);
+    if (!job.inFlightPaymentRequestSeqs.length) delete job.inFlightPaymentRequestSeqs;
+  });
+}
+
+export function markPaymentRequestPaid(jobId: string, requestSeq: number): void {
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (!job) return;
+    if (!job.paidPaymentRequestSeqs?.includes(requestSeq))
+      (job.paidPaymentRequestSeqs ??= []).push(requestSeq);
+    if (job.inFlightPaymentRequestSeqs) {
+      job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs.filter((seq) => seq !== requestSeq);
+      if (!job.inFlightPaymentRequestSeqs.length) delete job.inFlightPaymentRequestSeqs;
+    }
   });
 }
 

@@ -87,7 +87,7 @@ beforeAll(async () => {
         );
         return;
       }
-      const humanJob = decodeURIComponent(request.url ?? "").match(/^\/v1\/job\/(human-(?:prompt|pay(?:'s)?|done|working|change|failed|cancelled))(?:\/messages.*)?$/)?.[1];
+      const humanJob = decodeURIComponent(request.url ?? "").match(/^\/v1\/job\/(human-(?:prompt|pay(?:'s)?|done|working|heartbeat|change|failed|cancelled))(?:\/messages.*)?$/)?.[1];
       if (request.method === "GET" && humanJob) {
         if (request.url?.includes("/messages")) {
           const timestamp = "2026-01-01T00:00:00Z";
@@ -96,7 +96,8 @@ beforeAll(async () => {
           const charge = { seq: 2, from: "provider", timestamp, type: "payment-request",
             content: { amount_msats: 400_000, fiat_amount: { amount: 0.4, currency: "usd" }, reason: "More observing" } };
           const payment = { seq: 3, from: "requester", timestamp, type: "payment", content: { amount_msats: 400_000 } };
-          const messages = humanJob === "human-prompt" ? [prompt]
+          const messages = humanJob === "human-heartbeat" ? [{ seq: 1, from: "provider", timestamp, type: "progress", content: { percent_complete: 10 } }]
+            : humanJob === "human-prompt" ? [prompt]
             : (humanJob.startsWith("human-pay") || ["human-failed", "human-cancelled"].includes(humanJob)) ? [prompt, charge]
             : humanJob === "human-change" ? [
               { seq: 1, from: "provider", timestamp, type: "payment", content: { amount_msats: 1000, reason: "change", cashu_token: "already-claimed-token" } },
@@ -115,7 +116,7 @@ beforeAll(async () => {
         } else {
           response.end(JSON.stringify({ status: ["human-done", "human-change"].includes(humanJob) ? "completed"
             : humanJob === "human-failed" ? "failed" : humanJob === "human-cancelled" ? "cancelled"
-            : humanJob === "human-working" ? "processing" : "awaiting-input" }));
+            : ["human-working", "human-heartbeat"].includes(humanJob) ? "processing" : "awaiting-input" }));
         }
         return;
       }
@@ -724,6 +725,20 @@ describe("standalone caller contract", () => {
       display: "The provider asks: High cloud moving in, 18 of 40 frames usable. Choices: \"keep\", \"wait\", \"switch\".",
       hint: expect.stringContaining('dvm message prompt-options "<answer>" --type response --prompt-id weather'),
     });
+  });
+
+  it.each(["request", "messages", "messages-no-stream"])("%s reports heartbeat-only processing as poll", async (command) => {
+    const args = command === "request"
+      ? ["request", "--data", JSON.stringify({ scenario: "human-heartbeat" }), "--auto-pay-below", "0", "--timeout", "1"]
+      : ["messages", "human-heartbeat", ...(command === "messages-no-stream" ? ["--no-stream"] : [])];
+    const result = await runCli([...args, "--endpoint", endpoint], {
+      DVM_JOB_TOKEN: portableToken, DVM_IDENTITY_KEY: "11".repeat(32),
+    });
+    const body = JSON.parse(result.stdout);
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0].type).toBe("progress");
+    expect(body.next_action).toMatchObject({ type: "poll", job_id: "human-heartbeat" });
+    expect(body.next_action.hint).toContain("dvm messages human-heartbeat --wait");
   });
 
   describe("human job guidance", () => {

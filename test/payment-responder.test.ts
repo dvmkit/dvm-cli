@@ -45,6 +45,7 @@ vi.mock("../src/lib/budget-ledger", async (importOriginal) => ({
   recordSpend: sdk.recordSpend,
 }));
 
+import { streamLoop } from "../src/lib/stream-loop";
 import { handlePaymentRequest } from "../src/lib/payment-responder";
 
 const policy: JobPolicy = {
@@ -90,6 +91,72 @@ describe("mid-job payment rail selection", () => {
     sdk.loadX402Wallet.mockReturnValue({ privateKey: "0xkey" });
     sdk.tempoCredentialAmountMicro.mockReturnValue(10_000n);
     sdk.usdcToMsats.mockReturnValue(12_000);
+  });
+
+  it.each(["x402", "tempo"] as const)("retains an accepted %s request before ledger failure and refuses a second spend", async (rail) => {
+    const store = await vi.importActual<typeof import("../src/lib/job-store")>("../src/lib/job-store");
+    const jobId = `accepted's ${rail} job`;
+    store.saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0 });
+    sdk.loadJob.mockImplementation(store.loadJob);
+    sdk.tryX402Payment.mockResolvedValue({ paymentHeader: "x402-proof", amountMsats: 12_000,
+      amountUsdcMicro: "10000", btcRate: 100_000 });
+    sdk.buildTempoCredential.mockReturnValue({ credential: "tempo-proof" });
+    const transport = fakeTransport();
+    const failure = new Error("Ledger unavailable");
+    sdk.recordSpend.mockImplementationOnce(() => { throw failure; });
+    const ask = request(rail === "x402" ? { x402: x402Offer } : { tempo: tempoOffer });
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail, requestSeq: 5 })).rejects.toBe(failure);
+    expect(store.loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([5]);
+    expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail, requestSeq: 5 }))
+      .rejects.toMatchObject({ code: "payment_already_sent", hint: expect.stringContaining(String.raw`dvm messages 'accepted'\''s ${rail} job' --wait`) });
+    expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["x402", "tempo"] as const)("retains an uncertain %s send across restart before a later payment echo", async (rail) => {
+    const store = await vi.importActual<typeof import("../src/lib/job-store")>("../src/lib/job-store");
+    const jobId = `uncertain's ${rail} job`;
+    store.saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0 });
+    sdk.loadJob.mockImplementation(store.loadJob);
+    sdk.tryX402Payment.mockResolvedValue({ paymentHeader: "x402-proof", amountMsats: 12_000,
+      amountUsdcMicro: "10000", btcRate: 100_000 });
+    sdk.buildTempoCredential.mockReturnValue({ credential: "tempo-proof" });
+    const ask = request(rail === "x402" ? { x402: x402Offer } : { tempo: tempoOffer });
+    const transport = fakeTransport();
+    const failure = new Error("Process interrupted after provider acceptance, before acknowledgement");
+    let stateAtSend: unknown;
+    transport.sendMessage.mockImplementationOnce(async () => {
+      stateAtSend = store.loadJob(jobId)?.inFlightPaymentRequestSeqs;
+      throw failure;
+    });
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail, requestSeq: 5 })).rejects.toBe(failure);
+    expect(stateAtSend).toEqual([5]);
+    expect(store.loadJob(jobId)?.paidPaymentRequestSeqs).toBeUndefined();
+    const stream = vi.fn().mockResolvedValueOnce({ messages: [
+      { seq: 5, from: "provider", timestamp: 0, type: "payment-request", content: ask },
+    ] }).mockResolvedValueOnce({ messages: [
+      { seq: 6, from: "requester", timestamp: 0, type: "payment", content: { amount_msats: 12_000 } },
+      { seq: 7, from: "provider", timestamp: 0, type: "prompt", content: { id: "continue", text: "Continue?" } },
+    ] });
+    const getMessages = vi.fn().mockResolvedValue([
+      { seq: 5, from: "provider", timestamp: 0, type: "payment-request", content: ask },
+      { seq: 6, from: "requester", timestamp: 0, type: "payment", content: { amount_msats: 12_000 } },
+    ]);
+    const restartedTransport = { ...transport, stream, getMessages } as Transport;
+    const first = await streamLoop({ jobId, provider, policy, transport: restartedTransport, afterSeq: 4 });
+    expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+    expect(first.nextAction).toMatchObject({ type: "poll" });
+    expect(store.loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([5]);
+    expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
+    expect(getMessages).toHaveBeenCalledTimes(1);
+    expect(first.autoPayments).toEqual([]);
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail, requestSeq: 5 }))
+      .rejects.toMatchObject({ code: "payment_already_sent" });
+    const second = await streamLoop({ jobId, provider, policy, transport: restartedTransport, afterSeq: first.cursor });
+    expect(second.nextAction).toMatchObject({ type: "respond", prompt_id: "continue" });
+    expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+    expect(sdk.tryX402Payment).toHaveBeenCalledTimes(rail === "x402" ? 1 : 0);
+    expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(rail === "tempo" ? 1 : 0);
   });
 
   it.each(["auto", "explicit"] as const)("records %s approval on a successful forced x402 payment", async (approval) => {

@@ -1,8 +1,10 @@
+import { loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest } from "./yield-state";
 import { sameEndpoint } from "./job-access";
 import { bookedCreditPayment, sendCreditPayment, tryCreditPayment } from "./credit-payment";
 import { buildTempoCredential } from "./payment-rails/tempo-credential";
 import {
   DvmError,
+  shellQuoteArg,
   type JobPolicy,
   loadAgentWallet,
   type MppxCredential,
@@ -19,7 +21,10 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   addPayment,
+  clearPaymentRequestInFlight,
   loadJob,
+  markPaymentRequestPaid,
+  markPaymentRequestInFlight,
   type PaymentApproval,
 } from "./job-store";
 import {
@@ -107,6 +112,14 @@ export async function handlePaymentRequest(
       throw new DvmError("credit_payment_retry_required", "The prior balance payment was refused; reload this job's pending ask.");
   }
 
+  if (matchingEndpoint && opts?.requestSeq !== undefined) {
+    if (job.inFlightPaymentRequestSeqs?.includes(opts.requestSeq))
+      await reconcileInFlightPaymentRequest(jobId, opts.requestSeq, transport, provider, { jobToken });
+    if (loadAnsweredYieldSeqs(jobId).has(opts.requestSeq))
+      throw new DvmError("payment_already_sent", "Payment already sent for this request.",
+        `Keep watching with \`dvm messages ${shellQuoteArg(jobId)} --wait\` before paying again.`);
+  }
+
   if (policy.maxIncrementMsats > 0 && request.amount_msats > policy.maxIncrementMsats) {
     return "over-budget";
   }
@@ -181,6 +194,7 @@ export async function handlePaymentRequest(
       strictPerCall,
       approval,
       jobToken,
+      requestSeq: matchingEndpoint ? opts?.requestSeq : undefined,
     });
     if (paid) {
       return { status: "paid", rail: "cashu_p2pk", amountMsats: request.amount_msats };
@@ -233,7 +247,8 @@ export async function handlePaymentRequest(
             },
           },
           provider,
-          { jobToken }
+          { jobToken },
+          matchingEndpoint ? opts?.requestSeq : undefined
         );
         addPayment(jobId, proof.amountMsats, approval);
         recordSpend({
@@ -277,7 +292,8 @@ export async function handlePaymentRequest(
           },
         },
         provider,
-        { jobToken }
+        { jobToken },
+        matchingEndpoint ? opts?.requestSeq : undefined
       );
       addPayment(jobId, paidMsats, approval);
       recordSpend({
@@ -335,6 +351,7 @@ async function tryAgentWalletMidJobPayment(args: {
   strictPerCall?: boolean;
   /** anonymous-flow per-job token; sent as `X-Job-Token` on the `payment` POST. */
   jobToken?: string;
+  requestSeq?: number;
 }): Promise<boolean> {
   const {
     jobId,
@@ -432,6 +449,7 @@ async function tryAgentWalletMidJobPayment(args: {
       transport,
       provider,
       jobToken,
+      requestSeq: args.requestSeq,
     });
   } catch (err) {
     // Per the crash-safety contract: only abandon on `payment_invalid`
@@ -481,6 +499,7 @@ async function sendMidJobPaymentWithRetry(args: {
   provider: ProviderRef;
   sleep?: (ms: number) => Promise<void>;
   jobToken?: string;
+  requestSeq?: number;
 }): Promise<void> {
   const { jobId, amountMsats, prepared, transport, provider, jobToken } = args;
   await withAgentWalletPaymentRetry({
@@ -497,7 +516,8 @@ async function sendMidJobPaymentWithRetry(args: {
           },
         },
         provider,
-        { jobToken }
+        { jobToken },
+        args.requestSeq
       ),
     intendedLockPubkey: prepared.intendedLockPubkey,
     refetchInfo: () => transport.describe(provider),
@@ -510,7 +530,8 @@ async function sendRailPayment(
   jobId: string,
   message: OutboundMessage,
   provider: ProviderRef,
-  options?: SendMessageOptions
+  options?: SendMessageOptions,
+  requestSeq?: number
 ): Promise<void> {
   // The acknowledgement's seq is a post-dispatch cursor, not the inbound
   // payment sequence signed by the provider.
@@ -521,15 +542,38 @@ async function sendRailPayment(
       ...(typeof message.content.cashu_request_id === "string" ? { fundId: message.content.cashu_request_id } : {}),
     });
   };
+  // Persist before dispatch: a lost reply cannot distinguish a rejected send
+  // from a payment the provider already accepted.
+  if (requestSeq !== undefined) markPaymentRequestInFlight(jobId, requestSeq);
   try {
     const result = await transport.sendMessage(jobId, message, provider, options);
+    // Retain the accepted ask before wallet bookkeeping or receipt parsing can
+    // fail, so a later stream never constructs a fresh payment for the same seq.
+    if (requestSeq !== undefined) markPaymentRequestPaid(jobId, requestSeq);
     if (result) capture(result);
   } catch (error) {
-    // The provider may have committed the deposit before a snapshot failure or
-    // replay refusal. Retain its signed fact without changing payment recovery.
+    // A failure after deposit acceptance can still carry signed funding evidence.
+    if (requestSeq !== undefined) {
+      if (error instanceof DvmError && error.code === "replay_rejected") markPaymentRequestPaid(jobId, requestSeq);
+      else if (definitelyNotAccepted(error)) clearPaymentRequestInFlight(jobId, requestSeq);
+    }
     if (error instanceof DvmError && error.data) capture(error.data);
+    if (error instanceof DvmError && error.code === "replay_rejected") return;
     throw error;
   }
+}
+
+function definitelyNotAccepted(error: unknown): boolean {
+  if (error instanceof DvmError) {
+    const status = error.data?.http_status;
+    return typeof status === "number" && status >= 400 && status < 500;
+  }
+  if (!(error instanceof Error)) return false;
+  // These failures occur before an HTTP request can reach the provider. A
+  // generic fetch failure or ECONNRESET can also mean a lost acknowledgement.
+  if ("code" in error && ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"].includes(String(error.code))) return true;
+  if (error instanceof AggregateError) return error.errors.length > 0 && error.errors.every(definitelyNotAccepted);
+  return definitelyNotAccepted(error.cause);
 }
 
 /**
