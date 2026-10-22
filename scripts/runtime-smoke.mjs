@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { digest, readRuntimeArtifact } from "./runtime-artifact.mjs";
-import { installConsumer, runConsumer, runLauncher } from "./installed-consumer.mjs";
+import { ConsumerProcessError, checkConsumer, installConsumer, runConsumer, runLauncher } from "./installed-consumer.mjs";
 
 const temporaryRoot = mkdtempSync(join(tmpdir(), "dvm-runtime-"));
 let stage = "archive integrity";
@@ -17,9 +17,11 @@ try {
   const { consumer, installedPackage } = await installConsumer({
     archive: join(directory, metadata.archive), manifest: metadata, temporaryRoot,
   });
-  const installed = JSON.parse(readFileSync(join(installedPackage, "package.json"), "utf8"));
-  assert.equal(installed.name, metadata.name);
-  assert.equal(installed.version, metadata.version);
+  checkConsumer("installed-metadata-check", () => {
+    const installed = JSON.parse(readFileSync(join(installedPackage, "package.json"), "utf8"));
+    assert.equal(installed.name, metadata.name);
+    assert.equal(installed.version, metadata.version);
+  });
   stage = "exported bundled skill";
   const resolved = await runConsumer(process.execPath, ["-p", "require.resolve('@dvmkit/dvm-cli/skill')"], { cwd: consumer });
   assert.equal(resolved.status, 0);
@@ -105,9 +107,10 @@ try {
   for (const route of ["GET /v1/info", "POST /v1/job", "GET /v1/job/runtime-job"]) assert.ok(reached.has(route));
   assert.ok(readFileSync(join(env.DVM_CONFIG_DIR, "jobs.json"), "utf8").includes("runtime-job"));
   console.log(`runtime ok: Node ${process.versions.node}, ${process.platform}/${process.arch}, install, upgrade, skill, launcher, JSON, free request/poll`);
-} catch {
+} catch (error) {
   // Never echo captured npm/CLI text or exception stacks into public runner logs.
-  console.error(`runtime failed: ${stage} (captured output withheld)`);
+  const diagnostic = error instanceof ConsumerProcessError ? `; ${error.message}` : "";
+  console.error(`runtime failed: ${stage}${diagnostic} (captured output withheld)`);
   process.exitCode = 1;
 } finally {
   server?.closeAllConnections();

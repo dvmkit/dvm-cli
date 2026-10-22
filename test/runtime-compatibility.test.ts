@@ -73,8 +73,8 @@ it("withholds consumer npm diagnostics on a real invalid-archive install", () =>
     encoding: "utf8", timeout: 30_000,
   });
   expect(outcome.status).toBe(1);
-  expect(outcome.stderr).toBe("runtime failed: consumer install and upgrade (captured output withheld)\n");
-  expect(outcome.stdout).toBe("");
+  expect(outcome.stderr).toMatch(/^runtime failed: consumer install and upgrade; archive-upgrade: reason=nonzero-exit, elapsed_ms=[0-9]+, exit=[1-9][0-9]*, signal=none, exit_before_timeout=true, npm_category=unknown \(captured output withheld\)\n$/u);
+  expect(outcome.stdout).toBe("consumer operation start: legacy-install\nconsumer operation start: legacy-skill-check\nconsumer operation start: archive-upgrade\n");
 });
 
 it("contains malformed job JSON in the asynchronous fixture callback", () => {
@@ -92,6 +92,8 @@ it("contains malformed job JSON in the asynchronous fixture callback", () => {
   writeFileSync(join(scripts, "installed-consumer.mjs"), `
     import { mkdirSync, writeFileSync } from "node:fs";
     import { join } from "node:path";
+    export class ConsumerProcessError extends Error {}
+    export const checkConsumer = (_operation, check) => check();
     let installed;
     export async function installConsumer({ temporaryRoot }) {
       writeFileSync(process.env.RUNTIME_ROOT_RECORD, temporaryRoot);
