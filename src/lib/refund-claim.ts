@@ -165,17 +165,18 @@ export async function refundJsonField(
   };
 }
 
-export function printRefundSummaryHuman(claims: RefundClaim[]): void {
-  for (const claim of claims) {
-    const noun = claim.reason === "change" ? "change" : "refund";
-    if (claim.claimed) {
-      info(`Claimed ${noun} of ${formatAmountBestEffort(claim.amount_msats)} into your wallet.`);
-    } else {
-      info(
-        `${cap(noun)} of ${formatAmountBestEffort(claim.amount_msats)} could not be auto-claimed (the mint may be down). Recover with: dvm wallet receive-token ${claim.cashu_token}`
-      );
-    }
+export function refundSummaryHuman(
+  claim: Pick<NextActionRefund, "reason" | "claimed" | "amount_msats" | "cashu_token">
+): string {
+  const noun = claim.reason === "change" ? "change" : "refund";
+  if (claim.claimed) {
+    return `Claimed ${noun} of ${formatAmountBestEffort(claim.amount_msats)} into your wallet.`;
   }
+  return `${cap(noun)} of ${formatAmountBestEffort(claim.amount_msats)} could not be auto-claimed (the mint may be down). Recover with: dvm wallet receive-token ${claim.cashu_token}`;
+}
+
+export function printRefundSummaryHuman(claims: RefundClaim[]): void {
+  for (const claim of claims) info(refundSummaryHuman(claim));
 }
 
 function cap(s: string): string {

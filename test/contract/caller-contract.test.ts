@@ -87,7 +87,45 @@ beforeAll(async () => {
         );
         return;
       }
+      const humanJob = decodeURIComponent(request.url ?? "").match(/^\/v1\/job\/(human-(?:prompt|pay(?:'s)?|done|working|change|failed|cancelled))(?:\/messages.*)?$/)?.[1];
+      if (request.method === "GET" && humanJob) {
+        if (request.url?.includes("/messages")) {
+          const timestamp = "2026-01-01T00:00:00Z";
+          const prompt = { seq: 1, from: "provider", timestamp, type: "prompt",
+            content: { id: "weather", text: "Keep observing?", options: ["keep", "wait", "switch"] } };
+          const charge = { seq: 2, from: "provider", timestamp, type: "payment-request",
+            content: { amount_msats: 400_000, fiat_amount: { amount: 0.4, currency: "usd" }, reason: "More observing" } };
+          const payment = { seq: 3, from: "requester", timestamp, type: "payment", content: { amount_msats: 400_000 } };
+          const messages = humanJob === "human-prompt" ? [prompt]
+            : (humanJob.startsWith("human-pay") || ["human-failed", "human-cancelled"].includes(humanJob)) ? [prompt, charge]
+            : humanJob === "human-change" ? [
+              { seq: 1, from: "provider", timestamp, type: "payment", content: { amount_msats: 1000, reason: "change", cashu_token: "already-claimed-token" } },
+              { seq: 2, from: "provider", timestamp, type: "complete", content: { status: "success", summary: "Done" } },
+            ]
+              : [prompt, charge, payment,
+                { seq: 4, from: "requester", timestamp, type: "response", content: { prompt_id: "weather", text: "keep", data: { selected: true } } },
+                { seq: 5, from: "requester", timestamp, type: "approval", content: { ref_seq: 3, comment: "ok" } },
+                { seq: 6, from: "provider", timestamp, type: "unknown-event", content: { message: "New event", details: {} } },
+                { seq: 7, from: "provider", timestamp,
+                ...(humanJob === "human-done"
+                  ? { type: "complete", content: { status: "success", summary: "Finished observing" } }
+                  : { type: "working", content: { hint: "Observing the sky" } }) }];
+          const after = Number(new URL(request.url!, "http://provider.invalid").searchParams.get("after") ?? 0);
+          response.end(JSON.stringify({ messages: messages.filter((message) => message.seq > after) }));
+        } else {
+          response.end(JSON.stringify({ status: ["human-done", "human-change"].includes(humanJob) ? "completed"
+            : humanJob === "human-failed" ? "failed" : humanJob === "human-cancelled" ? "cancelled"
+            : humanJob === "human-working" ? "processing" : "awaiting-input" }));
+        }
+        return;
+      }
       if (request.method === "POST" && request.url === "/v1/job") {
+        const body = JSON.parse(text) as { data?: { scenario?: string } };
+        if (body.data?.scenario?.startsWith("human-")) {
+          response.statusCode = 202;
+          response.end(JSON.stringify({ job_id: body.data.scenario, status: "processing" }));
+          return;
+        }
         response.end(
           JSON.stringify({
             job_id: "contract-search",
@@ -672,6 +710,99 @@ describe("standalone caller contract", () => {
       options: ["keep", "wait", "switch"],
       display: "The provider asks: High cloud moving in, 18 of 40 frames usable. Choices: \"keep\", \"wait\", \"switch\".",
       hint: expect.stringContaining('dvm message prompt-options "<answer>" --type response --prompt-id weather'),
+    });
+  });
+
+  describe("human job guidance", () => {
+    const commands = ["request", "messages", "messages-stream", "status", "status-messages"] as const;
+
+    async function readHuman(command: typeof commands[number], jobId: string) {
+      const args = command === "request"
+        ? ["request", "--data", JSON.stringify({ scenario: jobId }), "--auto-pay-below", "0", "--timeout", "1"]
+        : command.startsWith("messages") ? ["messages", jobId, ...(command === "messages" ? ["--no-stream"] : [])]
+          : ["status", jobId, ...(command === "status-messages" ? ["--messages"] : [])];
+      const root = mkdtempSync(join(tmpdir(), "dvm-human-contract-"));
+      configRoots.add(root);
+      if (jobId === "human-change") {
+        writeFileSync(join(root, "jobs.json"), JSON.stringify([{
+          id: jobId, endpoint, status: "processing", submittedAt: 1, jobToken: portableToken, claimedPaymentSeqs: [1],
+        }]));
+      }
+      return runCli([...args, ...(jobId === "human-change" ? [] : ["--endpoint", endpoint]), "--human"], {
+        DVM_IDENTITY_KEY: "11".repeat(32), DVM_JOB_TOKEN: portableToken,
+      }, root);
+    }
+
+    it.each(commands)("%s ends with the pending question, choices, and answer command", async (command) => {
+      const result = await readHuman(command, "human-prompt");
+      const last = result.stderr.trimEnd().split("\n").at(-1);
+      expect(last).toContain('Next: The provider asks: Keep observing? Choices: "keep", "wait", "switch".');
+      expect(last).toContain("Provider is waiting for your input.");
+      expect(last).toContain('`dvm message human-prompt "<answer>" --type response --prompt-id weather`');
+    });
+
+    it.each(commands)("%s ends with an unpaid charge and the pay command", async (command) => {
+      const result = await readHuman(command, "human-pay");
+      expect(result.stderr.trimEnd().split("\n").at(-1)).toMatch(/^Next: Payment required to continue: \$0\.40.*`dvm pay human-pay`\.$/);
+    });
+
+    it("quotes the job id in the pay command", async () => {
+      const result = await readHuman("status", "human-pay's");
+      expect(result.stderr.trimEnd().split("\n").at(-1)).toContain("`dvm pay 'human-pay'\\''s'`");
+    });
+
+    it.each(["messages", "messages-stream"] as const)("%s reports claimed terminal change once without Next", async (command) => {
+      const result = await readHuman(command, "human-change");
+      expect(result.stderr).toContain("Job complete: Done");
+      expect(result.stderr.match(/Claimed change of .* into your wallet\./g)).toHaveLength(1);
+      expect(result.stderr).not.toContain("Next:");
+    });
+
+    it.each(commands)("%s omits Next for a terminal job", async (command) => {
+      const result = await readHuman(command, "human-done");
+      expect(result.stderr).not.toContain("Next:");
+    });
+
+    it.each(["messages", "messages-stream", "status", "status-messages"] as const)(
+      "%s omits stale guidance when the job has failed or been cancelled", async (command) => {
+        for (const jobId of ["human-failed", "human-cancelled"]) {
+          const result = await readHuman(command, jobId);
+          expect(result.stderr).not.toContain("Next:");
+        }
+      }
+    );
+
+    it.each(commands)("%s explains how to keep watching a working provider", async (command) => {
+      const result = await readHuman(command, "human-working");
+      const last = result.stderr.trimEnd().split("\n").at(-1);
+      expect(last).toBe(command.startsWith("status")
+        ? "Next: Provider is still working. Keep watching with `dvm messages human-working`."
+        : "Next: Provider is still working: Observing the sky. Keep watching with `dvm messages human-working`.");
+      expect(last).toContain("`dvm messages human-working`");
+    });
+
+    it.each(["human-prompt", "human-pay", "human-working", "human-done"])(
+      "messages keeps guidance after the cursor passes %s messages", async (jobId) => {
+        const result = await runCli(["messages", jobId, "--no-stream", "--after", "99",
+          "--endpoint", endpoint, "--job-token", portableToken, "--human"]);
+        expect(result.stderr).toContain("No new messages.");
+        const last = result.stderr.trimEnd().split("\n").at(-1);
+        if (jobId === "human-done") expect(result.stderr).not.toContain("Next:");
+        else if (jobId === "human-prompt") expect(last).toContain('`dvm message human-prompt "<answer>" --type response --prompt-id weather`');
+        else if (jobId === "human-pay") expect(last).toContain("`dvm pay human-pay`");
+        else expect(last).toContain("`dvm messages human-working`");
+      }
+    );
+
+    it("status renders prompt, charge, and payment content without JSON", async () => {
+      const result = await readHuman("status-messages", "human-done");
+      expect(result.stderr).toContain("[1] Provider asks: Keep observing?");
+      expect(result.stderr).toContain("[2] Provider requests $0.40");
+      expect(result.stderr).toContain("[3] You paid:");
+      expect(result.stderr).toContain("[4] You answered: keep (with structured data)");
+      expect(result.stderr).toContain("[5] You approved message 3: ok");
+      expect(result.stderr).toContain('[6] Provider sent a message of type "unknown-event".');
+      expect(result.stderr).not.toContain("{");
     });
   });
 

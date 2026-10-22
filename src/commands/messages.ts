@@ -1,5 +1,8 @@
-import { formatAmountBestEffort, formatPaymentAmount } from "../lib/currency";
-import { computeNextAction } from "../lib/next-action";
+export { formatMessageHuman } from "../lib/message-human";
+import { formatMessageHuman, paymentAmount } from "../lib/message-human";
+import { printNextActionHuman } from "../lib/next-action-human";
+import { formatPaymentAmount } from "../lib/currency";
+import { computeNextAction, isTerminalJobStatus, pollNextAction, type NextAction } from "../lib/next-action";
 import {
   asProviderText,
   DvmError,
@@ -18,21 +21,18 @@ import {
 } from "../lib/job-access";
 import { jobContentFields, observeJobContent } from "../lib/job-content";
 import { appendMessages, loadMessages, maxSeq } from "../lib/messages";
-import { finalizeProgressLine, renderProgressLine } from "../lib/progress-bar";
+import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
 import {
   claimInboundPayments,
-  printRefundSummaryHuman,
   refundJsonField,
   refundNextAction,
 } from "../lib/refund-claim";
 import {
-  type ArtifactSaveSession,
   createArtifactSaveSession,
-  saveArtifact,
 } from "../lib/save-artifact";
 import { streamLoop } from "../lib/stream-loop";
-import { persistStreamOutcome } from "../lib/stream-outcome";
+import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
 import { createDvmTransport } from "../lib/transport";
 
 export interface MessagesOptions extends JobAccessOptions {
@@ -56,6 +56,26 @@ async function messagesWithAccess(
 ): Promise<void> {
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
+
+  async function humanNextAction(action: NextAction, messages: Message[]): Promise<NextAction> {
+    if (!opts.human) return action;
+    if (streamTerminalStatus(messages) || (!access.endpointOverridden && stored && isTerminalJobStatus(stored.status))) return null;
+    // Terminal status takes precedence over actions from an older message.
+    // Empty incremental batches can still have a pending question in history.
+    try {
+      const readOptions = { jobToken, timeoutMs: opts.timeout ? Number(opts.timeout) * 1000 : 5000 };
+      const snapshot = await transport.status(jobId, ref, readOptions);
+      if (isTerminalJobStatus(snapshot.status)) return null;
+      if (action) return action;
+      if (snapshot.status === "awaiting-input") {
+        const history = await transport.getMessages(jobId, 0, ref, readOptions);
+        return computeNextAction(jobId, history) ?? pollNextAction(jobId);
+      }
+      return pollNextAction(jobId);
+    } catch {
+      return action;
+    }
+  }
   const transport = createDvmTransport();
 
   const isTerminal = stored?.status === "completed" || stored?.status === "failed";
@@ -108,6 +128,7 @@ async function messagesWithAccess(
       jobId,
       await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken })
     );
+    const humanAction = await humanNextAction(nextAction, msgs);
     transport.close();
 
     if (opts.human) {
@@ -119,8 +140,8 @@ async function messagesWithAccess(
           formatMessageHuman(msg, jobId, artifactSession);
         }
         finalizeProgressLine();
-        printRefundSummaryHuman(refunds);
       }
+      printNextActionHuman(humanAction, { refunds });
     } else {
       json({
         jobId,
@@ -168,6 +189,7 @@ async function messagesWithAccess(
       jobToken,
     })
   );
+  const humanAction = await humanNextAction(result.nextAction, result.messages);
   transport.close();
 
   if (opts.human) {
@@ -180,8 +202,8 @@ async function messagesWithAccess(
         formatMessageHuman(msg, jobId, artifactSession);
       }
       finalizeProgressLine();
-      printRefundSummaryHuman(result.refunds);
     }
+    printNextActionHuman(humanAction, { refunds: result.refunds });
   } else {
     json({
       jobId,
@@ -192,88 +214,6 @@ async function messagesWithAccess(
       ...(result.autoPayments.length > 0 ? { auto_payments: result.autoPayments } : {}),
       ...(await refundJsonField(result.refunds)),
     });
-  }
-}
-
-function paymentAmount(msg: Extract<Message, { type: "payment" }>): string {
-  if (msg.from === "requester" && msg.content.credit) {
-    const credit = msg.content.credit;
-    const digits = String(credit.amount_micro).padStart(7, "0");
-    const fraction = digits.slice(-6).replace(/0+$/, "");
-    const amount = digits.slice(0, -6) + (fraction ? `.${fraction}` : "");
-    return `${amount} ${credit.currency.toUpperCase()} from prepaid balance`;
-  }
-  return formatAmountBestEffort(msg.content.amount_msats);
-}
-
-export function formatMessageHuman(
-  msg: Message,
-  jobId?: string,
-  artifactSession?: ArtifactSaveSession
-): void {
-  const prefix = msg.from === "provider" ? "Provider" : "You";
-
-  // Progress redraws a single line in TTY mode; every other type prints a
-  // standalone line, so flush the bar's trailing position first.
-  if (msg.type !== "progress") finalizeProgressLine();
-
-  switch (msg.type) {
-    case "text":
-      info(`[${msg.seq}] ${prefix}: ${msg.content.text}`);
-      break;
-    case "prompt":
-      info(`[${msg.seq}] ${prefix} asks: ${msg.content.text}`);
-      if (msg.content.options) {
-        for (const opt of msg.content.options) {
-          info(`  - ${opt}`);
-        }
-      }
-      break;
-    case "artifact": {
-      const label = msg.content.name ?? msg.content.mime_type ?? "unknown type";
-      if (jobId) {
-        const saved = saveArtifact(msg.content, artifactSession ?? createArtifactSaveSession());
-        if (saved) {
-          info(
-            `[${msg.seq}] ${prefix} sent artifact: ${label} (${saved.bytes.toLocaleString()} bytes → ${saved.path})`
-          );
-          break;
-        }
-      }
-      info(`[${msg.seq}] ${prefix} sent artifact: ${label}`);
-      break;
-    }
-    case "payment-request":
-      info(
-        `[${msg.seq}] ${prefix} requests ${formatPaymentAmount(msg.content.amount_msats, msg.content.fiat_amount, { anchor: false })}${msg.content.reason ? `: ${msg.content.reason}` : ""}`
-      );
-      break;
-    case "payment": {
-      const amount = paymentAmount(msg);
-      if (msg.from === "provider") {
-        const noun = msg.content.reason === "change" ? "change" : "refund";
-        info(`[${msg.seq}] ${prefix} sent ${noun}: ${amount}`);
-      } else {
-        info(`[${msg.seq}] ${prefix} paid: ${amount}`);
-      }
-      break;
-    }
-    case "complete":
-      info(`[${msg.seq}] Job complete${msg.content.summary ? `: ${msg.content.summary}` : ""}`);
-      break;
-    case "working":
-      info(
-        `[${msg.seq}] Provider is working${msg.content.estimate_seconds ? ` (est. ${String(msg.content.estimate_seconds)}s)` : ""}${msg.content.hint ? `: ${msg.content.hint}` : ""}`
-      );
-      break;
-    case "progress":
-      renderProgressLine(msg.content, msg.seq);
-      break;
-    case "cancel":
-      info(`[${msg.seq}] Cancelled${msg.content.reason ? `: ${msg.content.reason}` : ""}`);
-      break;
-    default:
-      info(`[${msg.seq}] ${prefix} [${msg.type}]: ${JSON.stringify(msg.content)}`);
   }
 }
 
