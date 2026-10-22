@@ -1,21 +1,18 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from "node:child_process";
 import {
-  chmodSync,
   cpSync,
   mkdtempSync,
-  mkdirSync,
   readFileSync,
   rmSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { parse } from "yaml";
 
-import { consumerNpmrc } from "./consumer-npmrc.mjs";
+import { installConsumer } from "./installed-consumer.mjs";
 import { verifyContentRetention } from "./content-retention-smoke.mjs";
 import { verifyWalletHistory } from "./wallet-history-smoke.mjs";
 import { verifyRefundRecovery } from "./refund-recovery-smoke.mjs";
@@ -56,45 +53,9 @@ try {
     fail("dist/dvm.js is missing its executable shebang");
   }
 
-  const legacyRoot = join(temporaryRoot, "legacy");
-  mkdirSync(join(legacyRoot, "dist"), { recursive: true });
-  mkdirSync(join(legacyRoot, "skills", "dvm"), { recursive: true });
-  writeFileSync(
-    join(legacyRoot, "package.json"),
-    `${JSON.stringify(
-      {
-        name: manifest.name,
-        version: "0.0.0",
-        type: "module",
-        bin: { dvm: "dist/dvm.js" },
-        files: ["dist", "skills"],
-      },
-      null,
-      2
-    )}\n`
-  );
-  writeFileSync(join(legacyRoot, "dist", "dvm.js"), "#!/usr/bin/env node\nconsole.log('0.0.0');\n");
-  chmodSync(join(legacyRoot, "dist", "dvm.js"), 0o755);
-  writeFileSync(join(legacyRoot, "skills", "dvm", "SKILL.md"), "legacy skill\n");
-  const legacy = pack(legacyRoot, temporaryRoot);
-
-  const consumer = join(temporaryRoot, "consumer");
-  // `--prefix` moves npm's project-config lookup to the consumer directory, so
-  // the repository .npmrc no longer applies and whatever `~/.npmrc` says about
-  // the @dvmkit scope decides where a scoped dependency is fetched from. Give
-  // the consumer that scope line and only that line: the smoke must model a
-  // default machine resolving the public registry, not the developer's registry
-  // map and not this repository's own install settings.
-  mkdirSync(consumer, { recursive: true });
-  writeFileSync(join(consumer, ".npmrc"), consumerNpmrc(readFileSync(join(root, ".npmrc"), "utf8")));
-  npm(["install", "--ignore-scripts", "--prefix", consumer, join(temporaryRoot, legacy.filename)]);
-  const installedPackage = join(consumer, "node_modules", "@dvmkit", "dvm-cli");
-  const installedSkill = join(installedPackage, "skills", "dvm", "SKILL.md");
-  if (readFileSync(installedSkill, "utf8") !== "legacy skill\n") {
-    fail("legacy install fixture did not install its skill");
-  }
-
-  npm(["install", "--ignore-scripts", "--prefix", consumer, join(temporaryRoot, packed.filename)]);
+  const { consumer, installedPackage } = await installConsumer({
+    archive: join(temporaryRoot, packed.filename), manifest, temporaryRoot,
+  });
   assertSingleCashuVersion(consumer, manifest.dependencies["@cashu/cashu-ts"]);
   const exportedSkill = execFileSync(
     process.execPath,

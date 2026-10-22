@@ -60,7 +60,10 @@
     "test:contract": "vitest run --config vitest.config.ts test/contract",
     "test:unit": "vitest run --config vitest.config.ts --exclude 'test/contract/**'",
     "typecheck": "tsc --noEmit",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "artifact:runtime": "node scripts/runtime-artifact.mjs",
+    "check:runtime": "node scripts/runtime-smoke.mjs",
+    "check:runtime-policy": "node scripts/check-runtime-policy.mjs"
   },
   "dependencies": {
     "@cashu/cashu-ts": "4.10.2",
