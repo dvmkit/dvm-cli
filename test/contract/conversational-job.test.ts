@@ -28,6 +28,9 @@ it("drives a conversational metered job across CLI processes, from quote to veri
   const reads: number[] = [];
   const artifact = { name: "report.txt", mime_type: "text/plain", url: "",
     sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", size_bytes: 3 };
+  const promptExpiresAtMs = Date.now() + 2 * 3_600_000;
+  const promptDeadline = new Date(promptExpiresAtMs).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  const promptDeadlineClause = new RegExp(`Answer by ${promptDeadline} \\(in (?:1 h(?: \\d+ min)?|2 h)\\), or the provider cancels the job\\.`);
   const choices = ["keep  cadence — Δ", "wait", "switch"];
   let status = "processing";
   let streamCount = 0;
@@ -101,7 +104,7 @@ it("drives a conversational metered job across CLI processes, from quote to veri
             else if (paymentCount === 4) charge(100_000, "Fifth observing block");
             else if (paymentCount === 5) charge(100_000, "Sixth observing block");
             else if (paymentCount === 6) {
-              append("prompt", { id: "cadence", text: "Cloud moving in. Which cadence?", options: choices });
+              append("prompt", { id: "cadence", text: "Cloud moving in. Which cadence?", options: choices, expires_at_ms: promptExpiresAtMs });
             } else if (paymentCount === 7) {
               append("artifact", artifact);
               append("complete", { status: "success", summary: "Observation complete" });
@@ -177,6 +180,8 @@ it("drives a conversational metered job across CLI processes, from quote to veri
     const question = JSON.parse((await run(["messages", jobId, "--wait", "--until", "60s"])).stdout);
     expect(question).toMatchObject({ jobId, next_action: { type: "respond", job_id: jobId, prompt_id: "cadence",
       prompt: { _source: "provider", text: "Cloud moving in. Which cadence?" }, options: choices } });
+    expect(question.next_action.expires_at_ms).toBe(promptExpiresAtMs);
+    expect(question.next_action.display).toMatch(promptDeadlineClause);
     expect(question.messages.map((message: Message) => [message.seq, message.type])).toEqual([
       [1, "working"], [2, "payment-request"], [3, "payment"], [4, "payment-request"],
       [5, "payment"], [6, "payment-request"], [7, "payment"], [8, "payment-request"],
@@ -203,6 +208,7 @@ it("drives a conversational metered job across CLI processes, from quote to veri
     expect(humanQuestion.stdout).toBe("");
     const questionNext = humanQuestion.stderr.split("\n").find((line) => line.startsWith("Next:"));
     expect(questionNext).toContain('The provider asks: Cloud moving in. Which cadence? Choices: "keep  cadence — Δ", "wait", "switch".');
+    expect(questionNext).toMatch(promptDeadlineClause);
     expect(questionNext).toContain(`\`${answerTemplate}\``);
 
     mkdirSync(join(root, "bin"));

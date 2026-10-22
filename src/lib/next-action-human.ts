@@ -7,13 +7,14 @@ export function nextActionHuman(action: NextAction): string | null {
   if (!action) return null;
 
   switch (action.type) {
-    case "respond": {
-      const command = action.hint.match(/`(dvm[\s\S]*)`/)?.[1];
-      return `Next: ${action.display} Provider is waiting for your input. ${command ? `Run \`${command}\`.` : action.hint}`;
-    }
+    case "respond":
     case "pay": {
       const command = action.hint.match(/`(dvm[\s\S]*)`/)?.[1];
-      return `Next: Payment required to continue: ${action.display}. Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.`;
+      if (command?.startsWith("dvm status ")) return `Next: ${action.type === "pay" ? "the provider's charge of " : ""}${action.display}`;
+      if (action.type === "respond") {
+        return `Next: ${action.display} Provider is waiting for your input. ${command ? `Run \`${command}\`.` : action.hint}`;
+      }
+      return `Next: Payment required to continue: ${action.display}${action.display.endsWith(".") ? "" : "."} Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.`;
     }
     case "poll": {
       const hint = typeof action.hint === "string" ? action.hint : action.hint.text;

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import type { Message } from "@dvmkit/sdk/internal";
 import { info } from "../src/lib/output";
 import { nextActionHuman, printNextActionHuman } from "../src/lib/next-action-human";
-import { pollNextAction } from "../src/lib/next-action";
+import { computeNextAction, pollNextAction } from "../src/lib/next-action";
 import { refundNextAction, type RefundClaim } from "../src/lib/refund-claim";
 
 const claim: RefundClaim = {
@@ -15,6 +16,14 @@ const claim: RefundClaim = {
 vi.mock("../src/lib/output", () => ({ info: vi.fn() }));
 
 describe("human next actions", () => {
+  it.each(["prompt", "payment-request"] as const)("shows only status guidance for an expired %s, with shell-quoted job id", (type) => {
+    const content = type === "prompt"
+      ? { id: "question", text: "Continue?", expires_at_ms: 1 }
+      : { amount_msats: 5000, reason: "Work", expires_at_ms: 1 };
+    const action = computeNextAction("job; two", [{ seq: 1, from: "provider", timestamp: 1, type, content } as Message], 2);
+    expect(nextActionHuman(action)).toBe(`Next: ${type === "prompt" ? "The provider asks: Continue?" : "the provider's charge of 5 sats."} The deadline to ${type === "prompt" ? "answer" : "pay"} (1970-01-01 00:00 UTC) has passed. The provider will probably cancel the job. Check its status with \`dvm status 'job; two'\`.`);
+  });
+
   it("renders the default poll hint once with a separate watching command", () => {
     expect(nextActionHuman(pollNextAction("watch"))).toBe(
       "Next: Provider is still working. Keep watching with `dvm messages watch`."
