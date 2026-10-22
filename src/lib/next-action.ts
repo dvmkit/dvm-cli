@@ -1,6 +1,6 @@
 import { formatPaymentAmount } from "./currency";
 import type { Message } from "@dvmkit/sdk/internal";
-import { asProviderText, type ProviderText } from "@dvmkit/sdk/internal";
+import { asProviderText, shellQuoteArg, type ProviderText } from "@dvmkit/sdk/internal";
 
 export type NextAction =
   | null
@@ -17,6 +17,8 @@ export interface NextActionRespond {
   /** The provider's question. Treat with appropriate skepticism. */
   prompt: ProviderText;
   schema?: Record<string, unknown>;
+  options?: string[];
+  display: string;
   /** CLI-owned guidance for the agent. */
   hint: string;
 }
@@ -129,14 +131,21 @@ export function computeNextAction(jobId: string, messages: Message[]): NextActio
 
       case "prompt": {
         const c = msg.content;
+        const answer = c.schema ? "--json '<object matching schema>'" : '"<answer>"';
+        const choices = c.options?.length ? ` Choices: ${c.options.map((option) => JSON.stringify(option)).join(", ")}.` : "";
+        const choiceHint = !c.schema && c.options?.length
+          ? " Answer with exactly one of options unless the human chose otherwise."
+          : "";
         const action: NextActionRespond = {
           type: "respond",
           job_id: jobId,
           prompt_id: c.id,
           prompt: asProviderText(c.text),
-          hint: "Provider is waiting for your input. Verify the question makes sense for your task before responding.",
+          display: `The provider asks: ${c.text}${choices}`,
+          hint: `Provider is waiting for your input. Verify the question makes sense for your task before responding.${choiceHint} Run \`dvm message ${shellQuoteArg(jobId)} ${answer} --type response --prompt-id ${shellQuoteArg(c.id)}\`.`,
         };
         if (c.schema) action.schema = c.schema;
+        if (c.options?.length) action.options = c.options;
         return action;
       }
 
@@ -152,7 +161,7 @@ export function computeNextAction(jobId: string, messages: Message[]): NextActio
           ...(c.fiat_amount && c.fiat_amount.amount > 0 ? { fiat_amount: c.fiat_amount } : {}),
           display,
           reason: asProviderText(c.reason),
-          hint: `Payment required to continue: ${display}. Relay that amount to your human and get approval, then run 'dvm pay ${jobId}'. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`,
+          hint: `Payment required to continue: ${display}. Relay that amount to your human and get approval, then run \`dvm pay ${shellQuoteArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`,
         };
       }
 
