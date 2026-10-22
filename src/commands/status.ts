@@ -35,6 +35,7 @@ import {
 import { type ContentStatus, jobContentFields } from "../lib/job-content";
 import { takeCreditNoticeFields } from "../lib/credit-notice";
 import { settleCreditAfterRead } from "../lib/credit-topup";
+import { captureDrawFundingReceipts } from "../lib/draw-funding";
 import { formatIdentifier } from "../lib/dvm-identifier";
 import { takeFeedbackNoticeFields } from "../lib/feedback-notice";
 import { noteFeedbackAfterTerminal } from "../lib/feedback-nudges";
@@ -116,6 +117,7 @@ async function statusWithAccess(
   // thread the per-job opaque token (issued for anonymous callers
   // at create-time) into status / messages reads as `X-Job-Token`.
   const result: ContentStatus = await transport.status(jobId, ref, { timeoutMs: timeout, jobToken });
+  if (stored && !access.endpointOverridden) captureDrawFundingReceipts(jobId, result.drawFundingReceipts, { endpoint: ref.endpoint });
 
   let msgs: Message[] = [];
   let newCursor: number | undefined;

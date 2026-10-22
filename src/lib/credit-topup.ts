@@ -66,6 +66,7 @@ import {
 } from "./credit-policy";
 
 import { takeDeferredFunding } from "./credit-defer";
+import { jobDrawFundings } from "./draw-funding";
 import {
   buildCreditFundingIncomplete,
   buildCreditFundingReport,
@@ -264,6 +265,7 @@ async function settle(args: SettleCreditArgs): Promise<void> {
     jobId: receipt.job_id,
     outcome: receipt.outcome,
     credit,
+    drawFundings: jobDrawFundings(receipt.job_id, args.ref.endpoint, callerPubkey, credit),
   });
   if (!applied.credit) return;
 

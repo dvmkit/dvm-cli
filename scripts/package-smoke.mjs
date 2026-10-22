@@ -20,6 +20,7 @@ import { verifyContentRetention } from "./content-retention-smoke.mjs";
 import { verifyWalletHistory } from "./wallet-history-smoke.mjs";
 import { verifyRefundRecovery } from "./refund-recovery-smoke.mjs";
 import { verifyCreditReceiptRecovery } from "./credit-receipt-smoke.mjs";
+import { verifyDrawFunding } from "./draw-funding-smoke.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -133,6 +134,7 @@ try {
   await verifyWalletHistory(installedPackage, manifest.dependencies["@dvmkit/sdk"]);
   await verifyRefundRecovery(installedPackage, manifest.dependencies["@dvmkit/sdk"]);
   await verifyCreditReceiptRecovery(installedPackage, manifest.dependencies["@dvmkit/sdk"]);
+  verifyDrawFunding(installedPackage, manifest.dependencies["@dvmkit/sdk"]);
   await verifyContentRetention(installedPackage, manifest.dependencies["@dvmkit/sdk"]);
 
   console.log(
