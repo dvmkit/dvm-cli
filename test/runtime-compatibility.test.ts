@@ -95,7 +95,7 @@ it("withholds consumer npm diagnostics on a real invalid-archive install", () =>
   expect(outcome.stdout).not.toContain(archive);
 });
 
-function fixtureOutcome(mode: string) {
+function fixtureOutcome(mode: string, errorName?: string, errorErrno?: string) {
   const temporary = mkdtempSync(join(tmpdir(), "dvm-runtime-callback-"));
   temporaryRoots.push(temporary);
   const scripts = join(temporary, "scripts");
@@ -132,12 +132,13 @@ function fixtureOutcome(mode: string) {
         code: "job_access_required", message: "not in the local store", hint: "--endpoint and --job-token" } }) };
       else if (args[0] === "request") {
         const endpoint = args[args.indexOf("--endpoint") + 1];
-        if (process.env.FIXTURE_MODE === "command-failure" || process.env.FIXTURE_MODE === "known-error") {
+        if (process.env.FIXTURE_MODE === "command-failure" || process.env.FIXTURE_MODE === "known-error" || process.env.FIXTURE_MODE === "internal-error") {
           await fetch(endpoint + "/v1/info");
           await fetch(endpoint + "/do-not-print-route-marker");
           return { status: 9, termination: "do-not-print-termination-marker", elapsedMs: "do-not-print-elapsed-marker",
             stderr: process.env.MALFORMED_JOB_BODY + " " + _consumer + " " + endpoint,
-            stdout: JSON.stringify({ error: { code: process.env.FIXTURE_MODE === "known-error" ? "auth_required" : "secret_marker_exfiltrate",
+            stdout: JSON.stringify({ error: { code: process.env.FIXTURE_MODE === "known-error" ? "auth_required" : process.env.FIXTURE_MODE === "internal-error" ? "internal" : "secret_marker_exfiltrate",
+              error_name: process.env.RUNTIME_ERROR_NAME, error_code: process.env.RUNTIME_ERROR_ERRNO,
               message: process.env.MALFORMED_JOB_BODY, path: _consumer } }) };
         }
         if (process.env.FIXTURE_MODE === "invalid-json") return { status: 0, stderr: "", stdout: process.env.MALFORMED_JOB_BODY };
@@ -153,7 +154,7 @@ function fixtureOutcome(mode: string) {
   const rootRecord = join(temporary, "consumer-root.txt");
   const outcome = spawnSync(process.execPath, [join(scripts, "runtime-smoke.mjs")], {
     encoding: "utf8", timeout: 10_000,
-    env: { ...process.env, MALFORMED_JOB_BODY: `{${marker}`, RUNTIME_ROOT_RECORD: rootRecord, FIXTURE_MODE: mode },
+    env: { ...process.env, MALFORMED_JOB_BODY: `{${marker}`, RUNTIME_ROOT_RECORD: rootRecord, FIXTURE_MODE: mode, RUNTIME_ERROR_NAME: errorName, RUNTIME_ERROR_ERRNO: errorErrno },
   });
   const installedRoot = readFileSync(rootRecord, "utf8");
   temporaryRoots.push(installedRoot);
@@ -166,6 +167,8 @@ function fixtureOutcome(mode: string) {
   expect(outcome.stderr).not.toContain("do-not-print-termination-marker");
   expect(outcome.stderr).not.toContain("do-not-print-elapsed-marker");
   expect(outcome.stderr).not.toContain("secret_marker_exfiltrate");
+  expect(outcome.stderr).not.toContain("PrivateErrorMarker");
+  expect(outcome.stderr).not.toContain("EPRIVATE_ERROR_MARKER");
   expect(existsSync(installedRoot)).toBe(false);
   return outcome;
 }
@@ -174,7 +177,7 @@ it("contains malformed job JSON in the asynchronous fixture callback", () => {
   const outcome = fixtureOutcome("malformed-body");
   expect(outcome.stderr).toMatch(/^runtime failed: request-command; facts=/u);
   expect(failureFacts(outcome.stderr)).toEqual({
-    command: { command: "request", expected_exit: 0, actual_exit: 0, termination: "success", elapsed_ms: expect.any(Number), stderr_present: false, error_code: "unknown" },
+    command: { command: "request", expected_exit: 0, actual_exit: 0, termination: "success", elapsed_ms: expect.any(Number), stderr_present: false, error_code: "unknown", error_name: "unknown", error_errno: "unknown" },
     routes: { info: false, quote: false, job: true, status: false, messages: false }, fixtureFailed: true,
   });
 });
@@ -184,7 +187,7 @@ it.each([["command-failure", "unknown"], ["known-error", "auth_required"]])("rep
   expect(outcome.stderr).toMatch(/^runtime failed: request-command; facts=/u);
   const facts = failureFacts(outcome.stderr);
   expect(facts).toEqual({
-    command: { command: "request", expected_exit: 0, actual_exit: 9, termination: "unknown", elapsed_ms: expect.any(Number), stderr_present: true, error_code: code },
+    command: { command: "request", expected_exit: 0, actual_exit: 9, termination: "unknown", elapsed_ms: expect.any(Number), stderr_present: true, error_code: code, error_name: "unknown", error_errno: "unknown" },
     routes: { info: true, quote: false, job: false, status: false, messages: false }, fixtureFailed: false,
   });
   expect(Number.isSafeInteger(facts.command.elapsed_ms)).toBe(true);
@@ -201,4 +204,18 @@ it("identifies a rejected job identifier after reaching the real submit fixture"
   const outcome = fixtureOutcome("wrong-job-id");
   expect(outcome.stderr).toMatch(/^runtime failed: request-job-id; facts=/u);
   expect(failureFacts(outcome.stderr)).toMatchObject({ routes: { job: true }, fixtureFailed: false });
+});
+
+
+it.each([
+  ["Error", "EPERM", "Error", "EPERM"],
+  ["Error", "EBADF", "Error", "EBADF"],
+  ["TypeError", "EINVAL", "TypeError", "EINVAL"],
+  ["PrivateErrorMarker", "EPRIVATE_ERROR_MARKER", "unknown", "unknown"],
+])("projects only closed internal-error name and errno values for %s/%s", (name, errno, expectedName, expectedErrno) => {
+  const outcome = fixtureOutcome("internal-error", name, errno);
+  expect(outcome.stderr).toMatch(/^runtime failed: request-command; facts=/u);
+  expect(failureFacts(outcome.stderr).command).toMatchObject({
+    command: "request", actual_exit: 9, error_code: "internal", error_name: expectedName, error_errno: expectedErrno,
+  });
 });

@@ -53,7 +53,7 @@ try {
     lastCommand = {
       command: ["version", "help", "init", "unknown-job-status", "request", "status"].includes(command) ? command : "unknown",
       expected_exit: Number.isSafeInteger(status) ? status : null,
-      actual_exit: null, termination: "unknown", elapsed_ms: 0, stderr_present: false, error_code: "unknown",
+      actual_exit: null, termination: "unknown", elapsed_ms: 0, stderr_present: false, error_code: "unknown", error_name: "unknown", error_errno: "unknown",
     };
     const result = await runLauncher(consumer, args, env);
     const exit = result.exitStatus ?? result.status;
@@ -65,8 +65,13 @@ try {
     lastCommand.stderr_present = Boolean(result.stderr?.length);
     if (result.status !== 0 && typeof result.stdout === "string" && result.stdout.length <= 65_536) {
       try {
-        const code = JSON.parse(result.stdout)?.error?.code;
+        const error = JSON.parse(result.stdout)?.error;
+        const code = error?.code;
         if (["internal", "invalid_argument", "endpoint_unreachable", "unsupported_version", "auth_required", "job_access_required", "timeout"].includes(code)) lastCommand.error_code = code;
+        if (code === "internal") {
+          if (["Error", "TypeError", "RangeError", "SyntaxError", "SystemError"].includes(error.error_name)) lastCommand.error_name = error.error_name;
+          if (["EACCES", "EBADF", "EBUSY", "EEXIST", "EINVAL", "EIO", "EISDIR", "EMFILE", "ENFILE", "ENOENT", "ENOSPC", "ENOTDIR", "ENOTEMPTY", "ENOTSUP", "EPERM", "EROFS"].includes(error.error_code)) lastCommand.error_errno = error.error_code;
+        }
       } catch { /* Captured output remains private even when it is not JSON. */ }
     }
     assert.equal(fixtureFailed, false);
