@@ -182,6 +182,9 @@ function favoritesFileMode(): number {
 }
 
 function fsyncDirectory(path: string): void {
+  // Windows keeps synced file contents and atomic replacement; equivalent
+  // directory-entry crash durability is not established there.
+  if (process.platform === "win32") return;
   const fd = openSync(path, "r");
   try {
     fsyncSync(fd);

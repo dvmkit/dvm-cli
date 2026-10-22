@@ -216,8 +216,12 @@ function writeJobs(jobs: JobRecord[]): void {
     fsyncSync(fd);
   } finally { closeSync(fd); }
   renameSync(temporary, JOBS_FILE);
-  const directory = openSync(dirname(JOBS_FILE), "r");
-  try { fsyncSync(directory); } finally { closeSync(directory); }
+  // Windows keeps synced file contents and atomic replacement; equivalent
+  // directory-entry crash durability is not established there.
+  if (process.platform !== "win32") {
+    const directory = openSync(dirname(JOBS_FILE), "r");
+    try { fsyncSync(directory); } finally { closeSync(directory); }
+  }
 }
 
 /** Serialize intent creation and consumption booking, including concurrent pay processes. */
