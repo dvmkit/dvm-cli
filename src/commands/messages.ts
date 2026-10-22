@@ -286,6 +286,7 @@ function serialize(msg: Message): Record<string, unknown> {
       };
       if (msg.content.options) content.options = msg.content.options;
       if (msg.content.schema) content.schema = msg.content.schema;
+      if (msg.content.expires_at_ms !== undefined) content.expires_at_ms = msg.content.expires_at_ms;
       return { ...base, content, display };
     }
     case "artifact": {

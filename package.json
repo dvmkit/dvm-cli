@@ -67,7 +67,7 @@
   },
   "dependencies": {
     "@cashu/cashu-ts": "4.10.2",
-    "@dvmkit/sdk": "0.14.0",
+    "@dvmkit/sdk": "0.14.2",
     "@x402/evm": "2.21.0",
     "commander": "14.0.3",
     "mppx": "0.8.15",

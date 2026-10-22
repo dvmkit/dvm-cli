@@ -26,6 +26,121 @@ function msg(overrides: Partial<Message> & Pick<Message, "type" | "content">): M
 }
 
 describe("computeNextAction", () => {
+  describe.each([
+    { type: "prompt", message: (expires_at_ms?: number) => msg({ type: "prompt", content: { id: "p1", text: "Continue?", expires_at_ms } }),
+      action: "respond", verb: "Answer", display: "The provider asks: Continue?", legacyDisplay: "The provider asks: Continue?" },
+    { type: "payment-request", message: (expires_at_ms?: number) => msg({ type: "payment-request", content: { amount_msats: 5000, reason: "Work", expires_at_ms } }),
+      action: "pay", verb: "Pay", display: "5 sats.", legacyDisplay: "5 sats" },
+  ])("$type deadlines", ({ message, action, verb, display, legacyDisplay }) => {
+    const expires = Date.parse("2030-01-02T02:40:00Z");
+    const now = Date.parse("2030-01-01T23:30:00Z");
+
+    it("copies the deadline and relays UTC time and remaining time across midnight", () => {
+      const result = computeNextAction("job-1", [message(expires)], now);
+      expect(result).toMatchObject({ type: action, expires_at_ms: expires,
+        display: `${display} ${verb} by 2030-01-02 02:40 UTC (in 3 h 10 min), or the provider cancels the job.` });
+      expect(result?.hint).toContain(`${verb} by 2030-01-02 02:40 UTC (in 3 h 10 min), or the provider cancels the job.`);
+    });
+
+    it.each([expires, expires + 60_000])("reports a passed deadline without a negative duration at %i", (clock) => {
+      const result = computeNextAction("job-1", [message(expires)], clock);
+      expect(result).toMatchObject({ expires_at_ms: expires,
+        display: `${display} The deadline to ${verb.toLowerCase()} (2030-01-02 02:40 UTC) has passed. The provider will probably cancel the job. Check its status with \`dvm status job-1\`.` });
+      expect(result?.hint).toBe(`The deadline to ${verb.toLowerCase()} (2030-01-02 02:40 UTC) has passed. The provider will probably cancel the job. Check its status with \`dvm status job-1\`.`);
+    });
+
+    it.each([
+      { remaining: 30_000, duration: "less than 1 min" },
+      { remaining: 60_000, duration: "1 min" },
+      { remaining: 3_600_000, duration: "1 h" },
+      { remaining: 48 * 3_600_000, duration: "48 h" },
+      { remaining: 48 * 3_600_000 + 60_000, duration: "2 days" },
+      { remaining: 49 * 3_600_000, duration: "2 days 1 h" },
+      { remaining: 72 * 3_600_000, duration: "3 days" },
+      { remaining: (6 * 24 + 23) * 3_600_000 + 59 * 60_000, duration: "6 days 23 h" },
+    ])("keeps a positive $duration duration readable", ({ remaining, duration }) => {
+      const result = computeNextAction("job-1", [message(expires)], expires - remaining);
+      expect(result).toMatchObject({ display: expect.stringContaining(`(in ${duration}), or the provider cancels the job.`) });
+    });
+
+    it.each([1e300, "soon", null, -1, 1.5, 8_640_000_000_000_001])("ignores malformed expiry %s and preserves the complete legacy action", (expiry) => {
+      const malformed = message();
+      Object.assign(malformed.content, { expires_at_ms: expiry });
+      const result = computeNextAction("job-1", [malformed], now);
+      expect(result).toEqual(computeNextAction("job-1", [message()], now));
+      expect(result).not.toHaveProperty("expires_at_ms");
+      expect(result).toMatchObject({ display: legacyDisplay });
+      expect(result?.hint).not.toMatch(/deadline|cancel/);
+    });
+
+    it("leaves older messages without a deadline unchanged", () => {
+      const result = computeNextAction("job-1", [message()], now);
+      expect(result).not.toHaveProperty("expires_at_ms");
+      expect(result).toMatchObject({ display: legacyDisplay });
+    });
+  });
+
+  it.each(["prompt", "payment-request"] as const)("uses the earliest pending deadline when the latest ask is a %s", (latestType) => {
+    const early = Date.parse("2030-01-02T02:40:00Z");
+    const late = Date.parse("2030-01-02T03:40:00Z");
+    const messages = [
+      msg({ seq: 1, type: "prompt", content: { id: "first", text: "First?", expires_at_ms: early } }),
+      latestType === "prompt"
+        ? msg({ seq: 2, type: "prompt", content: { id: "second", text: "Second?", expires_at_ms: late } })
+        : msg({ seq: 2, type: "payment-request", content: { amount_msats: 5000, reason: "Work", expires_at_ms: late } }),
+    ];
+    const result = computeNextAction("job-1", messages, early - 600_000);
+    expect(result).toMatchObject({ expires_at_ms: early });
+    expect(result).toMatchObject({ display: expect.stringContaining("by 2030-01-02 02:40 UTC (in 10 min)") });
+    expect(result?.hint).toContain("by 2030-01-02 02:40 UTC (in 10 min)");
+  });
+
+  it.each(["answered prompt", "replaced prompt", "paid charge", "replaced charge", "zero charge"])("excludes the %s from the pending deadline", (settled) => {
+    const early = Date.parse("2030-01-02T02:40:00Z");
+    const late = Date.parse("2030-01-02T03:40:00Z");
+    const isPrompt = settled.includes("prompt");
+    const messages: Message[] = [isPrompt
+      ? msg({ seq: 1, type: "prompt", content: { id: "first", text: "First?", expires_at_ms: early } })
+      : msg({ seq: 1, type: "payment-request", content: { amount_msats: settled === "zero charge" ? 0 : 5000, reason: "Work", expires_at_ms: early } })];
+    if (settled === "answered prompt") messages.push(msg({ seq: 2, from: "requester", type: "response", content: { prompt_id: "first", text: "Yes" } }));
+    if (settled === "paid charge") messages.push(msg({ seq: 2, from: "requester", type: "payment", content: { amount_msats: 5000 } }));
+    if (settled === "replaced charge") messages.push(msg({ seq: 2, type: "payment-request", content: { amount_msats: 5000, reason: "Revised", expires_at_ms: late } }));
+    messages.push(msg({ seq: 3, type: "prompt", content: { id: settled === "replaced prompt" ? "first" : "latest", text: "Continue?", expires_at_ms: late } }));
+    const result = computeNextAction("job-1", messages, early - 600_000);
+    expect(result).toMatchObject({ type: "respond", expires_at_ms: late });
+    expect(result).toMatchObject({ display: expect.stringContaining("by 2030-01-02 03:40 UTC (in 1 h 10 min)") });
+  });
+
+  it("uses a pending payment deadline even when the latest prompt has none", () => {
+    const expires = Date.parse("2030-01-02T02:40:00Z");
+    const result = computeNextAction("job-1", [
+      msg({ seq: 1, type: "payment-request", content: { amount_msats: 5000, reason: "Work", expires_at_ms: expires } }),
+      msg({ seq: 2, type: "prompt", content: { id: "latest", text: "Continue?" } }),
+    ], expires - 60_000);
+    expect(result).toMatchObject({ type: "respond", expires_at_ms: expires });
+    expect(result).toMatchObject({ display: expect.stringContaining("by 2030-01-02 02:40 UTC (in 1 min)") });
+  });
+
+  it.each([
+    { firstType: "prompt", latestType: "payment-request" },
+    { firstType: "payment-request", latestType: "prompt" },
+    { firstType: "prompt", latestType: "prompt" },
+  ] as const)("uses neutral wording when $firstType sets the deadline for a later $latestType", ({ firstType, latestType }) => {
+    const early = Date.parse("2030-01-02T02:40:00Z");
+    const ask = (type: "prompt" | "payment-request", seq: number, expires_at_ms: number) => type === "prompt"
+      ? msg({ seq, type, content: { id: `question-${seq}`, text: "Continue?", expires_at_ms } })
+      : msg({ seq, type, content: { amount_msats: 5000, reason: "Work", expires_at_ms } });
+    const messages = [ask(firstType, 1, early), ask(latestType, 2, early + 3_600_000)];
+    const result = computeNextAction("job-1", messages, early - 600_000);
+    const clause = "Reply by 2030-01-02 02:40 UTC (in 10 min), or the provider cancels the job.";
+    expect(result).toMatchObject({ expires_at_ms: early, display: expect.stringContaining(clause) });
+    expect(result?.hint).toContain(clause);
+    expect(result).toMatchObject({ display: expect.not.stringMatching(/Answer by|Pay by/) });
+    const expired = computeNextAction("job-1", messages, early);
+    expect(expired).toMatchObject({ display: expect.stringContaining("The deadline to reply (2030-01-02 02:40 UTC) has passed.") });
+    expect(expired?.hint).not.toMatch(/deadline to answer|deadline to pay/);
+  });
+
   it("returns null for complete message", () => {
     const result = computeNextAction("job-1", [
       msg({ type: "complete", content: { summary: "Done" } }),

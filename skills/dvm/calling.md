@@ -33,6 +33,8 @@ Follow the returned action: respond to a provider question only with authorized 
 
 Answer with `dvm message <job-id> "<answer>" --type response --prompt-id <prompt-id>` (use `--json '<object matching schema>'` in place of `"<answer>"` for structured prompts); relay `next_action.display` and use exactly one of `next_action.options` unless the human chose otherwise.
 
+When a respond or pay action includes `expires_at_ms` (Unix milliseconds), relay the deadline in its `display` to the human: the provider cancels the job if they do not answer or pay by then.
+
 `dvm request --human`, `dvm messages <job-id> --human`, and `dvm status <job-id> --human` end with a `Next:` line when the caller needs to act or keep watching. It relays the pending question and choices, payment amount, or working status with the command to continue. Terminal jobs and already claimed refunds omit the line. Unclaimed refunds show the recovery instruction once. Add `--messages` to human status reads for a readable message log.
 
 Read `payload_in`: when it points to messages, retrieve them and obtain the artifact rather than reporting only the summary. Check the result against the user's request. Keep receipt verification separate from result quality and job completion.
