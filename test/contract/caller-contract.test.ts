@@ -426,7 +426,7 @@ describe("standalone caller contract", () => {
       status: "processing", submittedAt: 1700000000000, jobToken: portableToken,
       policy: { maxTotalMsats: 1500, maxIncrementMsats: 1500, autoPayBelowMsats: 1500, maxPayments: 1 },
       creditBinding: { creditId: "held-credit", drawId: "accepted-draw", callerPubkey: pubkey },
-      pendingCreditPayment: { authorization, request: { amount_msats: 1500, reason: "Additional work",
+      pendingCreditPayment: { approval: "auto", authorization, request: { amount_msats: 1500, reason: "Additional work",
         credit: { amount_micro: 1500, currency: "usd" } } } }]));
     balanceAttempts = 0;
     balanceAccepted.clear();
@@ -446,6 +446,7 @@ describe("standalone caller contract", () => {
     expect(balanceAccepted.size).toBe(1);
     const jobs = readJson(join(root, "jobs.json")) as Array<Record<string, unknown>>;
     expect(jobs[0]).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1, status: "completed" });
+    expect(jobs[0].paymentApprovals).toEqual([{ requestSeq: 4, approval: "auto" }]);
     expect(jobs[0].pendingCreditPayment).toBeUndefined();
     expect(existsSync(join(root, "budget.json"))).toBe(false);
   });
@@ -693,7 +694,19 @@ describe("standalone caller contract", () => {
         receipt_verified: "absent",
       })
     );
+    expect(JSON.parse(result.stdout)).not.toHaveProperty("spend");
     expect(existsSync(join(configRoot, "jobs.json"))).toBe(false);
+  });
+
+  it("prints the local bill before the next command on an active job", async () => {
+    const root = mkdtempSync(join(tmpdir(), "status-bill-order-"));
+    configRoots.add(root);
+    writeFileSync(join(root, "jobs.json"), JSON.stringify([{ id: "human-working", endpoint,
+      status: "processing", submittedAt: 1, jobToken: portableToken }]));
+    const result = await runCli(["status", "human-working", "--human"], {}, root);
+    expect(result.stderr).toContain("No charges yet");
+    expect(result.stderr.indexOf("No charges yet")).toBeLessThan(result.stderr.indexOf("Next:"));
+    expect(result.stderr.trimEnd().split("\n").at(-1)).toContain("`dvm messages human-working`");
   });
 
   it.each([[], ["--messages"]])("status relays pending choices with flags %j", async (...flags) => {

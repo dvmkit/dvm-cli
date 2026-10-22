@@ -13,7 +13,10 @@ import type { DrawFundingReceipt } from "@dvmkit/sdk/internal";
 import type { ReceiptTrustAnchor } from "@dvmkit/sdk/internal";
 import type { ProviderRef, ReceiptParseError } from "@dvmkit/sdk/internal";
 
+export type PaymentApproval = "auto" | "explicit";
+
 export interface CreditPaymentIntent {
+  approval?: PaymentApproval;
   authorization: NonNullable<PaymentContent["credit"]>;
   request: PaymentRequestContent;
   /** Caller-priced consumption, pinned before send for replay after rate changes. */
@@ -91,6 +94,8 @@ export interface JobRecord {
   totalPaidMsats?: number;
   /** Number of payments honoured for this job (auto + manual). */
   paymentsHonoured?: number;
+  /** Approval of mid-job asks, keyed by provider request sequence. Absent on older records. */
+  paymentApprovals?: { requestSeq: number; approval: PaymentApproval }[];
   /** Index of received artifact deliverables. */
   artifacts?: ArtifactRef[];
   /** Spending policy for this job's conversation. */
@@ -191,12 +196,13 @@ export function loadAllJobs(): JobRecord[] {
 }
 
 /** Add a payment to a job's running total and increment its honoured-payment count. No-op if job not found. */
-export function addPayment(jobId: string, amountMsats: number): void {
+export function addPayment(jobId: string, amountMsats: number, approval?: { requestSeq: number; approval: PaymentApproval }): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (!job) return;
     job.totalPaidMsats = (job.totalPaidMsats ?? 0) + amountMsats;
     job.paymentsHonoured = (job.paymentsHonoured ?? 0) + 1;
+    if (approval) (job.paymentApprovals ??= []).push(approval);
     // A rail may bind a previously free job to an implicit credit whose IDs
     // this message response does not expose. Future balance payments must not guess.
     if (job.creditBinding && "unbound" in job.creditBinding) delete job.creditBinding;
@@ -252,6 +258,9 @@ export function bookCreditPayment(jobId: string, intent: CreditPaymentIntent): v
       job.totalPaidMsats = (job.totalPaidMsats ?? 0) + (intent.amountMsats ?? intent.request.amount_msats);
       job.paymentsHonoured = (job.paymentsHonoured ?? 0) + 1;
       (job.bookedCreditPayments ??= []).push(intent);
+      if (intent.approval) (job.paymentApprovals ??= []).push({
+        requestSeq: intent.authorization.request_seq, approval: intent.approval,
+      });
     }
     if (job.pendingCreditPayment?.authorization.payment_id === intent.authorization.payment_id)
       delete job.pendingCreditPayment;

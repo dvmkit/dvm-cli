@@ -1,3 +1,4 @@
+import { jobSpend, renderSpendHuman } from "../lib/job-spend";
 import { formatMessageHuman } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
 import { finalizeProgressLine } from "../lib/progress-bar";
@@ -28,6 +29,7 @@ import {
 } from "../lib/output";
 import {
   type JobRecord,
+  loadJob,
   markJobTerminal,
   updateJob,
 } from "../lib/job-store";
@@ -253,6 +255,7 @@ function renderStatus(
   const msgs = fetched?.msgs ?? [];
   const receipt = fetched?.receipt;
   const content = jobContentFields(jobId, fetched?.content);
+  const spend = stored ? jobSpend(loadJob(jobId) ?? stored, receipt?.receipt) : undefined;
 
   if (opts.human) {
     if (jobStatus === "completed" && completion.summary) {
@@ -264,7 +267,6 @@ function renderStatus(
     }
     if (jobStatus === "completed" && hint) info(`📎 ${hint}`);
     info(String(content.content_hint));
-    if (receipt) renderReceiptHuman(receipt);
     if (msgs.length > 0) {
       info(`\n${msgs.length} new message(s):`);
       const artifactSession = createArtifactSaveSession();
@@ -273,6 +275,8 @@ function renderStatus(
     }
     const traceId = getOutputTraceId();
     if (traceId) info(`Trace: ${traceId}`);
+    if (spend) renderSpendHuman(spend, info);
+    if (receipt) renderReceiptHuman(receipt);
     printNextActionHuman(nextAction);
     return;
   }
@@ -295,6 +299,7 @@ function renderStatus(
     // do. Both spread blind and are absent when nothing was stashed.
     ...takeCreditNoticeFields(),
     ...takeFeedbackNoticeFields(),
+    ...(spend ? { spend } : {}),
     next_action: nextAction,
   };
   if (opts.messages) {

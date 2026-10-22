@@ -20,6 +20,7 @@ import {
 import {
   addPayment,
   loadJob,
+  type PaymentApproval,
 } from "./job-store";
 import {
   info,
@@ -65,8 +66,11 @@ export async function handlePaymentRequest(
   provider: ProviderRef,
   // `jobToken` is the anonymous-flow per-job token threaded into
   // every `payment` `sendMessage`.
-  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number }
+  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval }
 ): Promise<PaymentResult> {
+  const approval: { requestSeq: number; approval: PaymentApproval } | undefined = opts?.requestSeq === undefined ? undefined : {
+    requestSeq: opts.requestSeq, approval: opts.approval ?? "auto",
+  };
   const job = loadJob(jobId);
   const spent = job?.totalPaidMsats ?? 0;
   const paymentsHonoured = job?.paymentsHonoured ?? 0;
@@ -129,7 +133,7 @@ export async function handlePaymentRequest(
 
   if (matchingEndpoint && !balanceRefused && opts?.rail === undefined) {
     const creditPaid = await tryCreditPayment({ jobId, request, policy,
-      requestSeq: opts?.requestSeq, transport, provider, jobToken });
+      requestSeq: opts?.requestSeq, approval: opts?.approval ?? "auto", transport, provider, jobToken });
     if (creditPaid !== false) return { status: "paid", rail: "credit", amountMsats: creditPaid };
   }
 
@@ -175,6 +179,7 @@ export async function handlePaymentRequest(
       pinnedMint,
       maxCashuFeeSats,
       strictPerCall,
+      approval,
       jobToken,
     });
     if (paid) {
@@ -230,7 +235,7 @@ export async function handlePaymentRequest(
           provider,
           { jobToken }
         );
-        addPayment(jobId, proof.amountMsats);
+        addPayment(jobId, proof.amountMsats, approval);
         recordSpend({
           msats: proof.amountMsats,
           btcRate: proof.btcRate,
@@ -274,7 +279,7 @@ export async function handlePaymentRequest(
         provider,
         { jobToken }
       );
-      addPayment(jobId, paidMsats);
+      addPayment(jobId, paidMsats, approval);
       recordSpend({
         msats: paidMsats,
         btcRate: tempoRate,
@@ -321,6 +326,7 @@ async function tryAgentWalletMidJobPayment(args: {
   transport: Transport;
   provider: ProviderRef;
   btcRate: number;
+  approval?: { requestSeq: number; approval: PaymentApproval };
   /** Caller-pinned spend mint. Narrows the allowlist to this mint. */
   pinnedMint?: string;
   /** Job-wide Cashu fee ceiling persisted by the original request. */
@@ -339,6 +345,7 @@ async function tryAgentWalletMidJobPayment(args: {
     pinnedMint,
     maxCashuFeeSats,
     strictPerCall,
+    approval,
     jobToken,
   } = args;
 
@@ -449,7 +456,7 @@ async function tryAgentWalletMidJobPayment(args: {
     },
   });
 
-  addPayment(jobId, request.amount_msats);
+  addPayment(jobId, request.amount_msats, approval);
   recordSpend({
     msats: request.amount_msats,
     btcRate,
