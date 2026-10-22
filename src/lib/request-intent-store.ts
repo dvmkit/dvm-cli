@@ -145,6 +145,9 @@ function intentDirectory(requestId: string): string {
 }
 
 function fsyncDirectory(path: string): void {
+  // Windows keeps synced file contents and atomic replacement; equivalent
+  // directory-entry crash durability is not established there.
+  if (process.platform === "win32") return;
   let fd: number | undefined;
   try {
     fd = openSync(path, "r");

@@ -16,6 +16,7 @@ const npmCli =
   fail("run the gate through npm so the active npm executable is unambiguous");
 
 const sourceSteps = [
+  { name: "runtime policy", args: ["run", "check:runtime-policy"] },
   { name: "lint", args: ["run", "lint"] },
   { name: "build", args: ["run", "build"] },
   { name: "typecheck", args: ["run", "typecheck"] },
