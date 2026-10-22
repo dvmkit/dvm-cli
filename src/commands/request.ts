@@ -1,5 +1,5 @@
 import { buildTempoCredential } from "../lib/payment-rails/tempo-credential";
-import { pollNextAction } from "../lib/next-action";
+import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { parseBudget } from "../lib/currency";
 import { buildPolicy } from "../lib/policy";
 import {
@@ -158,7 +158,7 @@ import { selectRailOrder } from "../lib/payment-rails/select";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
 import { quoteWithinDeclaredLimit } from "../lib/quote-limit";
-import { printRefundSummaryHuman, refundJsonField } from "../lib/refund-claim";
+import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent } from "../lib/request-intent-store";
 import { createArtifactSaveSession } from "../lib/save-artifact";
 import { applyJsonSchemaDefaults, formatAppliedDefaults } from "../lib/schema-defaults";
@@ -177,7 +177,9 @@ import {
 import { groupProofsByMint } from "../lib/wallet-agent/balance";
 import { warmupProvider } from "../lib/warmup-provider";
 import { type DvmIdentity, dvmIdentity } from "./dvm-identity";
-import { formatMessageHuman, serializeMessageForOutput } from "./messages";
+import { serializeMessageForOutput } from "./messages";
+import { formatMessageHuman } from "../lib/message-human";
+import { printNextActionHuman } from "../lib/next-action-human";
 import {
   cheapestQuote,
   type NoEligibleMintDetail,
@@ -886,6 +888,9 @@ export async function request(opts: RequestOptions): Promise<void> {
     if (opts.human) {
       info(`Job published: ${receipt.jobId}`);
       echoTraceIdHuman();
+      if (!isTerminalJobStatus(receipt.status)) {
+        printNextActionHuman(pollNextAction(receipt.jobId, "Job submitted, check back for updates"));
+      }
     } else {
       json({
         jobId: receipt.jobId,
@@ -1036,8 +1041,8 @@ export async function request(opts: RequestOptions): Promise<void> {
         }
         if (captured) renderReceiptHuman(captured);
         finalizeProgressLine();
-        printRefundSummaryHuman(result.refunds);
         echoTraceIdHuman();
+        printNextActionHuman(result.nextAction, { refunds: result.refunds, terminal: isTerminalJobStatus(receipt.status) || !!streamTerminalStatus(result.messages) });
       } else {
         json({
           jobId: receipt.jobId,
@@ -3948,8 +3953,13 @@ async function streamAfterPayment(args: {
     });
     if (recovered) return;
 
+    const nextAction = pollNextAction(
+      jobId,
+      "Payment sent but the result stream timed out. The job is still running — check back with 'dvm status'."
+    );
     if (human) {
       info(paidTimeoutMessage);
+      printNextActionHuman(nextAction);
     } else {
       json({
         jobId,
@@ -3961,10 +3971,7 @@ async function streamAfterPayment(args: {
         // not the job. `poll`, not `null`: the result is still coming.
         ...takeCreditNoticeFields(),
         ...takeFeedbackNoticeFields(),
-        next_action: pollNextAction(
-          jobId,
-          "Payment sent but the result stream timed out. The job is still running — check back with 'dvm status'."
-        ),
+        next_action: nextAction,
       });
     }
     throw new DvmError("timeout", paidTimeoutMessage);
@@ -3981,7 +3988,7 @@ async function streamAfterPayment(args: {
     }
     if (captured) renderReceiptHuman(captured);
     finalizeProgressLine();
-    printRefundSummaryHuman(result.refunds);
+    printNextActionHuman(result.nextAction, { refunds: result.refunds, terminal: !!streamTerminalStatus(result.messages) });
   } else {
     json({
       jobId,

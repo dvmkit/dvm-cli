@@ -1,3 +1,7 @@
+import { formatMessageHuman } from "../lib/message-human";
+import { printNextActionHuman } from "../lib/next-action-human";
+import { finalizeProgressLine } from "../lib/progress-bar";
+import { createArtifactSaveSession } from "../lib/save-artifact";
 import { computeNextAction, isTerminalJobStatus, type NextAction, pollNextAction } from "../lib/next-action";
 import { buildCompletionHintFields, completionSnapshot, type JobCompletion, nextStepHint } from "../lib/completion-hints";
 import {
@@ -263,13 +267,13 @@ function renderStatus(
     if (receipt) renderReceiptHuman(receipt);
     if (msgs.length > 0) {
       info(`\n${msgs.length} new message(s):`);
-      for (const msg of msgs) {
-        const prefix = msg.from === "provider" ? "Provider" : "You";
-        info(`  [${msg.seq}] ${prefix} [${msg.type}]: ${JSON.stringify(msg.content)}`);
-      }
+      const artifactSession = createArtifactSaveSession();
+      for (const msg of msgs) formatMessageHuman(msg, jobId, artifactSession);
+      finalizeProgressLine();
     }
     const traceId = getOutputTraceId();
     if (traceId) info(`Trace: ${traceId}`);
+    printNextActionHuman(nextAction);
     return;
   }
 
