@@ -63,7 +63,8 @@ describe("computeNextAction", () => {
       job_id: "job-1",
       prompt_id: "p1",
       prompt: { _source: "provider", text: "What color?" },
-      hint: expect.stringContaining("Provider is waiting"),
+      display: "The provider asks: What color?",
+      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id p1'),
     });
   });
 
@@ -75,7 +76,81 @@ describe("computeNextAction", () => {
         content: { id: "p1", text: "Provide details", schema },
       }),
     ]);
-    expect(result).toMatchObject({ type: "respond", schema });
+    expect(result).toMatchObject({
+      type: "respond",
+      schema,
+      display: "The provider asks: Provide details",
+      hint: expect.stringContaining("dvm message job-1 --json '<object matching schema>' --type response --prompt-id p1"),
+    });
+    expect(result).not.toHaveProperty("options");
+  });
+
+  it.each([
+    {
+      options: ["keep", "wait", "switch"],
+      display: "The provider asks: High cloud moving in, 18 of 40 frames usable. Choices: \"keep\", \"wait\", \"switch\".",
+    },
+    {
+      options: [" Keep ", "wait, then retry", "切り替え"],
+      display: "The provider asks: High cloud moving in, 18 of 40 frames usable. Choices: \" Keep \", \"wait, then retry\", \"切り替え\".",
+    },
+  ])("relays preset choices verbatim and explains how to answer: $options", ({ options, display }) => {
+    const result = computeNextAction("job-1", [
+      msg({
+        type: "prompt",
+        content: { id: "p1", text: "High cloud moving in, 18 of 40 frames usable.", options },
+      }),
+    ]);
+    expect(result).toMatchObject({
+      type: "respond",
+      options,
+      display,
+      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id p1'),
+    });
+    expect(result?.hint).toContain("exactly one of options unless the human chose otherwise");
+    expect(result?.hint).toContain("Verify the question makes sense for your task");
+  });
+
+  it("shell-quotes job and prompt ids in the exact answer command", () => {
+    const result = computeNextAction("job; two", [
+      msg({ type: "prompt", content: { id: "prompt; two", text: "Continue?" } }),
+    ]);
+    expect(result?.hint).toBe(
+      'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message \'job; two\' "<answer>" --type response --prompt-id \'prompt; two\'`.'
+    );
+  });
+
+  it("omits empty options from the action and guidance", () => {
+    const result = computeNextAction("job-1", [
+      msg({ type: "prompt", content: { id: "p1", text: "Continue?", options: [] } }),
+    ]);
+    expect(result).not.toHaveProperty("options");
+    expect(result).toMatchObject({
+      display: "The provider asks: Continue?",
+      hint: 'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 "<answer>" --type response --prompt-id p1`.',
+    });
+  });
+
+  it("uses schema guidance when the prompt also has choices", () => {
+    const schema = { type: "object" };
+    const result = computeNextAction("job-1", [
+      msg({ type: "prompt", content: { id: "p1", text: "Provide details", schema, options: ["keep"] } }),
+    ]);
+    expect(result).toMatchObject({
+      schema,
+      options: ["keep"],
+      display: 'The provider asks: Provide details Choices: "keep".',
+      hint: "Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 --json '<object matching schema>' --type response --prompt-id p1`.",
+    });
+  });
+
+  it("shell-quotes the job id in the exact pay command", () => {
+    const result = computeNextAction("job; two", [
+      msg({ type: "payment-request", content: { amount_msats: 5000, reason: "Work" } }),
+    ]);
+    expect(result?.hint).toBe(
+      'Payment required to continue: 5 sats. Relay that amount to your human and get approval, then run `dvm pay \'job; two\'`. Provider\'s stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.'
+    );
   });
 
   it("returns pay for payment-request message", () => {

@@ -241,6 +241,24 @@ beforeAll(async () => {
         ] }));
         return;
       }
+      if (request.method === "GET" && request.url === "/v1/job/prompt-options") {
+        response.end(JSON.stringify({ status: "awaiting-input" }));
+        return;
+      }
+      if (request.method === "GET" && request.url?.startsWith("/v1/job/prompt-options/messages")) {
+        response.end(JSON.stringify({ messages: [{
+          seq: 1,
+          from: "provider",
+          timestamp: "2026-01-01T00:00:00Z",
+          type: "prompt",
+          content: {
+            id: "weather",
+            text: "High cloud moving in, 18 of 40 frames usable.",
+            options: ["keep", "wait", "switch"],
+          },
+        }] }));
+        return;
+      }
       if (
         request.method === "GET" &&
         request.url?.startsWith("/v1/job/override-state/messages")
@@ -638,6 +656,23 @@ describe("standalone caller contract", () => {
       })
     );
     expect(existsSync(join(configRoot, "jobs.json"))).toBe(false);
+  });
+
+  it.each([[], ["--messages"]])("status relays pending choices with flags %j", async (...flags) => {
+    const result = await runCli([
+      "status", "prompt-options", ...flags,
+      "--endpoint", endpoint, "--job-token", portableToken,
+    ]);
+
+    expect(JSON.parse(result.stdout).next_action).toEqual({
+      type: "respond",
+      job_id: "prompt-options",
+      prompt_id: "weather",
+      prompt: { _source: "provider", text: "High cloud moving in, 18 of 40 frames usable." },
+      options: ["keep", "wait", "switch"],
+      display: "The provider asks: High cloud moving in, 18 of 40 frames usable. Choices: \"keep\", \"wait\", \"switch\".",
+      hint: expect.stringContaining('dvm message prompt-options "<answer>" --type response --prompt-id weather'),
+    });
   });
 
   it("lets environment credentials override stored credentials without changing the saved job", async () => {
