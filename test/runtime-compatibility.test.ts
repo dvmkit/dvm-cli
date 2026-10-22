@@ -10,6 +10,14 @@ const root = resolve(import.meta.dirname, "..");
 const temporaryRoots: string[] = [];
 afterEach(() => { for (const path of temporaryRoots.splice(0)) rmSync(path, { recursive: true, force: true }); });
 
+function failureFacts(stderr: string) {
+  const marker = "; facts=";
+  expect(stderr).toContain(marker);
+  expect(stderr).toMatch(/ \(captured output withheld\)\n$/u);
+  return JSON.parse(stderr.slice(stderr.indexOf(marker) + marker.length, -" (captured output withheld)\n".length));
+}
+
+
 it.each(["success", "failure", "skipped", "cancelled"])("aggregate accepts only successful runtime cells: %s", (result) => {
   const workflow = parse(readFileSync(join(root, ".github/workflows/verify.yml"), "utf8"));
   const command = workflow.jobs.verify.steps[0].run;
@@ -56,7 +64,8 @@ it("rejects a tampered archive before installation without printing its path", (
   writeFileSync(join(temporary, "caller.tgz"), "corrupted archive");
   const outcome = spawnSync(process.execPath, [join(root, "scripts/runtime-smoke.mjs"), temporary], { encoding: "utf8" });
   expect(outcome.status).toBe(1);
-  expect(outcome.stderr).toBe("runtime failed: archive integrity (captured output withheld)\n");
+  expect(outcome.stderr).toMatch(/^runtime failed: archive integrity; facts=/u);
+  expect(failureFacts(outcome.stderr)).toEqual({ command: null, routes: { info: false, quote: false, job: false, status: false, messages: false }, fixtureFailed: false });
   expect(outcome.stdout).toBe("");
 });
 
@@ -73,7 +82,8 @@ it("withholds consumer npm diagnostics on a real invalid-archive install", () =>
     encoding: "utf8", timeout: 30_000,
   });
   expect(outcome.status).toBe(1);
-  expect(outcome.stderr).toMatch(/^runtime failed: consumer install and upgrade; archive-upgrade: reason=nonzero-exit, elapsed_ms=[0-9]+, exit=[1-9][0-9]*, signal=none, exit_before_timeout=true, npm_category=unknown \(captured output withheld\)\n$/u);
+  expect(outcome.stderr).toMatch(/^runtime failed: consumer install and upgrade; archive-upgrade: reason=nonzero-exit, elapsed_ms=[0-9]+, exit=[1-9][0-9]*, signal=none, exit_before_timeout=true, npm_category=unknown; facts=/u);
+  expect(failureFacts(outcome.stderr)).toEqual({ command: null, routes: { info: false, quote: false, job: false, status: false, messages: false }, fixtureFailed: false });
   const lines = outcome.stdout.trimEnd().split("\n");
   expect(lines.slice(0, 3)).toEqual(["consumer operation start: legacy-install", "consumer operation start: legacy-skill-check", "consumer operation start: archive-upgrade"]);
   expect(lines).toHaveLength(4);
@@ -85,7 +95,7 @@ it("withholds consumer npm diagnostics on a real invalid-archive install", () =>
   expect(outcome.stdout).not.toContain(archive);
 });
 
-it("contains malformed job JSON in the asynchronous fixture callback", () => {
+function fixtureOutcome(mode: string) {
   const temporary = mkdtempSync(join(tmpdir(), "dvm-runtime-callback-"));
   temporaryRoots.push(temporary);
   const scripts = join(temporary, "scripts");
@@ -122,9 +132,19 @@ it("contains malformed job JSON in the asynchronous fixture callback", () => {
         code: "job_access_required", message: "not in the local store", hint: "--endpoint and --job-token" } }) };
       else if (args[0] === "request") {
         const endpoint = args[args.indexOf("--endpoint") + 1];
-        const response = await fetch(endpoint + "/v1/job", { method: "POST", body: process.env.MALFORMED_JOB_BODY });
-        if (response.status !== 500) throw new Error("fixture accepted invalid JSON");
-        stdout = JSON.stringify({ jobId: "runtime-job" });
+        if (process.env.FIXTURE_MODE === "command-failure" || process.env.FIXTURE_MODE === "known-error") {
+          await fetch(endpoint + "/v1/info");
+          await fetch(endpoint + "/do-not-print-route-marker");
+          return { status: 9, termination: "do-not-print-termination-marker", elapsedMs: "do-not-print-elapsed-marker",
+            stderr: process.env.MALFORMED_JOB_BODY + " " + _consumer + " " + endpoint,
+            stdout: JSON.stringify({ error: { code: process.env.FIXTURE_MODE === "known-error" ? "auth_required" : "secret_marker_exfiltrate",
+              message: process.env.MALFORMED_JOB_BODY, path: _consumer } }) };
+        }
+        if (process.env.FIXTURE_MODE === "invalid-json") return { status: 0, stderr: "", stdout: process.env.MALFORMED_JOB_BODY };
+        const malformed = process.env.FIXTURE_MODE === "malformed-body";
+        const response = await fetch(endpoint + "/v1/job", { method: "POST", body: malformed ? process.env.MALFORMED_JOB_BODY : JSON.stringify({ capability: "echo", input: "runtime hello" }) });
+        if (malformed && response.status !== 500) throw new Error("fixture accepted invalid JSON");
+        stdout = JSON.stringify({ jobId: malformed ? "runtime-job" : "wrong-job-id" });
       }
       return { status: 0, stderr: "", stdout };
     }
@@ -133,14 +153,52 @@ it("contains malformed job JSON in the asynchronous fixture callback", () => {
   const rootRecord = join(temporary, "consumer-root.txt");
   const outcome = spawnSync(process.execPath, [join(scripts, "runtime-smoke.mjs")], {
     encoding: "utf8", timeout: 10_000,
-    env: { ...process.env, MALFORMED_JOB_BODY: `{${marker}`, RUNTIME_ROOT_RECORD: rootRecord },
+    env: { ...process.env, MALFORMED_JOB_BODY: `{${marker}`, RUNTIME_ROOT_RECORD: rootRecord, FIXTURE_MODE: mode },
   });
   const installedRoot = readFileSync(rootRecord, "utf8");
   temporaryRoots.push(installedRoot);
   expect(outcome.status).toBe(1);
   expect(outcome.stdout).toBe("");
-  expect(outcome.stderr).toBe("runtime failed: loopback free request and poll (captured output withheld)\n");
   expect(outcome.stderr).not.toContain(temporary);
   expect(outcome.stderr).not.toContain(marker);
+  expect(outcome.stderr).not.toContain(installedRoot);
+  expect(outcome.stderr).not.toContain("do-not-print-route-marker");
+  expect(outcome.stderr).not.toContain("do-not-print-termination-marker");
+  expect(outcome.stderr).not.toContain("do-not-print-elapsed-marker");
+  expect(outcome.stderr).not.toContain("secret_marker_exfiltrate");
   expect(existsSync(installedRoot)).toBe(false);
+  return outcome;
+}
+
+it("contains malformed job JSON in the asynchronous fixture callback", () => {
+  const outcome = fixtureOutcome("malformed-body");
+  expect(outcome.stderr).toMatch(/^runtime failed: request-command; facts=/u);
+  expect(failureFacts(outcome.stderr)).toEqual({
+    command: { command: "request", expected_exit: 0, actual_exit: 0, termination: "success", elapsed_ms: expect.any(Number), stderr_present: false, error_code: "unknown" },
+    routes: { info: false, quote: false, job: true, status: false, messages: false }, fixtureFailed: true,
+  });
+});
+
+it.each([["command-failure", "unknown"], ["known-error", "auth_required"]])("reports bounded failed-command facts while protecting %s output", (mode, code) => {
+  const outcome = fixtureOutcome(mode);
+  expect(outcome.stderr).toMatch(/^runtime failed: request-command; facts=/u);
+  const facts = failureFacts(outcome.stderr);
+  expect(facts).toEqual({
+    command: { command: "request", expected_exit: 0, actual_exit: 9, termination: "unknown", elapsed_ms: expect.any(Number), stderr_present: true, error_code: code },
+    routes: { info: true, quote: false, job: false, status: false, messages: false }, fixtureFailed: false,
+  });
+  expect(Number.isSafeInteger(facts.command.elapsed_ms)).toBe(true);
+  expect(facts.command.elapsed_ms).toBeGreaterThanOrEqual(0);
+});
+
+it("distinguishes invalid command JSON from command execution without printing the body", () => {
+  const outcome = fixtureOutcome("invalid-json");
+  expect(outcome.stderr).toMatch(/^runtime failed: request-parse; facts=/u);
+  expect(failureFacts(outcome.stderr)).toMatchObject({ command: { command: "request", actual_exit: 0, stderr_present: false }, fixtureFailed: false });
+});
+
+it("identifies a rejected job identifier after reaching the real submit fixture", () => {
+  const outcome = fixtureOutcome("wrong-job-id");
+  expect(outcome.stderr).toMatch(/^runtime failed: request-job-id; facts=/u);
+  expect(failureFacts(outcome.stderr)).toMatchObject({ routes: { job: true }, fixtureFailed: false });
 });
