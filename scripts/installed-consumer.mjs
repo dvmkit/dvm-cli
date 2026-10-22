@@ -1,12 +1,14 @@
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
+import { createNpmProgress } from "./npm-progress.mjs";
 import { consumerNpmrc } from "./consumer-npmrc.mjs";
 
 // Capture all dependency output: npm diagnostics can include paths and credentials.
-export function runConsumer(command, args, { cwd, env = {}, timeout = 120_000, windowsVerbatimArguments = false } = {}) {
+export function runConsumer(command, args, { cwd, env = {}, timeout = 120_000, windowsVerbatimArguments = false, observeNpm = false } = {}) {
   return new Promise((resolve) => {
     const started = Date.now();
+    const progress = observeNpm ? createNpmProgress() : undefined;
     const child = spawn(command, args, {
       cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true, windowsVerbatimArguments, detached: process.platform !== "win32",
@@ -31,10 +33,10 @@ export function runConsumer(command, args, { cwd, env = {}, timeout = 120_000, w
     };
     const timer = setTimeout(() => terminate("timeout"), timeout);
     child.stdout.on("data", (chunk) => { stdout += chunk; if (stdout.length > 8 * 1024 * 1024) terminate("output-limit"); });
-    child.stderr.on("data", (chunk) => { stderr += chunk; if (stderr.length > 8 * 1024 * 1024) terminate("output-limit"); });
+    child.stderr.on("data", (chunk) => { progress?.push(chunk, Date.now() - started); stderr += chunk; if (stderr.length > 8 * 1024 * 1024) terminate("output-limit"); });
     child.on("error", () => {
       clearTimeout(timer);
-      resolve({ status: null, termination: "spawn-error", exitStatus, exitSignal, exitBeforeTimeout, elapsedMs: Date.now() - started, stdout, stderr });
+      resolve({ status: null, npmProgress: progress?.finish(), termination: "spawn-error", exitStatus, exitSignal, exitBeforeTimeout, elapsedMs: Date.now() - started, stdout, stderr });
     });
     child.on("exit", (status, signal) => {
       exited = true;
@@ -43,7 +45,7 @@ export function runConsumer(command, args, { cwd, env = {}, timeout = 120_000, w
     });
     child.on("close", (status) => {
       clearTimeout(timer);
-      resolve({ status: termination ? null : status, termination: termination ?? (status === 0 ? undefined : "nonzero-exit"), exitStatus, exitSignal, exitBeforeTimeout: termination ? exitBeforeTimeout : exited, elapsedMs: Date.now() - started, stdout, stderr });
+      resolve({ npmProgress: progress?.finish(), status: termination ? null : status, termination: termination ?? (status === 0 ? undefined : "nonzero-exit"), exitStatus, exitSignal, exitBeforeTimeout: termination ? exitBeforeTimeout : exited, elapsedMs: Date.now() - started, stdout, stderr });
     });
   });
 }
@@ -88,9 +90,16 @@ export async function consumerNpm(args, cwd, env = {}, phase = "npm") {
     ? join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")
     : join(dirname(process.execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"));
   startOperation(phase);
-  const result = await runConsumer(process.execPath, [npmCli, ...args], {
+  const observeNpm = phase === "archive-upgrade";
+  const npmArgs = observeNpm ? [...args, "--loglevel=silly", "--timing"] : args;
+  const result = await runConsumer(process.execPath, [npmCli, ...npmArgs], {
+    observeNpm,
     cwd, env: { ...env, npm_config_engine_strict: "false", npm_config_legacy_peer_deps: "false", npm_config_audit: "false", npm_config_fund: "false", npm_config_ignore_scripts: "true" },
   });
+  if (result.npmProgress) {
+    result.npmProgress.truncated ||= result.termination === "output-limit";
+    console.log(`consumer npm progress: ${JSON.stringify(result.npmProgress)}`);
+  }
   if (result.status !== 0) throw new ConsumerProcessError(phase, result);
   if (/deprecated @cashu\/cashu-ts@/u.test(result.stdout + result.stderr)) {
     throw new ConsumerProcessError(phase, { ...result, termination: "assertion" });

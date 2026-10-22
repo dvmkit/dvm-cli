@@ -74,7 +74,15 @@ it("withholds consumer npm diagnostics on a real invalid-archive install", () =>
   });
   expect(outcome.status).toBe(1);
   expect(outcome.stderr).toMatch(/^runtime failed: consumer install and upgrade; archive-upgrade: reason=nonzero-exit, elapsed_ms=[0-9]+, exit=[1-9][0-9]*, signal=none, exit_before_timeout=true, npm_category=unknown \(captured output withheld\)\n$/u);
-  expect(outcome.stdout).toBe("consumer operation start: legacy-install\nconsumer operation start: legacy-skill-check\nconsumer operation start: archive-upgrade\n");
+  const lines = outcome.stdout.trimEnd().split("\n");
+  expect(lines.slice(0, 3)).toEqual(["consumer operation start: legacy-install", "consumer operation start: legacy-skill-check", "consumer operation start: archive-upgrade"]);
+  expect(lines).toHaveLength(4);
+  expect(lines[3]).toMatch(/^consumer npm progress: /u);
+  const progress = JSON.parse(lines[3].slice("consumer npm progress: ".length));
+  expect(progress.total_lines).toBeGreaterThan(0);
+  expect(progress.last_output_ms).toEqual(expect.any(Number));
+  expect(outcome.stdout).not.toContain(temporary);
+  expect(outcome.stdout).not.toContain(archive);
 });
 
 it("contains malformed job JSON in the asynchronous fixture callback", () => {
