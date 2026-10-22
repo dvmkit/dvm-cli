@@ -93,6 +93,7 @@ export async function consumerNpm(args, cwd, env = {}, phase = "npm") {
   const observeNpm = phase === "archive-upgrade";
   const npmArgs = observeNpm ? [...args, "--loglevel=silly", "--timing"] : args;
   const result = await runConsumer(process.execPath, [npmCli, ...npmArgs], {
+    ...(process.platform === "win32" && phase === "archive-upgrade" ? { timeout: 300_000 } : {}),
     observeNpm,
     cwd, env: { ...env, npm_config_engine_strict: "false", npm_config_legacy_peer_deps: "false", npm_config_audit: "false", npm_config_fund: "false", npm_config_ignore_scripts: "true" },
   });
