@@ -31,9 +31,12 @@ import {
   type JobAccessOptions,
   type ResolvedStoredJobAccess,
   resolveStoredJobAccess,
+  sameEndpoint,
   withJobTokenRedaction,
 } from "../lib/job-access";
 import { loadMessages } from "../lib/messages";
+import { isTerminalJobStatus } from "../lib/next-action";
+import { JOB_READ_TIMEOUT_MS, pendingPaymentRequest, reconcileInFlightPaymentRequest } from "../lib/yield-state";
 import { applyMintPin } from "../lib/mint-pin";
 import { paidConfirmationDisplay } from "../lib/payment-copy";
 import { handlePaymentRequest, type PaidPaymentResult } from "../lib/payment-responder";
@@ -84,10 +87,46 @@ async function payWithAccess(
 
   const msgs = loadMessages(jobId);
   const pending = stored.pendingCreditPayment;
-  const paymentMessage = findPendingPaymentRequest(msgs);
-  const paymentReq = pending?.request ?? paymentMessage?.content;
+  const transport = createDvmTransport();
+  const inFlightMessage = msgs.findLast((message) => message.from === "provider" &&
+    message.type === "payment-request" && stored.inFlightPaymentRequestSeqs?.includes(message.seq));
+  let paymentMessage = pendingPaymentRequest(msgs) ?? inFlightMessage;
+  // Recovery must retain the original intent when a send may have succeeded.
+  // New debits use provider history without consuming the ordinary read cursor.
+  const recovering = pending || (paymentMessage && stored.inFlightPaymentRequestSeqs?.includes(paymentMessage.seq));
+  if (!recovering) {
+    try {
+      const readOptions = { jobToken, timeoutMs: JOB_READ_TIMEOUT_MS };
+      const snapshot = await transport.status(jobId, ref, readOptions);
+      const history = snapshot.status === "awaiting-input"
+        ? await transport.getMessages(jobId, 0, ref, readOptions)
+        : [];
+      paymentMessage = pendingPaymentRequest(history);
+    } catch (error) {
+      transport.close();
+      throw error;
+    }
+  }
+  const inactiveRequest = isTerminalJobStatus(stored.status) ||
+    (paymentMessage?.type === "payment-request" && paymentMessage.content.expires_at_ms !== undefined &&
+      paymentMessage.content.expires_at_ms <= Date.now());
+  if (!pending && inactiveRequest) {
+    // Acceptance can arrive after expiry. Record it before refusing any new debit.
+    if (paymentMessage && stored.inFlightPaymentRequestSeqs?.includes(paymentMessage.seq) &&
+        ref.endpoint && sameEndpoint(stored.endpoint, ref.endpoint)) {
+      try {
+        await reconcileInFlightPaymentRequest(jobId, paymentMessage.seq, transport, ref, { jobToken });
+      } catch (error) {
+        transport.close();
+        throw error;
+      }
+    }
+    paymentMessage = undefined;
+  }
+  const paymentReq = pending?.request ?? (paymentMessage?.type === "payment-request" ? paymentMessage.content : undefined);
   const requestSeq = pending?.authorization.request_seq ?? paymentMessage?.seq;
   if (!paymentReq) {
+    transport.close();
     throw new DvmError(
       "no_payment_pending",
       "No pending payment request found for this job.",
@@ -105,8 +144,6 @@ async function payWithAccess(
     applyMintPin(paymentReq.mints ?? [], opts.mint);
     updateJob(jobId, { pinnedMint: opts.mint });
   }
-
-  const transport = createDvmTransport();
 
   if (!stored.policy) {
     throw new DvmError(
@@ -133,6 +170,7 @@ async function payWithAccess(
     maxCashuPrincipalSats,
     requestSeq,
     approval: "explicit",
+    creditRecoveryOnly: pending !== undefined,
   });
 
   if (result === "over-budget") {
@@ -331,17 +369,4 @@ function parsePositiveCashuSats(raw: string | undefined): number | undefined {
     );
   }
   return value;
-}
-
-function findPendingPaymentRequest(
-  msgs: { type: string; content: unknown; seq: number }[]
-): { content: PaymentRequestContent; seq: number } | undefined {
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const msg = msgs[i];
-    if (msg.type === "payment") return undefined; // Already paid
-    if (msg.type === "payment-request") {
-      return { content: msg.content as PaymentRequestContent, seq: msg.seq };
-    }
-  }
-  return undefined;
 }

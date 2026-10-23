@@ -1,3 +1,4 @@
+import lockfile from "proper-lockfile";
 import { createServer, type Server } from "node:http";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,6 +12,9 @@ import { waitForJob } from "../src/lib/wait-for-job";
 import { streamLoop } from "../src/lib/stream-loop";
 import { appendMessage } from "../src/lib/messages";
 import { pay } from "../src/commands/pay";
+import { status } from "../src/commands/status";
+import { loadMessages } from "../src/lib/messages";
+import { json } from "../src/lib/output";
 
 const budget = vi.hoisted(() => ({ enforce: vi.fn(), record: vi.fn(), rate: 100000 as number | null }));
 vi.mock("../src/lib/btc-rate", () => ({ tryResolveBtcUsdRate: async () => budget.rate === null ? null : { rate: budget.rate, stale: false } }));
@@ -64,10 +68,14 @@ beforeEach(async () => {
           credit: { balance_payment: advertisement, currency: "usd", funding: ["cashu"], min_micro: 1000, max_micro: 5000000, ttl_ms: 86400000 } }));
         return;
       }
+      if (request.method === "GET" && request.url === "/v1/job/job-a") {
+        response.end(JSON.stringify({ status: accepted ? "completed" : "awaiting-input" }));
+        return;
+      }
       if (request.method === "GET") {
         response.end(JSON.stringify({ messages: [accepted && !repeatPaidAsk
           ? { seq: 6, from: "provider", timestamp: 1700000000, type: "complete", content: { status: "success", summary: "Done" } }
-          : { seq: 4, from: "provider", timestamp: 1700000000, type: "payment-request", content: ask }] }));
+          : { seq: 4, from: "provider", timestamp: 1700000000, type: "payment-request", content: { ...ask, credit: { amount_micro: expectedMicro, currency: expectedCurrency } } }] }));
         return;
       }
       const body = JSON.parse(Buffer.concat(chunks).toString());
@@ -114,6 +122,53 @@ const respond = (overrides = policy, request = ask) => handlePaymentRequest("job
   new HttpsTransport(), { endpoint }, { requestSeq: 4 });
 
 describe("balance-backed mid-job payments", () => {
+  it.each([
+    { inactive: "expired", resolved: "cleared" }, { inactive: "terminal", resolved: "cleared" },
+    { inactive: "expired", resolved: "booked" }, { inactive: "terminal", resolved: "booked" },
+  ])("keeps $inactive credit recovery closed when another payer $resolved the intent before lock acquisition", async ({ inactive, resolved }) => {
+    reply = "unavailable";
+    await expect(respond()).rejects.toBeInstanceOf(Error);
+    const intent = loadJob("job-a")!.pendingCreditPayment!;
+    if (inactive === "expired") intent.request = { ...intent.request, expires_at_ms: 1 };
+    updateJob("job-a", { pendingCreditPayment: intent, ...(inactive === "terminal" ? { status: "completed" as const } : {}) });
+    reply = "ok";
+    accepted = resolved === "booked";
+    const acquire = lockfile.lockSync.bind(lockfile);
+    const lock = vi.spyOn(lockfile, "lockSync").mockImplementation((file, options) => {
+      if (String(file).includes(".payment-")) {
+        if (resolved === "booked") bookCreditPayment("job-a", intent);
+        else updateJob("job-a", { pendingCreditPayment: undefined });
+      }
+      return acquire(file, options);
+    });
+    try {
+      if (resolved === "booked") await pay("job-a", {});
+      else await expect(pay("job-a", {})).rejects.toMatchObject({ code: "credit_payment_retry_required" });
+    } finally { lock.mockRestore(); }
+    expect(received).toHaveLength(1);
+    expect(loadJob("job-a")?.pendingCreditPayment).toBeUndefined();
+    expect(loadJob("job-a")?.paymentsHonoured).toBe(resolved === "booked" ? 1 : undefined);
+    expect(loadJob("job-a")?.bookedCreditPayments?.map((payment) => payment.authorization.payment_id))
+      .toEqual(resolved === "booked" ? [intent.authorization.payment_id] : undefined);
+    expect(budget.enforce).not.toHaveBeenCalled();
+    expect(budget.record).not.toHaveBeenCalled();
+  });
+
+  it("ordinary status hands the untouched request to pay without consuming messages or charging twice", async () => {
+    updateJob("job-a", { messageCursor: 3 });
+    await status("job-a", {});
+    await status("job-a", {});
+    expect(vi.mocked(json).mock.calls.at(-1)?.[0]).toMatchObject({ next_action: { type: "pay", amount_msats: 1500 } });
+    expect(loadJob("job-a")?.messageCursor).toBe(3);
+    expect(loadMessages("job-a")).toEqual([]);
+    await pay("job-a", {});
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ request_seq: 4, amount_micro: 1500, currency: "usd" });
+    expect(loadJob("job-a")).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1 });
+    await expect(pay("job-a", {})).rejects.toMatchObject({ code: "no_payment_pending" });
+    expect(received).toHaveLength(1);
+  });
+
   it("uses the accepted draw with signed ask/path/token and books consumption once without another wallet debit", async () => {
     await expect(respond()).resolves.toMatchObject({ rail: "credit", amountMsats: 1500 });
     expect(received[0].draw_id).toBe("accepted-draw");

@@ -445,6 +445,8 @@ describe("follow-up command progress", () => {
     appendMessages(jobId, [msg(5, "payment-request", { amount_msats: 1000, reason: "A block" })]);
     transport([[msg(6, "progress", { percent_complete: 50 })]]);
     if (command === "pay") {
+      vi.mocked(seams.transport.status).mockResolvedValue({ status: "awaiting-input" } as never);
+      vi.mocked(seams.transport.getMessages).mockResolvedValue([msg(5, "payment-request", { amount_msats: 1000, reason: "A block" })]);
       await pay(jobId, {});
       expect(seams.pay).toHaveBeenCalledTimes(1);
     } else {
