@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.11.0](https://github.com/dvmkit/dvm-cli/compare/v0.10.0...v0.11.0) (2026-10-23)
+
+
+### Features
+
+* relay caller deadlines with SDK 0.14.2 ([#28](https://github.com/dvmkit/dvm-cli/issues/28)) ([d919e11](https://github.com/dvmkit/dvm-cli/commit/d919e11830a6c20142f082079d4887eb9a8cd596))
+* show itemized job spending in status ([#25](https://github.com/dvmkit/dvm-cli/issues/25)) ([74a6a18](https://github.com/dvmkit/dvm-cli/commit/74a6a18dd886949f66b661755841290e26dfb4fb))
+* show next steps in human job output ([#23](https://github.com/dvmkit/dvm-cli/issues/23)) ([0db413c](https://github.com/dvmkit/dvm-cli/commit/0db413cc90ec2fdc92bc1cf88be2bf8a6ffb855d))
+* verify downloaded files against signed receipts ([#22](https://github.com/dvmkit/dvm-cli/issues/22)) ([5e54814](https://github.com/dvmkit/dvm-cli/commit/5e54814d08b8477b2937161fb4682d064422ee25))
+* wait for long jobs within stored payment policy ([#26](https://github.com/dvmkit/dvm-cli/issues/26)) ([9ce8515](https://github.com/dvmkit/dvm-cli/commit/9ce8515fece9748319811f66b1815534c089e5f9))
+
+
+### Bug Fixes
+
+* delay retries for uncertain job payments ([#29](https://github.com/dvmkit/dvm-cli/issues/29)) ([208ba1c](https://github.com/dvmkit/dvm-cli/commit/208ba1cddfcf4f1ebe0a74c2dc6821751f701332))
+* **payments:** count upfront credit draws toward job limits ([094c268](https://github.com/dvmkit/dvm-cli/commit/094c2686441a412e40df53a84950f4b3f1a8b471))
+* refresh pending payment requests before paying ([7fc7a90](https://github.com/dvmkit/dvm-cli/commit/7fc7a90d90977ead1f22df80dd40f867c52f50ed))
+
 ## [0.10.0](https://github.com/dvmkit/dvm-cli/compare/v0.9.2...v0.10.0) (2026-10-22)
 
 
