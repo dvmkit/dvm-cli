@@ -47,7 +47,10 @@ async function exerciseReceiptRecovery(packageRoot, sdk, sample) {
   let drawId, signedReceipt;
   let published = false;
   const message = (seq, type, content) => ({ seq, type, content, from: "provider", timestamp: new Date().toISOString() });
+  const upfrontPayment = () => ({ amount_msats: 100_000, amount_micro: 100_000, currency: sample.currency,
+    credit_id: creditId, draw_id: drawId });
   const completed = () => ({ job_id: jobId, status: "completed", summary: "Done", has_artifacts: false,
+    upfront_payment: upfrontPayment(),
     ...(published ? { receipt: signedReceipt } : {}) });
   const creditWire = () => ({ credit_id: creditId, currency: sample.currency,
     balance_micro: 500_000, remaining_micro: 500_000, ledger_seq: 1,
@@ -89,7 +92,7 @@ async function exerciseReceiptRecovery(packageRoot, sdk, sample) {
         assert.equal(typeof drawId, "string");
         counters.draws++;
         response.setHeader("DVM-Job-Identity-V1", jobId);
-        reply(202, { job_id: jobId, status: "processing" });
+        reply(202, { job_id: jobId, status: "processing", upfront_payment: upfrontPayment() });
       } else if (request.method === "POST" && path === `/v1/job/${jobId}/messages`) {
         const authorization = body.content.credit;
         verifier.checkAuth(authorization, { audience, method: "POST", path, capability: null });
@@ -158,6 +161,10 @@ globalThis.fetch = (input, init) => {
     const budgetBefore = snapshot(root, "budget.json");
     const walletBefore = snapshot(root, "agent-wallet.json");
     const jobBefore = readJson(join(root, "jobs.json"))[0];
+    assert.equal(jobBefore.totalPaidMsats, 100_000 + sample.askMsats);
+    assert.equal(jobBefore.paymentsHonoured, 2);
+    assert.equal(jobBefore.upfrontCreditBooked, true);
+    assert.deepEqual(jobBefore.upfrontPayment, upfrontPayment());
 
     // Gate publication on request completion, making the race deterministic.
     published = true;
@@ -180,7 +187,8 @@ globalThis.fetch = (input, init) => {
     assert.equal(snapshot(root, "budget.json"), budgetBefore);
     assert.equal(snapshot(root, "agent-wallet.json"), walletBefore);
     const jobAfter = readJson(join(root, "jobs.json"))[0];
-    for (const field of ["totalPaidMsats", "paymentsHonoured", "bookedCreditPayments", "creditBinding"])
+    for (const field of ["totalPaidMsats", "paymentsHonoured", "bookedCreditPayments", "creditBinding",
+      "upfrontPayment", "upfrontCreditBooked", "upfrontCreditConflict"])
       assert.deepEqual(jobAfter[field], jobBefore[field]);
   } finally {
     server.closeAllConnections();
