@@ -56,6 +56,8 @@ import {
   loadJob,
   markJobTerminal,
   saveJob,
+  saveSubmittedJob,
+  recordUpfrontCreditPayment,
   updateJob,
 } from "../lib/job-store";
 import {
@@ -849,7 +851,7 @@ export async function request(opts: RequestOptions): Promise<void> {
     return;
   }
 
-  saveJob({
+  saveSubmittedJob({
     id: receipt.jobId,
     ...transactionRecordFields(receipt),
     endpoint,
@@ -882,6 +884,7 @@ export async function request(opts: RequestOptions): Promise<void> {
     ...receiptTrustFields(providerInfo),
     ...localCorrelationJobFields(localCorrelationId),
   });
+  recordUpfrontCreditPayment(receipt.jobId, receipt.upfrontPayment);
 
   if (noStream) {
     transport.close();

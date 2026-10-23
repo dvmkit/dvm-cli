@@ -3,7 +3,8 @@ import { existsSync, readFileSync, writeFileSync, renameSync, openSync, closeSyn
 import { JOBS_FILE } from "@dvmkit/sdk/internal";
 import { dirname } from "node:path";
 import lockfile from "proper-lockfile";
-import type { PaymentContent } from "@dvmkit/sdk";
+import type { PaymentContent, UpfrontPayment } from "@dvmkit/sdk";
+import { parseUpfrontPayment } from "./upfront-payment";
 import type { PaymentRequestContent } from "@dvmkit/sdk/internal";
 import type { JobCompletion } from "./completion-hints";
 import { ensureConfigDir } from "@dvmkit/sdk/internal";
@@ -26,6 +27,10 @@ export interface CreditPaymentIntent {
 }
 
 export interface JobRecord {
+  /** Original accepted debit, independent of later draw growth and receipts. */
+  upfrontPayment?: UpfrontPayment;
+  upfrontCreditBooked?: true;
+  upfrontCreditConflict?: true;
   /** Absent on legacy jobs: their existing draw must never be guessed. */
   creditBinding?: { creditId: string; drawId: string; callerPubkey: string } | { unbound: true; callerPubkey: string };
   pendingCreditPayment?: CreditPaymentIntent;
@@ -158,6 +163,52 @@ export interface ArtifactRef {
 
 export function saveJob(job: JobRecord): void {
   mutateJobs((jobs) => { jobs.push(job); });
+}
+
+/** Replayed submits preserve the original record, including subsequent payments. */
+export function saveSubmittedJob(job: JobRecord): void {
+  mutateJobs((jobs) => {
+    const existing = jobs.find((entry) => entry.id === job.id);
+    if (!existing) jobs.push(job);
+    else if (existing.endpoint !== job.endpoint || (existing.requestId && existing.requestId !== job.requestId))
+      throw new Error("Submitted job conflicts with an existing local job.");
+  });
+}
+
+export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOnRail = false): void {
+  const payment = parseUpfrontPayment(value);
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (!job || !payment) return;
+    // Fund-and-draw submissions already book their attached rail payment.
+    if (paidOnRail || (job.paymentMethod && job.paymentMethod !== "credit")) {
+      job.upfrontPayment ??= payment;
+      return;
+    }
+    if (!payment.credit_id || !payment.draw_id) {
+      if (job.paymentMethod === "credit") job.upfrontCreditConflict = true;
+      return;
+    }
+    const binding = job.creditBinding;
+    if (!binding || "unbound" in binding || binding.creditId !== payment.credit_id || binding.drawId !== payment.draw_id) {
+      job.upfrontCreditConflict = true;
+      return;
+    }
+    if (job.upfrontPayment && JSON.stringify(job.upfrontPayment) !== JSON.stringify(payment)) {
+      job.upfrontCreditConflict = true;
+      return;
+    }
+    job.upfrontPayment = payment;
+    job.paymentMethod = "credit";
+    if (job.upfrontCreditBooked) return;
+    job.totalPaidMsats = (job.totalPaidMsats ?? 0) + payment.amount_msats;
+    job.paymentsHonoured = (job.paymentsHonoured ?? 0) + (payment.amount_msats > 0 ? 1 : 0);
+    job.upfrontCreditBooked = true;
+  });
+}
+
+export function hasUnknownUpfrontCredit(job: JobRecord): boolean {
+  return job.upfrontCreditConflict === true || (job.paymentMethod === "credit" && (!job.upfrontCreditBooked || !parseUpfrontPayment(job.upfrontPayment)));
 }
 
 /** Merge a partial update into an existing job record. No-op if job not found. */

@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { jobSpend } from "../job-spend";
-import { addPayment, loadJob, markJobTerminal, saveJob } from "../job-store";
+import { addPayment, loadJob, markJobTerminal, recordUpfrontCreditPayment, saveJob } from "../job-store";
 import { appendMessages } from "../messages";
 
 it("includes the upfront Cashu payment while active and after completion", () => {
@@ -67,4 +67,30 @@ it("flags an upward-tampered total without conversation charges", () => {
   const spend = jobSpend({ id: "tampered-upfront-bill", endpoint: "https://provider.example", submittedAt: 1,
     status: "completed", costMsats: 2000, totalPaidMsats: 3000, paymentsHonoured: 1, paymentMethod: "cashu" });
   expect(spend.log_mismatch).toBe(true);
+});
+
+it.each(["processing", "completed"] as const)("shows the original credit debit in the %s bill", (status) => {
+  const id = `credit-bill-${status}`;
+  saveJob({ id, endpoint: "https://provider.example", status, submittedAt: 1, paymentMethod: "credit",
+    creditBinding: { creditId: "credit", drawId: "draw", callerPubkey: "caller" } });
+  recordUpfrontCreditPayment(id, { amount_msats: 6000, amount_micro: 6000, currency: "usd",
+    credit_id: "credit", draw_id: "draw" });
+  addPayment(id, 1000);
+  appendMessages(id, [
+    { seq: 1, from: "provider", timestamp: 1767225600000, type: "payment-request",
+      content: { amount_msats: 1000, reason: "More work" } },
+    { seq: 2, from: "requester", timestamp: 1767225600000, type: "payment", content: { amount_msats: 1000 } },
+  ]);
+  const spend = jobSpend(loadJob(id)!);
+  expect(spend).toMatchObject({ total_msats: 7000, upfront_display: "$0.0060 USD (6 sats)", payments: 2, log_mismatch: false });
+  expect(spend.display).toContain("Paid 7 sats over 2 charges");
+  expect(spend.display).not.toContain("not recorded");
+});
+
+it("keeps legacy credit consumption unknown even with a zero recorded total", () => {
+  const spend = jobSpend({ id: "legacy-credit-bill", endpoint: "https://provider.example", status: "completed",
+    submittedAt: 1, paymentMethod: "credit", totalPaidMsats: 0 });
+  expect(spend.display).toContain("upfront amount is not recorded locally");
+  expect(spend.display).not.toContain("free");
+  expect(spend).not.toHaveProperty("upfront_display");
 });

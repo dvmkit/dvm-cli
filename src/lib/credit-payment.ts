@@ -24,6 +24,7 @@ import { loadConfig } from "./identity";
 import {
   bookCreditPayment,
   loadJob,
+  hasUnknownUpfrontCredit,
   mutateCreditPayment,
   type CreditPaymentIntent,
   type PaymentApproval,
@@ -129,6 +130,8 @@ export async function tryCreditPayment(args: {
   const { jobId, request, requestSeq, transport, provider, jobToken } = args;
   const job = loadJob(jobId);
   const ask = request.credit;
+  if (job && hasUnknownUpfrontCredit(job))
+    throw new DvmError("upfront_credit_unknown", "The original upfront credit debit must be recovered before another balance payment.");
   if (!job?.creditBinding || !ask || !Number.isSafeInteger(requestSeq) || requestSeq! < 0 ||
       !Number.isSafeInteger(ask.amount_micro) || ask.amount_micro <= 0 || !/^[a-z]{3}$/.test(ask.currency)) return false;
   const signer = findSigningIdentityByPubkey(job.creditBinding.callerPubkey);

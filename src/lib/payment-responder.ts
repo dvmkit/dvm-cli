@@ -24,6 +24,7 @@ import {
   addPayment,
   clearPaymentRequestInFlight,
   loadJob,
+  hasUnknownUpfrontCredit,
   markPaymentRequestPaid,
   markPaymentRequestInFlight,
   type PaymentApproval,
@@ -102,6 +103,9 @@ async function handleLockedPaymentRequest(
     requestSeq: opts.requestSeq, approval: opts.approval ?? "auto",
   };
   const job = loadJob(jobId);
+  if (job && hasUnknownUpfrontCredit(job))
+    throw new DvmError("upfront_credit_unknown", "The original upfront credit debit is unknown or conflicting.",
+      "Recover the accepted upfront amount with 'dvm request-result' before authorizing more payments.");
   const spent = job?.totalPaidMsats ?? 0;
   const paymentsHonoured = job?.paymentsHonoured ?? 0;
   // Caller-pinned spend mint, persisted at request time or by

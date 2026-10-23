@@ -115,6 +115,20 @@ it.each([0, 1000])("leaves receipt comparison unknown for prepaid credit with %i
   expect(spend).not.toHaveProperty("upfront_display");
 });
 
+it("renders a recorded upfront credit draw in JSON and human bills offline", async () => {
+  const root = seed({ paymentMethod: "credit", totalPaidMsats: 6000, paymentsHonoured: 1,
+    upfrontCreditBooked: true, upfrontPayment: { amount_msats: 6000, amount_micro: 6000, currency: "usd",
+      credit_id: "credit", draw_id: "draw" } });
+  const output = await run(root);
+  expect(output.code).toBe(0);
+  const spend = JSON.parse(output.stdout).spend;
+  expect(spend).toMatchObject({ total_msats: 6000, payments: 1, upfront_display: "$0.0060 USD (6 sats)", log_mismatch: false });
+  expect(spend.display).not.toContain("not recorded");
+  const human = await run(root, ["--human"]);
+  expect(human.code).toBe(0);
+  expect(human.stderr).toContain("Upfront: $0.0060 USD (6 sats)");
+});
+
 it.each([4000, 6000])("neutrally compares a signed %i-msat receipt with 5000 msats paid", async (receiptTotal) => {
   const dvm = attestedDvm();
   const receipt = dvm.sign({ job_id: "bill", paid: { ...unsignedReceipt().paid, msats: receiptTotal } });
