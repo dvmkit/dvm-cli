@@ -73,7 +73,7 @@ export async function handlePaymentRequest(
   provider: ProviderRef,
   // `jobToken` is the anonymous-flow per-job token threaded into
   // every `payment` `sendMessage`.
-  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval }
+  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean }
 ): Promise<PaymentResult> {
   return withJobPaymentLock(jobId, (assertOwned) => {
     // Guard every rail, balance recovery, and retry at the dispatch boundary.
@@ -97,7 +97,7 @@ async function handleLockedPaymentRequest(
   policy: JobPolicy,
   transport: Transport,
   provider: ProviderRef,
-  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval }
+  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean }
 ): Promise<PaymentResult> {
   const approval: { requestSeq: number; approval: PaymentApproval } | undefined = opts?.requestSeq === undefined ? undefined : {
     requestSeq: opts.requestSeq, approval: opts.approval ?? "auto",
@@ -140,6 +140,10 @@ async function handleLockedPaymentRequest(
     if (pending.authorization.request_seq !== opts?.requestSeq)
       throw new DvmError("credit_payment_retry_required", "The prior balance payment was refused; reload this job's pending ask.");
   }
+  // A competing payer may clear the saved intent before this lock is acquired.
+  if (opts?.creditRecoveryOnly)
+    throw new DvmError("credit_payment_retry_required", "The saved balance payment was not recovered; no replacement payment was sent.",
+      `Run \`dvm status ${shellQuoteArg(jobId)}\` to refresh the job, then run \`dvm pay ${shellQuoteArg(jobId)}\` only if payment is still requested.`);
 
   if (matchingEndpoint && opts?.requestSeq !== undefined) {
     if (job.inFlightPaymentRequestSeqs?.includes(opts.requestSeq))
