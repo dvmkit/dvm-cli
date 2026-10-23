@@ -25,6 +25,7 @@ import {
   loadJob,
   markJobTerminal,
   saveJob,
+  recordUpfrontCreditPayment,
   updateJob,
 } from "../lib/job-store";
 
@@ -164,12 +165,14 @@ export async function requestResult(
       pinnedMint: intent.pinnedMint,
       strictPerCall: intent.strictPerCall,
       maxCashuFeeSats: intent.maxCashuFeeSats,
-      paymentMethod: paymentMethod(receipt),
+      paymentMethod: creditBinding && !originalData?.fund ? "credit" : paymentMethod(receipt),
       receiptsSupported: intent.receiptsSupported,
       builderAnchor: intent.builderAnchor,
       ...restored,
     });
   }
+
+  recordUpfrontCreditPayment(receipt.jobId, receipt.upfrontPayment, originalData?.fund !== undefined);
 
   if (
     receipt.status === "completed" ||

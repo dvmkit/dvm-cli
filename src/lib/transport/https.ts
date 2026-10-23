@@ -1,3 +1,4 @@
+import { parseUpfrontPayment } from "../upfront-payment";
 import {
   type CancelOptions,
   type CreditOpResult,
@@ -415,6 +416,7 @@ export class HttpsTransport implements Transport {
         ...(tempoTransactionHash ? { transactionHash: tempoTransactionHash } : {}),
         ...(feedbackClaim ? { feedbackClaim } : {}),
         ...parseFundingResponse(data),
+        upfrontPayment: parseUpfrontPayment(data.upfront_payment),
       };
     }
 
@@ -431,6 +433,7 @@ export class HttpsTransport implements Transport {
       ...(feedbackClaim ? { feedbackClaim } : {}),
       ...parseSignedReceipt(data.receipt),
       ...parseFundingResponse(data),
+      upfrontPayment: parseUpfrontPayment(data.upfront_payment),
     };
   }
 
@@ -1089,6 +1092,7 @@ function parseRequestResultResponse(
     ...(typeof data.job_token === "string" ? { jobToken: data.job_token } : {}),
     ...(receipt ? { receipt } : {}),
     ...parseFundingResponse(data),
+    upfrontPayment: parseUpfrontPayment(data.upfront_payment),
   };
 }
 

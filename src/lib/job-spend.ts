@@ -1,6 +1,6 @@
 import { asProviderText, type JobReceipt, type PaymentRequestContent } from "@dvmkit/sdk/internal";
 import { formatPaymentAmount } from "./currency";
-import type { JobRecord } from "./job-store";
+import { hasUnknownUpfrontCredit, type JobRecord } from "./job-store";
 import { loadMessages } from "./messages";
 import { isTerminalJobStatus } from "./next-action";
 
@@ -36,15 +36,16 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
     });
     request = undefined;
   }
-  // Submit books upfront rail payments in both counters before any conversation
+  // Submit books upfront payments in both counters before any conversation
   // charges. costMsats is only written at completion and must not be added again.
   const chargeTotal = charges.reduce((sum, charge) => sum + charge.amount_msats, 0);
   const total = job.totalPaidMsats ?? job.costMsats ?? 0;
-  const upfront = Math.max(0, total - chargeTotal);
+  const knownCredit = job.paymentMethod === "credit" && !hasUnknownUpfrontCredit(job);
+  const upfront = knownCredit ? job.upfrontPayment!.amount_msats : Math.max(0, total - chargeTotal);
   const payments = job.paymentsHonoured ?? charges.length + (upfront > 0 ? 1 : 0);
   const currency = charges[0]?.fiat_amount?.currency;
-  // Upfront fiat prices are not stored locally; do not extrapolate them from
-  // conversation prices. A common fiat unit is usable only for the whole bill.
+  // Conversation fiat prices describe the whole bill only when no upfront
+  // charge is present; do not extrapolate an upfront price from later charges.
   const fiat = upfront === 0 && currency && charges.every((charge) => charge.fiat_amount?.currency === currency)
     ? { currency, amount: charges.reduce((sum, charge) => sum + charge.fiat_amount!.amount, 0) } : undefined;
   const totalDisplay = formatPaymentAmount(total, fiat, { anchor: false });
@@ -56,11 +57,13 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
     { anchor: false }) : undefined;
   const logMismatch = isTerminalJobStatus(job.status) && (chargeTotal > total
     || payments !== charges.length + (upfront > 0 ? 1 : 0)
-    || (job.costMsats !== undefined && total - chargeTotal !== job.costMsats));
+    || (knownCredit ? total !== chargeTotal + upfront
+      : job.costMsats !== undefined && total - chargeTotal !== job.costMsats));
+  // Credit receipts reflect settlement; local counters retain the original hold.
   const receiptMismatch = receipt && job.paymentMethod !== "credit" ? receipt.paid.msats !== total : undefined;
   const receiptTotalDisplay = receipt
     ? formatPaymentAmount(receipt.paid.msats, undefined, { anchor: false }) : undefined;
-  let display = job.paymentMethod === "credit"
+  let display = job.paymentMethod === "credit" && !knownCredit
     ? "Paid from prepaid credit; the upfront amount is not recorded locally"
       + (total > 0 ? `; recorded conversation payments: ${totalDisplay} over ${payments} charge${payments === 1 ? "" : "s"}` : "")
     : total === 0 && charges.length === 0
@@ -70,13 +73,17 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   if (refunds.length > 0) display += `, ${refunds.length} refund${refunds.length === 1 ? "" : "s"}`;
   display += ".";
   if (logMismatch) display += " Local payment log disagrees with the job record.";
-  if (receipt && job.paymentMethod === "credit") display += " The receipt total includes the unrecorded credit draw.";
+  if (receipt && job.paymentMethod === "credit" && !knownCredit) display += " The receipt total includes the unrecorded credit draw.";
   // Rounded labels can match while the msat totals differ, so fall back to exact msats.
   const [receiptLabel, localLabel] = receiptTotalDisplay === totalDisplay
     ? [`${receipt!.paid.msats} msats`, `${total} msats`] : [receiptTotalDisplay, totalDisplay];
   if (receiptMismatch) display += ` Receipt total ${receiptLabel} differs from local total ${localLabel}; mint fees, returned change, or a payment not recorded locally can explain the difference.`;
   return { charges, refunds, total_msats: total, total_display: totalDisplay,
-    ...(upfront > 0 && job.paymentMethod !== "credit" ? { upfront_display: formatPaymentAmount(upfront, undefined, { anchor: false }) } : {}),
+    ...(upfront > 0 && (job.paymentMethod !== "credit" || knownCredit) ? {
+      upfront_display: formatPaymentAmount(upfront, knownCredit && job.upfrontPayment?.amount_micro !== undefined
+        ? { amount: job.upfrontPayment.amount_micro / 1_000_000, currency: job.upfrontPayment.currency! } : undefined,
+      { anchor: false }),
+    } : {}),
     ...(budgetDisplay ? { budget_display: budgetDisplay } : {}),
     payments, max_payments: job.policy?.maxPayments ?? null, log_mismatch: logMismatch,
     ...(receipt ? { receipt_total_display: receiptTotalDisplay,

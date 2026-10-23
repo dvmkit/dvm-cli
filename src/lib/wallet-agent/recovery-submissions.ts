@@ -35,6 +35,7 @@ import {
   loadJob,
   saveJob,
   updateJob,
+  recordUpfrontCreditPayment,
 } from "../job-store";
 import { sameEndpoint } from "../job-access";
 import { requestRecoveryPath } from "../request-recovery-path";
@@ -937,6 +938,7 @@ async function shipEntry(
             ...(record.jobToken && !existing.jobToken ? { jobToken: record.jobToken } : {}),
           });
         } else saveJob(record);
+        recordUpfrontCreditPayment(identity.jobId, response.body?.upfront_payment, true);
       }
       await reconcileResumedJobCredit(active, response.body, httpPost);
       return { kind: "shipped", entry, jobId: identity.jobId };
@@ -1121,10 +1123,12 @@ function saveRecoveredJob(
       requestId,
       ...(jobToken && !existing.jobToken ? { jobToken } : {}),
     });
+    recordUpfrontCreditPayment(jobId, body?.upfront_payment, true);
     return "saved";
   }
   const { jobToken: _unchecked, ...record } = jobRecordFromEntry(entry, jobId, body, undefined);
   saveJob({ ...record, requestId, ...(jobToken ? { jobToken } : {}) });
+  recordUpfrontCreditPayment(jobId, body?.upfront_payment, true);
   return "saved";
 }
 

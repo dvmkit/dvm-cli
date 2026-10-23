@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -470,6 +470,100 @@ describe("generated request IDs", () => {
 });
 
 describe("a credit-funded submit to a recovery-capable provider", () => {
+  it.each(["prepaid", "implicit"])("counts the original %s draw before authorizing later charges", async (source) => {
+    writeConfig("auto");
+    seedCredit(40_000);
+    if (source === "implicit") {
+      const state = JSON.parse(readFileSync(join(root, "credits.json"), "utf8"));
+      state.implicitCredits = [{ ...state.credits[0], creditId: "imp:cashu:released",
+        releasedByJobId: "prior-job", releasedAt: Date.now() }];
+      state.credits = [];
+      writeFileSync(join(root, "credits.json"), JSON.stringify(state));
+    }
+    let upfront: Record<string, unknown>;
+    provider.draw = (post, accepted) => {
+      upfront = { amount_msats: 6000, amount_micro: 6000, currency: "usd",
+        credit_id: post.body.credit_id, draw_id: post.body.draw_id, rail: "cashu" };
+      return answer(202, { job_id: accepted, status: "processing", job_token: provider.token,
+        upfront_payment: upfront }, { [FIELD]: accepted });
+    };
+    const before = budget.loadLedger();
+    await paidRequest({ budget: "10000", maxPayments: "3", stream: false });
+    const requestId = provider.jobPosts[0].body.request_id as string;
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 6000, paymentsHonoured: 1,
+      upfrontCreditBooked: true, upfrontPayment: { amount_msats: 6000 } });
+    const { handlePaymentRequest } = await import("../src/lib/payment-responder");
+    const { HttpsTransport } = await import("../src/lib/transport/https");
+    const transport = new HttpsTransport();
+    const policy = jobs.loadJob("job-a")!.policy!;
+    const ask = { amount_msats: 3000, reason: "Additional work", credit: { amount_micro: 3000, currency: "usd" } };
+    await expect(handlePaymentRequest("job-a", ask, policy, transport,
+      { endpoint: provider.endpoint }, { requestSeq: 4 })).resolves.toMatchObject({ rail: "credit", amountMsats: 3000 });
+    provider.requestResult = () => answer(202, { request_id: requestId, job_id: "job-a", status: "processing",
+      job_token: provider.token, upfront_payment: upfront });
+    seams.rate = 200_000;
+    await requestResult(requestId);
+    await requestResult(requestId);
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 9000, paymentsHonoured: 2,
+      upfrontPayment: { amount_msats: 6000, amount_micro: 6000 } });
+    await expect(handlePaymentRequest("job-a", ask, policy, transport,
+      { endpoint: provider.endpoint }, { requestSeq: 6 })).resolves.toBe("over-budget");
+    expect(provider.balancePayments).toHaveLength(1);
+    expect(budget.loadLedger()).toEqual(before);
+  });
+
+  it("counts a recovered draw toward max-payments without drawing again", async () => {
+    writeConfig("auto");
+    seedCredit(40_000);
+    provider.draw = () => (response) => response.socket?.destroy();
+    await expect(paidRequest({ budget: "10000", maxPayments: "1", stream: false })).rejects.toMatchObject({ code: "request_outcome_unknown" });
+    const original = provider.jobPosts[0].body;
+    const requestId = original.request_id as string;
+    provider.requestResult = () => answer(202, { request_id: requestId, job_id: "job-a", status: "processing",
+      job_token: provider.token, upfront_payment: { amount_msats: 6000,
+        credit_id: original.credit_id, draw_id: original.draw_id } });
+    await requestResult(requestId);
+    await requestResult(requestId);
+    const { handlePaymentRequest } = await import("../src/lib/payment-responder");
+    const { HttpsTransport } = await import("../src/lib/transport/https");
+    await expect(handlePaymentRequest("job-a", { amount_msats: 1000, reason: "More" }, jobs.loadJob("job-a")!.policy!,
+      new HttpsTransport(), { endpoint: provider.endpoint }, { requestSeq: 4 })).resolves.toBe("payment-cap-exceeded");
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 6000, paymentsHonoured: 1 });
+    expect(provider.jobPosts).toHaveLength(1);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, { amount_msats: -1 }, { amount_msats: 1000, credit_id: "wrong", draw_id: "wrong" }])(
+    "refuses further payments when the accepted draw evidence is unknown or invalid: %j", async (upfront) => {
+      writeConfig("auto");
+      seedCredit(40_000);
+      provider.draw = (_post, accepted) => answer(202, { job_id: accepted, status: "processing",
+        upfront_payment: upfront }, { [FIELD]: accepted });
+      await paidRequest({ stream: false });
+      const { handlePaymentRequest } = await import("../src/lib/payment-responder");
+      const { HttpsTransport } = await import("../src/lib/transport/https");
+      await expect(handlePaymentRequest("job-a", { amount_msats: 1000, reason: "More" }, jobs.loadJob("job-a")!.policy!,
+        new HttpsTransport(), { endpoint: provider.endpoint }, { requestSeq: 4 })).rejects.toMatchObject({ code: "upfront_credit_unknown" });
+      expect(provider.balancePayments).toHaveLength(0);
+      expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+    });
+
+  it("does not count fund-and-draw consumption a second time", async () => {
+    writeConfig("auto");
+    seedCredit(0);
+    provider.paid = (post, accepted) => answer(200, { job_id: accepted, status: "completed", summary: "Done",
+      upfront_payment: { amount_msats: 1000, amount_micro: 1000, currency: "usd",
+        credit_id: post.body.credit_id, draw_id: post.body.draw_id } }, { [FIELD]: accepted });
+    await paidRequest();
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 1000, paymentsHonoured: 1 });
+    const requestId = provider.paidPosts()[0].body.request_id as string;
+    const body = provider.paidPosts()[0].body;
+    provider.requestResult = () => answer(202, { request_id: requestId, job_id: "job-a", status: "processing",
+      upfront_payment: { amount_msats: 1000, credit_id: body.credit_id, draw_id: body.draw_id } });
+    await requestResult(requestId);
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 1000, paymentsHonoured: 1 });
+  });
+
   it("binds a fund-and-draw to a persisted request ID on its final signed data", async () => {
     writeConfig("auto");
     seedCredit(0);
@@ -1112,7 +1206,7 @@ function writeConfig(posture: "auto" | "off"): void {
 const completeDraw = (_post: JobPost, accepted: string): Reply =>
   answer(200, { job_id: accepted, status: "completed", summary: "Done" }, { [FIELD]: accepted });
 
-async function paidRequest(extra: { requestId?: string; rail?: string } = {}): Promise<void> {
+async function paidRequest(extra: { requestId?: string; rail?: string; budget?: string; maxPayments?: string; stream?: boolean } = {}): Promise<void> {
   await request({
     endpoint: provider.endpoint,
     input: "Echo",
