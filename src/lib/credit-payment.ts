@@ -25,6 +25,7 @@ import {
   bookCreditPayment,
   loadJob,
   hasUnknownUpfrontCredit,
+  hasUnknownUpfrontRail,
   mutateCreditPayment,
   type CreditPaymentIntent,
   type PaymentApproval,
@@ -129,6 +130,8 @@ export async function tryCreditPayment(args: {
 }): Promise<number | false> {
   const { jobId, request, requestSeq, transport, provider, jobToken } = args;
   const job = loadJob(jobId);
+  if (job && hasUnknownUpfrontRail(job))
+    throw new DvmError("upfront_rail_unknown", "Recover the original upfront rail charge before another balance payment.");
   const ask = request.credit;
   if (job && hasUnknownUpfrontCredit(job))
     throw new DvmError("upfront_credit_unknown", "The original upfront credit debit must be recovered before another balance payment.");

@@ -26,10 +26,12 @@ import {
   markJobTerminal,
   saveJob,
   recordUpfrontCreditPayment,
+  recordUpfrontRailPayment,
   updateJob,
 } from "../lib/job-store";
 
 import { sameEndpoint } from "../lib/job-access";
+import { parseUpfrontPayment } from "../lib/upfront-payment";
 import { isIdentityFailure, type ProviderIdentityError, withRequestResultRecovery } from "../lib/job-identity";
 import { loadRequestIntent, type RequestIntent } from "../lib/request-intent-store";
 import { requestRecoveryPath } from "../lib/request-recovery-path";
@@ -165,13 +167,19 @@ export async function requestResult(
       pinnedMint: intent.pinnedMint,
       strictPerCall: intent.strictPerCall,
       maxCashuFeeSats: intent.maxCashuFeeSats,
-      paymentMethod: creditBinding && !originalData?.fund ? "credit" : paymentMethod(receipt),
+      paymentMethod: creditBinding && !originalData?.fund ? "credit" : intent.railPayment?.method ?? paymentMethod(receipt),
       receiptsSupported: intent.receiptsSupported,
       builderAnchor: intent.builderAnchor,
       ...restored,
     });
   }
 
+  if (!(creditBinding && !originalData?.fund) && existing?.paymentMethod !== "credit") {
+    const accepted = parseUpfrontPayment(receipt.upfrontPayment);
+    const method = intent.railPayment?.method ?? existing?.paymentMethod ?? accepted?.rail ?? paymentMethod(receipt);
+    recordUpfrontRailPayment(receipt.jobId, intent.railPayment ?? (accepted && method
+      ? { method, amountMsats: accepted.amount_msats } : undefined));
+  }
   recordUpfrontCreditPayment(receipt.jobId, receipt.upfrontPayment, originalData?.fund !== undefined);
 
   if (

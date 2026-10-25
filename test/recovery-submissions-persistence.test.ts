@@ -1,15 +1,17 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DvmError, WALLET_FILE, WALLET_VERSION, loadAgentWallet, saveAgentWallet, type AgentWallet, type PendingSubmission } from "@dvmkit/sdk/internal";
-import { loadJob } from "../src/lib/job-store";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DvmError, JOBS_FILE, WALLET_FILE, WALLET_VERSION, loadAgentWallet, saveAgentWallet, type AgentWallet, type PendingSubmission, type Transport } from "@dvmkit/sdk/internal";
+import { addPayment, loadJob } from "../src/lib/job-store";
+import { handlePaymentRequest } from "../src/lib/payment-responder";
+import type { PricedSubmissionContext } from "../src/lib/upfront-payment";
 import {
   loadSubmissionEvidence,
   recordSubmissionEvidence,
   SUBMISSION_EVIDENCE_DIR,
 } from "../src/lib/submission-evidence";
-import { sweepPendingSubmissions } from "../src/lib/wallet-agent/recovery-submissions";
+import { bookRecoveredSubmissions, sweepPendingSubmissions } from "../src/lib/wallet-agent/recovery-submissions";
 import { describePendingSubmissions } from "../src/lib/wallet-agent/submissions-view";
 
 const ENDPOINT = "https://dvm.test";
@@ -85,6 +87,41 @@ describe("pending-submission sweep", () => {
 
   afterEach(() => {
     globalThis.fetch = realFetch;
+  });
+
+  it("restores the selected job price once, independently of token value, fees and settlement", async () => {
+    rmSync(JOBS_FILE, { force: true });
+    const entry = pendingEntry(REQUEST_ID, { request_id: PUBLIC_ID });
+    const policy = { maxTotalMsats: 10000, autoPayBelowMsats: 10000, maxIncrementMsats: 10000, maxPayments: 2 };
+    entry.initial_cashu_fee_sats = 2;
+    entry.context = { ...entry.context!, policy,
+      upfront_rail_payment: { method: "cashu", amountMsats: 6500 } } as PricedSubmissionContext;
+    seedWallet([entry]);
+    const httpPost = async () => ({ status: 200, body: { job_id: "job-rail", status: "completed",
+      upfront_payment: { amount_msats: 6500 }, receipt: { paid: { msats: 1000 } } } });
+    await sweepPendingSubmissions({ httpPost });
+    expect(loadJob("job-rail")).toMatchObject({ totalPaidMsats: 6500, paymentsHonoured: 1 });
+    addPayment("job-rail", 3000);
+
+    // Replay a journal left behind after job booking but before wallet cleanup.
+    const wallet = loadAgentWallet()!;
+    saveAgentWallet({ ...wallet, pending_submissions: [entry] });
+    await sweepPendingSubmissions({ httpPost });
+    saveAgentWallet({ ...loadAgentWallet()!, pending_submissions: [entry] });
+    await bookRecoveredSubmissions({ publicRequestId: PUBLIC_ID, endpoint: ENDPOINT, jobId: "job-rail" });
+    await bookRecoveredSubmissions({ publicRequestId: PUBLIC_ID, endpoint: ENDPOINT, jobId: "job-rail" });
+    expect(loadJob("job-rail")).toMatchObject({ totalPaidMsats: 9500, paymentsHonoured: 2 });
+    expect(loadAgentWallet()?.recent_spends).toHaveLength(1);
+    expect(loadAgentWallet()?.recent_spends[0].amount_sats).toBe(21);
+    expect(loadAgentWallet()?.pending_submissions).toEqual([]);
+
+    const sendMessage = vi.fn();
+    const transport = { sendMessage } as unknown as Transport;
+    await expect(handlePaymentRequest("job-rail", { amount_msats: 1000, reason: "More" }, policy,
+      transport, { endpoint: ENDPOINT })).resolves.toBe("over-budget");
+    await expect(handlePaymentRequest("job-rail", { amount_msats: 100, reason: "More" }, policy,
+      transport, { endpoint: ENDPOINT })).resolves.toBe("payment-cap-exceeded");
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it("re-ships through the injected fetch", async () => {

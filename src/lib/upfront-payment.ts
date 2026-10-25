@@ -1,4 +1,23 @@
 import type { UpfrontPayment } from "@dvmkit/sdk";
+import type { PendingSubmissionContext } from "@dvmkit/sdk/internal";
+
+export interface UpfrontRailPayment {
+  method: "cashu" | "x402" | "tempo";
+  amountMsats: number;
+}
+
+export interface PricedSubmissionContext extends PendingSubmissionContext {
+  /** Selected job price, independent of token rounding, fees and credit funding. */
+  upfront_rail_payment?: UpfrontRailPayment;
+}
+
+export function parseUpfrontRailPayment(value: unknown): UpfrontRailPayment | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as UpfrontRailPayment;
+  if (!["cashu", "x402", "tempo"].includes(raw.method) ||
+      !Number.isSafeInteger(raw.amountMsats) || raw.amountMsats < 0) return undefined;
+  return { method: raw.method, amountMsats: raw.amountMsats };
+}
 
 /** Missing or malformed evidence is unknown, never a zero-price payment. */
 export function parseUpfrontPayment(value: unknown): UpfrontPayment | undefined {

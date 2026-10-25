@@ -36,7 +36,9 @@ import {
   saveJob,
   updateJob,
   recordUpfrontCreditPayment,
+  recordUpfrontRailPayment,
 } from "../job-store";
+import { parseUpfrontPayment, type PricedSubmissionContext } from "../upfront-payment";
 import { sameEndpoint } from "../job-access";
 import { requestRecoveryPath } from "../request-recovery-path";
 import { isFundingReceipt } from "@dvmkit/sdk/internal";
@@ -423,6 +425,7 @@ export async function bookRecoveredSubmissions(args: {
     const fresh = loadAgentWallet();
     const booked = matches(fresh);
     if (!fresh || booked.length === 0) return [];
+    for (const entry of booked) restoreUpfrontRailPayment(entry, args.jobId, null);
     saveAgentWallet(
       booked.reduce<AgentWallet>(
         (acc, entry) => applyOutcome(acc, { kind: "shipped", entry, jobId: args.jobId }, now),
@@ -938,6 +941,7 @@ async function shipEntry(
             ...(record.jobToken && !existing.jobToken ? { jobToken: record.jobToken } : {}),
           });
         } else saveJob(record);
+        restoreUpfrontRailPayment(active, identity.jobId, response.body);
         recordUpfrontCreditPayment(identity.jobId, response.body?.upfront_payment, true);
       }
       await reconcileResumedJobCredit(active, response.body, httpPost);
@@ -1124,12 +1128,21 @@ function saveRecoveredJob(
       ...(jobToken && !existing.jobToken ? { jobToken } : {}),
     });
     recordUpfrontCreditPayment(jobId, body?.upfront_payment, true);
+    restoreUpfrontRailPayment(entry, jobId, body);
     return "saved";
   }
   const { jobToken: _unchecked, ...record } = jobRecordFromEntry(entry, jobId, body, undefined);
   saveJob({ ...record, requestId, ...(jobToken ? { jobToken } : {}) });
   recordUpfrontCreditPayment(jobId, body?.upfront_payment, true);
+  restoreUpfrontRailPayment(entry, jobId, body);
   return "saved";
+}
+
+function restoreUpfrontRailPayment(entry: PendingSubmission, jobId: string, body: Record<string, unknown> | null): void {
+  const context = entry.context as PricedSubmissionContext | undefined;
+  const accepted = parseUpfrontPayment(body?.upfront_payment);
+  recordUpfrontRailPayment(jobId, context?.upfront_rail_payment ?? (accepted
+    ? { method: "cashu", amountMsats: accepted.amount_msats } : undefined));
 }
 
 /** The machine code of an error body: `error` as a string, or `error.code`. */
@@ -1480,6 +1493,7 @@ function applyOutcome(
       signed_at_ms: now(),
     };
     const dropped = drop();
+    if (dropped.recent_spends.some((spend) => spend.request_id === recentSpend.request_id)) return dropped;
     return {
       ...dropped,
       recent_spends: [...dropped.recent_spends, recentSpend].slice(-RECENT_SPENDS_CAP),

@@ -18,8 +18,12 @@ import {
   writeFileSync,
 } from "fs";
 import { join } from "path";
+import lockfile from "proper-lockfile";
+import { parseUpfrontRailPayment, type UpfrontRailPayment } from "./upfront-payment";
 
 export interface RequestIntent {
+  /** Caller-priced rail charge persisted before its paid submit. */
+  railPayment?: UpfrontRailPayment;
   v: 2;
   requestId: string;
   /** Provider endpoint that accepted or may have accepted the request. */
@@ -99,6 +103,28 @@ export function loadRequestIntent(requestId: string): RequestIntent | null {
       { request_id: requestId, cause: error instanceof Error ? error.message : String(error) }
     );
   }
+}
+
+export function recordRequestRailPayment(requestId: string, payment: UpfrontRailPayment): void {
+  assertRequestId(requestId);
+  if (!parseUpfrontRailPayment(payment)) throw new DvmError("invalid_upfront_payment", "Invalid upfront rail price.");
+  const dir = intentDirectory(requestId);
+  const target = join(dir, "intent.json");
+  const release = lockfile.lockSync(target, { realpath: false });
+  try {
+    const intent = loadRequestIntent(requestId);
+    if (!intent) throw new DvmError("request_not_found", "No saved request intent exists for this rail payment.");
+    if (intent.railPayment && JSON.stringify(intent.railPayment) !== JSON.stringify(payment))
+      throw new DvmError("upfront_payment_conflict", "This request already records a different upfront rail price.");
+    const temp = join(dir, `rail.${String(process.pid)}.tmp`);
+    const fd = openSync(temp, "w", 0o600);
+    try {
+      writeFileSync(fd, JSON.stringify({ ...intent, railPayment: payment }, null, 2) + "\n");
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(temp, target);
+    fsyncDirectory(dir);
+  } finally { release(); }
 }
 
 function assertNoPaymentOrAuthSecrets(body: Record<string, unknown>): void {

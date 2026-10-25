@@ -52,7 +52,7 @@ import {
   type X402Wallet,
 } from "@dvmkit/sdk/internal";
 import {
-  addPayment,
+  recordUpfrontRailPayment,
   loadJob,
   markJobTerminal,
   saveJob,
@@ -161,7 +161,7 @@ import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
 import { quoteWithinDeclaredLimit } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
-import { saveRequestIntent } from "../lib/request-intent-store";
+import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
 import { createArtifactSaveSession } from "../lib/save-artifact";
 import { applyJsonSchemaDefaults, formatAppliedDefaults } from "../lib/schema-defaults";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "../lib/stream-loop";
@@ -2274,6 +2274,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
   // money that moves. The rate is `tryTempoPayment`'s, always > 0.
   const usdcMicroUnits = Number(tempoCredentialAmountMicro(credential));
   const paidMsats = usdcToMsats(usdcMicroUnits / 1e6, btcRate);
+  if (opts.requestId) recordRequestRailPayment(opts.requestId, { method: "tempo", amountMsats: paidMsats });
   const usd = usdcMicroUnits / 1e6;
   const priceLabel = `$${formatUsd(usd)} USDC`;
   const accountShort = `${account.address.slice(0, 6)}…${account.address.slice(-4)}`;
@@ -2382,7 +2383,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
     );
   }
 
-  addPayment(effectiveJobId, paidMsats);
+  recordUpfrontRailPayment(effectiveJobId, { method: "tempo", amountMsats: paidMsats }, true);
   recordSpend({
     msats: paidMsats,
     btcRate: args.btcRate,
@@ -2789,6 +2790,7 @@ async function tryAgentWalletPayment(
   const priceSats = Math.ceil(chosen.priceMsats / 1000);
   const maxCashuFeeSats = parseMaxCashuFeeSats(opts.maxCashuFeeSats);
   const baseContext = {
+    upfront_rail_payment: { method: "cashu" as const, amountMsats: chosen.priceMsats },
     dvm_id: identity.dvmId,
     capability: identity.capability,
     pinned_mint: opts.mint,
@@ -2968,6 +2970,9 @@ async function tryAgentWalletPayment(
       providerInfo,
     });
   }
+
+  const pricedRequestId = opts.requestId ?? generatedRequestId;
+  if (pricedRequestId) recordRequestRailPayment(pricedRequestId, { method: "cashu", amountMsats: chosen.priceMsats });
 
   // The fund leg is on its way — record the credit locally as provisional so
   // the countersigned receipt (or a later balance op) can adopt the server's
@@ -3389,7 +3394,7 @@ async function payWithAgentWallet(
 
   await collectCashuChange(effectiveJobId, receipt.cashuChange);
 
-  addPayment(effectiveJobId, chosen.priceMsats);
+  recordUpfrontRailPayment(effectiveJobId, { method: "cashu", amountMsats: chosen.priceMsats }, true);
   if (fundPlan) {
     // The funding is the spend (spec §10): the caps were charged with the
     // full funding, and the job's draw is consumption of it — visible via the
@@ -3562,6 +3567,7 @@ async function tryX402UpfrontPayment(args: X402AttemptArgs): Promise<boolean> {
 
 async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Promise<void> {
   const { transport, ref, envelope, chosen, opts, identity, policy, wallet } = args;
+  if (opts.requestId) recordRequestRailPayment(opts.requestId, { method: "x402", amountMsats: proof.amountMsats });
   const dvmFields = dvmIdentity(identity.dvmId, identity.capability);
   const usdcMicroUnits = Number(proof.amountUsdcMicro);
   const usd = usdcMicroUnits / 1e6;
@@ -3665,7 +3671,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
     );
   }
 
-  addPayment(effectiveJobId, proof.amountMsats);
+  recordUpfrontRailPayment(effectiveJobId, { method: "x402", amountMsats: proof.amountMsats }, true);
   recordSpend({
     msats: proof.amountMsats,
     btcRate: proof.btcRate,
