@@ -869,7 +869,7 @@ export async function request(opts: RequestOptions): Promise<void> {
       : {}),
     // the job cleared by drawing on a prepaid credit — no payment
     // attach, no budget-ledger entry (the funding already counted).
-    ...(probePlan.mode === "draw" ? { paymentMethod: "credit" as const } : {}),
+    ...(probePlan.mode === "draw" ? { paymentMethod: "credit" as const } : { upfrontRailPayment: "free" as const }),
     ...(signing ? { creditBinding: probePlan.mode === "draw"
       ? { creditId: probePlan.creditId, drawId: probePlan.drawId, callerPubkey: signing.pubkey }
       : { unbound: true as const, callerPubkey: signing.pubkey } } : {}),

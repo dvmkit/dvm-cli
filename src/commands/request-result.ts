@@ -31,7 +31,7 @@ import {
 } from "../lib/job-store";
 
 import { sameEndpoint } from "../lib/job-access";
-import { parseUpfrontPayment } from "../lib/upfront-payment";
+import { parseUpfrontPayment, parseUpfrontRailPayment } from "../lib/upfront-payment";
 import { isIdentityFailure, type ProviderIdentityError, withRequestResultRecovery } from "../lib/job-identity";
 import { loadRequestIntent, type RequestIntent } from "../lib/request-intent-store";
 import { requestRecoveryPath } from "../lib/request-recovery-path";
@@ -176,8 +176,11 @@ export async function requestResult(
 
   if (!(creditBinding && !originalData?.fund) && existing?.paymentMethod !== "credit") {
     const accepted = parseUpfrontPayment(receipt.upfrontPayment);
-    const method = intent.railPayment?.method ?? existing?.paymentMethod ?? accepted?.rail ?? paymentMethod(receipt);
-    recordUpfrontRailPayment(receipt.jobId, intent.railPayment ?? (accepted && method
+    // A crash can leave the caller price booked by the sweep but absent from the intent.
+    const localPayment = intent.railPayment ?? parseUpfrontRailPayment(existing?.upfrontRailPayment);
+    const method = localPayment?.method ?? existing?.paymentMethod ?? accepted?.rail ?? paymentMethod(receipt);
+    const free = existing?.upfrontRailPayment === "free" || (accepted?.amount_msats === 0 && !method);
+    recordUpfrontRailPayment(receipt.jobId, localPayment ?? (free ? "free" : accepted && method
       ? { method, amountMsats: accepted.amount_msats } : undefined));
   }
   recordUpfrontCreditPayment(receipt.jobId, receipt.upfrontPayment, originalData?.fund !== undefined);

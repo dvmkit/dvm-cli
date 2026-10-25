@@ -1,10 +1,12 @@
 import { rmSync } from "node:fs";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { JOBS_FILE, REQUEST_INTENTS_DIR, receiptPubkeyFromSecret, type Transport } from "@dvmkit/sdk/internal";
+import { JOBS_FILE, REQUEST_INTENTS_DIR, WALLET_FILE, WALLET_VERSION, receiptPubkeyFromSecret, saveAgentWallet, type Transport } from "@dvmkit/sdk/internal";
 import { requestResult } from "../src/commands/request-result";
-import { addPayment, loadJob } from "../src/lib/job-store";
+import { addPayment, loadJob, saveJob } from "../src/lib/job-store";
 import { handlePaymentRequest } from "../src/lib/payment-responder";
 import { loadRequestIntent, recordRequestRailPayment, saveRequestIntent } from "../src/lib/request-intent-store";
+import { sweepPendingSubmissions } from "../src/lib/wallet-agent/recovery-submissions";
+import type { PricedSubmissionContext } from "../src/lib/upfront-payment";
 
 vi.mock("../src/lib/cli-identity-resolve", async (original) => ({
   ...(await original<typeof import("../src/lib/cli-identity-resolve")>()),
@@ -13,6 +15,16 @@ vi.mock("../src/lib/cli-identity-resolve", async (original) => ({
 vi.mock("../src/lib/output", async (original) => ({
   ...(await original<typeof import("../src/lib/output")>()), json: vi.fn(),
 }));
+vi.mock("../src/lib/btc-rate", async (original) => ({
+  ...(await original<typeof import("../src/lib/btc-rate")>()), resolveBtcUsdRate: async () => ({ rate: 100000, stale: false }),
+}));
+vi.mock("../src/lib/x402/wallet", async (original) => ({
+  ...(await original<typeof import("../src/lib/x402/wallet")>()), loadX402Wallet: () => ({ privateKey: `0x${"01".repeat(32)}` }),
+}));
+vi.mock("../src/lib/x402/client", async (original) => ({
+  ...(await original<typeof import("../src/lib/x402/client")>()),
+  tryX402Payment: async () => ({ paymentHeader: "payment-proof", amountMsats: 1000, amountUsdcMicro: 1000n, btcRate: 100000, x402Version: 2 }),
+}));
 
 const endpoint = "https://provider.example";
 const policy = { maxTotalMsats: 10000, autoPayBelowMsats: 10000, maxIncrementMsats: 10000, maxPayments: 2 };
@@ -20,6 +32,7 @@ let upfront: unknown;
 let fetch: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   rmSync(JOBS_FILE, { force: true });
+  rmSync(WALLET_FILE, { force: true });
   rmSync(REQUEST_INTENTS_DIR, { recursive: true, force: true });
   saveRequestIntent({ v: 2, requestId: "request", endpoint, capability: "echo", body: { input: "Work", data: { request_id: "request" } },
     callerPubkey: receiptPubkeyFromSecret("01".repeat(32)), policy,
@@ -30,6 +43,50 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetch);
 });
 afterEach(() => vi.unstubAllGlobals());
+
+async function payMeteredAsk(): Promise<void> {
+  const sendMessage = vi.fn(async () => ({ seq: 5 }));
+  await expect(handlePaymentRequest("job", { amount_msats: 1000, reason: "Metered work", x402: {
+    pay_to: `0x${"02".repeat(20)}`, network: "eip155:8453", asset: `0x${"03".repeat(20)}`,
+  } }, policy, { sendMessage } as unknown as Transport, { endpoint }, { rail: "x402", requestSeq: 4 }))
+    .resolves.toMatchObject({ status: "paid", rail: "x402", amountMsats: 1000 });
+  expect(sendMessage).toHaveBeenCalledTimes(1);
+}
+
+it.each(["new", "existing"])("pays the first metered ask after recovering the %s free-start job without a rail", async (local) => {
+  if (local === "existing") saveJob({ id: "job", endpoint, status: "processing", submittedAt: 1,
+    upfrontRailPayment: "free", policy });
+  upfront = { amount_msats: 0 };
+  await requestResult("request");
+  await payMeteredAsk();
+  // Later read-backs can omit the original free-start evidence.
+  upfront = undefined;
+  await requestResult("request");
+  expect(loadJob("job")).toMatchObject({ totalPaidMsats: 1000, paymentsHonoured: 1, upfrontRailPayment: "free" });
+});
+
+it("retains the journal price after sweep recovery when the intent price was never persisted", async () => {
+  const context: PricedSubmissionContext = { submit_body: { input: "Work", data: { request_id: "request" } },
+    upfront_rail_payment: { method: "cashu", amountMsats: 6500 }, policy };
+  saveAgentWallet({ version: WALLET_VERSION, lock_privkey: "01".repeat(32), lock_pubkey: `02${"01".repeat(32)}`,
+    mnemonic_fingerprint: null, mints: ["https://mint.example"], proofs: [], nut13_counters: {}, pending_mints: [], pending_melts: [],
+    pending_submissions: [{ endpoint, request_id: "11111111-1111-4111-8111-111111111111", intended_lock_pubkey: `02${"01".repeat(32)}`,
+      mint: "https://mint.example", amount_sats: 7, output_proofs: [{ mint: "https://mint.example", secret: "proof-secret",
+        C: `02${"02".repeat(32)}`, amount: 7, id: "00ad268c4d1f5826", locked_to_pubkey: `02${"01".repeat(32)}`, status: "valid" }],
+      cashu_token: "cashuBtest", created_at: new Date().toISOString(), context }], recent_spends: [], created_at: new Date().toISOString() });
+  expect(loadRequestIntent("request")?.railPayment).toBeUndefined();
+  await sweepPendingSubmissions({ httpPost: async () => ({ status: 202, body: { job_id: "job", status: "processing",
+    upfront_payment: { amount_msats: 5000, rail: "cashu" } } }) });
+  expect(loadJob("job")).toMatchObject({ totalPaidMsats: 6500, paymentsHonoured: 1 });
+  upfront = { amount_msats: 5000, rail: "cashu" };
+  await requestResult("request");
+  await requestResult("request");
+  await payMeteredAsk();
+  await requestResult("request");
+  expect(loadJob("job")).toMatchObject({ totalPaidMsats: 7500, paymentsHonoured: 2,
+    upfrontRailPayment: { method: "cashu", amountMsats: 6500 } });
+  expect(loadJob("job")).not.toHaveProperty("upfrontRailConflict");
+});
 
 it.each(["cashu", "x402", "tempo"] as const)("restores a %s intent's exact price once without another rail payment", async (method) => {
   recordRequestRailPayment("request", { method, amountMsats: 6500 });

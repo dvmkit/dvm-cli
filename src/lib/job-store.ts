@@ -27,8 +27,8 @@ export interface CreditPaymentIntent {
 }
 
 export interface JobRecord {
-  /** Booked upfront rail price, or an explicit unknown recovery state. */
-  upfrontRailPayment?: UpfrontRailPayment | "unknown";
+  /** Booked upfront rail price, a free start, or unresolved accounting. */
+  upfrontRailPayment?: UpfrontRailPayment | "free" | "unknown";
   upfrontRailConflict?: true;
   /** Original accepted debit, independent of later draw growth and receipts. */
   upfrontPayment?: UpfrontPayment;
@@ -223,6 +223,10 @@ export function recordUpfrontRailPayment(jobId: string, value: unknown, freshSub
     if (booked) {
       if (payment && (booked.method !== payment.method || booked.amountMsats !== payment.amountMsats))
         job.upfrontRailConflict = true;
+      return;
+    }
+    if (value === "free" || (job.upfrontRailPayment === "free" && !payment)) {
+      job.upfrontRailPayment = "free";
       return;
     }
     // Legacy counters do not say whether they include the upfront charge.
