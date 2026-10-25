@@ -482,10 +482,13 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     expect(intents.loadRequestIntent(requestId)?.railPayment).toEqual({ method: "cashu", amountMsats: 1000 });
     expect(entry.amount_sats).toBeGreaterThan(1);
     const before = budget.loadLedger();
+    const postsBeforeRecovery = provider.jobPosts.length;
+    provider.bindsPaid = true;
     provider.paid = (_post, accepted) => answer(202, { job_id: accepted, job_token: provider.token,
       status: "processing" }, { [FIELD]: accepted });
     if (recovery === "direct") await requestResult(requestId);
     else await seams.realSweep!({ fetchImpl: globalThis.fetch });
+    expect(provider.jobPosts).toHaveLength(postsBeforeRecovery + (recovery === "re-ship" ? 1 : 0));
     expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 1000, paymentsHonoured: 1, paymentMethod: "cashu" });
 
     seedCredit(40000);
