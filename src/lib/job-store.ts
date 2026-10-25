@@ -4,7 +4,7 @@ import { JOBS_FILE } from "@dvmkit/sdk/internal";
 import { dirname } from "node:path";
 import lockfile from "proper-lockfile";
 import type { PaymentContent, UpfrontPayment } from "@dvmkit/sdk";
-import { parseUpfrontPayment } from "./upfront-payment";
+import { parseUpfrontPayment, parseUpfrontRailPayment, type UpfrontRailPayment } from "./upfront-payment";
 import type { PaymentRequestContent } from "@dvmkit/sdk/internal";
 import type { JobCompletion } from "./completion-hints";
 import { ensureConfigDir } from "@dvmkit/sdk/internal";
@@ -27,6 +27,9 @@ export interface CreditPaymentIntent {
 }
 
 export interface JobRecord {
+  /** Booked upfront rail price, a free start, or unresolved accounting. */
+  upfrontRailPayment?: UpfrontRailPayment | "free" | "unknown";
+  upfrontRailConflict?: true;
   /** Original accepted debit, independent of later draw growth and receipts. */
   upfrontPayment?: UpfrontPayment;
   upfrontCreditBooked?: true;
@@ -209,6 +212,38 @@ export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOn
 
 export function hasUnknownUpfrontCredit(job: JobRecord): boolean {
   return job.upfrontCreditConflict === true || (job.paymentMethod === "credit" && (!job.upfrontCreditBooked || !parseUpfrontPayment(job.upfrontPayment)));
+}
+
+export function recordUpfrontRailPayment(jobId: string, value: unknown, freshSubmit = false): void {
+  const payment = parseUpfrontRailPayment(value);
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (!job) return;
+    const booked = parseUpfrontRailPayment(job.upfrontRailPayment);
+    if (booked) {
+      if (payment && (booked.method !== payment.method || booked.amountMsats !== payment.amountMsats))
+        job.upfrontRailConflict = true;
+      return;
+    }
+    if (value === "free" || (job.upfrontRailPayment === "free" && !payment)) {
+      job.upfrontRailPayment = "free";
+      return;
+    }
+    // Legacy counters do not say whether they include the upfront charge.
+    // Preserve them rather than adding it twice or treating later charges as proof.
+    if (!payment || (!freshSubmit && ((job.totalPaidMsats ?? 0) !== 0 || (job.paymentsHonoured ?? 0) !== 0))) {
+      job.upfrontRailPayment = "unknown";
+      return;
+    }
+    job.totalPaidMsats = (job.totalPaidMsats ?? 0) + payment.amountMsats;
+    job.paymentsHonoured = (job.paymentsHonoured ?? 0) + (payment.amountMsats > 0 ? 1 : 0);
+    job.paymentMethod = payment.method;
+    job.upfrontRailPayment = payment;
+  });
+}
+
+export function hasUnknownUpfrontRail(job: JobRecord): boolean {
+  return job.upfrontRailPayment === "unknown" || job.upfrontRailConflict === true;
 }
 
 /** Merge a partial update into an existing job record. No-op if job not found. */

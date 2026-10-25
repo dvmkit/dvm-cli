@@ -470,6 +470,50 @@ describe("generated request IDs", () => {
 });
 
 describe("a credit-funded submit to a recovery-capable provider", () => {
+  it.each(["read-back", "re-ship", "direct"])("counts a lost rail submit once through %s recovery and subsequent charges", async (recovery) => {
+    writeConfig("auto");
+    seedCredit(0);
+    provider.bindsPaid = recovery !== "re-ship";
+    provider.paid = () => (response) => response.socket?.destroy();
+    await expect(paidRequest({ budget: "10000", maxPayments: "2", stream: false })).rejects.toBeInstanceOf(Error);
+    const entry = onlyJournalEntry();
+    const requestId = provider.paidPosts()[0].body.request_id as string;
+    expect(jobs.loadJob("job-a")).toBeNull();
+    expect(intents.loadRequestIntent(requestId)?.railPayment).toEqual({ method: "cashu", amountMsats: 1000 });
+    expect(entry.amount_sats).toBeGreaterThan(1);
+    const before = budget.loadLedger();
+    const postsBeforeRecovery = provider.jobPosts.length;
+    provider.bindsPaid = true;
+    provider.paid = (_post, accepted) => answer(202, { job_id: accepted, job_token: provider.token,
+      status: "processing" }, { [FIELD]: accepted });
+    if (recovery === "direct") await requestResult(requestId);
+    else await seams.realSweep!({ fetchImpl: globalThis.fetch });
+    expect(provider.jobPosts).toHaveLength(postsBeforeRecovery + (recovery === "re-ship" ? 1 : 0));
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 1000, paymentsHonoured: 1, paymentMethod: "cashu" });
+
+    seedCredit(40000);
+    const { handlePaymentRequest } = await import("../src/lib/payment-responder");
+    const { HttpsTransport } = await import("../src/lib/transport/https");
+    const policy = jobs.loadJob("job-a")!.policy!;
+    const transport = new HttpsTransport();
+    await expect(handlePaymentRequest("job-a", { amount_msats: 3000, reason: "More",
+      credit: { amount_micro: 3000, currency: "usd" } }, policy,
+      transport, { endpoint: provider.endpoint }, { requestSeq: 4 })).resolves.toMatchObject({ rail: "credit", amountMsats: 3000 });
+    await requestResult(requestId);
+    await requestResult(requestId);
+    // Reconcile a journal surviving the job write, after a later payment.
+    sdk.saveAgentWallet({ ...sdk.loadAgentWallet()!, pending_submissions: [entry] });
+    await seams.realSweep!({ fetchImpl: globalThis.fetch });
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 4000, paymentsHonoured: 2 });
+    await expect(handlePaymentRequest("job-a", { amount_msats: 7000, reason: "More" }, policy,
+      transport, { endpoint: provider.endpoint }, { requestSeq: 6 })).resolves.toBe("over-budget");
+    await expect(handlePaymentRequest("job-a", { amount_msats: 100, reason: "More" }, policy,
+      transport, { endpoint: provider.endpoint }, { requestSeq: 6 })).resolves.toBe("payment-cap-exceeded");
+    expect(provider.balancePayments).toHaveLength(1);
+    expect(sdk.loadAgentWallet()?.recent_spends).toHaveLength(1);
+    expect(budget.loadLedger()).toEqual(before);
+  });
+
   it.each(["prepaid", "implicit"])("counts the original %s draw before authorizing later charges", async (source) => {
     writeConfig("auto");
     seedCredit(40_000);
@@ -709,10 +753,24 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 
-  it("records a signed zero-upfront job as known unbound", async () => {
-    provider.unpaid = () => answer(200, { job_id: "job-a", status: "completed", summary: "Done" }, { [FIELD]: "job-a" });
-    await paidRequest();
+  it("retains a signed free-start job across read-back before its first balance ask", async () => {
+    provider.unpaid = () => answer(202, { job_id: "job-a", status: "processing", job_token: provider.token }, { [FIELD]: "job-a" });
+    await paidRequest({ requestId: "free-start", stream: false });
     expect(jobs.loadJob("job-a")?.creditBinding).toEqual({ unbound: true, callerPubkey: sdk.receiptPubkeyFromSecret(secret) });
+    expect(jobs.loadJob("job-a")?.upfrontRailPayment).toBe("free");
+    provider.requestResult = () => answer(202, { request_id: "free-start", job_id: "job-a", status: "processing", job_token: provider.token });
+    await requestResult("free-start");
+    writeConfig("auto");
+    seedCredit(40000);
+    const { handlePaymentRequest } = await import("../src/lib/payment-responder");
+    const { HttpsTransport } = await import("../src/lib/transport/https");
+    await expect(handlePaymentRequest("job-a", { amount_msats: 1000, reason: "Metered work",
+      credit: { amount_micro: 1000, currency: "usd" } }, jobs.loadJob("job-a")!.policy!,
+      new HttpsTransport(), { endpoint: provider.endpoint }, { requestSeq: 4 }))
+      .resolves.toMatchObject({ rail: "credit", amountMsats: 1000 });
+    await requestResult("free-start");
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 1000, paymentsHonoured: 1, upfrontRailPayment: "free" });
+    expect(provider.balancePayments).toHaveLength(1);
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 

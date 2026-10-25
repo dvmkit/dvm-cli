@@ -25,6 +25,7 @@ import {
   clearPaymentRequestInFlight,
   loadJob,
   hasUnknownUpfrontCredit,
+  hasUnknownUpfrontRail,
   markPaymentRequestPaid,
   markPaymentRequestInFlight,
   type PaymentApproval,
@@ -103,6 +104,9 @@ async function handleLockedPaymentRequest(
     requestSeq: opts.requestSeq, approval: opts.approval ?? "auto",
   };
   const job = loadJob(jobId);
+  if (job && hasUnknownUpfrontRail(job))
+    throw new DvmError("upfront_rail_unknown", "The original upfront rail charge is unknown or conflicting.",
+      "Recover the original job price before authorizing more payments.");
   if (job && hasUnknownUpfrontCredit(job))
     throw new DvmError("upfront_credit_unknown", "The original upfront credit debit is unknown or conflicting.",
       "Recover the accepted upfront amount with 'dvm request-result' before authorizing more payments.");
