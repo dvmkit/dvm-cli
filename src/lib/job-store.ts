@@ -27,6 +27,8 @@ export interface CreditPaymentIntent {
 }
 
 export interface JobRecord {
+  /** Hashes of locally sent message payloads; remote sender labels are not ownership evidence. */
+  callerMessageHashes?: string[];
   /** Booked upfront rail price, a free start, or unresolved accounting. */
   upfrontRailPayment?: UpfrontRailPayment | "free" | "unknown";
   upfrontRailConflict?: true;
@@ -251,6 +253,13 @@ export function updateJob(id: string, update: Partial<Omit<JobRecord, "id">>): v
   mutateJobs((jobs) => {
     const idx = jobs.findIndex((j) => j.id === id);
     if (idx !== -1) jobs[idx] = { ...jobs[idx], ...update };
+  });
+}
+
+export function recordCallerMessageHash(jobId: string, endpoint: string, hash: string): void {
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId && entry.endpoint === endpoint);
+    if (job) job.callerMessageHashes = [...new Set([...(job.callerMessageHashes ?? []), hash])];
   });
 }
 

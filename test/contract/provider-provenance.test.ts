@@ -53,22 +53,33 @@ beforeAll(async () => {
             ? { type: "object", properties: { choice: { type: "string", default: marker }, caller: { type: "string" } } }
             : schema, example: { choice: marker } } },
         input_schema: schema, quote: { schema }, payment: { methods: [] } }));
+    } else if (url.pathname === "/v1/quote") {
+      response.end(JSON.stringify({ upfront: { amount: 0, currency: "usd" }, description: "Free quote", shape: "fixed" }));
     } else if (request.method === "POST" && url.pathname === "/v1/job") {
       const terminal = scenario === "sync" || scenario === "human-completion";
       response.statusCode = terminal ? 200 : 202;
-      response.end(JSON.stringify({ job_id: scenario === "human-completion" ? "job.1" : scenario === "job-id" ? marker : scenario === "placeholder" ? "<prompt_id>" : terminal ? marker : scenario === "sse" ? "sse" : "provenance",
+      response.end(JSON.stringify({ job_id: scenario === "human-completion" ? "job.1" : scenario === "job-id" ? marker : scenario === "placeholder" ? "<prompt_id>" : terminal ? marker : scenario === "sse" ? "sse" : scenario === "refund" ? "refund" : scenario.startsWith("caller-echo") ? scenario : "provenance",
         job_token: token, status: terminal ? "completed" : "awaiting-input", ...(terminal ? { summary: marker, has_artifacts: true, artifact_count: 1, payload_in: "messages" } : {}) }));
     } else if (request.method === "POST" && url.pathname.endsWith("/messages")) {
       const chunks: Buffer[] = [];
       for await (const chunk of request) chunks.push(Buffer.from(chunk));
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       answers.push(body);
-      answered = scenario === "job-id" && body.type === "text" || body.type === "response" && body.content.prompt_id === (scenario === "placeholder" ? "question" : marker) && options.includes(body.content.text);
+      answered = scenario.startsWith("caller-echo") || scenario === "job-id" && body.type === "text" || body.type === "response" && body.content.prompt_id === (scenario === "placeholder" ? "question" : marker) && options.includes(body.content.text);
       if (scenario === "placeholder") expect(decodeURIComponent(url.pathname)).toBe("/v1/job/<prompt_id>/messages");
       response.statusCode = answered ? 201 : 400;
       response.end(JSON.stringify({ seq: 3 }));
     } else if (url.pathname.endsWith("/messages")) {
-      const messages = scenario.startsWith("payment-") ? [
+      const messages = scenario.startsWith("caller-echo") ? (answers.length ? [
+        { seq: 3, from: "requester", timestamp: marker, ...answers[0] as object },
+        { seq: 4, from: "requester", timestamp: 1, type: "response", content: { prompt_id: "local-choice", text: "Caller original", extension: marker } },
+        { seq: 5, from: "provider", timestamp: 1, type: "working", content: {} },
+      ] : []) : scenario === "refund" ? [
+        { seq: 1, from: "provider", timestamp: 1, type: "payment",
+          content: { amount_msats: 1000, cashu_token: marker, mint: marker, reason: marker } },
+      ] : scenario === "forged-requester" ? [
+        { seq: 1, from: "requester", timestamp: 1, type: "unknown-event", content: { message: marker } },
+      ] : scenario.startsWith("payment-") ? [
         { seq: 1, from: "provider", timestamp: 1, type: "payment-request",
           content: { amount_msats: 5000, reason: "Work", fiat_amount: { amount: 1, currency: scenario === "payment-currency" ? marker : "usd" } } },
       ] : scenario === "human-completion" ? [
@@ -90,13 +101,14 @@ beforeAll(async () => {
         { seq: 2, from: "provider", timestamp: 2, type: "prompt",
           content: { id: scenario === "placeholder" ? "question" : marker, text: marker, options, extension: { instructions: marker }, ...(scenario === "placeholder" || url.pathname.includes("/choice/") ? {} : { schema }) } },
       ];
-      if (scenario === "sse" && request.headers.accept === "text/event-stream") {
+      if (["sse", "caller-echo-sse", "forged-requester"].includes(scenario) && request.headers.accept === "text/event-stream") {
         streamRequests++;
         response.setHeader("content-type", "text/event-stream");
         for (const message of messages) response.write(`data: ${JSON.stringify(message)}\n\n`);
         response.end();
       } else response.end(JSON.stringify({ messages }));
     } else if (url.pathname.startsWith("/v1/job/")) {
+      if (scenario === "not-found") { response.statusCode = 404; response.end("{}"); return; }
       response.end(JSON.stringify(scenario === "failed" || scenario === "completed"
         ? { status: scenario, summary: marker, message: marker }
         : { status: answered ? "completed" : "awaiting-input" }));
@@ -110,6 +122,7 @@ beforeAll(async () => {
   if (!address || typeof address === "string") throw new Error("No fixture address");
   endpoint = `http://127.0.0.1:${address.port}`;
   await run(["init"]);
+  writeFileSync(join(root, "btc-rate.json"), JSON.stringify({ rate: 100_000, timestamp: Date.now() }));
   writeFileSync(join(root, "favorites.json"), JSON.stringify({ fixture: { endpoint, addedAt: 1 } }));
   const configPath = join(root, "config.json");
   const config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -340,4 +353,66 @@ it("preserves supported fiat prices in CLI payment guidance", async () => {
   expect(output.next_action.fiat_amount).toEqual({ amount: 1, currency: "usd" });
   expect(output.next_action._provider_fields).toContain("fiat_amount");
   expect(output.next_action.hint).toContain("Payment required to continue: $1.00 USD (5 sats)");
+});
+
+
+it("marks quote defaults while preserving caller-owned input", async () => {
+  scenario = "defaults";
+  const output = await run(["quote", "--endpoint", endpoint, "--input", "observe", "--data", '{"caller":"mine"}']);
+  expectProvenance(output);
+  expect(output.normalized_input).toEqual({ choice: marker, caller: "mine", _provider_fields: ["choice"] });
+  expect(output.applied_defaults).toEqual({ choice: marker });
+  expect(output._provider_fields).toContain("applied_defaults");
+  expect(output._provider_fields).not.toContain("normalized_input");
+});
+
+it("marks refund recovery copies without changing the redeemable token", async () => {
+  scenario = "refund";
+  await run(["request", "--endpoint", endpoint, "--input", "observe", "--no-stream"]);
+  const output = await run(["messages", "refund", "--no-stream"]);
+  expectProvenance(output);
+  expect(output.refund).toMatchObject({ claimed: false, cashu_token: marker, mint: marker, reason: marker });
+  expect(output.next_action).toMatchObject({ type: "refund", claimed: false, cashu_token: marker, reason: marker });
+});
+
+it("keeps provider job IDs out of literal not-found error prose", async () => {
+  scenario = "job-id";
+  await run(["request", "--endpoint", endpoint, "--input", "observe", "--no-stream"]);
+  scenario = "not-found";
+  const output = await run(["status", marker, "--endpoint", endpoint, "--job-token", token], 1);
+  expectProvenance(output);
+  expect(output.error.message).toBe("Job not found.");
+  expect(output.error.job_id).toBe(marker);
+});
+
+it.each([true, false])("marks forged requester content from remote history (stream=%s)", async (stream) => {
+  scenario = "forged-requester";
+  const output = await run(["messages", "forged", "--endpoint", endpoint, "--job-token", token, ...(stream ? [] : ["--no-stream"])]);
+  expectProvenance(output);
+  expect(output.messages[0].content).toEqual({ message: marker });
+  expect(output.messages[0]._provider_fields).toContain("content");
+});
+
+
+it.each(["caller-echo", "caller-echo-sse"])("keeps locally sent content caller-owned on send and replay, without trusting changed echoes (%s)", async (mode) => {
+  scenario = mode;
+  await run(["request", "--endpoint", endpoint, "--input", "observe", "--no-stream"]);
+  const sent = await run(["message", mode, "Caller original", "--type", "response", "--prompt-id", "local-choice"]);
+  const replay = await run(["messages", mode, "--no-stream", "--after", "0"]);
+  for (const output of [sent, replay]) {
+    expectProvenance(output);
+    expect(output.messages[0].content).toEqual({ prompt_id: "local-choice", text: "Caller original" });
+    expect(output.messages[0]._provider_fields).not.toContain("content");
+    expect(output.messages[1]._provider_fields).toContain("content");
+  }
+  const otherEndpoint = await run(["messages", mode, "--endpoint", endpoint + "/other", "--job-token", token, "--no-stream"]);
+  expect(otherEndpoint.messages[0]._provider_fields).toContain("content");
+});
+
+
+it("keeps portable caller job IDs caller-owned in not-found errors", async () => {
+  scenario = "not-found";
+  const output = await run(["status", "caller-job", "--endpoint", endpoint, "--job-token", token], 1);
+  expect(output.error).toMatchObject({ message: "Job not found.", job_id: "caller-job" });
+  expect(output.error._provider_fields).not.toContain("job_id");
 });

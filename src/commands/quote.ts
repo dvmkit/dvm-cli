@@ -1,3 +1,4 @@
+import { providerFields } from "../lib/provider-output";
 import { fundingRailLabel, isPaymentRailKey, paymentRailLabel } from "../lib/rail-labels";
 import { formatFiat, SIGNED_REQUEST_AUTH_ID } from "@dvmkit/sdk";
 import {
@@ -401,7 +402,7 @@ export async function quote(opts: QuoteOptions): Promise<void> {
       // full payload. Uses pre-sign merged data so signature material
       // doesn't leak into the diagnostic.
       ...(normalizedInput && Object.keys(appliedDefaults).length > 0
-        ? { normalized_input: normalizedInput, applied_defaults: appliedDefaults }
+        ? providerFields({ normalized_input: providerFields(normalizedInput, Object.keys(appliedDefaults)), applied_defaults: appliedDefaults }, ["applied_defaults"])
         : {}),
       ...takeCreditNoticeFields(),
     });

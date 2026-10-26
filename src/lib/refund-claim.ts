@@ -1,4 +1,4 @@
-import { guidanceJobArg } from "./provider-output";
+import { guidanceJobArg, providerFields } from "./provider-output";
 import { type NextAction, type NextActionRefund } from "./next-action";
 import { formatAmountBestEffort, monetaryJson } from "./currency";
 import {
@@ -116,8 +116,8 @@ export function refundNextAction(jobId: string, claims: RefundClaim[]): NextActi
   const noun = claim.reason === "change" ? "change" : "refund";
 
   if (!claim.claimed) {
-    return {
-      type: "refund",
+    return providerFields({
+      type: "refund" as const,
       job_id: jobId,
       amount_msats: claim.amount_msats,
       display: `${cap(noun)} of ${amount} could not be auto-claimed`,
@@ -125,18 +125,18 @@ export function refundNextAction(jobId: string, claims: RefundClaim[]): NextActi
       claimed: false,
       cashu_token: claim.cashu_token,
       hint: `The provider sent a ${noun} but the auto-claim into your wallet failed (the mint may be unreachable). Claim it manually with 'dvm wallet receive-token <cashu_token>' — the token is in this action's 'cashu_token' field, don't lose it. Or retry the auto-claim with 'dvm messages ${guidanceJobArg(jobId)} --no-stream' (re-running plain 'dvm messages' won't retry — its cursor has already advanced past this message).`,
-    };
+    }, ["amount_msats", "reason", "cashu_token"]);
   }
 
-  return {
-    type: "refund",
+  return providerFields({
+    type: "refund" as const,
     job_id: jobId,
     amount_msats: claim.amount_msats,
     display: `Received ${noun} of ${amount}`,
     reason: claim.reason,
     claimed: true,
     hint: `The provider ${noun === "refund" ? "refunded" : "returned change of"} ${amount}, now added to your wallet. Relay to your human: they got ${amount} back.`,
-  };
+  }, ["reason"]);
 }
 
 /**
@@ -155,14 +155,14 @@ export async function refundJsonField(
       ? monetaryJson(claim.amount_msats, rate)
       : { msats: claim.amount_msats, display: `${Math.round(claim.amount_msats / 1000)} sats` };
   return {
-    refund: {
+    refund: providerFields({
       seq: claim.seq,
       reason: claim.reason,
       claimed: claim.claimed,
       amount,
       ...(claim.mint ? { mint: claim.mint } : {}),
       cashu_token: claim.cashu_token,
-    },
+    }, ["seq", "reason", "mint", "cashu_token", ...(!claim.claimed ? ["amount"] : [])]),
   };
 }
 
