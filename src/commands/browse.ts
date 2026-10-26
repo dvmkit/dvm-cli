@@ -14,6 +14,7 @@ import {
   discoveryCapabilityJson,
   type DiscoveryCapability,
   type DiscoveryDisplay,
+  type DiscoveryOwner,
   type DiscoveryRowFields,
   type DiscoveryTrust,
   renderDiscoveryDisplay,
@@ -61,13 +62,7 @@ interface BrowseResultEntry {
     successRate: number;
     avgLatencyMs: number | null;
   } | null;
-  owner?: {
-    handle: string;
-    type: "builder" | "org";
-    displayName: string | null;
-    avatarUrl: string | null;
-    profileUrl: string | null;
-  } | null;
+  owner?: DiscoveryOwner | null;
   createdAt?: number;
   capabilities?: DiscoveryCapability[];
   trust?: DiscoveryTrust;

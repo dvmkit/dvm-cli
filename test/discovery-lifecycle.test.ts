@@ -345,7 +345,7 @@ function trustResults() {
   }];
 }
 
-function resultSummary(name: CommandFixture["name"], results = trustResults()) {
+function resultSummary(name: CommandFixture["name"], results: unknown[] = trustResults()) {
   return JSON.stringify(name === "search"
     ? { results, query: "weather", mode: "keyword", total: 3, future_envelope: "preserved" }
     : { entries: results, total: 91, offset: 10, limit: 10, query: null, future_envelope: "preserved" });
@@ -430,5 +430,95 @@ describe.each(commands)("$name discover trust rows", (fixture) => {
     expect(text).not.toContain("Owner: null");
     expect(seams.describe).toHaveBeenCalledExactlyOnceWith(expect.anything());
     if (fixture.name === "browse") expect(text).toContain("dvm browse --offset 13");
+  });
+});
+
+function ownershipResults() {
+  const base = trustResults()[0];
+  const owner = {
+    handle: "plainops", type: "org", displayName: "Plain Ops",
+    avatarUrl: null, profileUrl: "https://example.com/plainops",
+  };
+  return [
+    {
+      ...base, identifier: "plainops--scribe", name: "Plain service",
+      owner: { ...owner, operatedByDvmkit: true },
+      display: { ...base.display, owner: "by Plain Ops (@plainops) · Operated by dvmkit" },
+    },
+    {
+      ...base, identifier: "dvmkit--lookalike", name: "dvmkit official service",
+      owner: { ...owner, handle: "dvmkit", displayName: "dvmkit", operatedByDvmkit: false },
+      display: { ...base.display, owner: "by dvmkit (@dvmkit)" },
+    },
+    {
+      ...base, identifier: "dvmkit--legacy", name: "dvmkit legacy service",
+      owner: { ...owner, handle: "dvmkit", displayName: "dvmkit" },
+      display: { ...base.display, owner: "by dvmkit (@dvmkit), legacy identity" },
+    },
+    {
+      ...base, identifier: null, owner: null,
+      display: { ...base.display, owner: "by @example (self-reported)" },
+    },
+  ];
+}
+
+describe.each(commands)("$name discover ownership", (fixture) => {
+  it("preserves owner identity and authoritative flags on every capability row", async () => {
+    seams.submit.mockResolvedValue({
+      status: "completed", summary: resultSummary(fixture.name, ownershipResults()),
+    });
+
+    await fixture.invoke();
+
+    expect(seams.json).toHaveBeenCalledTimes(1);
+    const output = seams.json.mock.calls[0][0];
+    const rows = fixture.name === "search" ? output.results : output.entries;
+    expect(rows.map((row: { identifier: string | null }) => row.identifier)).toEqual([
+      "plainops--scribe/transcribe", "plainops--scribe/caption",
+      "dvmkit--lookalike/transcribe", "dvmkit--lookalike/caption",
+      "dvmkit--legacy/transcribe", "dvmkit--legacy/caption", null,
+    ]);
+    for (const row of rows.slice(0, 2)) {
+      expect(row.owner).toEqual({
+        handle: "plainops", type: "org", displayName: "Plain Ops", avatarUrl: null,
+        profileUrl: "https://example.com/plainops", operatedByDvmkit: true,
+      });
+      expect(row.display.owner).toBe("by Plain Ops (@plainops) · Operated by dvmkit");
+    }
+    for (const row of rows.slice(2, 4)) {
+      expect(row.owner).toEqual({
+        handle: "dvmkit", type: "org", displayName: "dvmkit", avatarUrl: null,
+        profileUrl: "https://example.com/plainops", operatedByDvmkit: false,
+      });
+      expect(row.display.owner).toBe("by dvmkit (@dvmkit)");
+    }
+    for (const row of rows.slice(4, 6)) {
+      expect(row.owner).toEqual({
+        handle: "dvmkit", type: "org", displayName: "dvmkit", avatarUrl: null,
+        profileUrl: "https://example.com/plainops",
+      });
+      expect(row.display.owner).toBe("by dvmkit (@dvmkit), legacy identity");
+    }
+    expect(rows[6].owner).toBeNull();
+    expect(rows[6].display.owner).toBe("by @example (self-reported)");
+  });
+
+  it("relays ownership words verbatim without claiming lookalikes or external services", async () => {
+    seams.submit.mockResolvedValue({
+      status: "completed", summary: resultSummary(fixture.name, ownershipResults()),
+    });
+
+    await fixture.invoke({ human: true });
+
+    const lines = seams.info.mock.calls.map(([line]) => String(line).trim());
+    expect(lines.filter((line) => line.startsWith("Owner:"))).toEqual([
+      "Owner: by Plain Ops (@plainops) · Operated by dvmkit",
+      "Owner: by Plain Ops (@plainops) · Operated by dvmkit",
+      "Owner: by dvmkit (@dvmkit)", "Owner: by dvmkit (@dvmkit)",
+      "Owner: by dvmkit (@dvmkit), legacy identity", "Owner: by dvmkit (@dvmkit), legacy identity",
+      "Owner: by @example (self-reported)",
+    ]);
+    expect(lines.filter((line) => line.includes("Operated by dvmkit"))).toHaveLength(2);
+    expect(seams.json).not.toHaveBeenCalled();
   });
 });

@@ -24,6 +24,16 @@ export interface DiscoveryTrust {
   listed_at_ms: number;
 }
 
+export interface DiscoveryOwner {
+  handle: string;
+  type: "builder" | "org";
+  displayName: string | null;
+  avatarUrl: string | null;
+  profileUrl: string | null;
+  /** Older discover producers omit this flag; absence makes no ownership claim. */
+  operatedByDvmkit?: boolean;
+}
+
 export interface DiscoveryDisplay {
   price?: string | null;
   endpoint_hint?: string;

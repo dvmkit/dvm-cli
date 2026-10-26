@@ -15,6 +15,7 @@ import {
   discoveryCapabilityJson,
   type DiscoveryCapability,
   type DiscoveryDisplay,
+  type DiscoveryOwner,
   type DiscoveryRowFields,
   type DiscoveryTrust,
   renderDiscoveryDisplay,
@@ -42,6 +43,7 @@ export interface SearchOptions {
 interface DiscoverResultEntry {
   dvm_id: string | null;
   owner_handle: string | null;
+  owner?: DiscoveryOwner | null;
   identifier: string | null;
   slug: string;
   name: string;
