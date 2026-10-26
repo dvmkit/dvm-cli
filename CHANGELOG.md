@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.2](https://github.com/dvmkit/dvm-cli/compare/v0.11.1...v0.11.2) (2026-10-26)
+
+
+### Bug Fixes
+
+* **discovery:** keep operator ownership in search and browse output ([#35](https://github.com/dvmkit/dvm-cli/issues/35)) ([1d6869d](https://github.com/dvmkit/dvm-cli/commit/1d6869d8c2bdcbaa5311557b495e933417e99613))
+* **output:** mark provider provenance on the remaining provider-supplied fields ([#36](https://github.com/dvmkit/dvm-cli/issues/36)) ([a707167](https://github.com/dvmkit/dvm-cli/commit/a707167286bc4aaa182a4b6a96bc1c3320a11c51))
+
 ## [0.11.1](https://github.com/dvmkit/dvm-cli/compare/v0.11.0...v0.11.1) (2026-10-26)
 
 
