@@ -285,6 +285,7 @@ function serialize(msg: Message): Record<string, unknown> {
         text: asProviderText(msg.content.text),
       };
       content._provider_fields = [
+        "id",
         ...(msg.content.options ? ["options"] : []),
         ...(msg.content.schema ? ["schema"] : []),
       ];
@@ -353,6 +354,7 @@ function serialize(msg: Message): Record<string, unknown> {
       return {
         ...base,
         content: msg.content,
+        ...(fromProvider ? { _provider_fields: ["content"] } : {}),
         display: `[${msg.type}] ${JSON.stringify(msg.content)}`,
       };
   }

@@ -287,6 +287,10 @@ function renderStatus(
     ...dvmIdentity(stored?.dvmId, stored?.capability),
     status: jobStatus,
     source,
+    _provider_fields: [
+      ...(completion.summary ? ["summary"] : []),
+      ...(completion.message ? ["message"] : []),
+    ],
     ...content,
     ...(completion.summary ? { summary: completion.summary } : {}),
     ...(jobStatus === "completed" ? buildCompletionHintFields(jobId, completion) : {}),

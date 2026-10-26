@@ -178,9 +178,9 @@ describe("computeNextAction", () => {
       job_id: "job-1",
       prompt_id: "p1",
       prompt: { _source: "provider", text: "What color?" },
-      _provider_fields: [],
+      _provider_fields: ["prompt_id"],
       display: "The provider asks: What color?",
-      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id p1'),
+      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id \'<prompt_id>\''),
     });
   });
 
@@ -196,7 +196,7 @@ describe("computeNextAction", () => {
       type: "respond",
       schema,
       display: "The provider asks: Provide details",
-      hint: expect.stringContaining("dvm message job-1 --json '<object matching schema>' --type response --prompt-id p1"),
+      hint: expect.stringContaining("dvm message job-1 --json '<object matching schema>' --type response --prompt-id '<prompt_id>'"),
     });
     expect(result).not.toHaveProperty("options");
   });
@@ -221,18 +221,18 @@ describe("computeNextAction", () => {
       type: "respond",
       options,
       display,
-      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id p1'),
+      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id \'<prompt_id>\''),
     });
     expect(result?.hint).toContain("exactly one of options unless the human chose otherwise");
     expect(result?.hint).toContain("Verify the question makes sense for your task");
   });
 
-  it("shell-quotes job and prompt ids in the exact answer command", () => {
+  it("keeps provider prompt ids separate from shell-quoted job guidance", () => {
     const result = computeNextAction("job; two", [
       msg({ type: "prompt", content: { id: "prompt; two", text: "Continue?" } }),
     ]);
     expect(result?.hint).toBe(
-      'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message \'job; two\' "<answer>" --type response --prompt-id \'prompt; two\'`.'
+      'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message \'job; two\' "<answer>" --type response --prompt-id \'<prompt_id>\'`.'
     );
   });
 
@@ -243,7 +243,7 @@ describe("computeNextAction", () => {
     expect(result).not.toHaveProperty("options");
     expect(result).toMatchObject({
       display: "The provider asks: Continue?",
-      hint: 'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 "<answer>" --type response --prompt-id p1`.',
+      hint: 'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 "<answer>" --type response --prompt-id \'<prompt_id>\'`.',
     });
   });
 
@@ -256,7 +256,7 @@ describe("computeNextAction", () => {
       schema,
       options: ["keep"],
       display: 'The provider asks: Provide details Choices: "keep".',
-      hint: "Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 --json '<object matching schema>' --type response --prompt-id p1`.",
+      hint: "Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 --json '<object matching schema>' --type response --prompt-id \'<prompt_id>\'`.",
     });
   });
 

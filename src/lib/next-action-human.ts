@@ -9,7 +9,10 @@ export function nextActionHuman(action: NextAction): string | null {
   switch (action.type) {
     case "respond":
     case "pay": {
-      const command = action.hint.match(/`(dvm[\s\S]*)`/)?.[1];
+      const template = action.hint.match(/`(dvm[\s\S]*)`/)?.[1];
+      const command = action.type === "respond"
+        ? template?.replace("'<prompt_id>'", () => shellQuoteArg(action.prompt_id))
+        : template;
       if (command?.startsWith("dvm status ")) return `Next: ${action.type === "pay" ? "the provider's charge of " : ""}${action.display}`;
       if (action.type === "respond") {
         return `Next: ${action.display} Provider is waiting for your input. ${command ? `Run \`${command}\`.` : action.hint}`;

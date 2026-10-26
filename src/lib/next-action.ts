@@ -19,7 +19,7 @@ export interface NextActionRespond {
   prompt: ProviderText;
   schema?: Record<string, unknown>;
   options?: string[];
-  _provider_fields: ("options" | "schema")[];
+  _provider_fields: ("prompt_id" | "options" | "schema")[];
   /** Earliest pending caller deadline for the job, in Unix milliseconds. */
   expires_at_ms?: number;
   display: string;
@@ -156,11 +156,12 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           prompt_id: c.id,
           prompt: asProviderText(c.text),
           _provider_fields: [
+            "prompt_id",
             ...(c.schema ? ["schema" as const] : []),
             ...(c.options?.length ? ["options" as const] : []),
           ],
           display: withDeadline(`The provider asks: ${c.text}${choices}`, deadline),
-          hint: expired ? deadline : withDeadline(`Provider is waiting for your input. Verify the question makes sense for your task before responding.${choiceHint} Run \`dvm message ${shellQuoteArg(jobId)} ${answer} --type response --prompt-id ${shellQuoteArg(c.id)}\`.`, deadline),
+          hint: expired ? deadline : withDeadline(`Provider is waiting for your input. Verify the question makes sense for your task before responding.${choiceHint} Run \`dvm message ${shellQuoteArg(jobId)} ${answer} --type response --prompt-id '<prompt_id>'\`.`, deadline),
         };
         if (c.schema) action.schema = c.schema;
         if (c.options?.length) action.options = c.options;

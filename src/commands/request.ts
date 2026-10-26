@@ -962,6 +962,7 @@ export async function request(opts: RequestOptions): Promise<void> {
           ...transactionOutputFields(receipt),
           ...dvmIdentity(dvmId, capability),
           summary: receipt.summary,
+          _provider_fields: ["summary"],
           ...buildCompletionHintFields(receipt.jobId, receipt),
           ...receiptJsonFields(captured),
           ...takeCreditNoticeFields(),
@@ -1058,7 +1059,7 @@ export async function request(opts: RequestOptions): Promise<void> {
           // these come off the streamed log instead. Without them this arc
           // returned `next_action: null` and nothing else: no summary, and no
           // signal that a payload was waiting in artifacts.
-          ...(completion?.summary !== undefined ? { summary: completion.summary } : {}),
+          ...(completion?.summary !== undefined ? { summary: completion.summary, _provider_fields: ["summary"] } : {}),
           ...(completion ? buildCompletionHintFields(receipt.jobId, completion) : {}),
           ...(captured ? receiptJsonFields(captured) : {}),
           ...takeCreditNoticeFields(),
@@ -2427,6 +2428,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
         ...transactionOutputFields(receipt),
         ...dvmFields,
         summary: receipt.summary,
+        _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
         ...receiptJsonFields(captured),
         paidWith: "tempo",
@@ -3451,6 +3453,7 @@ async function payWithAgentWallet(
         jobId: effectiveJobId,
         ...dvmFields,
         summary: receipt.summary,
+        _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
         ...receiptJsonFields(captured),
         paidWith: "cashu_p2pk",
@@ -3718,6 +3721,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
         ...transactionOutputFields(receipt),
         ...dvmFields,
         summary: receipt.summary,
+        _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
         ...receiptJsonFields(captured),
         paidWith: "x402",
@@ -3986,7 +3990,7 @@ async function streamAfterPayment(args: {
       // Same as the unpaid arc above: the outcome is only knowable from the
       // streamed log here, so render it rather than leaving the agent to dig
       // the summary out of `messages` and guess about artifacts.
-      ...(completion?.summary !== undefined ? { summary: completion.summary } : {}),
+      ...(completion?.summary !== undefined ? { summary: completion.summary, _provider_fields: ["summary"] } : {}),
       ...(completion ? buildCompletionHintFields(jobId, completion) : {}),
       ...(captured ? receiptJsonFields(captured) : {}),
       ...takeCreditNoticeFields(),
@@ -4073,6 +4077,7 @@ async function recoverViaStatusPoll(args: {
         ...dvmFields,
         status: "completed",
         summary: status.summary ?? null,
+        _provider_fields: ["summary"],
         recovered: true,
         ...paymentFields,
         ...receiptJsonFields(captured),
@@ -4109,6 +4114,7 @@ async function recoverViaStatusPoll(args: {
         ...dvmFields,
         status: status.status,
         message: errorMsg,
+        ...(status.message !== undefined ? { _provider_fields: ["message"] } : {}),
         ...paymentFields,
         ...receiptJsonFields(captured),
         ...takeCreditNoticeFields(),
@@ -4116,7 +4122,8 @@ async function recoverViaStatusPoll(args: {
         next_action: null,
       });
     }
-    throw new DvmError(status.status === "failed" ? "provider_error" : "cancelled", errorMsg);
+    throw new DvmError(status.status === "failed" ? "provider_error" : "cancelled", errorMsg, undefined, undefined, undefined,
+      status.message !== undefined ? { message: "provider" } : undefined);
   }
 
   return false;
