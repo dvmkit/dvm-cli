@@ -303,20 +303,20 @@ describe("payment replay and terminal refund regressions", () => {
     const pending = messages("term-refund", { wait: true });
     await vi.runAllTimersAsync();
     await pending;
-    expect(output().next_action).toEqual({ type: "refund", job_id: expect.any(String), amount_msats: 1000, reason: "change", claimed: false, cashu_token: "tok", display: expect.any(String), hint: expect.stringContaining("dvm wallet receive-token") });
+    expect(output().next_action).toEqual({ type: "refund", job_id: expect.any(String), _provider_fields: ["job_id"], amount_msats: 1000, reason: "change", claimed: false, cashu_token: "tok", display: expect.any(String), hint: expect.stringContaining("dvm wallet receive-token") });
   });
   it("retains terminal refund recovery in streamed JSON", async () => {
     transport([[msg(2, "payment", { amount_msats: 1000, reason: "change", cashu_token: "tok" }), msg(3, "complete", { summary: "Done" })]], "completed");
     seams.claim.mockResolvedValue([{ seq: 2, amount_msats: 1000, reason: "change", claimed: false, cashu_token: "tok" }]);
     await messages("term-refund2", {});
-    expect(output().next_action).toEqual({ type: "refund", job_id: expect.any(String), amount_msats: 1000, reason: "change", claimed: false, cashu_token: "tok", display: expect.any(String), hint: expect.stringContaining("dvm wallet receive-token") });
+    expect(output().next_action).toEqual({ type: "refund", job_id: expect.any(String), _provider_fields: ["job_id"], amount_msats: 1000, reason: "change", claimed: false, cashu_token: "tok", display: expect.any(String), hint: expect.stringContaining("dvm wallet receive-token") });
   });
   it("preserves terminal refund recovery in non-streamed JSON", async () => {
     transport([], "completed");
     vi.mocked(seams.transport.getMessages).mockResolvedValue([msg(2, "payment", { amount_msats: 1000, reason: "change", cashu_token: "tok" }), msg(3, "complete", { summary: "Done" })]);
     seams.claim.mockResolvedValue([{ seq: 2, amount_msats: 1000, reason: "change", claimed: false, cashu_token: "tok" }]);
     await messages("term-refund3", { stream: false });
-    expect(output().next_action).toEqual({ type: "refund", job_id: expect.any(String), amount_msats: 1000, reason: "change", claimed: false, cashu_token: "tok", display: expect.any(String), hint: expect.stringContaining("dvm wallet receive-token") });
+    expect(output().next_action).toEqual({ type: "refund", job_id: expect.any(String), _provider_fields: ["job_id"], amount_msats: 1000, reason: "change", claimed: false, cashu_token: "tok", display: expect.any(String), hint: expect.stringContaining("dvm wallet receive-token") });
   });
   it.each([undefined, "6"])("does not return respond for an already-answered prompt (after=%s)", async (after) => {
     vi.useFakeTimers();
@@ -556,7 +556,7 @@ it("keeps an uncertain send actionable without auto-paying in non-streamed JSON"
   vi.mocked(seams.transport.getMessages).mockResolvedValue([msg(5, "payment-request", { amount_msats: 1000, reason: "One block" })]);
   await messages(jobId, { stream: false });
   expect(output().next_action).toMatchObject({ type: "pay", hint: expect.stringContaining("payment may already have been sent") });
-  expect(output().next_action.hint).toContain(String.raw`dvm pay 'uncertain'\''s job'`);
+  expect(output().next_action.hint).toContain("dvm pay '<job_id>'");
   expect(seams.pay).not.toHaveBeenCalled();
   expect(seams.transport.sendMessage).not.toHaveBeenCalled();
 });

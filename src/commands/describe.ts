@@ -1,3 +1,4 @@
+import { providerFields } from "../lib/provider-output";
 import { formatFiat } from "@dvmkit/sdk";
 import {
   asProviderText,
@@ -49,7 +50,7 @@ export async function describe(input: string, opts: DescribeOptions): Promise<vo
     if (providerInfo.sdkSha) info(`  SDK SHA: ${providerInfo.sdkSha}`);
     renderCapabilitiesHuman(providerInfo, endpoint, qualifiedDvmId);
   } else {
-    // Wrap provider-supplied free-text fields. Mints are URLs (data, not free text).
+    // The descriptor is provider-owned; endpoint remains a CLI-owned sibling.
     const wrapped: Record<string, unknown> = { ...providerInfo };
     if (providerInfo.name !== undefined) wrapped.name = asProviderTextOpt(providerInfo.name);
     if (providerInfo.about !== undefined) wrapped.about = asProviderTextOpt(providerInfo.about);
@@ -60,9 +61,7 @@ export async function describe(input: string, opts: DescribeOptions): Promise<vo
         { ...capability, ...(capability.description !== undefined ? { description: asProviderText(capability.description) } : {}) },
       ]));
     }
-    // Adjacent metadata preserves schemas and examples as usable structured data.
-    wrapped._provider_fields = ["capabilities", "inputSchema", "quote"].filter((field) => wrapped[field] !== undefined);
-    json({ endpoint, ...wrapped });
+    json({ endpoint, ...providerFields(wrapped) });
   }
 
   transport.close();

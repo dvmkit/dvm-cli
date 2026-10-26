@@ -1,3 +1,4 @@
+import { providerJobJson } from "../lib/provider-output";
 import { jobSpend, renderSpendHuman } from "../lib/job-spend";
 import { formatMessageHuman } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
@@ -25,7 +26,6 @@ import {
 import {
   getOutputTraceId,
   info,
-  json,
 } from "../lib/output";
 import {
   type JobRecord,
@@ -310,7 +310,7 @@ function renderStatus(
     output.messages = msgs.map(serializeMessageForOutput);
     output.cursor = fetched?.cursor ?? 0;
   }
-  json(output);
+  providerJobJson(output, !!stored);
 }
 
 /**

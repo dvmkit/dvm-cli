@@ -1,3 +1,4 @@
+import { providerJobJson } from "../lib/provider-output";
 export { formatMessageHuman } from "../lib/message-human";
 import { formatMessageHuman, paymentAmount } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
@@ -10,7 +11,6 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   info,
-  json,
 } from "../lib/output";
 
 import {
@@ -65,6 +65,7 @@ async function messagesWithAccess(
   const waitDuration = opts.wait ? parseDurationMs(opts.until ?? "12h") : undefined;
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
+  const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);
 
   function actionFromMessages(batch: Message[]): NextAction {
     const answered = access.endpointOverridden ? new Set<number>() : loadAnsweredYieldSeqs(jobId);
@@ -264,7 +265,8 @@ export function serializeMessageForOutput(msg: Message): Record<string, unknown>
 }
 
 function serialize(msg: Message): Record<string, unknown> {
-  const base = { seq: msg.seq, from: msg.from, timestamp: msg.timestamp, type: msg.type };
+  const base = { seq: msg.seq, from: msg.from, timestamp: msg.timestamp, type: msg.type,
+    ...(msg.from === "provider" ? { _provider_fields: ["seq", "from", "timestamp", "type", "content"] } : {}) };
   const fromProvider = msg.from === "provider";
 
   switch (msg.type) {
@@ -354,7 +356,6 @@ function serialize(msg: Message): Record<string, unknown> {
       return {
         ...base,
         content: msg.content,
-        ...(fromProvider ? { _provider_fields: ["content"] } : {}),
         display: `[${msg.type}] ${JSON.stringify(msg.content)}`,
       };
   }

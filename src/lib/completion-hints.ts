@@ -1,3 +1,4 @@
+import { guidanceJobArg } from "./provider-output";
 import type { Message } from "@dvmkit/sdk/internal";
 
 /**
@@ -47,7 +48,7 @@ export function nextStepHint(
 ): string | undefined {
   if (payloadIn !== "messages") return undefined;
   const noun = artifactCount === 1 ? "artifact" : "artifacts";
-  return `Run 'dvm messages ${jobId} --no-stream' to fetch the ${noun}.`;
+  return `Run 'dvm messages ${guidanceJobArg(jobId)} --no-stream' to fetch the ${noun}.`;
 }
 
 /**

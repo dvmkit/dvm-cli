@@ -1,10 +1,10 @@
+import { providerJobJson } from "../lib/provider-output";
 import {
   DvmError,
   type OutboundMessage,
 } from "@dvmkit/sdk/internal";
 import {
   info,
-  json,
 } from "../lib/output";
 
 import { takeCreditNoticeFields } from "../lib/credit-notice";
@@ -55,6 +55,7 @@ async function messageWithAccess(
 ): Promise<void> {
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
+  const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);
 
   const msgType = opts.type ?? (opts.json ? "response" : "text");
 

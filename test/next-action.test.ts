@@ -227,12 +227,12 @@ describe("computeNextAction", () => {
     expect(result?.hint).toContain("Verify the question makes sense for your task");
   });
 
-  it("keeps provider prompt ids separate from shell-quoted job guidance", () => {
+  it("keeps unrestricted job and prompt ids out of CLI guidance", () => {
     const result = computeNextAction("job; two", [
       msg({ type: "prompt", content: { id: "prompt; two", text: "Continue?" } }),
     ]);
     expect(result?.hint).toBe(
-      'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message \'job; two\' "<answer>" --type response --prompt-id \'<prompt_id>\'`.'
+      'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message \'<job_id>\' "<answer>" --type response --prompt-id \'<prompt_id>\'`.'
     );
   });
 
@@ -260,12 +260,12 @@ describe("computeNextAction", () => {
     });
   });
 
-  it("shell-quotes the job id in the exact pay command", () => {
+  it("uses a job placeholder in the pay command for unrestricted IDs", () => {
     const result = computeNextAction("job; two", [
       msg({ type: "payment-request", content: { amount_msats: 5000, reason: "Work" } }),
     ]);
     expect(result?.hint).toBe(
-      'Payment required to continue: 5 sats. Relay that amount to your human and get approval, then run `dvm pay \'job; two\'`. Provider\'s stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.'
+      'Payment required to continue: 5 sats. Relay that amount to your human and get approval, then run `dvm pay \'<job_id>\'`. Provider\'s stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.'
     );
   });
 
@@ -379,8 +379,8 @@ describe("isTerminalJobStatus", () => {
 });
 
 describe("pollNextAction", () => {
-  it("shell-quotes the job id in the unattended wait command", () => {
-    expect(pollNextAction("job's").hint).toContain("dvm messages 'job'\\''s' --wait");
+  it("uses a job placeholder in the unattended wait command for unrestricted IDs", () => {
+    expect(pollNextAction("job's").hint).toContain("dvm messages '<job_id>' --wait");
   });
 
   it("defaults to the CLI-owned working hint", () => {

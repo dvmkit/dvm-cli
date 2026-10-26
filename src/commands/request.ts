@@ -1,3 +1,4 @@
+import { providerFields, providerJobJson as json } from "../lib/provider-output";
 import { buildTempoCredential } from "../lib/payment-rails/tempo-credential";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { parseBudget } from "../lib/currency";
@@ -79,7 +80,6 @@ import {
 import {
   getOutputTraceId,
   info,
-  json,
 } from "../lib/output";
 import {
   loadX402Wallet,
@@ -905,7 +905,7 @@ export async function request(opts: RequestOptions): Promise<void> {
         // Streaming paths surface the actual job result, which already
         // tells the agent what the server processed.
         ...(normalizedInput && Object.keys(appliedDefaults).length > 0
-          ? { normalized_input: normalizedInput, applied_defaults: appliedDefaults }
+          ? providerFields({ normalized_input: providerFields(normalizedInput, Object.keys(appliedDefaults)), applied_defaults: appliedDefaults }, ["applied_defaults"])
           : {}),
         // This branch returns before the job has an outcome, so it is the only
         // JSON the caller gets — a credit notice stashed during the probe has

@@ -1,3 +1,4 @@
+import { guidanceJobArg } from "./provider-output";
 import { type JobStatus, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
 import { type JobContentMetadata } from "@dvmkit/sdk/server";
 import { captureDrawFundingReceipts } from "./draw-funding";
@@ -37,8 +38,8 @@ export function jobContentFields(
       ? `Automatic content expiry: ${new Date(metadata.content_expires_at).toISOString()}. A passed deadline alone does not prove content is unavailable.`
       : "Current automatic content expiry is unknown.";
   const save = metadata.content_available === false
-    ? `Check existing local saves and 'dvm receipts verify ${jobId}' for stored receipt evidence.`
-    : `Save message output with 'dvm messages ${jobId} --no-stream > messages.json'. For portable jobs, retain your original --endpoint and --job-token options before the redirection, or keep DVM_JOB_ENDPOINT and DVM_JOB_TOKEN set. Use '--human' to save artifacts to private temporary files at the printed paths. Reads do not extend expiry.`;
+    ? `Check existing local saves and 'dvm receipts verify ${guidanceJobArg(jobId)}' for stored receipt evidence.`
+    : `Save message output with 'dvm messages ${guidanceJobArg(jobId)} --no-stream > messages.json'. For portable jobs, retain your original --endpoint and --job-token options before the redirection, or keep DVM_JOB_ENDPOINT and DVM_JOB_TOKEN set. Use '--human' to save artifacts to private temporary files at the printed paths. Reads do not extend expiry.`;
   return {
     ...metadata,
     content_metadata_source: observed ? "provider" : "unknown",

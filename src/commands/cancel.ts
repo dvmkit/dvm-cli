@@ -1,6 +1,6 @@
+import { providerJobJson } from "../lib/provider-output";
 import {
   info,
-  json,
 } from "../lib/output";
 import {
   markJobTerminal,
@@ -33,6 +33,7 @@ async function cancelWithAccess(
   access: ResolvedJobAccess
 ): Promise<void> {
   const { stored, ref, jobToken } = access;
+  const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);
   const transport = createDvmTransport();
 
   progressNotice("Cancelling job...", opts.human);

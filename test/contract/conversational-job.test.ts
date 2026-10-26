@@ -204,7 +204,7 @@ it("drives a conversational metered job across CLI processes, from quote to veri
 
     const answerTemplate = /`([^`]+)`/.exec(question.next_action.hint)?.[1];
     expect(answerTemplate).toBe(`dvm message conversation "<answer>" --type response --prompt-id '<prompt_id>'`);
-    const answerCommand = answerTemplate!.replace("'<prompt_id>'", () => shellQuoteArg(question.next_action.prompt_id));
+    const answerCommand = answerTemplate!.replace("--prompt-id '<prompt_id>'", () => `--prompt-id ${shellQuoteArg(question.next_action.prompt_id)}`);
     const humanQuestion = await run(["status", jobId, "--human"]);
     expect(humanQuestion.stdout).toBe("");
     const questionNext = humanQuestion.stderr.split("\n").find((line) => line.startsWith("Next:"));
