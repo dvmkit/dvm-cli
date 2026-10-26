@@ -178,6 +178,7 @@ describe("computeNextAction", () => {
       job_id: "job-1",
       prompt_id: "p1",
       prompt: { _source: "provider", text: "What color?" },
+      _provider_fields: [],
       display: "The provider asks: What color?",
       hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id p1'),
     });

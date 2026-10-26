@@ -284,6 +284,10 @@ function serialize(msg: Message): Record<string, unknown> {
         id: msg.content.id,
         text: asProviderText(msg.content.text),
       };
+      content._provider_fields = [
+        ...(msg.content.options ? ["options"] : []),
+        ...(msg.content.schema ? ["schema"] : []),
+      ];
       if (msg.content.options) content.options = msg.content.options;
       if (msg.content.schema) content.schema = msg.content.schema;
       if (msg.content.expires_at_ms !== undefined) content.expires_at_ms = msg.content.expires_at_ms;

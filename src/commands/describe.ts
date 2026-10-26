@@ -54,6 +54,14 @@ export async function describe(input: string, opts: DescribeOptions): Promise<vo
     if (providerInfo.name !== undefined) wrapped.name = asProviderTextOpt(providerInfo.name);
     if (providerInfo.about !== undefined) wrapped.about = asProviderTextOpt(providerInfo.about);
     if (providerInfo.tags) wrapped.tags = providerInfo.tags.map((t) => asProviderText(t));
+    if (providerInfo.capabilities) {
+      wrapped.capabilities = Object.fromEntries(Object.entries(providerInfo.capabilities).map(([name, capability]) => [
+        name,
+        { ...capability, ...(capability.description !== undefined ? { description: asProviderText(capability.description) } : {}) },
+      ]));
+    }
+    // Adjacent metadata preserves schemas and examples as usable structured data.
+    wrapped._provider_fields = ["capabilities", "inputSchema", "quote"].filter((field) => wrapped[field] !== undefined);
     json({ endpoint, ...wrapped });
   }
 
