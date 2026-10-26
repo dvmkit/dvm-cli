@@ -1,3 +1,4 @@
+import { providerFields } from "../lib/provider-output";
 import { type NextAction } from "../lib/next-action";
 import {
   asProviderText,
@@ -210,7 +211,7 @@ function outputResults(
     if (human) {
       info(resultJson);
     } else {
-      json({ result: resultJson });
+      json(providerFields({ result: resultJson }));
     }
     return;
   }
@@ -238,15 +239,21 @@ function outputResults(
       tags: r.tags.map((t) => asProviderText(t)),
       ...discoveryCapabilityJson(r),
     };
-    return alias ? { ...wrapped, favorite: alias } : wrapped;
+    delete wrapped._provider_fields;
+    if (alias) delete wrapped.favorite;
+    const marked = providerFields(wrapped);
+    return alias ? { ...marked, favorite: alias } : marked;
   });
 
   // `total` stays as the discover-side filtered DVM count (drives pagination
   // math); `provider_count` is the in-page DVM count pre-expansion. Mirrors
   // search.ts so agents can reason about pagination without conflating one
   // DVM with its capability rows.
+  // Mark rows individually so their CLI-added siblings stay outside producer metadata.
+  const producerOutput: Record<string, unknown> = { ...output };
+  for (const field of ["entries", "provider_count", "next_action", "_provider_fields"]) delete producerOutput[field];
   const payload: Record<string, unknown> = {
-    ...output,
+    ...providerFields(producerOutput),
     entries,
     total: output.total,
     offset: output.offset,
