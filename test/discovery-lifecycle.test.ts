@@ -28,6 +28,8 @@ vi.mock("../src/lib/transport", () => ({
   }),
 }));
 
+import * as favorites from "../src/lib/favorites";
+import type { DiscoveryOwner } from "../src/lib/discovery-rows";
 import { browse } from "../src/commands/browse";
 import { search } from "../src/commands/search";
 
@@ -52,6 +54,7 @@ const commands: CommandFixture[] = [
       mode: "keyword",
       total: 0,
       provider_count: 0,
+      _provider_fields: ["query", "mode"],
     },
     emptyHuman: "No providers found.",
     timeoutMessage: "Search is still processing.",
@@ -68,6 +71,7 @@ const commands: CommandFixture[] = [
       limit: 10,
       query: null,
       provider_count: 0,
+      _provider_fields: ["total", "offset", "limit", "query"],
     },
     emptyHuman: "No DVMs found.",
     timeoutMessage: "Browse is still processing.",
@@ -109,6 +113,16 @@ describe.each(commands)("$name discovery lifecycle", (fixture) => {
     expect(seams.json).toHaveBeenCalledExactlyOnceWith(fixture.emptyJson);
     expect(seams.getMessages).not.toHaveBeenCalled();
     expect(seams.close).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("marks an unparsed producer summary without changing its words", async () => {
+    seams.submit.mockResolvedValue({ status: "completed", summary: "{unparsed producer words}" });
+
+    await fixture.invoke();
+
+    expect(seams.json).toHaveBeenCalledExactlyOnceWith({
+      result: "{unparsed producer words}", _provider_fields: ["result"],
+    });
   });
 
   it("renders an immediately completed receipt as command-specific human output", async () => {
@@ -345,7 +359,7 @@ function trustResults() {
   }];
 }
 
-function resultSummary(name: CommandFixture["name"], results = trustResults()) {
+function resultSummary(name: CommandFixture["name"], results: unknown[] = trustResults()) {
   return JSON.stringify(name === "search"
     ? { results, query: "weather", mode: "keyword", total: 3, future_envelope: "preserved" }
     : { entries: results, total: 91, offset: 10, limit: 10, query: null, future_envelope: "preserved" });
@@ -430,5 +444,174 @@ describe.each(commands)("$name discover trust rows", (fixture) => {
     expect(text).not.toContain("Owner: null");
     expect(seams.describe).toHaveBeenCalledExactlyOnceWith(expect.anything());
     if (fixture.name === "browse") expect(text).toContain("dvm browse --offset 13");
+  });
+});
+
+function ownershipResults() {
+  const base = trustResults()[0];
+  const owner: DiscoveryOwner = {
+    handle: "plainops", type: "org", displayName: "Plain Ops",
+    avatarUrl: null, profileUrl: "https://example.com/plainops",
+  };
+  return [
+    {
+      ...base, identifier: "plainops--scribe", name: "Plain service",
+      owner: { ...owner, operatedByDvmkit: true },
+      display: { ...base.display, owner: "by Plain Ops (@plainops) · Operated by dvmkit" },
+    },
+    {
+      ...base, identifier: "dvmkit--lookalike", name: "dvmkit official service",
+      owner: { ...owner, handle: "dvmkit", displayName: "dvmkit", operatedByDvmkit: false },
+      display: { ...base.display, owner: "by dvmkit (@dvmkit)" },
+    },
+    {
+      ...base, identifier: "dvmkit--legacy", name: "dvmkit legacy service",
+      owner: { ...owner, handle: "dvmkit", displayName: "dvmkit" },
+      display: { ...base.display, owner: "by dvmkit (@dvmkit), legacy identity" },
+    },
+    {
+      ...base, identifier: null, owner: null,
+      display: { ...base.display, owner: "by @example (self-reported)" },
+    },
+  ];
+}
+
+describe.each(commands)("$name discover ownership", (fixture) => {
+  it("preserves owner identity and authoritative flags on every capability row", async () => {
+    seams.submit.mockResolvedValue({
+      status: "completed", summary: resultSummary(fixture.name, ownershipResults()),
+    });
+
+    await fixture.invoke();
+
+    expect(seams.json).toHaveBeenCalledTimes(1);
+    const output = seams.json.mock.calls[0][0];
+    const rows = fixture.name === "search" ? output.results : output.entries;
+    expect(rows.map((row: { identifier: string | null }) => row.identifier)).toEqual([
+      "plainops--scribe/transcribe", "plainops--scribe/caption",
+      "dvmkit--lookalike/transcribe", "dvmkit--lookalike/caption",
+      "dvmkit--legacy/transcribe", "dvmkit--legacy/caption", null,
+    ]);
+    for (const row of rows.slice(0, 2)) {
+      expect(row.owner).toEqual({
+        handle: "plainops", type: "org", displayName: "Plain Ops", avatarUrl: null,
+        profileUrl: "https://example.com/plainops", operatedByDvmkit: true,
+      });
+      expect(row.display.owner).toBe("by Plain Ops (@plainops) · Operated by dvmkit");
+    }
+    for (const row of rows.slice(2, 4)) {
+      expect(row.owner).toEqual({
+        handle: "dvmkit", type: "org", displayName: "dvmkit", avatarUrl: null,
+        profileUrl: "https://example.com/plainops", operatedByDvmkit: false,
+      });
+      expect(row.display.owner).toBe("by dvmkit (@dvmkit)");
+    }
+    for (const row of rows.slice(4, 6)) {
+      expect(row.owner).toEqual({
+        handle: "dvmkit", type: "org", displayName: "dvmkit", avatarUrl: null,
+        profileUrl: "https://example.com/plainops",
+      });
+      expect(row.display.owner).toBe("by dvmkit (@dvmkit), legacy identity");
+    }
+    expect(rows[6].owner).toBeNull();
+    expect(rows[6].display.owner).toBe("by @example (self-reported)");
+    for (const row of rows) {
+      expect(row._provider_fields).toEqual(expect.arrayContaining([
+        "owner", "display", "identifier", "endpoint", "capabilities", "trust", "future_field",
+      ]));
+    }
+    expect(output._provider_fields).toEqual(fixture.name === "search"
+      ? ["query", "mode", "future_envelope"]
+      : ["total", "offset", "limit", "query", "future_envelope"]);
+    for (const field of ["results", "entries", "provider_count", "next_action"]) {
+      expect(output._provider_fields).not.toContain(field);
+    }
+  });
+
+  it("keeps local favourites and next actions outside producer metadata", async () => {
+    vi.spyOn(favorites, "loadFavorites").mockReturnValue({ local: { endpoint: "https://provider.example", addedAt: 1 } });
+    const results = ownershipResults().map((row) => ({
+      ...row, favorite: "producer alias", _provider_fields: ["favorite"],
+    }));
+    const envelope = JSON.parse(resultSummary(fixture.name, results));
+    envelope._provider_fields = ["results", "entries", "provider_count", "next_action"];
+    envelope.provider_count = 900;
+    seams.submit.mockResolvedValue({ status: "accepted", jobId: "next-job" });
+    seams.getMessages.mockResolvedValueOnce([complete(1, JSON.stringify(envelope)), working(2)])
+      .mockResolvedValueOnce([]);
+
+    vi.useFakeTimers();
+    try {
+      const invocation = fixture.invoke();
+      await vi.runAllTimersAsync();
+      await invocation;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const output = seams.json.mock.calls[0][0];
+    const rows = fixture.name === "search" ? output.results : output.entries;
+    expect(output.provider_count).toBe(4);
+    expect(output.next_action).toMatchObject({ type: "poll", job_id: "next-job" });
+    for (const field of ["results", "entries", "provider_count", "next_action"]) {
+      expect(output._provider_fields).not.toContain(field);
+    }
+    for (const row of rows) {
+      expect(row.favorite).toBe("local");
+      expect(row._provider_fields).not.toContain("favorite");
+      expect(row._provider_fields).toContain("owner");
+    }
+  });
+
+  describe.each([
+    { shape: "absent", capabilities: undefined },
+    { shape: "empty", capabilities: [] },
+    { shape: "expanded", capabilities: trustResults()[0].capabilities },
+  ])("$shape capabilities", ({ capabilities }) => {
+    it.each([
+      { label: "true", flag: true }, { label: "false", flag: false },
+      { label: "missing", flag: undefined }, { label: "string false", flag: "false" },
+      { label: "string true", flag: "true" }, { label: "number", flag: 1 },
+      { label: "null", flag: null }, { label: "object", flag: { claimed: true } },
+    ])("preserves the $label flag without coercion", async ({ flag }) => {
+      const base = ownershipResults()[0];
+      const { operatedByDvmkit: _flag, ...identity } = base.owner!;
+      const row = {
+        ...base, capabilities,
+        owner: { ...identity, ...(flag === undefined ? {} : { operatedByDvmkit: flag }) },
+      };
+      seams.submit.mockResolvedValue({ status: "completed", summary: resultSummary(fixture.name, [row]) });
+
+      await fixture.invoke();
+
+      const output = seams.json.mock.calls[0][0];
+      const rows = fixture.name === "search" ? output.results : output.entries;
+      expect(rows).toHaveLength(capabilities?.length || 1);
+      for (const result of rows) {
+        expect(result.owner.operatedByDvmkit).toEqual(flag);
+        if (flag !== true) expect(result.owner.operatedByDvmkit).not.toBe(true);
+        expect(Object.hasOwn(result.owner, "operatedByDvmkit")).toBe(flag !== undefined);
+        expect(result._provider_fields).toEqual(expect.arrayContaining(["owner", "display"]));
+      }
+    });
+  });
+
+  it("relays ownership words verbatim without claiming lookalikes or external services", async () => {
+    seams.submit.mockResolvedValue({
+      status: "completed", summary: resultSummary(fixture.name, ownershipResults()),
+    });
+
+    await fixture.invoke({ human: true });
+
+    const lines = seams.info.mock.calls.map(([line]) => String(line).trim());
+    expect(lines.filter((line) => line.startsWith("Owner:"))).toEqual([
+      "Owner: by Plain Ops (@plainops) · Operated by dvmkit",
+      "Owner: by Plain Ops (@plainops) · Operated by dvmkit",
+      "Owner: by dvmkit (@dvmkit)", "Owner: by dvmkit (@dvmkit)",
+      "Owner: by dvmkit (@dvmkit), legacy identity", "Owner: by dvmkit (@dvmkit), legacy identity",
+      "Owner: by @example (self-reported)",
+    ]);
+    expect(lines.filter((line) => line.includes("Operated by dvmkit"))).toHaveLength(2);
+    expect(seams.json).not.toHaveBeenCalled();
   });
 });
