@@ -9,12 +9,17 @@ export function nextActionHuman(action: NextAction): string | null {
   switch (action.type) {
     case "respond":
     case "pay": {
-      const command = action.hint.match(/`(dvm[\s\S]*)`/)?.[1];
-      if (command?.startsWith("dvm status ")) return `Next: ${action.type === "pay" ? "the provider's charge of " : ""}${action.display}`;
+      const display = action.display.replace(/`dvm status '<job_id>'`/g, () => `\`dvm status ${shellQuoteArg(action.job_id)}\``);
+      const template = action.hint.match(/`(dvm[\s\S]*)`/)?.[1]
+        ?.replace(/^(dvm (?:message|pay|status)) '<job_id>'/, (_, prefix: string) => `${prefix} ${shellQuoteArg(action.job_id)}`);
+      const command = action.type === "respond"
+        ? template?.replace("--prompt-id '<prompt_id>'", () => `--prompt-id ${shellQuoteArg(action.prompt_id)}`)
+        : template;
+      if (command?.startsWith("dvm status ")) return `Next: ${action.type === "pay" ? "the provider's charge of " : ""}${display}`;
       if (action.type === "respond") {
-        return `Next: ${action.display} Provider is waiting for your input. ${command ? `Run \`${command}\`.` : action.hint}`;
+        return `Next: ${display} Provider is waiting for your input. ${command ? `Run \`${command}\`.` : action.hint}`;
       }
-      return `Next: Payment required to continue: ${action.display}${action.display.endsWith(".") ? "" : "."} Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.`;
+      return `Next: Payment required to continue: ${display}${display.endsWith(".") ? "" : "."} Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.`;
     }
     case "poll": {
       const hint = typeof action.hint === "string" ? action.hint : action.hint.text;

@@ -1,3 +1,4 @@
+import { providerJobJson } from "../lib/provider-output";
 import { jobSpend, renderSpendHuman } from "../lib/job-spend";
 import { formatMessageHuman } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
@@ -25,7 +26,6 @@ import {
 import {
   getOutputTraceId,
   info,
-  json,
 } from "../lib/output";
 import {
   type JobRecord,
@@ -251,10 +251,10 @@ function renderStatus(
   fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: ContentStatus }
 ): void {
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
-  const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount);
+  const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, opts.human);
   const msgs = fetched?.msgs ?? [];
   const receipt = fetched?.receipt;
-  const content = jobContentFields(jobId, fetched?.content);
+  const content = jobContentFields(jobId, fetched?.content, opts.human);
   const spend = stored ? jobSpend(loadJob(jobId) ?? stored, receipt?.receipt) : undefined;
 
   if (opts.human) {
@@ -287,6 +287,10 @@ function renderStatus(
     ...dvmIdentity(stored?.dvmId, stored?.capability),
     status: jobStatus,
     source,
+    _provider_fields: [
+      ...(completion.summary ? ["summary"] : []),
+      ...(completion.message ? ["message"] : []),
+    ],
     ...content,
     ...(completion.summary ? { summary: completion.summary } : {}),
     ...(jobStatus === "completed" ? buildCompletionHintFields(jobId, completion) : {}),
@@ -306,7 +310,7 @@ function renderStatus(
     output.messages = msgs.map(serializeMessageForOutput);
     output.cursor = fetched?.cursor ?? 0;
   }
-  json(output);
+  providerJobJson(output, !!stored);
 }
 
 /**

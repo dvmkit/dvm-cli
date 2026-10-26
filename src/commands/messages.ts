@@ -1,3 +1,4 @@
+import { providerJobJson } from "../lib/provider-output";
 export { formatMessageHuman } from "../lib/message-human";
 import { formatMessageHuman, paymentAmount } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
@@ -10,7 +11,6 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   info,
-  json,
 } from "../lib/output";
 
 import {
@@ -65,6 +65,7 @@ async function messagesWithAccess(
   const waitDuration = opts.wait ? parseDurationMs(opts.until ?? "12h") : undefined;
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
+  const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);
 
   function actionFromMessages(batch: Message[]): NextAction {
     const answered = access.endpointOverridden ? new Set<number>() : loadAnsweredYieldSeqs(jobId);
@@ -148,7 +149,8 @@ async function messagesWithAccess(
       (streamTerminalStatus(msgs) || isTerminal ? null : pollNextAction(jobId)), refunds);
     const content = jobContentFields(
       jobId,
-      await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken })
+      await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken }),
+      opts.human
     );
     const resolvedAction = await resolveNextAction(nextAction, msgs);
     transport.close();
@@ -223,7 +225,8 @@ async function messagesWithAccess(
         timeoutMs: waitDeadline === undefined ? (opts.timeout ? Number(opts.timeout) * 1000 : 5000)
           : Math.max(1, Math.min(streamOptions.timeoutMs, waitDeadline - Date.now())),
         jobToken,
-      })
+      }),
+    opts.human
   );
   const resolvedAction = opts.wait ? result.nextAction : await resolveNextAction(result.nextAction, result.messages);
   transport.close();
@@ -264,7 +267,8 @@ export function serializeMessageForOutput(msg: Message): Record<string, unknown>
 }
 
 function serialize(msg: Message): Record<string, unknown> {
-  const base = { seq: msg.seq, from: msg.from, timestamp: msg.timestamp, type: msg.type };
+  const base = { seq: msg.seq, from: msg.from, timestamp: msg.timestamp, type: msg.type,
+    ...(msg.from === "provider" ? { _provider_fields: ["seq", "from", "timestamp", "type", "content"] } : {}) };
   const fromProvider = msg.from === "provider";
 
   switch (msg.type) {
@@ -284,6 +288,11 @@ function serialize(msg: Message): Record<string, unknown> {
         id: msg.content.id,
         text: asProviderText(msg.content.text),
       };
+      content._provider_fields = [
+        "id",
+        ...(msg.content.options ? ["options"] : []),
+        ...(msg.content.schema ? ["schema"] : []),
+      ];
       if (msg.content.options) content.options = msg.content.options;
       if (msg.content.schema) content.schema = msg.content.schema;
       if (msg.content.expires_at_ms !== undefined) content.expires_at_ms = msg.content.expires_at_ms;

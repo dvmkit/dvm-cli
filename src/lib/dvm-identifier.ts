@@ -177,24 +177,22 @@ export function resolveCapability(
   }
   if (requested !== undefined) {
     if (caps.includes(requested)) return requested;
-    const list = dvmId ? caps.map((c) => `${dvmId}/${c}`).join(", ") : caps.join(", ");
     throw new DvmError(
       "unknown_capability",
       `"${requested}" is not a capability of ${reference}.`,
       dvmId
-        ? `Known capabilities: ${list}.`
-        : `Known capability names: ${list}. Run \`dvm search\` to find a qualified identifier.`
+        ? `Pass -d ${dvmId}/<capability> using a name from available_capabilities.`
+        : "Choose a name from available_capabilities. Run `dvm search` to find a qualified identifier.",
+      { available_capabilities: caps, _provider_fields: ["available_capabilities"] }
     );
   }
   if (caps.length === 1) return caps[0];
-  const list = dvmId ? caps.map((c) => `${dvmId}/${c}`).join(", ") : caps.join(", ");
   throw new DvmError(
     "ambiguous_capability",
+    `${reference} has multiple capabilities; specify one from available_capabilities.`,
     dvmId
-      ? `${dvmId} has multiple capabilities; specify one: ${list}.`
-      : `This endpoint has multiple capabilities: ${list}.`,
-    dvmId
-      ? `Pass -d ${dvmId}/<capability> with one of: ${caps.join(", ")}.`
-      : "Run `dvm search` to find a qualified identifier for the capability you need."
+      ? `Pass -d ${dvmId}/<capability> using a name from available_capabilities.`
+      : "Run `dvm search` to find a qualified identifier for the capability you need.",
+    { available_capabilities: caps, _provider_fields: ["available_capabilities"] }
   );
 }

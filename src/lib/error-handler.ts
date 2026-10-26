@@ -75,7 +75,9 @@ export function handleError(err: unknown, human?: boolean): never {
       const display = typeof dataDisplay === "string" ? dataDisplay : err.display;
       const dataNextStep = err.data?.next_step;
       const nextStep = typeof dataNextStep === "string" ? dataNextStep : undefined;
-      info([`Error: ${err.message}`, display, nextStep, err.hint].filter(Boolean).join("\n"));
+      const capabilities = Array.isArray(err.data?.available_capabilities)
+        ? `Available capabilities: ${err.data.available_capabilities.join(", ")}` : undefined;
+      info([`Error: ${err.message}`, display, capabilities, nextStep, err.hint].filter(Boolean).join("\n"));
     } else {
       const error: Record<string, unknown> = {
         code: err.code,

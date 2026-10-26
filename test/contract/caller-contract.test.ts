@@ -722,8 +722,9 @@ describe("standalone caller contract", () => {
       prompt_id: "weather",
       prompt: { _source: "provider", text: "High cloud moving in, 18 of 40 frames usable." },
       options: ["keep", "wait", "switch"],
+      _provider_fields: ["prompt_id", "options"],
       display: "The provider asks: High cloud moving in, 18 of 40 frames usable. Choices: \"keep\", \"wait\", \"switch\".",
-      hint: expect.stringContaining('dvm message prompt-options "<answer>" --type response --prompt-id weather'),
+      hint: expect.stringContaining('dvm message prompt-options "<answer>" --type response --prompt-id \'<prompt_id>\''),
     });
   });
 

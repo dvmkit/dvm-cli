@@ -1,3 +1,4 @@
+import { providerFields, providerJobJson as json } from "../lib/provider-output";
 import { buildTempoCredential } from "../lib/payment-rails/tempo-credential";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { parseBudget } from "../lib/currency";
@@ -79,7 +80,6 @@ import {
 import {
   getOutputTraceId,
   info,
-  json,
 } from "../lib/output";
 import {
   loadX402Wallet,
@@ -905,7 +905,7 @@ export async function request(opts: RequestOptions): Promise<void> {
         // Streaming paths surface the actual job result, which already
         // tells the agent what the server processed.
         ...(normalizedInput && Object.keys(appliedDefaults).length > 0
-          ? { normalized_input: normalizedInput, applied_defaults: appliedDefaults }
+          ? providerFields({ normalized_input: providerFields(normalizedInput, Object.keys(appliedDefaults)), applied_defaults: appliedDefaults }, ["applied_defaults"])
           : {}),
         // This branch returns before the job has an outcome, so it is the only
         // JSON the caller gets — a credit notice stashed during the probe has
@@ -951,7 +951,7 @@ export async function request(opts: RequestOptions): Promise<void> {
       transport.close();
       if (opts.human) {
         console.log(receipt.summary);
-        const hint = nextStepHint(receipt.jobId, receipt.payloadIn, receipt.artifactCount);
+        const hint = nextStepHint(receipt.jobId, receipt.payloadIn, receipt.artifactCount, true);
         if (hint) info(`📎 ${hint}`);
         renderReceiptHuman(captured);
         echoTraceIdHuman();
@@ -962,6 +962,7 @@ export async function request(opts: RequestOptions): Promise<void> {
           ...transactionOutputFields(receipt),
           ...dvmIdentity(dvmId, capability),
           summary: receipt.summary,
+          _provider_fields: ["summary"],
           ...buildCompletionHintFields(receipt.jobId, receipt),
           ...receiptJsonFields(captured),
           ...takeCreditNoticeFields(),
@@ -1039,7 +1040,7 @@ export async function request(opts: RequestOptions): Promise<void> {
           formatMessageHuman(msg, receipt.jobId, artifactSession);
         }
         if (completion) {
-          const hint = nextStepHint(receipt.jobId, completion.payloadIn, completion.artifactCount);
+          const hint = nextStepHint(receipt.jobId, completion.payloadIn, completion.artifactCount, true);
           if (hint) info(`📎 ${hint}`);
         }
         if (captured) renderReceiptHuman(captured);
@@ -1058,7 +1059,7 @@ export async function request(opts: RequestOptions): Promise<void> {
           // these come off the streamed log instead. Without them this arc
           // returned `next_action: null` and nothing else: no summary, and no
           // signal that a payload was waiting in artifacts.
-          ...(completion?.summary !== undefined ? { summary: completion.summary } : {}),
+          ...(completion?.summary !== undefined ? { summary: completion.summary, _provider_fields: ["summary"] } : {}),
           ...(completion ? buildCompletionHintFields(receipt.jobId, completion) : {}),
           ...(captured ? receiptJsonFields(captured) : {}),
           ...takeCreditNoticeFields(),
@@ -2417,7 +2418,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
     transport.close?.();
     if (opts.human) {
       console.log(receipt.summary);
-      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount);
+      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
       renderReceiptHuman(captured);
     } else {
@@ -2427,6 +2428,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
         ...transactionOutputFields(receipt),
         ...dvmFields,
         summary: receipt.summary,
+        _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
         ...receiptJsonFields(captured),
         paidWith: "tempo",
@@ -3443,7 +3445,7 @@ async function payWithAgentWallet(
     transport.close?.();
     if (opts.human) {
       console.log(receipt.summary);
-      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount);
+      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
       renderReceiptHuman(captured);
     } else {
@@ -3451,6 +3453,7 @@ async function payWithAgentWallet(
         jobId: effectiveJobId,
         ...dvmFields,
         summary: receipt.summary,
+        _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
         ...receiptJsonFields(captured),
         paidWith: "cashu_p2pk",
@@ -3708,7 +3711,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
     transport.close?.();
     if (opts.human) {
       console.log(receipt.summary);
-      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount);
+      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
       renderReceiptHuman(captured);
     } else {
@@ -3718,6 +3721,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
         ...transactionOutputFields(receipt),
         ...dvmFields,
         summary: receipt.summary,
+        _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
         ...receiptJsonFields(captured),
         paidWith: "x402",
@@ -3972,7 +3976,7 @@ async function streamAfterPayment(args: {
       formatMessageHuman(msg, jobId, artifactSession);
     }
     if (completion) {
-      const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount);
+      const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
     }
     if (captured) renderReceiptHuman(captured);
@@ -3986,7 +3990,7 @@ async function streamAfterPayment(args: {
       // Same as the unpaid arc above: the outcome is only knowable from the
       // streamed log here, so render it rather than leaving the agent to dig
       // the summary out of `messages` and guess about artifacts.
-      ...(completion?.summary !== undefined ? { summary: completion.summary } : {}),
+      ...(completion?.summary !== undefined ? { summary: completion.summary, _provider_fields: ["summary"] } : {}),
       ...(completion ? buildCompletionHintFields(jobId, completion) : {}),
       ...(captured ? receiptJsonFields(captured) : {}),
       ...takeCreditNoticeFields(),
@@ -4073,6 +4077,7 @@ async function recoverViaStatusPoll(args: {
         ...dvmFields,
         status: "completed",
         summary: status.summary ?? null,
+        _provider_fields: ["summary"],
         recovered: true,
         ...paymentFields,
         ...receiptJsonFields(captured),
@@ -4109,6 +4114,7 @@ async function recoverViaStatusPoll(args: {
         ...dvmFields,
         status: status.status,
         message: errorMsg,
+        ...(status.message !== undefined ? { _provider_fields: ["message"] } : {}),
         ...paymentFields,
         ...receiptJsonFields(captured),
         ...takeCreditNoticeFields(),
@@ -4116,7 +4122,8 @@ async function recoverViaStatusPoll(args: {
         next_action: null,
       });
     }
-    throw new DvmError(status.status === "failed" ? "provider_error" : "cancelled", errorMsg);
+    throw new DvmError(status.status === "failed" ? "provider_error" : "cancelled", errorMsg, undefined, undefined, undefined,
+      status.message !== undefined ? { message: "provider" } : undefined);
   }
 
   return false;

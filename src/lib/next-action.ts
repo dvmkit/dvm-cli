@@ -1,7 +1,8 @@
+import { guidanceJobArg } from "./provider-output";
 import { answeredYieldSeqs } from "./yield-state";
 import { formatPaymentAmount } from "./currency";
 import type { Message } from "@dvmkit/sdk/internal";
-import { asProviderText, shellQuoteArg, type ProviderText } from "@dvmkit/sdk/internal";
+import { asProviderText, type ProviderText } from "@dvmkit/sdk/internal";
 
 export type NextAction =
   | null
@@ -19,6 +20,7 @@ export interface NextActionRespond {
   prompt: ProviderText;
   schema?: Record<string, unknown>;
   options?: string[];
+  _provider_fields: ("prompt_id" | "options" | "schema")[];
   /** Earliest pending caller deadline for the job, in Unix milliseconds. */
   expires_at_ms?: number;
   display: string;
@@ -36,6 +38,7 @@ export interface NextActionPay {
    * against the figure the human is actually being asked to approve.
    */
   fiat_amount?: { amount: number; currency: string };
+  _provider_fields?: "fiat_amount"[];
   /** Earliest pending caller deadline for the job, in Unix milliseconds. */
   expires_at_ms?: number;
   display: string;
@@ -105,12 +108,12 @@ export function pollNextAction(jobId: string, hint?: string): NextActionPoll {
   return {
     type: "poll",
     job_id: jobId,
-    hint: hint ?? `Provider is still working. Keep the job moving unattended with \`dvm messages ${shellQuoteArg(jobId)} --wait\`.`,
+    hint: hint ?? `Provider is still working. Keep the job moving unattended with \`dvm messages ${guidanceJobArg(jobId)} --wait\`.`,
   };
 }
 
 export function paymentInFlightHint(jobId: string): string {
-  return `A payment may already have been sent for this request. Resolve it with \`dvm pay ${shellQuoteArg(jobId)}\`; it checks provider history before paying again.`;
+  return `A payment may already have been sent for this request. Resolve it with \`dvm pay ${guidanceJobArg(jobId)}\`; it checks provider history before paying again.`;
 }
 
 /** Message types that signal the end of a provider's turn. */
@@ -154,8 +157,13 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           job_id: jobId,
           prompt_id: c.id,
           prompt: asProviderText(c.text),
+          _provider_fields: [
+            "prompt_id",
+            ...(c.schema ? ["schema" as const] : []),
+            ...(c.options?.length ? ["options" as const] : []),
+          ],
           display: withDeadline(`The provider asks: ${c.text}${choices}`, deadline),
-          hint: expired ? deadline : withDeadline(`Provider is waiting for your input. Verify the question makes sense for your task before responding.${choiceHint} Run \`dvm message ${shellQuoteArg(jobId)} ${answer} --type response --prompt-id ${shellQuoteArg(c.id)}\`.`, deadline),
+          hint: expired ? deadline : withDeadline(`Provider is waiting for your input. Verify the question makes sense for your task before responding.${choiceHint} Run \`dvm message ${guidanceJobArg(jobId)} ${answer} --type response --prompt-id '<prompt_id>'\`.`, deadline),
         };
         if (c.schema) action.schema = c.schema;
         if (c.options?.length) action.options = c.options;
@@ -166,6 +174,8 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
       case "payment-request": {
         const c = msg.content;
         const display = formatPaymentAmount(c.amount_msats, c.fiat_amount);
+        const safeCurrency = !c.fiat_amount || c.fiat_amount.amount <= 0 || (c.fiat_amount.currency.length === 3 && /^[A-Z]{3}$/i.test(c.fiat_amount.currency));
+        const priceGuidance = safeCurrency ? display : "see the provider price in next_action.fiat_amount";
         const deadline = deadlineClause(expiresAtMs === validDeadline(c.expires_at_ms) ? "Pay" : "Reply", expiresAtMs, nowMs, jobId);
         const expired = expiresAtMs !== undefined && expiresAtMs <= nowMs;
         return {
@@ -174,11 +184,11 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           amount_msats: c.amount_msats,
           // Mirror only a fiat figure the display actually led with: echoing a
           // zero amount would tell an agent doing budget math the charge is free.
-          ...(c.fiat_amount && c.fiat_amount.amount > 0 ? { fiat_amount: c.fiat_amount } : {}),
+          ...(c.fiat_amount && c.fiat_amount.amount > 0 ? { fiat_amount: c.fiat_amount, _provider_fields: ["fiat_amount"] } : {}),
           ...(expiresAtMs !== undefined ? { expires_at_ms: expiresAtMs } : {}),
           display: withDeadline(display, deadline),
           reason: asProviderText(c.reason),
-          hint: expired ? deadline : withDeadline(`Payment required to continue: ${display}. Relay that amount to your human and get approval, then run \`dvm pay ${shellQuoteArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`, deadline),
+          hint: expired ? deadline : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`, deadline),
         };
       }
 
@@ -232,7 +242,7 @@ function deadlineClause(action: "Answer" | "Pay" | "Reply", expiresAtMs: number 
   if (expiresAtMs === undefined) return "";
   const deadline = new Date(expiresAtMs).toISOString().slice(0, 16).replace("T", " ") + " UTC";
   if (expiresAtMs <= nowMs) {
-    return `The deadline to ${action.toLowerCase()} (${deadline}) has passed. The provider will probably cancel the job. Check its status with \`dvm status ${shellQuoteArg(jobId)}\`.`;
+    return `The deadline to ${action.toLowerCase()} (${deadline}) has passed. The provider will probably cancel the job. Check its status with \`dvm status ${guidanceJobArg(jobId)}\`.`;
   }
   const minutes = Math.floor((expiresAtMs - nowMs) / 60_000);
   const hours = Math.floor(minutes / 60);

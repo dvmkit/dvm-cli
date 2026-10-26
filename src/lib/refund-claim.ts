@@ -1,3 +1,4 @@
+import { guidanceJobArg } from "./provider-output";
 import { type NextAction, type NextActionRefund } from "./next-action";
 import { formatAmountBestEffort, monetaryJson } from "./currency";
 import {
@@ -123,7 +124,7 @@ export function refundNextAction(jobId: string, claims: RefundClaim[]): NextActi
       reason: claim.reason,
       claimed: false,
       cashu_token: claim.cashu_token,
-      hint: `The provider sent a ${noun} but the auto-claim into your wallet failed (the mint may be unreachable). Claim it manually with 'dvm wallet receive-token <cashu_token>' — the token is in this action's 'cashu_token' field, don't lose it. Or retry the auto-claim with 'dvm messages ${jobId} --no-stream' (re-running plain 'dvm messages' won't retry — its cursor has already advanced past this message).`,
+      hint: `The provider sent a ${noun} but the auto-claim into your wallet failed (the mint may be unreachable). Claim it manually with 'dvm wallet receive-token <cashu_token>' — the token is in this action's 'cashu_token' field, don't lose it. Or retry the auto-claim with 'dvm messages ${guidanceJobArg(jobId)} --no-stream' (re-running plain 'dvm messages' won't retry — its cursor has already advanced past this message).`,
     };
   }
 

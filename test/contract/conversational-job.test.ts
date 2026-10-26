@@ -203,17 +203,18 @@ it("drives a conversational metered job across CLI processes, from quote to veri
     })));
 
     const answerTemplate = /`([^`]+)`/.exec(question.next_action.hint)?.[1];
-    expect(answerTemplate).toBe('dvm message conversation "<answer>" --type response --prompt-id cadence');
+    expect(answerTemplate).toBe(`dvm message conversation "<answer>" --type response --prompt-id '<prompt_id>'`);
+    const answerCommand = answerTemplate!.replace("--prompt-id '<prompt_id>'", () => `--prompt-id ${shellQuoteArg(question.next_action.prompt_id)}`);
     const humanQuestion = await run(["status", jobId, "--human"]);
     expect(humanQuestion.stdout).toBe("");
     const questionNext = humanQuestion.stderr.split("\n").find((line) => line.startsWith("Next:"));
     expect(questionNext).toContain('The provider asks: Cloud moving in. Which cadence? Choices: "keep  cadence — Δ", "wait", "switch".');
     expect(questionNext).toMatch(promptDeadlineClause);
-    expect(questionNext).toContain(`\`${answerTemplate}\``);
+    expect(questionNext).toContain(`\`${answerCommand}\``);
 
     mkdirSync(join(root, "bin"));
     symlinkSync(binary, join(root, "bin", "dvm"));
-    const answered = JSON.parse((await run(answerTemplate!.replace('"<answer>"', shellQuoteArg(choices[0])))).stdout);
+    const answered = JSON.parse((await run(answerCommand.replace('"<answer>"', shellQuoteArg(choices[0])))).stdout);
     expect(answered).toMatchObject({ jobId, sent: { type: "response",
       content: { prompt_id: "cadence", text: "keep  cadence — Δ" } }, next_action: { type: "poll" } });
     expect(answers).toEqual([{ prompt_id: "cadence", text: "keep  cadence — Δ" }]);

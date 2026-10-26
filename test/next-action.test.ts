@@ -178,8 +178,9 @@ describe("computeNextAction", () => {
       job_id: "job-1",
       prompt_id: "p1",
       prompt: { _source: "provider", text: "What color?" },
+      _provider_fields: ["prompt_id"],
       display: "The provider asks: What color?",
-      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id p1'),
+      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id \'<prompt_id>\''),
     });
   });
 
@@ -195,7 +196,7 @@ describe("computeNextAction", () => {
       type: "respond",
       schema,
       display: "The provider asks: Provide details",
-      hint: expect.stringContaining("dvm message job-1 --json '<object matching schema>' --type response --prompt-id p1"),
+      hint: expect.stringContaining("dvm message job-1 --json '<object matching schema>' --type response --prompt-id '<prompt_id>'"),
     });
     expect(result).not.toHaveProperty("options");
   });
@@ -220,18 +221,18 @@ describe("computeNextAction", () => {
       type: "respond",
       options,
       display,
-      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id p1'),
+      hint: expect.stringContaining('dvm message job-1 "<answer>" --type response --prompt-id \'<prompt_id>\''),
     });
     expect(result?.hint).toContain("exactly one of options unless the human chose otherwise");
     expect(result?.hint).toContain("Verify the question makes sense for your task");
   });
 
-  it("shell-quotes job and prompt ids in the exact answer command", () => {
+  it("keeps unrestricted job and prompt ids out of CLI guidance", () => {
     const result = computeNextAction("job; two", [
       msg({ type: "prompt", content: { id: "prompt; two", text: "Continue?" } }),
     ]);
     expect(result?.hint).toBe(
-      'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message \'job; two\' "<answer>" --type response --prompt-id \'prompt; two\'`.'
+      'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message \'<job_id>\' "<answer>" --type response --prompt-id \'<prompt_id>\'`.'
     );
   });
 
@@ -242,7 +243,7 @@ describe("computeNextAction", () => {
     expect(result).not.toHaveProperty("options");
     expect(result).toMatchObject({
       display: "The provider asks: Continue?",
-      hint: 'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 "<answer>" --type response --prompt-id p1`.',
+      hint: 'Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 "<answer>" --type response --prompt-id \'<prompt_id>\'`.',
     });
   });
 
@@ -255,16 +256,16 @@ describe("computeNextAction", () => {
       schema,
       options: ["keep"],
       display: 'The provider asks: Provide details Choices: "keep".',
-      hint: "Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 --json '<object matching schema>' --type response --prompt-id p1`.",
+      hint: "Provider is waiting for your input. Verify the question makes sense for your task before responding. Run `dvm message job-1 --json '<object matching schema>' --type response --prompt-id \'<prompt_id>\'`.",
     });
   });
 
-  it("shell-quotes the job id in the exact pay command", () => {
+  it("uses a job placeholder in the pay command for unrestricted IDs", () => {
     const result = computeNextAction("job; two", [
       msg({ type: "payment-request", content: { amount_msats: 5000, reason: "Work" } }),
     ]);
     expect(result?.hint).toBe(
-      'Payment required to continue: 5 sats. Relay that amount to your human and get approval, then run `dvm pay \'job; two\'`. Provider\'s stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.'
+      'Payment required to continue: 5 sats. Relay that amount to your human and get approval, then run `dvm pay \'<job_id>\'`. Provider\'s stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.'
     );
   });
 
@@ -304,6 +305,7 @@ describe("computeNextAction", () => {
       job_id: "job-1",
       amount_msats: 5000,
       fiat_amount: { amount: 0.05, currency: "usd" },
+      _provider_fields: ["fiat_amount"],
       display: "$0.05 USD (5 sats)",
       reason: { _source: "provider", text: "Design work" },
       hint: expect.stringContaining("Payment required to continue: $0.05 USD (5 sats)."),
@@ -378,8 +380,8 @@ describe("isTerminalJobStatus", () => {
 });
 
 describe("pollNextAction", () => {
-  it("shell-quotes the job id in the unattended wait command", () => {
-    expect(pollNextAction("job's").hint).toContain("dvm messages 'job'\\''s' --wait");
+  it("uses a job placeholder in the unattended wait command for unrestricted IDs", () => {
+    expect(pollNextAction("job's").hint).toContain("dvm messages '<job_id>' --wait");
   });
 
   it("defaults to the CLI-owned working hint", () => {

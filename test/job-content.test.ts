@@ -16,6 +16,15 @@ describe("content observations", () => {
     expect(fields.content_hint).toContain("1970-01-01T00:00:00.001Z");
   });
 
+  it.each([true, false])("quotes the real job ID in human content guidance when available=%s", (available) => {
+    const fields = jobContentFields("job; one", { content_available: available }, true);
+    expect(fields.content_hint).toContain(available
+      ? "dvm messages 'job; one' --no-stream"
+      : "dvm receipts verify 'job; one'");
+    expect(fields.content_hint).not.toContain("<job_id>");
+    expect(jobContentFields("job; one", { content_available: available }).content_hint).toContain("'<job_id>'");
+  });
+
   it("distinguishes a legacy provider observation from an unobserved cache", () => {
     expect(jobContentFields("job", {})).toMatchObject({ content_metadata_source: "provider", content_metadata_known: false });
     const cached = jobContentFields("job");

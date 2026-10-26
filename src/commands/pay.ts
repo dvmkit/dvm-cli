@@ -1,3 +1,4 @@
+import { providerJobJson } from "../lib/provider-output";
 import { type PaymentRailKey, paymentRailLabel } from "../lib/rail-labels";
 import { formatPaymentAmount } from "../lib/currency";
 import { buildCompletionHintFields, completionFromMessages, nextStepHint } from "../lib/completion-hints";
@@ -13,7 +14,6 @@ import {
 } from "../lib/payment-rails/tempo-wallet";
 import {
   info,
-  json,
 } from "../lib/output";
 import {
   loadX402Wallet,
@@ -84,6 +84,7 @@ async function payWithAccess(
   }
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
+  const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);
 
   const msgs = loadMessages(jobId);
   const pending = stored.pendingCreditPayment;
@@ -254,7 +255,7 @@ async function payWithAccess(
       formatMessageHuman(msg, jobId, artifactSession);
     }
     if (completion) {
-      const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount);
+      const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
     }
     finalizeProgressLine();
@@ -269,7 +270,7 @@ async function payWithAccess(
       // so without these an agent that pays sees `next_action: null` and can't
       // tell whether the payload is the summary or artifacts it must go fetch
       // Mirrors what `dvm request` renders on the upfront-paid arc.
-      ...(completion?.summary !== undefined ? { summary: completion.summary } : {}),
+      ...(completion?.summary !== undefined ? { summary: completion.summary, _provider_fields: ["summary"] } : {}),
       ...(completion ? buildCompletionHintFields(jobId, completion) : {}),
       ...takeCreditNoticeFields(),
       ...takeFeedbackNoticeFields(),
