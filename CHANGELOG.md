@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/dvmkit/dvm-cli/compare/v0.11.0...v0.11.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* mark provider prose in prompt choices and schemas ([#34](https://github.com/dvmkit/dvm-cli/issues/34)) ([1108226](https://github.com/dvmkit/dvm-cli/commit/1108226e0c1156164dc1db5fc5af72ae94976983))
+
 ## [0.11.0](https://github.com/dvmkit/dvm-cli/compare/v0.10.0...v0.11.0) (2026-10-25)
 
 
