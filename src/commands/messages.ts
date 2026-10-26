@@ -1,4 +1,5 @@
-import { providerJobJson } from "../lib/provider-output";
+import { isCallerMessage } from "../lib/message-ownership";
+import { providerFields, providerJobJson } from "../lib/provider-output";
 export { formatMessageHuman } from "../lib/message-human";
 import { formatMessageHuman, paymentAmount } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
@@ -267,9 +268,9 @@ export function serializeMessageForOutput(msg: Message): Record<string, unknown>
 }
 
 function serialize(msg: Message): Record<string, unknown> {
-  const base = { seq: msg.seq, from: msg.from, timestamp: msg.timestamp, type: msg.type,
-    ...(msg.from === "provider" ? { _provider_fields: ["seq", "from", "timestamp", "type", "content"] } : {}) };
-  const fromProvider = msg.from === "provider";
+  const fromProvider = !isCallerMessage(msg);
+  const base = providerFields({ seq: msg.seq, from: msg.from, timestamp: msg.timestamp, type: msg.type, content: msg.content },
+    ["seq", "from", "timestamp", ...(fromProvider ? ["type", "content"] : [])]);
 
   switch (msg.type) {
     case "text": {
@@ -319,7 +320,7 @@ function serialize(msg: Message): Record<string, unknown> {
     case "payment": {
       // Requester payments must not borrow provider refund/change wording.
       const amount = paymentAmount(msg);
-      const display = fromProvider
+      const display = msg.from === "provider"
         ? `${msg.content.reason === "change" ? "Change" : "Refund"} sent: ${amount}`
         : `Paid: ${amount}`;
       return { ...base, content: { ...msg.content }, display };

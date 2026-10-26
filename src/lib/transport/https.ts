@@ -1,3 +1,7 @@
+import { sameEndpoint } from "../provider-endpoint";
+import { callerMessageRecognizer, rememberCallerMessage } from "../message-ownership";
+import { loadJob } from "../job-store";
+import { providerFields } from "../provider-output";
 import { parseUpfrontPayment } from "../upfront-payment";
 import {
   type CancelOptions,
@@ -643,7 +647,9 @@ export class HttpsTransport implements Transport {
       captureTraceId(res);
 
       if (res.status === 404) {
-        throw new DvmError("job_not_found", `Job ${jobId} not found.`);
+        const storedEndpoint = loadJob(jobId)?.endpoint;
+        throw new DvmError("job_not_found", "Job not found.", undefined, providerFields({ job_id: jobId },
+          storedEndpoint && sameEndpoint(storedEndpoint, endpoint) ? ["job_id"] : []));
       }
       if (!res.ok) {
         const credentialErr = jobCredentialError(res.status, await res.text());
@@ -717,7 +723,7 @@ export class HttpsTransport implements Transport {
       }
 
       const data = (await readMessagePollBody(() => res.json(), jobId)) as { messages: Message[] };
-      return data.messages;
+      return data.messages.map(callerMessageRecognizer(jobId, endpoint));
     } catch (err) {
       if (err instanceof DvmError) throw err;
       if (isAbortError(err)) {
@@ -816,6 +822,7 @@ export class HttpsTransport implements Transport {
       }
       throw providerResponseError("provider_error", `sendMessage failed (${res.status}): ${text}`);
     }
+    rememberCallerMessage(jobId, endpoint, message);
     if (message.type !== "payment") return;
     const acknowledgement = parseJsonObject(await res.text());
     if (message.type === "payment" && message.content.credit) {
@@ -854,9 +861,10 @@ export class HttpsTransport implements Transport {
     // (e.g. job already flushed to store), parse the snapshot directly rather
     // than feeding it to the SSE parser where it would hang until timeout.
     const contentType = res.headers.get("content-type") ?? "";
+    const recognize = callerMessageRecognizer(jobId, endpoint);
     if (contentType.includes("application/json")) {
       const body = (await res.json()) as { messages?: Message[] };
-      const messages = body.messages ?? [];
+      const messages = (body.messages ?? []).map(recognize);
       const last = messages.at(-1);
       const reason: StreamResult["reason"] =
         last?.type === "complete" ? "complete" : last?.type === "cancel" ? "cancel" : "yield";
@@ -864,7 +872,7 @@ export class HttpsTransport implements Transport {
       return { messages, reason };
     }
 
-    return parseSSEStream(res, options);
+    return parseSSEStream(res, options, recognize);
   }
 
   async cancel(
@@ -1151,7 +1159,7 @@ function x402RequiredUsdcMicro(required: PaymentRequired | undefined): string | 
 /** Message types that signal the end of a provider's turn (yield points). */
 const YIELD_TYPES = new Set(["prompt", "payment-request", "working", "complete", "cancel"]);
 
-async function parseSSEStream(res: Response, options?: StreamOptions): Promise<StreamResult> {
+async function parseSSEStream(res: Response, options?: StreamOptions, recognize = (message: Message) => message): Promise<StreamResult> {
   const messages: Message[] = [];
 
   if (!res.body) {
@@ -1185,7 +1193,7 @@ async function parseSSEStream(res: Response, options?: StreamOptions): Promise<S
 
         const json = dataLine.slice("data:".length).trim();
         try {
-          const msg = JSON.parse(json) as Message;
+          const msg = recognize(JSON.parse(json) as Message);
           messages.push(msg);
           options?.onMessage?.(msg);
 

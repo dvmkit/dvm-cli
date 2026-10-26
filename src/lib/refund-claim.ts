@@ -1,4 +1,4 @@
-import { guidanceJobArg } from "./provider-output";
+import { guidanceJobArg, providerFields } from "./provider-output";
 import { type NextAction, type NextActionRefund } from "./next-action";
 import { formatAmountBestEffort, monetaryJson } from "./currency";
 import {
@@ -22,8 +22,10 @@ import {
  */
 export interface RefundClaim {
   seq: number;
-  /** Amount claimed (or, when unclaimed, the provider-declared amount), in msats. */
+  /** Wallet-confirmed amount when available; otherwise the provider-declared amount, in msats. */
   amount_msats: number;
+  /** Only wallet-confirmed amounts may be emitted without provider provenance. */
+  amountConfirmed?: true;
   reason: "refund" | "change";
   mint?: string;
   claimed: boolean;
@@ -45,6 +47,7 @@ export async function claimInboundPayments(
 ): Promise<RefundClaim[]> {
   const job = loadJob(jobId);
   const claimedSeqs = new Set(job?.claimedPaymentSeqs ?? []);
+  const claimedAmounts = { ...job?.claimedPaymentAmountsMsats };
   const results: RefundClaim[] = [];
 
   for (const msg of messages) {
@@ -56,9 +59,12 @@ export async function claimInboundPayments(
     const declaredMsats = c.amount_msats ?? 0;
 
     if (claimedSeqs.has(msg.seq)) {
+      const retained = claimedAmounts[msg.seq];
+      const confirmedAmount = typeof retained === "number" && Number.isFinite(retained) && retained > 0 ? retained : undefined;
       results.push({
         seq: msg.seq,
-        amount_msats: declaredMsats,
+        amount_msats: confirmedAmount ?? declaredMsats,
+        ...(confirmedAmount !== undefined ? { amountConfirmed: true as const } : {}),
         reason,
         mint: c.mint,
         claimed: true,
@@ -79,10 +85,12 @@ export async function claimInboundPayments(
     }
     if (claimedMsats > 0) {
       claimedSeqs.add(msg.seq);
-      updateJob(jobId, { claimedPaymentSeqs: [...claimedSeqs] });
+      claimedAmounts[msg.seq] = claimedMsats;
+      updateJob(jobId, { claimedPaymentSeqs: [...claimedSeqs], claimedPaymentAmountsMsats: claimedAmounts });
       results.push({
         seq: msg.seq,
         amount_msats: claimedMsats,
+        amountConfirmed: true,
         reason,
         mint: c.mint,
         claimed: true,
@@ -116,8 +124,8 @@ export function refundNextAction(jobId: string, claims: RefundClaim[]): NextActi
   const noun = claim.reason === "change" ? "change" : "refund";
 
   if (!claim.claimed) {
-    return {
-      type: "refund",
+    return providerFields({
+      type: "refund" as const,
       job_id: jobId,
       amount_msats: claim.amount_msats,
       display: `${cap(noun)} of ${amount} could not be auto-claimed`,
@@ -125,18 +133,18 @@ export function refundNextAction(jobId: string, claims: RefundClaim[]): NextActi
       claimed: false,
       cashu_token: claim.cashu_token,
       hint: `The provider sent a ${noun} but the auto-claim into your wallet failed (the mint may be unreachable). Claim it manually with 'dvm wallet receive-token <cashu_token>' — the token is in this action's 'cashu_token' field, don't lose it. Or retry the auto-claim with 'dvm messages ${guidanceJobArg(jobId)} --no-stream' (re-running plain 'dvm messages' won't retry — its cursor has already advanced past this message).`,
-    };
+    }, ["amount_msats", "reason", "cashu_token"]);
   }
 
-  return {
-    type: "refund",
+  return providerFields({
+    type: "refund" as const,
     job_id: jobId,
     amount_msats: claim.amount_msats,
     display: `Received ${noun} of ${amount}`,
     reason: claim.reason,
     claimed: true,
     hint: `The provider ${noun === "refund" ? "refunded" : "returned change of"} ${amount}, now added to your wallet. Relay to your human: they got ${amount} back.`,
-  };
+  }, ["reason", ...(!claim.amountConfirmed ? ["amount_msats"] : [])]);
 }
 
 /**
@@ -155,14 +163,14 @@ export async function refundJsonField(
       ? monetaryJson(claim.amount_msats, rate)
       : { msats: claim.amount_msats, display: `${Math.round(claim.amount_msats / 1000)} sats` };
   return {
-    refund: {
+    refund: providerFields({
       seq: claim.seq,
       reason: claim.reason,
       claimed: claim.claimed,
       amount,
       ...(claim.mint ? { mint: claim.mint } : {}),
       cashu_token: claim.cashu_token,
-    },
+    }, ["seq", "reason", "mint", "cashu_token", ...(!claim.amountConfirmed ? ["amount"] : [])]),
   };
 }
 

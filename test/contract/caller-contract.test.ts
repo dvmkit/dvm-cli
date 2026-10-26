@@ -519,6 +519,7 @@ describe("standalone caller contract", () => {
       const result = await runCli(args());
       const history = JSON.parse(result.stdout).messages;
       expect(history[0]).toEqual({ seq: 2, from: "requester", timestamp: "2026-01-01T00:00:00Z", type: "payment",
+        _provider_fields: ["seq", "from", "timestamp", "type", "content"],
         content: { credit: { credit_id: "history-credit", draw_id: "history-draw", payment_id: "history-payment",
           request_seq: 1, amount_micro: amountMicro, currency } },
         display: `Paid: ${nativeAmount} from prepaid balance` });
