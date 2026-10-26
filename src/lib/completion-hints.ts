@@ -1,5 +1,5 @@
 import { guidanceJobArg } from "./provider-output";
-import type { Message } from "@dvmkit/sdk/internal";
+import { shellQuoteArg, type Message } from "@dvmkit/sdk/internal";
 
 /**
  * The terminal-outcome fields a job carries once it is over — the summary, the
@@ -44,11 +44,12 @@ export function buildCompletionHintFields(
 export function nextStepHint(
   jobId: string,
   payloadIn: "summary" | "messages" | undefined,
-  artifactCount: number | undefined
+  artifactCount: number | undefined,
+  human = false
 ): string | undefined {
   if (payloadIn !== "messages") return undefined;
   const noun = artifactCount === 1 ? "artifact" : "artifacts";
-  return `Run 'dvm messages ${guidanceJobArg(jobId)} --no-stream' to fetch the ${noun}.`;
+  return `Run 'dvm messages ${human ? shellQuoteArg(jobId) : guidanceJobArg(jobId)} --no-stream' to fetch the ${noun}.`;
 }
 
 /**

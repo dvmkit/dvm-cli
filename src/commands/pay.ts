@@ -255,7 +255,7 @@ async function payWithAccess(
       formatMessageHuman(msg, jobId, artifactSession);
     }
     if (completion) {
-      const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount);
+      const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
     }
     finalizeProgressLine();

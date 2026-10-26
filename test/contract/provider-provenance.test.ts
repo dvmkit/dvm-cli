@@ -54,10 +54,10 @@ beforeAll(async () => {
             : schema, example: { choice: marker } } },
         input_schema: schema, quote: { schema }, payment: { methods: [] } }));
     } else if (request.method === "POST" && url.pathname === "/v1/job") {
-      const terminal = scenario === "sync";
+      const terminal = scenario === "sync" || scenario === "human-completion";
       response.statusCode = terminal ? 200 : 202;
-      response.end(JSON.stringify({ job_id: scenario === "job-id" ? marker : scenario === "placeholder" ? "<prompt_id>" : terminal ? marker : scenario === "sse" ? "sse" : "provenance",
-        job_token: token, status: terminal ? "completed" : "awaiting-input", ...(terminal ? { summary: marker } : {}) }));
+      response.end(JSON.stringify({ job_id: scenario === "human-completion" ? "job.1" : scenario === "job-id" ? marker : scenario === "placeholder" ? "<prompt_id>" : terminal ? marker : scenario === "sse" ? "sse" : "provenance",
+        job_token: token, status: terminal ? "completed" : "awaiting-input", ...(terminal ? { summary: marker, has_artifacts: true, artifact_count: 1, payload_in: "messages" } : {}) }));
     } else if (request.method === "POST" && url.pathname.endsWith("/messages")) {
       const chunks: Buffer[] = [];
       for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -68,7 +68,13 @@ beforeAll(async () => {
       response.statusCode = answered ? 201 : 400;
       response.end(JSON.stringify({ seq: 3 }));
     } else if (url.pathname.endsWith("/messages")) {
-      const messages = scenario === "known-extra" ? [
+      const messages = scenario.startsWith("payment-") ? [
+        { seq: 1, from: "provider", timestamp: 1, type: "payment-request",
+          content: { amount_msats: 5000, reason: "Work", fiat_amount: { amount: 1, currency: scenario === "payment-currency" ? marker : "usd" } } },
+      ] : scenario === "human-completion" ? [
+        { seq: 1, from: "provider", timestamp: 1, type: "artifact", content: { name: "result.txt", mime_type: "text/plain", data: "Completed output" } },
+        { seq: 2, from: "provider", timestamp: 2, type: "complete", content: { status: "success", summary: "Done" } },
+      ] : scenario === "known-extra" ? [
         { seq: 1, from: "provider", timestamp: 1, type: "complete", content: { status: "success", extension: { instructions: marker } } },
       ] : scenario === "event-type" ? [
         { seq: 1, from: "provider", timestamp: 1, type: marker, content: { message: marker } },
@@ -126,7 +132,7 @@ const plainPaths = [
 ];
 
 function markerPaths(value: unknown, path = "", provider = false): { path: string; marked: boolean }[] {
-  if (typeof value === "string") return value.includes(marker) ? [{ path, marked: provider }] : [];
+  if (typeof value === "string") return value.toLowerCase().includes(marker.toLowerCase()) ? [{ path, marked: provider }] : [];
   if (!value || typeof value !== "object") return [];
   if (Array.isArray(value)) return value.flatMap((item, index) => markerPaths(item, `${path}.${index}`, provider));
   const object = value as Record<string, unknown>;
@@ -300,4 +306,38 @@ it("marks both copies of schema defaults without marking caller input", async ()
   expect(output._provider_fields).toContain("applied_defaults");
   expect(output._provider_fields).not.toContain("normalized_input");
   expectProvenance(output);
+});
+
+it("keeps unrestricted payment currency in marked price data, outside CLI guidance", async () => {
+  scenario = "payment-currency";
+  const output = await run(["messages", "currency", "--endpoint", endpoint, "--job-token", token, "--no-stream"]);
+  expectProvenance(output);
+  expect(output.next_action.fiat_amount).toEqual({ amount: 1, currency: marker });
+  expect(output.next_action._provider_fields).toContain("fiat_amount");
+  expect(output.next_action.hint).toContain("next_action.fiat_amount");
+  expect(output.next_action.hint.toLowerCase()).not.toContain(marker.toLowerCase());
+});
+
+it("executes the human completion command for a job ID containing punctuation", async () => {
+  scenario = "human-completion";
+  const completion = await runRaw(["request", "--endpoint", endpoint, "--input", "observe", "--human"]);
+  const command = completion.stderr.match(/Run '(dvm messages .+ --no-stream)'/)?.[1];
+  expect(command).toBe("dvm messages job.1 --no-stream");
+  const result = await execute("/bin/sh", ["-c", 'dvm() { "$DVM_NODE" "$DVM_BINARY" "$@"; }; ' + command], {
+    env: { ...process.env, DVM_NODE: process.execPath, DVM_BINARY: binary, DVM_CONFIG_DIR: root }, timeout: 15_000,
+  });
+  expect(JSON.parse(result.stdout).messages[0].content.data).toBe("Completed output");
+  const replay = await runRaw(["status", "job.1", "--human"]);
+  expect(replay.stderr).toContain("dvm messages job.1 --no-stream");
+  expect(replay.stderr).not.toContain("<job_id>");
+  const jsonReplay = await run(["status", "job.1"]);
+  expect(jsonReplay.content_hint).toContain("dvm messages '<job_id>' --no-stream");
+});
+
+it("preserves supported fiat prices in CLI payment guidance", async () => {
+  scenario = "payment-supported";
+  const output = await run(["messages", "supported-price", "--endpoint", endpoint, "--job-token", token, "--no-stream"]);
+  expect(output.next_action.fiat_amount).toEqual({ amount: 1, currency: "usd" });
+  expect(output.next_action._provider_fields).toContain("fiat_amount");
+  expect(output.next_action.hint).toContain("Payment required to continue: $1.00 USD (5 sats)");
 });

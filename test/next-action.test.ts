@@ -305,6 +305,7 @@ describe("computeNextAction", () => {
       job_id: "job-1",
       amount_msats: 5000,
       fiat_amount: { amount: 0.05, currency: "usd" },
+      _provider_fields: ["fiat_amount"],
       display: "$0.05 USD (5 sats)",
       reason: { _source: "provider", text: "Design work" },
       hint: expect.stringContaining("Payment required to continue: $0.05 USD (5 sats)."),

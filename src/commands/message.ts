@@ -110,7 +110,8 @@ async function messageWithAccess(
   }
   const content = jobContentFields(
     jobId,
-    await observeJobContent(jobId, transport, ref, { timeoutMs: timeoutMs ?? 5000, jobToken })
+    await observeJobContent(jobId, transport, ref, { timeoutMs: timeoutMs ?? 5000, jobToken }),
+    opts.human
   );
   transport.close();
 

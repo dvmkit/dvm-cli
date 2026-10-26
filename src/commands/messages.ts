@@ -149,7 +149,8 @@ async function messagesWithAccess(
       (streamTerminalStatus(msgs) || isTerminal ? null : pollNextAction(jobId)), refunds);
     const content = jobContentFields(
       jobId,
-      await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken })
+      await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken }),
+      opts.human
     );
     const resolvedAction = await resolveNextAction(nextAction, msgs);
     transport.close();
@@ -224,7 +225,8 @@ async function messagesWithAccess(
         timeoutMs: waitDeadline === undefined ? (opts.timeout ? Number(opts.timeout) * 1000 : 5000)
           : Math.max(1, Math.min(streamOptions.timeoutMs, waitDeadline - Date.now())),
         jobToken,
-      })
+      }),
+    opts.human
   );
   const resolvedAction = opts.wait ? result.nextAction : await resolveNextAction(result.nextAction, result.messages);
   transport.close();

@@ -38,6 +38,7 @@ export interface NextActionPay {
    * against the figure the human is actually being asked to approve.
    */
   fiat_amount?: { amount: number; currency: string };
+  _provider_fields?: "fiat_amount"[];
   /** Earliest pending caller deadline for the job, in Unix milliseconds. */
   expires_at_ms?: number;
   display: string;
@@ -173,6 +174,8 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
       case "payment-request": {
         const c = msg.content;
         const display = formatPaymentAmount(c.amount_msats, c.fiat_amount);
+        const safeCurrency = !c.fiat_amount || c.fiat_amount.amount <= 0 || (c.fiat_amount.currency.length === 3 && /^[A-Z]{3}$/i.test(c.fiat_amount.currency));
+        const priceGuidance = safeCurrency ? display : "see the provider price in next_action.fiat_amount";
         const deadline = deadlineClause(expiresAtMs === validDeadline(c.expires_at_ms) ? "Pay" : "Reply", expiresAtMs, nowMs, jobId);
         const expired = expiresAtMs !== undefined && expiresAtMs <= nowMs;
         return {
@@ -181,11 +184,11 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           amount_msats: c.amount_msats,
           // Mirror only a fiat figure the display actually led with: echoing a
           // zero amount would tell an agent doing budget math the charge is free.
-          ...(c.fiat_amount && c.fiat_amount.amount > 0 ? { fiat_amount: c.fiat_amount } : {}),
+          ...(c.fiat_amount && c.fiat_amount.amount > 0 ? { fiat_amount: c.fiat_amount, _provider_fields: ["fiat_amount"] } : {}),
           ...(expiresAtMs !== undefined ? { expires_at_ms: expiresAtMs } : {}),
           display: withDeadline(display, deadline),
           reason: asProviderText(c.reason),
-          hint: expired ? deadline : withDeadline(`Payment required to continue: ${display}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`, deadline),
+          hint: expired ? deadline : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`, deadline),
         };
       }
 

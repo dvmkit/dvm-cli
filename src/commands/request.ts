@@ -951,7 +951,7 @@ export async function request(opts: RequestOptions): Promise<void> {
       transport.close();
       if (opts.human) {
         console.log(receipt.summary);
-        const hint = nextStepHint(receipt.jobId, receipt.payloadIn, receipt.artifactCount);
+        const hint = nextStepHint(receipt.jobId, receipt.payloadIn, receipt.artifactCount, true);
         if (hint) info(`📎 ${hint}`);
         renderReceiptHuman(captured);
         echoTraceIdHuman();
@@ -1040,7 +1040,7 @@ export async function request(opts: RequestOptions): Promise<void> {
           formatMessageHuman(msg, receipt.jobId, artifactSession);
         }
         if (completion) {
-          const hint = nextStepHint(receipt.jobId, completion.payloadIn, completion.artifactCount);
+          const hint = nextStepHint(receipt.jobId, completion.payloadIn, completion.artifactCount, true);
           if (hint) info(`📎 ${hint}`);
         }
         if (captured) renderReceiptHuman(captured);
@@ -2418,7 +2418,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
     transport.close?.();
     if (opts.human) {
       console.log(receipt.summary);
-      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount);
+      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
       renderReceiptHuman(captured);
     } else {
@@ -3445,7 +3445,7 @@ async function payWithAgentWallet(
     transport.close?.();
     if (opts.human) {
       console.log(receipt.summary);
-      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount);
+      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
       renderReceiptHuman(captured);
     } else {
@@ -3711,7 +3711,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
     transport.close?.();
     if (opts.human) {
       console.log(receipt.summary);
-      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount);
+      const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
       renderReceiptHuman(captured);
     } else {
@@ -3976,7 +3976,7 @@ async function streamAfterPayment(args: {
       formatMessageHuman(msg, jobId, artifactSession);
     }
     if (completion) {
-      const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount);
+      const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
     }
     if (captured) renderReceiptHuman(captured);

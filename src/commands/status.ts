@@ -251,10 +251,10 @@ function renderStatus(
   fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: ContentStatus }
 ): void {
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
-  const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount);
+  const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, opts.human);
   const msgs = fetched?.msgs ?? [];
   const receipt = fetched?.receipt;
-  const content = jobContentFields(jobId, fetched?.content);
+  const content = jobContentFields(jobId, fetched?.content, opts.human);
   const spend = stored ? jobSpend(loadJob(jobId) ?? stored, receipt?.receipt) : undefined;
 
   if (opts.human) {
