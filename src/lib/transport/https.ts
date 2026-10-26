@@ -1,3 +1,4 @@
+import { sameEndpoint } from "../provider-endpoint";
 import { callerMessageRecognizer, rememberCallerMessage } from "../message-ownership";
 import { loadJob } from "../job-store";
 import { providerFields } from "../provider-output";
@@ -646,7 +647,9 @@ export class HttpsTransport implements Transport {
       captureTraceId(res);
 
       if (res.status === 404) {
-        throw new DvmError("job_not_found", "Job not found.", undefined, providerFields({ job_id: jobId }, loadJob(jobId)?.endpoint === endpoint ? ["job_id"] : []));
+        const storedEndpoint = loadJob(jobId)?.endpoint;
+        throw new DvmError("job_not_found", "Job not found.", undefined, providerFields({ job_id: jobId },
+          storedEndpoint && sameEndpoint(storedEndpoint, endpoint) ? ["job_id"] : []));
       }
       if (!res.ok) {
         const credentialErr = jobCredentialError(res.status, await res.text());

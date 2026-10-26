@@ -1,3 +1,5 @@
+import { sameEndpoint } from "./provider-endpoint";
+export { sameEndpoint } from "./provider-endpoint";
 import {
   DvmError,
   type ProviderRef,
@@ -144,19 +146,6 @@ export function redactJobTokenFromError(err: unknown, jobToken: string | undefin
     err.display === undefined ? undefined : redact(err.display),
     err.proseSources
   );
-}
-
-/** Whether two provider endpoints name the same service: origin and path, ignoring a trailing slash. */
-export function sameEndpoint(a: string, b: string): boolean {
-  const normalize = (value: string): string => {
-    try {
-      const url = new URL(value);
-      return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
-    } catch {
-      return value.replace(/\/+$/, "");
-    }
-  };
-  return normalize(a) === normalize(b);
 }
 
 /**

@@ -1,3 +1,4 @@
+import { sameEndpoint } from "./provider-endpoint";
 import { existsSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, fsyncSync } from "fs";
 
 import { JOBS_FILE } from "@dvmkit/sdk/internal";
@@ -98,6 +99,8 @@ export interface JobRecord {
    * and prevents double-claim on replay/re-poll.
    */
   claimedPaymentSeqs?: number[];
+  /** Wallet-confirmed amounts for replay; older records retain sequence numbers only. */
+  claimedPaymentAmountsMsats?: Record<number, number>;
   /** Rail sends started without a confirmed acknowledgement; reconcile before spending again. */
   inFlightPaymentRequestSeqs?: number[];
   /** Latest dispatch or uncertain-outcome times (Unix milliseconds), keyed by request seq. Missing on older records, which skip the settle delay. */
@@ -258,7 +261,7 @@ export function updateJob(id: string, update: Partial<Omit<JobRecord, "id">>): v
 
 export function recordCallerMessageHash(jobId: string, endpoint: string, hash: string): void {
   mutateJobs((jobs) => {
-    const job = jobs.find((entry) => entry.id === jobId && entry.endpoint === endpoint);
+    const job = jobs.find((entry) => entry.id === jobId && sameEndpoint(entry.endpoint, endpoint));
     if (job) job.callerMessageHashes = [...new Set([...(job.callerMessageHashes ?? []), hash])];
   });
 }

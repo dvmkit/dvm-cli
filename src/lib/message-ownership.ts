@@ -1,3 +1,4 @@
+import { normalizeProviderEndpoint, sameEndpoint } from "./provider-endpoint";
 import { createHash } from "node:crypto";
 import type { Message, OutboundMessage } from "@dvmkit/sdk/internal";
 import { loadJob, recordCallerMessageHash } from "./job-store";
@@ -19,18 +20,19 @@ function payloadHash(message: Pick<Message, "type" | "content"> | OutboundMessag
 
 export function rememberCallerMessage(jobId: string, endpoint: string, message: OutboundMessage): void {
   const hash = payloadHash(message);
-  const key = JSON.stringify([endpoint, jobId]);
+  const key = JSON.stringify([normalizeProviderEndpoint(endpoint), jobId]);
   const hashes = sentHashes.get(key) ?? new Set<string>();
   hashes.add(hash);
   sentHashes.set(key, hashes);
-  if (loadJob(jobId)?.endpoint === endpoint) recordCallerMessageHash(jobId, endpoint, hash);
+  const job = loadJob(jobId);
+  if (job && sameEndpoint(job.endpoint, endpoint)) recordCallerMessageHash(jobId, endpoint, hash);
 }
 
 export function callerMessageRecognizer(jobId: string, endpoint: string): (message: Message) => Message {
   const job = loadJob(jobId);
   const hashes = new Set([
-    ...(sentHashes.get(JSON.stringify([endpoint, jobId])) ?? []),
-    ...(job?.endpoint === endpoint ? job.callerMessageHashes ?? [] : []),
+    ...(sentHashes.get(JSON.stringify([normalizeProviderEndpoint(endpoint), jobId])) ?? []),
+    ...(job && sameEndpoint(job.endpoint, endpoint) ? job.callerMessageHashes ?? [] : []),
   ]);
   return (message) => {
     if (message.from === "requester" && hashes.has(payloadHash(message))) callerMessages.add(message);

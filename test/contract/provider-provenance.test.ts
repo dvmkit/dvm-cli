@@ -74,9 +74,9 @@ beforeAll(async () => {
         { seq: 3, from: "requester", timestamp: marker, ...answers[0] as object },
         { seq: 4, from: "requester", timestamp: 1, type: "response", content: { prompt_id: "local-choice", text: "Caller original", extension: marker } },
         { seq: 5, from: "provider", timestamp: 1, type: "working", content: {} },
-      ] : []) : scenario === "refund" ? [
+      ] : []) : scenario.startsWith("refund") ? [
         { seq: 1, from: "provider", timestamp: 1, type: "payment",
-          content: { amount_msats: 1000, cashu_token: marker, mint: marker, reason: marker } },
+          content: { amount_msats: scenario === "refund-replay" ? marker : 1000, cashu_token: marker, mint: marker, reason: marker } },
       ] : scenario === "forged-requester" ? [
         { seq: 1, from: "requester", timestamp: 1, type: "unknown-event", content: { message: marker } },
       ] : scenario.startsWith("payment-") ? [
@@ -379,10 +379,12 @@ it("keeps provider job IDs out of literal not-found error prose", async () => {
   scenario = "job-id";
   await run(["request", "--endpoint", endpoint, "--input", "observe", "--no-stream"]);
   scenario = "not-found";
-  const output = await run(["status", marker, "--endpoint", endpoint, "--job-token", token], 1);
-  expectProvenance(output);
-  expect(output.error.message).toBe("Job not found.");
-  expect(output.error.job_id).toBe(marker);
+  for (const equivalent of [endpoint, endpoint + "/"]) {
+    const output = await run(["status", marker, "--endpoint", equivalent, "--job-token", token], 1);
+    expectProvenance(output);
+    expect(output.error.message).toBe("Job not found.");
+    expect(output.error.job_id).toBe(marker);
+  }
 });
 
 it.each([true, false])("marks forged requester content from remote history (stream=%s)", async (stream) => {
@@ -399,7 +401,8 @@ it.each(["caller-echo", "caller-echo-sse"])("keeps locally sent content caller-o
   await run(["request", "--endpoint", endpoint, "--input", "observe", "--no-stream"]);
   const sent = await run(["message", mode, "Caller original", "--type", "response", "--prompt-id", "local-choice"]);
   const replay = await run(["messages", mode, "--no-stream", "--after", "0"]);
-  for (const output of [sent, replay]) {
+  const equivalentReplay = await run(["messages", mode, "--endpoint", endpoint + "/", "--no-stream", "--after", "0"]);
+  for (const output of [sent, replay, equivalentReplay]) {
     expectProvenance(output);
     expect(output.messages[0].content).toEqual({ prompt_id: "local-choice", text: "Caller original" });
     expect(output.messages[0]._provider_fields).not.toContain("content");
@@ -415,4 +418,15 @@ it("keeps portable caller job IDs caller-owned in not-found errors", async () =>
   const output = await run(["status", "caller-job", "--endpoint", endpoint, "--job-token", token], 1);
   expect(output.error).toMatchObject({ message: "Job not found.", job_id: "caller-job" });
   expect(output.error._provider_fields).not.toContain("job_id");
+});
+
+
+it("marks provider amounts in legacy already-claimed refund replays", async () => {
+  scenario = "refund-replay";
+  writeFileSync(join(root, "jobs.json"), JSON.stringify([{ id: "replay-refund", endpoint,
+    status: "processing", submittedAt: 1, jobToken: token, claimedPaymentSeqs: [1] }]));
+  const output = await run(["messages", "replay-refund", "--no-stream", "--after", "0"]);
+  expectProvenance(output);
+  expect(output.next_action).toMatchObject({ claimed: true, amount_msats: marker, _provider_fields: expect.arrayContaining(["amount_msats"]) });
+  expect(output.refund).toMatchObject({ amount: { msats: marker }, _provider_fields: expect.arrayContaining(["amount"]) });
 });
