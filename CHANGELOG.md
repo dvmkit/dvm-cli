@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.3](https://github.com/dvmkit/dvm-cli/compare/v0.11.2...v0.11.3) (2026-10-28)
+
+
+### Bug Fixes
+
+* preserve mint diagnostics after successful Cashu fallback ([c3374e7](https://github.com/dvmkit/dvm-cli/commit/c3374e72d245aefd39b87972e9c8b43f0b585619))
+
 ## [0.11.2](https://github.com/dvmkit/dvm-cli/compare/v0.11.1...v0.11.2) (2026-10-26)
 
 
