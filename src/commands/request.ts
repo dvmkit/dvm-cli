@@ -3460,6 +3460,7 @@ async function payWithAgentWallet(
         mint: prepared.mint,
         amountSats: prepared.totalSats,
         requestId: prepared.requestId,
+        ...(prepared.attempts?.length ? { mint_attempts: prepared.attempts } : {}),
         ...(prepared.submissionBindingFingerprint
           ? { submissionBindingFingerprint: prepared.submissionBindingFingerprint }
           : {}),
@@ -3488,6 +3489,7 @@ async function payWithAgentWallet(
       mint: prepared.mint,
       amountSats: prepared.totalSats,
       requestId: prepared.requestId,
+      ...(prepared.attempts?.length ? { mint_attempts: prepared.attempts } : {}),
       ...(prepared.submissionBindingFingerprint
         ? { submissionBindingFingerprint: prepared.submissionBindingFingerprint }
         : {}),
