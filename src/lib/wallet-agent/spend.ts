@@ -13,6 +13,7 @@ import { canSwap } from "@dvmkit/sdk/internal";
 import { type SwapSendReserve, swapSendReserve } from "@dvmkit/sdk/internal";
 import { getWallet } from "@dvmkit/sdk/internal";
 import { readAgentMnemonic } from "@dvmkit/sdk/internal";
+import { redactUrl } from "@dvmkit/sdk/internal";
 import { reservedForMarker } from "./builder-handle";
 import {
   inFlightTimeoutSeconds,
@@ -80,6 +81,8 @@ export interface PreparedAgentSpend {
   intendedLockPubkey: string;
   /** Exact public request-binding hash persisted with a strict per-call submission. */
   submissionBindingFingerprint?: string;
+  /** Earlier failed candidates, in trial order; success messages exclude dependency prose. */
+  attempts?: SpendMintAttempt[];
 }
 
 /**
@@ -720,10 +723,35 @@ export async function prepareAgentSpend(args: {
     totalSats: inner.submission.amount_sats,
     endpoint: args.endpoint,
     intendedLockPubkey: args.cashuP2pk.lock_pubkey,
+    ...(attempts.length > 0 ? { attempts: successfulSpendAttempts(attempts) } : {}),
     ...(boundContext?.binding_fingerprint
       ? { submissionBindingFingerprint: boundContext.binding_fingerprint }
       : {}),
   };
+}
+
+function successfulSpendAttempts(attempts: SpendMintAttempt[]): SpendMintAttempt[] {
+  // Dependency messages may echo proofs, tokens or authorization headers. Only
+  // publish CLI-authored explanations on the additive success surface.
+  const messages: Record<SpendMintAttempt["reason"], string> = {
+    unreachable: "Mint could not be loaded.",
+    keys_unavailable: "Mint did not provide an active keyset.",
+    swap_disabled: "Mint advertises swaps switched off (NUT-3 disabled).",
+    fee_cap_exceeded: "Mint swap fee exceeds the approved limit.",
+    insufficient_balance: "Mint balance cannot cover the price and swap fee.",
+    no_eligible_mint: "Mint no longer has eligible proofs for this payment.",
+    swap_rejected: "Mint swap could not be prepared or was definitely refused.",
+  };
+  return attempts.map(({ mint, reason }) => {
+    let safeMint: string;
+    try {
+      new URL(mint);
+      safeMint = redactUrl(mint).replace(/\/$/u, "").slice(0, 2048);
+    } catch {
+      safeMint = "[invalid mint URL]";
+    }
+    return { mint: safeMint, reason, message: messages[reason] };
+  });
 }
 
 function principalCapFailure(

@@ -238,6 +238,7 @@ describe("prepareAgentSpend per-call swap", () => {
     expect(result.endpoint).toBe(ENDPOINT);
     expect(result.intendedLockPubkey).toBe(dvmPubkey);
     expect(result.cashuToken).toBe("cashu:https://mint.example:dvm-locked-1,dvm-locked-2");
+    expect(result).not.toHaveProperty("attempts");
 
     const sendSpy = vi.mocked(mockWallet.ops.send);
     expect(sendSpy).toHaveBeenCalledWith(7, expect.any(Array));
@@ -703,6 +704,7 @@ describe("prepareAgentSpend reserve-direct path", () => {
     if ("error" in result) return;
 
     expect(result.totalSats).toBeGreaterThanOrEqual(4);
+    expect(result).not.toHaveProperty("attempts");
     expect(result.mint).toBe("https://mint.example");
     const sendSpy = vi.mocked(mockWallet.ops.send);
     expect(sendSpy).not.toHaveBeenCalled();
@@ -1191,6 +1193,9 @@ describe("prepareAgentSpend multi-mint failover", () => {
     expect("error" in result).toBe(false);
     if ("error" in result) return;
     expect(result.mint).toBe(MINT_B);
+    expect(result.attempts).toEqual([
+      { mint: MINT_A, reason: "unreachable", message: "Mint could not be loaded." },
+    ]);
 
     const saved = lastSavedWallet();
     expect(saved.pending_submissions).toHaveLength(1);
@@ -1217,6 +1222,9 @@ describe("prepareAgentSpend multi-mint failover", () => {
     expect("error" in result).toBe(false);
     if ("error" in result) return;
     expect(result.mint).toBe(MINT_B);
+    expect(result.attempts).toEqual([
+      { mint: MINT_A, reason: "swap_rejected", message: "Mint swap could not be prepared or was definitely refused." },
+    ]);
 
     const saved = lastSavedWallet();
     expect(saved.proofs.find((p) => p.secret === "a")?.status).toBe("valid");
@@ -1241,6 +1249,9 @@ describe("prepareAgentSpend multi-mint failover", () => {
     expect("error" in result).toBe(false);
     if ("error" in result) return;
     expect(result.mint).toBe(MINT_B);
+    expect(result.attempts).toEqual([
+      { mint: MINT_A, reason: "keys_unavailable", message: "Mint did not provide an active keyset." },
+    ]);
   });
 
   it("skips a mint that advertises swaps switched off without attempting the swap", async () => {
@@ -1255,8 +1266,60 @@ describe("prepareAgentSpend multi-mint failover", () => {
     expect("error" in result).toBe(false);
     if ("error" in result) return;
     expect(result.mint).toBe(MINT_B);
+    expect(result.attempts).toEqual([
+      { mint: MINT_A, reason: "swap_disabled", message: "Mint advertises swaps switched off (NUT-3 disabled)." },
+    ]);
     expect(vi.mocked(meltOnly.ops.send)).not.toHaveBeenCalled();
     expect(lastSavedWallet().proofs.find((p) => p.secret === "a")?.status).toBe("valid");
+  });
+
+  it("stops at an ambiguous swap without trying a funded fallback mint", async () => {
+    const { privkey, pubkey } = generateAgentKeypair();
+    mockWalletState(privkey, pubkey, [proofAt(MINT_A, "a", 8), proofAt(MINT_B, "b", 8)]);
+    const healthy = makeMockWallet(healthySwap);
+    const getWalletForMint = vi.fn(router({
+      [MINT_A]: makeMockWallet(new Error("lost swap response")),
+      [MINT_B]: healthy,
+    }));
+
+    const result = await spend(getWalletForMint);
+
+    expect(result).toMatchObject({ error: { code: "swap_failed", attempts: [
+      { mint: MINT_A, reason: "swap_rejected" },
+    ] } });
+    expect(getWalletForMint.mock.calls).toEqual([[MINT_A]]);
+    expect(healthy.completeSwap).not.toHaveBeenCalled();
+    const saved = lastSavedWallet();
+    expect(saved.proofs.find((p) => p.secret === "a")?.status).toBe("in_flight");
+    expect(saved.proofs.find((p) => p.secret === "b")?.status).toBe("valid");
+    expect(saved.pending_submissions).toHaveLength(1);
+    expect(saved.pending_submissions[0].swapping).toBeDefined();
+  });
+
+  it("redacts and bounds mint URLs without publishing dependency prose on success", async () => {
+    const { privkey, pubkey } = generateAgentKeypair();
+    const sensitiveMint = `https://user:credential-secret@example.invalid/${"ab".repeat(32)}?token=query-secret#fragment-secret`;
+    const longMint = `https://long.mint/${"x".repeat(3_000)}`;
+    mockWalletState(privkey, pubkey, [
+      proofAt(sensitiveMint, "a", 8), proofAt(longMint, "long", 8), proofAt(MINT_B, "b", 8),
+    ]);
+
+    const result = await spend(router({
+      [sensitiveMint]: new Error("Authorization: Bearer credential-secret " + "x".repeat(20_000)),
+      [longMint]: new Error("query-secret"),
+      [MINT_B]: makeMockWallet(healthySwap),
+    }), [sensitiveMint, longMint, MINT_B]);
+
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.attempts?.[0]).toEqual({
+      mint: "https://example.invalid/:hex", reason: "unreachable", message: "Mint could not be loaded.",
+    });
+    expect(result.attempts?.[1].mint.length).toBeLessThanOrEqual(2048);
+    const output = JSON.stringify(result.attempts);
+    for (const secret of ["credential-secret", "query-secret", "fragment-secret", "Authorization", "ab".repeat(32)]) {
+      expect(output).not.toContain(secret);
+    }
   });
 
   it("names every mint it tried, and why, when none of them work", async () => {
