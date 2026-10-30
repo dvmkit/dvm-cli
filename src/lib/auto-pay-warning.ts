@@ -36,7 +36,7 @@ export function autoPayWarnings(
   for (const quote of quotes) {
     if (quote.upfront?.currency === "usd" && positive(quote.upfront.amount)) amounts.push(quote.upfront.amount);
     const rate = quote.rate;
-    if (rate?.per_unit.currency === "usd" && positive(rate.per_unit.amount) && positive(rate.max_units)) {
+    if (rate?.per_unit?.currency === "usd" && positive(rate.per_unit.amount) && positive(rate.max_units)) {
       const maximum = Number((rate.per_unit.amount * rate.max_units).toPrecision(15));
       if (positive(maximum)) amounts.push(maximum);
     }

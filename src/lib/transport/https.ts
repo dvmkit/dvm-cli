@@ -172,13 +172,20 @@ export class HttpsTransport implements Transport {
     };
   }
 
-  async quote(provider: ProviderRef, job: JobEnvelope): Promise<Quote[]> {
+  async quote(
+    provider: ProviderRef,
+    job: JobEnvelope,
+    options?: { timeoutMs?: number; btcRate?: number }
+  ): Promise<Quote[]> {
     const url = `${provider.endpoint}/v1/quote`;
     const body = JSON.stringify(envelopeToPayload(job));
+    const signal = options?.timeoutMs && options.timeoutMs > 0
+      ? AbortSignal.timeout(options.timeoutMs) : undefined;
     const res = await dvmFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
+      signal,
     });
     captureTraceId(res);
 
@@ -196,7 +203,7 @@ export class HttpsTransport implements Transport {
     // forward-compat.
     const upfront = parseUpfront(data);
     const description = typeof data.description === "string" ? data.description : "";
-    const advisorySats = await deriveAdvisorySats(upfront, data);
+    const advisorySats = await deriveAdvisorySats(upfront, data, options?.btcRate);
     const quote: Quote = {
       upfront,
       description,
@@ -1580,10 +1587,14 @@ function exactMicro(raw: unknown): number | undefined {
  */
 async function deriveAdvisorySats(
   upfront: Quote["upfront"],
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  btcRate?: number
 ): Promise<number | undefined> {
   if (typeof data.price_msats === "number") return data.price_msats;
   if (upfront.currency !== "usd" || upfront.amount <= 0) return undefined;
+  // A supplied snapshot (including an unavailable rate of zero) keeps a
+  // bounded preview from starting an independent FX lookup.
+  if (btcRate !== undefined) return Number.isFinite(btcRate) && btcRate > 0 ? usdToMsats(upfront.amount, btcRate) : undefined;
   try {
     const rate = await fetchBtcUsdRate();
     return usdToMsats(upfront.amount, rate);

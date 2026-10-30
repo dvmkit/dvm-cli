@@ -709,7 +709,11 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
             provider: providerInfo, endpoint, method: "POST", path: "v1/quote", capability,
           }))
         : data;
-      previewQuotes = await transport.quote(ref, { ...envelope, data: quoteData });
+      previewQuotes = await transport.quote(ref, { ...envelope, data: quoteData }, {
+        // Leave the rest of the job deadline available for submission and work.
+        timeoutMs: Math.min(1_000, Math.max(1, Math.floor(timeout / 10))),
+        btcRate,
+      });
     } catch { /* Older providers may support submit without a quote endpoint. */ }
   }
   const pricing = providerInfo.capabilities?.[capability]?.pricing as { max?: unknown } | undefined;

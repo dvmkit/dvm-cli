@@ -5,7 +5,7 @@ import { JOBS_FILE, deriveIdentityFromPrivkey, type ProviderInfo, type Quote, ty
 
 const seams = vi.hoisted(() => ({
   describe: vi.fn(), quote: vi.fn(), submit: vi.fn(), close: vi.fn(),
-  getMessages: vi.fn(), sendMessage: vi.fn(), requestResult: vi.fn(),
+  getMessages: vi.fn(), sendMessage: vi.fn(), requestResult: vi.fn(), fetchRate: vi.fn(),
   stdout: [] as string[], stderr: [] as string[],
 }));
 vi.mock("node:fs", async (original) => {
@@ -21,6 +21,10 @@ vi.mock("node:fs", async (original) => {
     return Reflect.apply(fs.writeSync, fs, args);
   } };
 });
+vi.mock("@dvmkit/sdk/internal", async (original) => ({
+  ...await original<typeof import("@dvmkit/sdk/internal")>(),
+  fetchBtcUsdRate: seams.fetchRate,
+}));
 vi.mock("../src/lib/transport", () => ({ createDvmTransport: () => seams }));
 vi.mock("../src/lib/btc-rate", async (original) => ({
   ...await original<typeof import("../src/lib/btc-rate")>(),
@@ -28,6 +32,7 @@ vi.mock("../src/lib/btc-rate", async (original) => ({
   tryResolveBtcUsdRate: async () => ({ rate: 100_000, stale: false }),
 }));
 
+import { HttpsTransport } from "../src/lib/transport/https";
 import { quote } from "../src/commands/quote";
 import { request } from "../src/commands/request";
 import { createSignedRequestVerifier } from "@dvmkit/sdk";
@@ -56,6 +61,7 @@ beforeEach(() => {
   seams.stderr.length = 0;
   seams.describe.mockResolvedValue(info);
   seams.quote.mockResolvedValue([metered]);
+  seams.fetchRate.mockResolvedValue(100_000);
   seams.submit.mockResolvedValue({ jobId: "job-metered", status: "processing" });
   seams.getMessages.mockResolvedValue([{ seq: 1, from: "provider", timestamp: 1, type: "payment-request", content: ask }]);
   seams.sendMessage.mockResolvedValue({ seq: 2 });
@@ -157,6 +163,65 @@ describe("metered caller guidance", () => {
     expect(output()).toMatchObject({ status: "quotes-collected", warnings: [{ auto_pay_below: "900000" }] });
     expect(seams.sendMessage).not.toHaveBeenCalled();
   });
+
+  it.each(["headers", "body", "error body"])("cancels a preview stalled at %s and proceeds with submission", async (phase) => {
+    const transport = new HttpsTransport();
+    seams.quote.mockImplementation(transport.quote.bind(transport));
+    let aborted = false;
+    vi.stubGlobal("fetch", vi.fn(async (_input, init?: RequestInit) => {
+      const signal = init?.signal;
+      if (phase === "headers") {
+        return new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => { aborted = true; reject(signal.reason); }, { once: true });
+        });
+      }
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"upfront":'));
+          signal?.addEventListener("abort", () => { aborted = true; controller.error(signal.reason); }, { once: true });
+        },
+      }), { status: phase === "error body" ? 500 : 200, headers: { "content-type": "application/json" } });
+    }));
+    seams.submit.mockImplementation(async () => {
+      expect(aborted).toBe(true);
+      return { jobId: "job-metered", status: "processing" };
+    });
+    await request({ endpoint, input: "work", budget: "$1.50", timeout: "1", stream: false });
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(output()).toMatchObject({ jobId: "job-metered", next_action: { type: "poll" } });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(seams.quote).toHaveBeenCalledWith({ endpoint }, expect.anything(), { timeoutMs: 100, btcRate: 100_000 });
+    expect(seams.sendMessage).not.toHaveBeenCalled();
+  }, 2_000);
+
+  it.each(["$1.50", "1500000"])("avoids an independent FX lookup during the bounded preview for budget %s", async (budget) => {
+    const transport = new HttpsTransport();
+    seams.quote.mockImplementation(transport.quote.bind(transport));
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      upfront: { amount: 0.4, currency: "usd" }, shape: "rate", rate: metered.rate,
+    })));
+    await request({ endpoint, input: "work", budget, stream: false });
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(output().jobId).toBe("job-metered");
+    expect(seams.fetchRate).not.toHaveBeenCalled();
+    expect(seams.quote.mock.calls[0][2].timeoutMs).toBe(1_000);
+    if (budget.startsWith("$")) expect(output().warnings[0].auto_pay_below).toBe("900000");
+  });
+
+  it.each([{}, { max_units: 10 }, { per_unit: null }, { per_unit: { currency: "usd" } }])(
+    "submits with incomplete rate metadata %j and retains the advertised ceiling warning", async (rate) => {
+      const transport = new HttpsTransport();
+      seams.quote.mockImplementation(transport.quote.bind(transport));
+      seams.describe.mockResolvedValue({ ...info, capabilities: { work: { pricing: { max: { amount: 1.25, currency: "usd" } } } } });
+      vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+        upfront: { amount: 0, currency: "usd" }, shape: "rate", rate,
+      })));
+      await request({ endpoint, input: "work", budget: "$1.50", stream: false });
+      expect(seams.submit).toHaveBeenCalledTimes(1);
+      expect(output()).toMatchObject({ jobId: "job-metered", warnings: [{ source: "provider_ceiling", auto_pay_below: "1250000" }] });
+      expect(seams.sendMessage).not.toHaveBeenCalled();
+    }
+  );
 
   it("does not suggest a threshold increase when the remaining budget or increment is insufficient", async () => {
     for (const overrides of [{ totalPaidMsats: 1_000_000 }, { policy: { ...policy, maxIncrementMsats: 800_000 } }]) {
