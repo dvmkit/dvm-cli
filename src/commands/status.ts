@@ -101,8 +101,11 @@ async function statusWithAccess(
     if (stored.receiptsSupported && receipt.status === "absent") {
       const fetched = await fetchMissingJobReceipt(jobId, transport, ref);
       if (fetched.status && isTerminalJobStatus(fetched.status)) {
+        const saved = stored.status === fetched.status ? completion : undefined;
         terminalStatus = fetched.status;
-        completion = { ...completion, ...completionSnapshot(fetched) };
+        completion = fetched.content_available === false && saved
+          ? saved
+          : { ...saved, ...completionSnapshot(fetched) };
         markJobTerminal(jobId, terminalStatus, completion);
       }
       if (fetched.receipt || fetched.receiptParseError) {
@@ -150,6 +153,15 @@ async function statusWithAccess(
   // Update job store if we learned something new. A terminal read snapshots the
   // outcome so every later `dvm status` replays this exact payload.
   const completion = completionSnapshot(result);
+  const reasonUnavailable = completion.message === undefined ||
+    (result.content_available === false && completion.message === "");
+  if (reasonUnavailable && (result.status === "failed" || result.status === "cancelled")) {
+    const savedReason = !access.endpointOverridden && stored?.status === result.status
+      ? stored.completion?.message : undefined;
+    const terminal = msgs.findLast((message) => message.type === "complete" || message.type === "cancel");
+    const reason = savedReason ?? (terminal?.type === "cancel" ? terminal.content.reason : undefined);
+    if (reason !== undefined) completion.message = reason;
+  }
   let receipt: ReceiptCapture | undefined;
   if (isTerminalJobStatus(result.status)) {
     if (stored && !access.endpointOverridden) {

@@ -1,9 +1,9 @@
 import { isTerminalJobStatus, type TerminalJobStatus } from "./next-action";
 import { completionFromMessages, completionSnapshot, type JobCompletion } from "./completion-hints";
 import {
-  type JobStatus,
   type Message,
 } from "@dvmkit/sdk/internal";
+import type { ContentStatus } from "./job-content";
 import {
   type JobRecord,
   loadJob,
@@ -18,7 +18,7 @@ export type TerminalExtra = Partial<
 >;
 
 export interface StreamStatusContext {
-  providerStatus?: Partial<JobStatus>;
+  providerStatus?: Partial<ContentStatus>;
   callerCancelled?: boolean;
 }
 
@@ -53,9 +53,13 @@ export function persistStreamOutcome(outcome: StreamOutcome): JobCompletion | un
   const log = terminal ? fullMessageLog(jobId, messages, afterSeq) : undefined;
   const providerTerminal = providerStatus?.status && isTerminalJobStatus(providerStatus.status);
   if (terminal && (log || providerTerminal)) {
-    const completion = {
-      ...(stored?.status === terminal ? stored.completion : {}),
-      ...(log?.some((m) => m.type === "complete" || m.type === "cancel") ? completionFromMessages(log) : {}),
+    const saved = stored?.status === terminal ? stored.completion : undefined;
+    const fromLog = log?.some((m) => m.type === "complete" || m.type === "cancel") ? completionFromMessages(log) : undefined;
+    const retained = saved ?? fromLog;
+    // Unavailable provider content cannot disprove retained artifact evidence.
+    const completion = providerStatus?.content_available === false && retained ? retained : {
+      ...saved,
+      ...fromLog,
       ...(terminal === "cancelled" && callerCancelled && stored?.completion?.message !== undefined
         ? { message: stored.completion.message } : {}),
       ...(providerTerminal ? completionSnapshot(providerStatus) : {}),

@@ -83,6 +83,78 @@ it("retains a caller cancellation and reason across stream replay and offline st
   expect(output()).toMatchObject({ status: "cancelled", message: "Plans changed", source: "local" });
 });
 
+it.each([
+  { command: "request", redacted: false },
+  { command: "cancel", redacted: false },
+  { command: "request", redacted: true },
+  { command: "cancel", redacted: true },
+])("retains the $command reason through a fresh status read and offline replay (redacted=$redacted)", async ({ command, redacted }) => {
+  const terminal = command === "request" ? "failed" : "cancelled";
+  if (command === "request") await request({ endpoint, input: "work" });
+  else {
+    seed();
+    await cancel(jobId, { reason });
+  }
+  wire.status.mockResolvedValue({ jobId, status: terminal,
+    ...(redacted ? { content_available: false, message: "", hasArtifacts: false } : {}) });
+  wire.getMessages.mockResolvedValue([]);
+
+  await status(jobId, { messages: true });
+  expect(output()).toMatchObject({ status: terminal, message: reason, source: "provider" });
+  expect(loadJob(jobId)?.completion?.message).toBe(reason);
+
+  wire.status.mockRejectedValue(new Error("Provider offline"));
+  await status(jobId, {});
+  expect(output()).toMatchObject({ status: terminal, message: reason, source: "local" });
+});
+
+it("recovers a terminal reason from the fresh log when no reason was saved", async () => {
+  seed();
+  wire.status.mockResolvedValue({ jobId, status: "failed" });
+  await status(jobId, { messages: true });
+  expect(output()).toMatchObject({ status: "failed", message: reason });
+  expect(loadJob(jobId)?.completion?.message).toBe(reason);
+});
+
+it("prefers a fresh provider reason to the saved reason", async () => {
+  seed();
+  await cancel(jobId, { reason });
+  wire.status.mockResolvedValue({ jobId, status: "cancelled", message: "Cancellation confirmed" });
+  await status(jobId, { messages: true });
+  expect(output()).toMatchObject({ status: "cancelled", message: "Cancellation confirmed" });
+  expect(loadJob(jobId)?.completion?.message).toBe("Cancellation confirmed");
+});
+
+it("does not reuse a saved reason for another terminal status or endpoint", async () => {
+  seed();
+  await cancel(jobId, { reason });
+  wire.status.mockResolvedValue({ jobId, status: "failed" });
+  wire.getMessages.mockResolvedValue([]);
+  await status(jobId, { messages: true, endpoint: "https://other-provider.example", jobToken: "ab".repeat(32) });
+  expect(output()).not.toHaveProperty("message");
+  expect(loadJob(jobId)).toMatchObject({ status: "cancelled", completion: { message: reason } });
+  await status(jobId, { messages: true });
+  expect(output()).not.toHaveProperty("message");
+});
+
+it.each(["batch", "stream", "receipt"])("preserves saved artifacts after a redacted %s read", async (path) => {
+  const completion = { summary: "Saved result", message: reason, hasArtifacts: true, artifactCount: 2, payloadIn: "messages" as const };
+  saveJob({ id: jobId, endpoint, status: "completed", submittedAt: 1, completion, receiptsSupported: path === "receipt" });
+  wire.getMessages.mockResolvedValue([]);
+  wire.stream.mockResolvedValue({ messages: [], lastSeq: 0 });
+  wire.status.mockResolvedValue({ jobId, status: "completed", content_available: false,
+    summary: "", message: "", hasArtifacts: false });
+
+  if (path === "receipt") await status(jobId, {});
+  else await messages(jobId, { stream: path === "stream" });
+  expect(loadJob(jobId)?.completion).toEqual(completion);
+
+  wire.status.mockRejectedValue(new Error("Provider offline"));
+  await status(jobId, {});
+  expect(output()).toMatchObject({ source: "local", summary: "Saved result", has_artifacts: true,
+    artifact_count: 2, payload_in: "messages" });
+});
+
 it("records cancellation sent through the message command", async () => {
   seed();
   wire.status.mockRejectedValue(new Error("Legacy provider"));

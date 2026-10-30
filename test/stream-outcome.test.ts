@@ -39,20 +39,28 @@ it("saves provider status without inventing artifact metadata for an incomplete 
   expect(loadJob("partial")?.status).toBe("failed");
 });
 
-it("counts artifacts from a whole local log when only the terminal tail is returned", () => {
-  saveJob({ id: "whole", endpoint: "https://provider.example", status: "processing", submittedAt: 1 });
-  appendMessages("whole", [
+it.each([
+  undefined,
+  { status: "failed" as const, content_available: false, hasArtifacts: false },
+])("counts artifacts from a whole local log when only the terminal tail is returned: %j", (providerStatus) => {
+  const jobId = providerStatus ? "whole-redacted" : "whole";
+  saveJob({ id: jobId, endpoint: "https://provider.example", status: "processing", submittedAt: 1 });
+  appendMessages(jobId, [
     { seq: 1, from: "provider", type: "artifact", timestamp: 1, content: { name: "report.txt", mime_type: "text/plain", data: "report" } },
     { seq: 2, from: "provider", type: "text", timestamp: 1, content: { text: "Coverage report" } }, cancel,
   ]);
-  expect(persistStreamOutcome({ jobId: "whole", messages: [cancel], cursor: 3, afterSeq: 2 }))
+  expect(persistStreamOutcome({ jobId, messages: [cancel], cursor: 3, afterSeq: 2, providerStatus }))
     .toEqual({ message: "No coverage", artifactCount: 1, hasArtifacts: true, payloadIn: "messages" });
 });
 
-it("preserves saved artifact evidence when a terminal status has no message content", () => {
-  saveJob({ id: "redacted", endpoint: "https://provider.example", status: "failed", submittedAt: 1,
+it.each([
+  { status: "failed" as const },
+  { status: "failed" as const, content_available: false, hasArtifacts: false },
+])("preserves saved artifact evidence when a terminal status has no message content: %j", (providerStatus) => {
+  const jobId = "content_available" in providerStatus ? "redacted" : "legacy";
+  saveJob({ id: jobId, endpoint: "https://provider.example", status: "failed", submittedAt: 1,
     completion: { message: "No coverage", artifactCount: 2, hasArtifacts: true, payloadIn: "messages" } });
-  expect(persistStreamOutcome({ jobId: "redacted", messages: [], cursor: 0, afterSeq: 0,
-    providerStatus: { status: "failed" } }))
+  expect(persistStreamOutcome({ jobId, messages: [], cursor: 0, afterSeq: 0,
+    providerStatus }))
     .toEqual({ message: "No coverage", artifactCount: 2, hasArtifacts: true, payloadIn: "messages" });
 });
