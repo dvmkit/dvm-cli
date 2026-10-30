@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/dvmkit/dvm-cli/compare/v0.11.3...v0.12.0) (2026-10-30)
+
+
+### Features
+
+* explain metered auto-pay limits ([d4cf491](https://github.com/dvmkit/dvm-cli/commit/d4cf4913c279a5bf163d7d3e39d07db1812e50e1))
+
 ## [0.11.3](https://github.com/dvmkit/dvm-cli/compare/v0.11.2...v0.11.3) (2026-10-28)
 
 
