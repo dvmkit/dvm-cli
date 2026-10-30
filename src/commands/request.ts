@@ -1,3 +1,5 @@
+import { autoPayWarnings } from "../lib/auto-pay-warning";
+import { addOutputWarnings, withOutputWarnings } from "../lib/output";
 import { providerFields, providerJobJson as json } from "../lib/provider-output";
 import { buildTempoCredential } from "../lib/payment-rails/tempo-credential";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
@@ -274,6 +276,10 @@ export interface RequestOptions {
 }
 
 export async function request(opts: RequestOptions): Promise<void> {
+  return withOutputWarnings(() => requestWithWarnings(opts));
+}
+
+async function requestWithWarnings(opts: RequestOptions): Promise<void> {
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const timeout = opts.timeout ? Number(opts.timeout) * 1000 : 30000;
   // Validate the money cap before warmup or quote I/O. The wallet repeats the
@@ -386,7 +392,7 @@ export async function request(opts: RequestOptions): Promise<void> {
   // upfront charge on every request. The emptiness check keeps consent in lockstep
   // with the bound, since buildPolicy treats a falsy value as unset too.
   const autoPayConsent =
-    opts.autoPay === true || (opts.autoPayBelow !== undefined && opts.autoPayBelow.trim() !== "");
+    !opts.creditOnly && (opts.autoPay === true || (opts.autoPayBelow !== undefined && opts.autoPayBelow.trim() !== ""));
 
   // Resolve --max-payments: flag → config default → hardcoded default of 5
   const DEFAULT_MAX_PAYMENTS = 5;
@@ -693,6 +699,24 @@ export async function request(opts: RequestOptions): Promise<void> {
     bidMsats: budgetMsats,
   });
 
+  // Quote before a free or credit-draw submit can start the job without a 402.
+  // Advisory pricing must not turn quote availability into a submit requirement.
+  let previewQuotes: Quote[] = [];
+  if (policy.maxTotalMsats > 0 || policy.autoPayBelowMsats > 0) {
+    try {
+      const quoteData = signing
+        ? signDvmRequestData(signing.privkey, signing.unsignedData, signedRequestDomain({
+            provider: providerInfo, endpoint, method: "POST", path: "v1/quote", capability,
+          }))
+        : data;
+      previewQuotes = await transport.quote(ref, { ...envelope, data: quoteData });
+    } catch { /* Older providers may support submit without a quote endpoint. */ }
+  }
+  const pricing = providerInfo.capabilities?.[capability]?.pricing as { max?: unknown } | undefined;
+  const warningLimits = { budget: effectiveBudget, autoPayBelow: effectiveAutoPayBelow };
+  const previewWarnings = autoPayWarnings(previewQuotes, warningLimits, pricing?.max ?? providerInfo.pricing?.max, btcRate);
+  addOutputWarnings(previewWarnings, opts.human);
+
   // The ID the submitted job is recorded and reported under: the caller's own,
   // else the one generated for the draw leg that ends up accepted.
   let jobRequestId = opts.requestId ?? drawRequestId;
@@ -803,6 +827,11 @@ export async function request(opts: RequestOptions): Promise<void> {
   // Upfront payment required — handle before saving (no job exists yet)
   if (receipt.status === "payment-required") {
     const quotes = receipt.quotes ?? [];
+    if (opts.creditOnly) {
+      transport.close();
+      throw new DvmError("credit_only_unavailable", "The selected prepaid credit did not cover this submission; no fresh payment was attempted.");
+    }
+    if (!previewWarnings.length) addOutputWarnings(autoPayWarnings(quotes, warningLimits, undefined, btcRate), opts.human);
     if (autoPayConsent && quotes.length > 0) {
       const pay = () =>
         handleAutoPayQuotes(
@@ -863,6 +892,7 @@ export async function request(opts: RequestOptions): Promise<void> {
     submittedAt: Date.now(),
     policy,
     pinnedMint: opts.mint,
+    ...(opts.creditOnly ? { creditOnly: opts.creditOnly } : {}),
     ...(opts.strictPerCall ? { strictPerCall: true as const } : {}),
     ...(requestedMaxCashuFeeSats !== undefined
       ? { maxCashuFeeSats: requestedMaxCashuFeeSats }
@@ -937,6 +967,7 @@ export async function request(opts: RequestOptions): Promise<void> {
           dvmId,
           providerInfo,
           signing,
+          allowTopup: !opts.creditOnly,
           human: opts.human,
         });
       // the job is over and this emission is terminal — the one
@@ -1015,6 +1046,7 @@ export async function request(opts: RequestOptions): Promise<void> {
           dvmId,
           providerInfo,
           signing,
+          allowTopup: !opts.creditOnly,
           human: opts.human,
         });
       }
@@ -2191,11 +2223,11 @@ function validateCreditOnlyOptions(opts: RequestOptions): void {
       "invalid_credit_only",
       "--credit-only must name one non-empty public credit id of at most 128 characters."
     );
-  if (opts.strictPerCall || opts.autoPay === true || opts.autoPayBelow !== undefined)
+  if (opts.strictPerCall || opts.autoPay === true)
     throw new DvmError(
       "credit_only_payment_conflict",
       "--credit-only cannot be combined with a fresh-payment consent mode.",
-      "Omit --auto-pay, --auto-pay-below, and --strict-per-call; the selected prepaid balance is the only allowed payment source."
+      "Omit --auto-pay and --strict-per-call; the selected prepaid balance is the only allowed payment source."
     );
   if (opts.budget === undefined || !opts.requestId)
     throw new DvmError(
@@ -2531,6 +2563,7 @@ function persistRequestIntent(args: {
     callerPubkey: signing.pubkey,
     policy: args.policy,
     ...(opts.mint ? { pinnedMint: opts.mint } : {}),
+    ...(opts.creditOnly ? { creditOnly: opts.creditOnly } : {}),
     ...(opts.strictPerCall ? { strictPerCall: true as const } : {}),
     ...(maxCashuFeeSats !== undefined ? { maxCashuFeeSats } : {}),
     ...receiptTrustFields(args.providerInfo),

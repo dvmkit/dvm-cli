@@ -140,6 +140,7 @@ export async function requestResult(
     : undefined;
   const restored = {
     ...(creditBinding ? { creditBinding } : {}),
+    ...(intent.creditOnly ? { creditOnly: intent.creditOnly } : {}),
     requestId,
     transactionHash: receipt.transactionHash,
     jobToken: receipt.jobToken,

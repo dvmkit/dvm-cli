@@ -23,6 +23,8 @@ Check the existing mapping before replacing an alias. Reuse it with `dvm request
 2. Quote the selected service with the same input you intend to submit. Relay its amount, currency, and pricing description. For metered work, establish an authorized ceiling. Explain any cost/quality choice that affects the requested result; do not silently downgrade it to fit a budget.
 3. Check `dvm budget status` when the planned spend may approach a cap. Obtain approval only for choices not already authorized. If a wallet or funding is needed, continue through [wallets](wallets.md). If repeat work warrants prepayment, use [credit](credit.md).
 
+For metered DVMs, size `--auto-pay-below` for the largest authorized charge (the default is 20% of `--budget`); relay quote `warnings` and use the suggested value only within approved limits, including with `--credit-only`.
+
 ## Run and deliver
 
 Submit once with `dvm request`, preserving the approved input and spending limits. Save the returned request and job identifiers. A long job can use `--no-stream` and be followed through its recorded job.

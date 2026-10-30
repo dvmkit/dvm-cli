@@ -19,7 +19,8 @@ export function nextActionHuman(action: NextAction): string | null {
       if (action.type === "respond") {
         return `Next: ${display} Provider is waiting for your input. ${command ? `Run \`${command}\`.` : action.hint}`;
       }
-      return `Next: Payment required to continue: ${display}${display.endsWith(".") ? "" : "."} Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.`;
+      const thresholdHint = action.hint.match(/ For the next run, use --auto-pay-below .+$/)?.[0] ?? "";
+      return `Next: Payment required to continue: ${display}${display.endsWith(".") ? "" : "."} Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.${thresholdHint}`;
     }
     case "poll": {
       const hint = typeof action.hint === "string" ? action.hint : action.hint.text;

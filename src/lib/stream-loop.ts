@@ -142,7 +142,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     else pendingAction = computeNextAction(jobId, [{
       seq: pending.authorization.request_seq, from: "provider", timestamp: 0,
       type: "payment-request", content: pending.request,
-    }]);
+    }], undefined, policy ? { policy, totalPaidMsats: loadJob(jobId)?.totalPaidMsats } : undefined);
   }
   const deadline =
     opts.timeoutMs === undefined ? undefined : Date.now() + Math.max(0, opts.timeoutMs);
@@ -332,7 +332,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   if (persistLocalState) for (const seq of loadAnsweredYieldSeqs(jobId)) answeredSeqs.add(seq);
   for (const seq of answeredYieldSeqs(allMessages)) answeredSeqs.add(seq);
   const terminal = allMessages.some((msg) => msg.type === "complete" || msg.type === "cancel");
-  const yieldAction = computeNextAction(jobId, allMessages.filter((message) => !answeredSeqs.has(message.seq)))
+  const yieldAction = computeNextAction(jobId, allMessages.filter((message) => !answeredSeqs.has(message.seq)), undefined, policy ? { policy, totalPaidMsats: loadJob(jobId)?.totalPaidMsats } : undefined)
     ?? (terminal ? null : pendingAction);
   let nextAction = withRefundNextAction(jobId, yieldAction ?? (terminal ? null : pollNextAction(jobId)), refunds);
 

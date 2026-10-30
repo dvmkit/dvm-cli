@@ -4,7 +4,7 @@ import { formatMessageHuman } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { createArtifactSaveSession } from "../lib/save-artifact";
-import { computeNextAction, isTerminalJobStatus, type NextAction, pollNextAction } from "../lib/next-action";
+import { type PaymentPolicyContext, computeNextAction, isTerminalJobStatus, type NextAction, pollNextAction } from "../lib/next-action";
 import { buildCompletionHintFields, completionSnapshot, type JobCompletion, nextStepHint } from "../lib/completion-hints";
 import {
   getLastKnownBtcRate,
@@ -137,6 +137,7 @@ async function statusWithAccess(
   const nextAction = await resolveNextAction(jobId, result.status, msgs, transport, ref, {
     timeoutMs: timeout,
     jobToken,
+    context: access.endpointOverridden ? undefined : stored ?? undefined,
   });
 
   // Update job store if we learned something new. A terminal read snapshots the
@@ -330,14 +331,14 @@ async function resolveNextAction(
   fetched: Message[],
   transport: Transport,
   ref: ProviderRef,
-  opts: { timeoutMs: number; jobToken?: string }
+  opts: { timeoutMs: number; jobToken?: string; context?: PaymentPolicyContext }
 ): Promise<NextAction> {
   if (isTerminalJobStatus(status)) return null;
   if (status === "awaiting-input") {
-    const fromBatch = computeNextAction(jobId, fetched);
+    const fromBatch = computeNextAction(jobId, fetched, undefined, opts.context);
     if (fromBatch) return fromBatch;
     const history = await transport.getMessages(jobId, 0, ref, opts);
-    return computeNextAction(jobId, history) ?? pollNextAction(jobId);
+    return computeNextAction(jobId, history, undefined, opts.context) ?? pollNextAction(jobId);
   }
   return pollNextAction(jobId);
 }
