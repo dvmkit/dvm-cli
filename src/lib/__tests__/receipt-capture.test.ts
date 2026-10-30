@@ -146,10 +146,15 @@ describe("fetchMissingJobReceipt", () => {
 
   it("spends one read against a DVM that advertised receipts", async () => {
     const receipt = DVM.sign();
-    vi.mocked(loadJob).mockReturnValue(jobRecord({ receiptsSupported: true }));
-    statusRead.mockResolvedValue({ status: "completed", receipt });
+    vi.mocked(loadJob).mockReturnValue(jobRecord({ receiptsSupported: true, jobToken: "job-token" }));
+    statusRead.mockResolvedValue({ status: "completed", receipt, summary: "", hasArtifacts: false,
+      content_available: false, content_expires_at: 1, internal_notes: "not public metadata" });
 
-    expect(await fetchMissingJobReceipt("job-a7571b-1", transport, REF)).toEqual({ receipt });
+    expect(await fetchMissingJobReceipt("job-a7571b-1", transport, REF)).toEqual({
+      status: "completed", receipt, summary: "", hasArtifacts: false,
+      content_available: false, content_expires_at: 1,
+    });
+    expect(statusRead).toHaveBeenCalledExactlyOnceWith("job-a7571b-1", REF, { jobToken: "job-token" });
   });
 
   it("hands back the receipt it already holds instead of reporting absent", async () => {
@@ -169,6 +174,7 @@ describe("fetchMissingJobReceipt", () => {
     statusRead.mockResolvedValue({ status: "completed", receipt: fresh });
 
     expect(await fetchMissingJobReceipt("job-a7571b-1", transport, REF)).toEqual({
+      status: "completed",
       receipt: fresh,
     });
   });
@@ -195,6 +201,7 @@ describe("fetchMissingJobReceipt", () => {
     });
 
     expect(await fetchMissingJobReceipt("job-a7571b-1", transport, REF)).toEqual({
+      status: "completed",
       receiptParseError: "shape_invalid",
     });
   });
