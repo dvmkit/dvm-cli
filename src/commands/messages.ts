@@ -70,7 +70,7 @@ async function messagesWithAccess(
 
   function actionFromMessages(batch: Message[]): NextAction {
     const answered = access.endpointOverridden ? new Set<number>() : loadAnsweredYieldSeqs(jobId);
-    const action = computeNextAction(jobId, batch.filter((message) => !answered.has(message.seq)));
+    const action = computeNextAction(jobId, batch.filter((message) => !answered.has(message.seq)), undefined, access.endpointOverridden ? undefined : stored ?? undefined);
     const request = batch.findLast((message) => message.type === "payment-request");
     if (action?.type === "pay" && request && !access.endpointOverridden &&
         stored?.inFlightPaymentRequestSeqs?.includes(request.seq))

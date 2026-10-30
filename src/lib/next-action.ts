@@ -1,7 +1,7 @@
 import { guidanceJobArg } from "./provider-output";
 import { answeredYieldSeqs } from "./yield-state";
 import { formatPaymentAmount } from "./currency";
-import type { Message } from "@dvmkit/sdk/internal";
+import type { JobPolicy, Message } from "@dvmkit/sdk/internal";
 import { asProviderText, type ProviderText } from "@dvmkit/sdk/internal";
 
 export type NextAction =
@@ -125,13 +125,18 @@ const TERMINAL_STATUSES: ReadonlySet<string> = new Set<TerminalJobStatus>([
   "cancelled",
 ]);
 
+export interface PaymentPolicyContext {
+  policy?: JobPolicy;
+  totalPaidMsats?: number;
+}
+
 /**
  * Derive the next action from a batch of messages.
  * Scans from the end for the last yield-type message and returns the
  * appropriate action. Returns null if the job is done (complete/cancel)
  * or no yield message is found.
  */
-export function computeNextAction(jobId: string, messages: Message[], nowMs = Date.now()): NextAction {
+export function computeNextAction(jobId: string, messages: Message[], nowMs = Date.now(), context?: PaymentPolicyContext): NextAction {
   const answered = answeredYieldSeqs(messages);
   const expiresAtMs = pendingDeadline(messages, answered);
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -178,6 +183,12 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
         const priceGuidance = safeCurrency ? display : "see the provider price in next_action.fiat_amount";
         const deadline = deadlineClause(expiresAtMs === validDeadline(c.expires_at_ms) ? "Pay" : "Reply", expiresAtMs, nowMs, jobId);
         const expired = expiresAtMs !== undefined && expiresAtMs <= nowMs;
+        const policy = context?.policy;
+        const thresholdHint = !expired && policy && Number.isSafeInteger(c.amount_msats) &&
+          c.amount_msats > policy.autoPayBelowMsats &&
+          (context?.totalPaidMsats ?? 0) + c.amount_msats <= policy.maxTotalMsats &&
+          (policy.maxIncrementMsats === 0 || c.amount_msats <= policy.maxIncrementMsats)
+          ? ` For the next run, use --auto-pay-below ${c.amount_msats} within your approved budget; other payment limits still apply.` : "";
         return {
           type: "pay",
           job_id: jobId,
@@ -188,7 +199,7 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           ...(expiresAtMs !== undefined ? { expires_at_ms: expiresAtMs } : {}),
           display: withDeadline(display, deadline),
           reason: asProviderText(c.reason),
-          hint: expired ? deadline : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`, deadline),
+          hint: expired ? deadline : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`, deadline) + thresholdHint,
         };
       }
 

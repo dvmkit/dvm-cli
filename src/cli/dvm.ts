@@ -296,6 +296,8 @@ export function buildProgram(): Command {
       collectOption,
       [] as string[]
     )
+    .option("--budget <amount>", "Preview the request budget (millisats or $USD); authorizes no payment")
+    .option("--auto-pay-below <amount>", "Preview the per-charge auto-pay bound; authorizes no payment")
     .option("--output-type <mime>", "Desired output MIME type")
     .option(
       "--as <identity>",
@@ -341,7 +343,7 @@ export function buildProgram(): Command {
     )
     .option(
       "--auto-pay-below <amount>",
-      "Auto-pay any single charge at or below this — upfront quote or mid-job (millisats or $USD). Bounded consent: implies --auto-pay."
+      "Auto-pay any single charge at or below this — upfront quote or mid-job (millisats or $USD). Bounded consent: implies --auto-pay, except with --credit-only where only that prepaid credit may be spent."
     )
     .option("--max-increment <amount>", "Max single payment (millisats or $USD)")
     .option(

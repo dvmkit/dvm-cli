@@ -1,3 +1,5 @@
+import { autoPayWarnings } from "../lib/auto-pay-warning";
+import { addOutputWarnings, withOutputWarnings } from "../lib/output";
 import { providerFields } from "../lib/provider-output";
 import { fundingRailLabel, isPaymentRailKey, paymentRailLabel } from "../lib/rail-labels";
 import { formatFiat, SIGNED_REQUEST_AUTH_ID } from "@dvmkit/sdk";
@@ -44,6 +46,8 @@ import { warmupProvider } from "../lib/warmup-provider";
 import { dvmIdentity } from "./dvm-identity";
 
 export interface QuoteOptions {
+  budget?: string;
+  autoPayBelow?: string;
   input?: string;
   data?: string;
   /**
@@ -65,6 +69,10 @@ export interface QuoteOptions {
 }
 
 export async function quote(opts: QuoteOptions): Promise<void> {
+  return withOutputWarnings(() => quoteWithWarnings(opts));
+}
+
+async function quoteWithWarnings(opts: QuoteOptions): Promise<void> {
   if (!opts.dvm && !opts.endpoint) {
     throw new DvmError(
       "endpoint_required",
@@ -236,6 +244,11 @@ export async function quote(opts: QuoteOptions): Promise<void> {
   // `--human` branch derives an advisory sats line client-side from the
   // transport-populated `priceMsats` (current fx × upfront amount).
   const q = quotes[0];
+  const pricing = providerInfo.capabilities?.[capability]?.pricing as { max?: unknown } | undefined;
+  addOutputWarnings(autoPayWarnings([q], {
+    budget: opts.budget ?? config?.defaultBudget,
+    autoPayBelow: opts.autoPayBelow ?? config?.autoPayThreshold,
+  }, pricing?.max ?? providerInfo.pricing?.max), opts.human);
   const attestedIdentity = providerDvmIdentity(providerInfo);
   const stored = signerPubkey ? loadCredit(endpoint, signerPubkey, attestedIdentity) : undefined;
   // The transport already derived `priceMsats` from this quote's fiat amount.

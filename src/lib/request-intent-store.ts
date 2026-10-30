@@ -36,6 +36,8 @@ export interface RequestIntent {
   callerPubkey: string;
   policy: JobPolicy;
   pinnedMint?: string;
+  /** Only this prepaid credit may pay; no new rail spend is authorized. */
+  creditOnly?: string;
   /** Fail-closed direct-Cashu mode marker. */
   strictPerCall?: true;
   maxCashuFeeSats?: number;

@@ -124,6 +124,9 @@ async function handleLockedPaymentRequest(
   const matchingEndpoint = !!job && !!provider.endpoint && sameEndpoint(job.endpoint, provider.endpoint);
   if (!matchingEndpoint && job?.pendingCreditPayment)
     throw new DvmError("credit_payment_endpoint_mismatch", "Recover this balance payment at its original endpoint.");
+  if (job?.creditOnly && (!matchingEndpoint || !job.creditBinding || "unbound" in job.creditBinding ||
+      job.creditBinding.creditId !== job.creditOnly || opts?.rail !== undefined))
+    throw new DvmError("credit_only_unavailable", "This job may spend only its original prepaid credit.");
   let balanceRefused = false;
   const booked = matchingEndpoint ? bookedCreditPayment(jobId, opts?.requestSeq) : undefined;
   if (booked && (booked.request.amount_msats !== request.amount_msats ||
@@ -186,6 +189,9 @@ async function handleLockedPaymentRequest(
       requestSeq: opts?.requestSeq, approval: opts?.approval ?? "auto", transport, provider, jobToken });
     if (creditPaid !== false) return { status: "paid", rail: "credit", amountMsats: creditPaid };
   }
+
+  if (job?.creditOnly)
+    throw new DvmError("credit_only_unavailable", "The selected prepaid credit cannot pay this ask; no fresh payment was attempted.");
 
   // Deposits already entered the wallet-outflow ledger; only a new rail spend
   // needs another global budget check and ledger entry.

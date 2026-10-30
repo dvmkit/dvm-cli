@@ -86,6 +86,8 @@ export interface JobRecord {
    * this mint — no fallback to another allowlisted mint.
    */
   pinnedMint?: string;
+  /** Only this prepaid credit may pay; no new rail spend is authorized. */
+  creditOnly?: string;
   /** Request was submitted through the fail-closed direct-Cashu mode. */
   strictPerCall?: true;
   /** Job-wide Cashu swap-fee ceiling in sats, including later recovery swaps. */

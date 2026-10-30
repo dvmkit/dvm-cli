@@ -53,6 +53,11 @@ async function fixture(packageRoot, expectedSdkVersion) {
         capabilities: { work: { description: "Work" } } }));
       return;
     }
+    if (request.method === "POST" && request.url === "/v1/quote") {
+      response.end(JSON.stringify({ upfront: { amount: 0, currency: "usd" },
+        description: "Prepaid work settles on completion." }));
+      return;
+    }
     if (request.method !== "POST" || request.url !== "/v1/job") {
       unexpected.push(request.url);
       response.writeHead(400).end("{}");
