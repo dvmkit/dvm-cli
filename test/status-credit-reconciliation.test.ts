@@ -3,7 +3,7 @@ import { readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { appendReceipt, CREDITS_FILE, loadCredit, receiptPubkeyFromSecret, type Transport, type UnsignedJobReceipt } from "@dvmkit/sdk/internal";
+import { appendReceipt, CREDITS_FILE, loadCredit, loadReceipts, receiptPubkeyFromSecret, type Transport, type UnsignedJobReceipt } from "@dvmkit/sdk/internal";
 import { attestedDvm, CALLER_B } from "../src/lib/__tests__/fixtures/receipt-fixture";
 import { loadJob, saveJob, type JobRecord } from "../src/lib/job-store";
 import { status } from "../src/commands/status";
@@ -126,6 +126,8 @@ describe("credit settlement on receipt reads", () => {
       amount: 200_000, balance_after: 150_000, ledger_seq: 3 } });
     saveJob({ ...loadJob(jobId)!, id: newerJobId, receipt: newer,
       creditBinding: { ...bound, drawId: "newer-draw" } });
+    appendReceipt({ receipt: newer, endpoint, builder: dvm.anchor,
+      verification: "verified", verified_at: Date.now() });
     await status(newerJobId, {});
     const before = loadCredit(endpoint, CALLER_A);
     expect(before).toMatchObject({ remainingMicro: 150_000, ledgerSeq: 3,
@@ -133,7 +135,7 @@ describe("credit settlement on receipt reads", () => {
     await status(jobId, {});
     const replayed = loadCredit(endpoint, CALLER_A);
     expect(replayed).toEqual(before);
-    expect(planProbeDraw({ stored: replayed, drawCeilingMsats: 175_000,
+    expect(planProbeDraw({ stored: replayed, capability: "count", receipts: loadReceipts(), drawCeilingMsats: 175_000,
       drawCeilingSource: "budget", btcRate: 100_000, config: { posture: "auto" } })).toMatchObject({
       mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 200_000, ceilingMicro: 175_000 },
     });
@@ -152,11 +154,12 @@ describe("credit settlement on receipt reads", () => {
       expect(loadCredit(endpoint, CALLER_A)).toMatchObject({ ledgerSeq: 2, lastPriceMicro: 150_000 });
       await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `
         import assert from "node:assert/strict";
-        import { applyReceiptCredit, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
+        import { appendReceipt, applyReceiptCredit, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
         const { endpoint, receipt, builder } = JSON.parse(process.argv[1]);
         assert.equal(verifyJobReceipt({ receipt, builder, expectedJobId: "concurrent-job" }).status, "verified");
         applyReceiptCredit({ endpoint, identity: attestedDvmIdentity(builder), callerPubkey: receipt.requester_pubkey,
           jobId: receipt.job_id, outcome: receipt.outcome, credit: receipt.credit });
+        appendReceipt({ receipt, endpoint, builder, verification: "verified", verified_at: Date.now() });
       `, JSON.stringify({ endpoint, receipt: newer, builder: dvm.anchor })], {
         env: { ...process.env, DVM_CONFIG_DIR: root }, timeout: 10_000,
       });
@@ -173,7 +176,7 @@ describe("credit settlement on receipt reads", () => {
     const stored = loadCredit(endpoint, CALLER_A);
     expect(stored).toMatchObject({ remainingMicro: 150_000, ledgerSeq: 3,
       lastPriceMicro: 200_000, lastReceiptJobId: "concurrent-job" });
-    expect(planProbeDraw({ stored, drawCeilingMsats: 175_000, drawCeilingSource: "budget",
+    expect(planProbeDraw({ stored, capability: "count", receipts: loadReceipts(), drawCeilingMsats: 175_000, drawCeilingSource: "budget",
       btcRate: 100_000, config: { posture: "auto" } })).toMatchObject({
       mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 200_000, ceilingMicro: 175_000 },
     });

@@ -263,6 +263,8 @@ async function quoteWithWarnings(opts: QuoteOptions): Promise<void> {
   // still tell the caller whether this held balance would be drawn at all.
   const probePlan = planProbeDraw({
     stored,
+    capability,
+    quote: q,
     drawCeilingMsats: 0,
     drawCeilingSource: "budget",
     btcRate: routeBtcRate ?? 0,

@@ -13,6 +13,7 @@ const receiptSecret = "02".repeat(32);
 
 const seams = vi.hoisted(() => ({
   describe: vi.fn(),
+  quote: vi.fn(),
   submit: vi.fn(),
   close: vi.fn(),
   prepareAgentSpend: vi.fn(),
@@ -24,6 +25,7 @@ const seams = vi.hoisted(() => ({
 vi.mock("../src/lib/transport", () => ({
   createDvmTransport: () => ({
     describe: seams.describe,
+    quote: seams.quote,
     submit: seams.submit,
     close: seams.close,
   }),
@@ -71,6 +73,8 @@ vi.doMock("../src/lib/wallet-agent/recovery-submissions", async (importOriginal)
     return {
       ...actual,
       tryResolveBtcUsdRate: () => seams.rate === undefined ? actual.tryResolveBtcUsdRate() : Promise.resolve({ rate: seams.rate, stale: false }),
+      resolveBtcUsdRate: (...args: Parameters<typeof actual.resolveBtcUsdRate>) => seams.rate === undefined
+        ? actual.resolveBtcUsdRate(...args) : Promise.resolve({ rate: seams.rate, stale: false }),
     };
   });
   sdk = await import("@dvmkit/sdk/internal");
@@ -83,6 +87,7 @@ beforeEach(() => {
   mkdirSync(root, { recursive: true });
   notices.resetCreditNotices();
   seams.rate = undefined;
+  seams.quote.mockResolvedValue([]);
   writeConfig("auto");
   fetchRate = vi.fn().mockRejectedValue(new Error("rate provider unavailable"));
   vi.stubGlobal("fetch", fetchRate);
@@ -193,7 +198,7 @@ describe("automatic credit funding notices", () => {
   });
 
   it("names a refill when an active prepaid credit cannot cover the job", async () => {
-    seedEmptyCredit();
+    seedCredit();
     await paidRequest();
 
     expect(terminal()).toMatchObject({
@@ -241,19 +246,93 @@ describe("automatic credit funding notices", () => {
   });
 });
 
+describe("capability-scoped credit draws", () => {
+  beforeEach(async () => {
+    seams.rate = 100_000;
+    writeConfig("suggest");
+    seedCredit(5_000_000);
+    writeFileSync(sdk.FAVORITES_FILE, JSON.stringify({ panel: { endpoint, addedAt: 1 } }));
+    const provider = await seams.describe();
+    seams.describe.mockResolvedValue({ ...provider, capabilities: { stress: {}, recheck: {} } });
+    seams.quote.mockImplementation(async (_ref, envelope: JobEnvelope) => {
+      return [{
+        upfront: { amount: envelope.capability === "stress" ? 0.83 : 0.06,
+          amount_micro: envelope.capability === "stress" ? 830_000 : 60_000, currency: "usd" },
+        priceMsats: envelope.capability === "stress" ? 830_000 : 60_000,
+        shape: "fixed", description: "Upfront",
+      }];
+    });
+    let sequence = 1;
+    let remaining = 5_000_000;
+    seams.submit.mockImplementation(async (_ref, envelope: JobEnvelope, payment?: Payment) => {
+      if (!envelope.data?.credit_id) return { jobId: "", status: "payment-required", quotes: [] };
+      expect(payment).toBeUndefined();
+      const amount = envelope.capability === "stress" ? 830_000 : 60_000;
+      remaining -= amount;
+      const jobId = `draw-${++sequence}`;
+      return { jobId, status: "completed", summary: "Done",
+        upfrontPayment: { amount_msats: amount, amount_micro: amount, currency: "usd",
+          credit_id: "prepaid-credit", draw_id: envelope.data.draw_id },
+        receipt: sdk.signReceipt({
+          v: 1, job_id: jobId, dvm_id: "test-provider", dvm: "echo-provider",
+          capability: envelope.capability!, outcome: "completed", reason: null, seq: sequence,
+          issued_at: Math.floor(Date.now() / 1000), requester_pubkey: sdk.receiptPubkeyFromSecret(secret),
+          paid: { msats: amount, rail: "cashu", native_amount: null, native_asset: null,
+            tx_hash: null, mint }, result_hash: sdk.computeResultHash("Done", []),
+          receipt_pubkey: sdk.receiptPubkeyFromSecret(receiptSecret),
+          credit: { credit_id: "prepaid-credit", draw_id: String(envelope.data.draw_id),
+            amount, balance_after: remaining, ledger_seq: sequence },
+        }, receiptSecret) };
+    });
+  });
+
+  it.each(["available", "unavailable"])("draws a cheap capability after an expensive one with its quote %s", async (quoteAvailability) => {
+    await request({ dvm: "panel/stress", input: "Run", budget: "$0.83", autoPayBelow: "$0.83" });
+    expect(sdk.loadCredit(endpoint, sdk.receiptPubkeyFromSecret(secret))).toMatchObject({
+      remainingMicro: 4_170_000, lastPriceMicro: 830_000,
+    });
+    if (quoteAvailability === "unavailable") seams.quote.mockRejectedValueOnce(new Error("Quote unavailable"));
+    await request({ dvm: "panel/recheck", input: "Run", budget: "$0.06", autoPayBelow: "$0.06" });
+
+    expect(sdk.loadCredit(endpoint, sdk.receiptPubkeyFromSecret(secret))).toMatchObject({
+      remainingMicro: 4_110_000, lastPriceMicro: 60_000,
+    });
+    expect(terminal()).not.toHaveProperty("credit_draw_skipped");
+    expect(seams.submit.mock.calls.map(([, envelope]) => envelope.data.credit_id))
+      .toEqual(["prepaid-credit", "prepaid-credit"]);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it("skips a metered capability whose own last draw exceeds the ceiling", async () => {
+    await request({ dvm: "panel/stress", input: "Run", budget: "$0.83", autoPayBelow: "$0.83" });
+    seams.quote.mockResolvedValueOnce([{ upfront: { amount: 0, currency: "usd" },
+      priceMsats: 0, shape: "rate", description: "Metered",
+      rate: { per_unit: { amount: 0.01, currency: "usd" }, unit: "item" } }]);
+    await request({ dvm: "panel/stress", input: "Run", budget: "$0.06", autoPayBelow: "$0.06" });
+
+    expect(terminal()).toMatchObject({ credit_draw_skipped: {
+      reason: "price_above_ceiling", credit_id: "prepaid-credit", last_price_micro: 830_000,
+      ceiling_micro: 60_000, ceiling_source: "auto_pay_below", balance_micro: 4_170_000,
+    } });
+    expect(seams.submit.mock.calls[1][1].data).not.toHaveProperty("credit_id");
+    expect(sdk.loadCredit(endpoint, sdk.receiptPubkeyFromSecret(secret))?.remainingMicro).toBe(4_170_000);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+});
+
 function writeConfig(posture: "auto" | "off" | "suggest"): void {
   writeFileSync(join(root, "config.json"), JSON.stringify({ credit: { posture }, feedback: { posture: "off" } }));
 }
 
-function seedEmptyCredit(): void {
+function seedCredit(remainingMicro = 0): void {
   writeFileSync(join(root, "credits.json"), JSON.stringify({
     credits: [{
       endpoint,
       callerPubkey: sdk.receiptPubkeyFromSecret(secret),
       creditId: "prepaid-credit",
       currency: "usd",
-      remainingMicro: 0,
-      balanceMicro: 0,
+      remainingMicro,
+      balanceMicro: remainingMicro,
       targetMicro: 40_000,
       expiryMs: Date.now() + 86_400_000,
       status: "active",

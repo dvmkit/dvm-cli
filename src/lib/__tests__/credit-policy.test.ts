@@ -35,7 +35,7 @@ import type { StoredCredit, StoredImplicitCredit } from "@dvmkit/sdk/internal";
 import type { CreditConfig } from "../identity";
 import type { StoredReceipt } from "@dvmkit/sdk/internal";
 import { attestedDvmIdentity } from "@dvmkit/sdk/internal";
-import type { CreditMenu } from "@dvmkit/sdk/internal";
+import type { CreditMenu, Quote } from "@dvmkit/sdk/internal";
 import {
   attestedDvm,
   CALLER_A,
@@ -118,6 +118,15 @@ function implicit(overrides: Partial<StoredImplicitCredit> = {}): StoredImplicit
     releasedAt: 0,
     updatedAt: 0,
     ...overrides,
+  };
+}
+
+function drawn(amount: number, capability = "count", ledgerSeq = 3): StoredReceipt {
+  return {
+    receipt: dvm.sign({ requester_pubkey: CALLER_A, capability,
+      credit: { credit_id: "credit-1", draw_id: `draw-${ledgerSeq}`, amount,
+        balance_after: 400_000, ledger_seq: ledgerSeq } }),
+    endpoint: ENDPOINT, builder: dvm.anchor, verification: "verified", verified_at: 0,
   };
 }
 
@@ -1028,6 +1037,7 @@ describe("credit posture", () => {
   it("off refuses a draw on a credit already held; suggest does not", () => {
     const probe = {
       stored: stored(),
+      capability: "count",
       drawCeilingMsats: 1e6,
       drawCeilingSource: "budget" as const,
       btcRate: RATE,
@@ -1074,6 +1084,8 @@ describe("credit posture", () => {
 describe("planProbeDraw", () => {
   const base = {
     stored: stored(),
+    capability: "count",
+    receipts: [drawn(10_000)],
     drawCeilingMsats: 1_000_000,
     drawCeilingSource: "budget" as const,
     btcRate: RATE,
@@ -1131,7 +1143,7 @@ describe("planProbeDraw", () => {
 
   it("draws again at a ceiling the last drawn price sits under", () => {
     const stale = stored({ lastPriceMicro: 5_091 });
-    expect(planProbeDraw({ ...base, stored: stale, drawCeilingMsats: 31_427 }).mode).toBe("draw");
+    expect(planProbeDraw({ ...base, stored: stale, receipts: [drawn(5_091)], drawCeilingMsats: 31_427 }).mode).toBe("draw");
   });
 
   it.each([
@@ -1145,7 +1157,7 @@ describe("planProbeDraw", () => {
     ],
     [
       "last price above the declared ceiling",
-      { stored: stored({ lastPriceMicro: 5_000_000 }), drawCeilingMsats: 10_000 },
+      { stored: stored({ lastPriceMicro: 5_000_000 }), receipts: [drawn(5_000_000)], drawCeilingMsats: 10_000 },
       "price_above_ceiling",
     ],
   ])("stands down: %s, naming why", (_label, overrides, reason) => {
@@ -1162,6 +1174,7 @@ describe("planProbeDraw", () => {
       const plan = planProbeDraw({
         ...base,
         stored: stored({ lastPriceMicro: 5_000_000 }),
+        receipts: [drawn(5_000_000)],
         drawCeilingMsats: 10_000,
         drawCeilingSource: source,
       });
@@ -1193,6 +1206,76 @@ describe("planProbeDraw", () => {
     expect(plan.mode).toBe("none");
     if (plan.mode !== "none") return;
     expect(plan.drawSkipped?.reason).toBe("expired");
+  });
+
+  const fixed = (micro: number): Quote => ({
+    upfront: { amount: micro / 1_000_000, amount_micro: micro, currency: "usd" },
+    priceMsats: micro, shape: "fixed", description: "Upfront",
+  });
+  const scoped = { ...base, drawCeilingMsats: 60_000, stored: stored({ lastPriceMicro: 830_000 }) };
+
+  it("prefers the capability's exact upfront quote over both historical prices", () => {
+    expect(planProbeDraw({ ...scoped, quote: { ...fixed(60_000),
+      upfront: { amount: 0.061, amount_micro: 60_000, currency: "usd" } },
+      receipts: [drawn(830_000)] })).toMatchObject({ mode: "draw" });
+    expect(planProbeDraw({ ...scoped, quote: fixed(60_001) })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 60_001 },
+    });
+  });
+
+  it("accepts a legacy decimal upfront quote and a free fixed quote", () => {
+    for (const amount of [0, 0.06]) {
+      expect(planProbeDraw({ ...scoped, quote: { ...fixed(0),
+        upfront: { amount, currency: "usd" } }, receipts: [drawn(830_000)] }).mode).toBe("draw");
+    }
+  });
+
+  it("uses a metered capability's own latest draw despite another capability's newer price", () => {
+    const history = [drawn(830_000, "count", 2), drawn(1_000, "other", 3), drawn(20_000, "count", 1)];
+    const metered: Quote = { ...fixed(0), shape: "rate",
+      rate: { per_unit: { amount: 0.01, currency: "usd" }, unit: "item" } };
+    expect(planProbeDraw({ ...scoped, stored: stored({ lastPriceMicro: 1_000 }),
+      quote: metered, receipts: history })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 830_000 },
+    });
+    expect(planProbeDraw({ ...scoped, quote: metered,
+      receipts: [drawn(20_000, "count", 2), drawn(830_000, "count", 1)] }).mode).toBe("draw");
+  });
+
+  it("makes no guess from another capability or a legacy DVM-wide price", () => {
+    for (const history of [[], [drawn(830_000, "other")]]) {
+      expect(planProbeDraw({ ...scoped, receipts: history }).mode).toBe("draw");
+    }
+  });
+
+  it.each([
+    ["another caller", (entry: StoredReceipt) => ({ ...entry,
+      receipt: dvm.sign({ ...entry.receipt, requester_pubkey: CALLER_B }) })],
+    ["another credit", (entry: StoredReceipt) => ({ ...entry,
+      receipt: dvm.sign({ ...entry.receipt, credit: { ...entry.receipt.credit!, credit_id: "other" } }) })],
+    ["a failed job", (entry: StoredReceipt) => ({ ...entry,
+      receipt: dvm.sign({ ...entry.receipt, outcome: "failed", reason: "failed" }) })],
+    ["a tampered price", (entry: StoredReceipt) => ({ ...entry,
+      receipt: { ...entry.receipt, credit: { ...entry.receipt.credit!, amount: 999_999 } } })],
+    ["an unrelated endpoint", (entry: StoredReceipt) => ({ ...entry, endpoint: "https://other.example", builder: undefined })],
+  ] as const)("does not price a draw using %s", (_label, change) => {
+    expect(planProbeDraw({ ...scoped, receipts: [change(drawn(830_000))] }).mode).toBe("draw");
+  });
+
+  it("pools attested aliases but rejects a replacement builder at the same endpoint", () => {
+    const entry = drawn(830_000);
+    expect(planProbeDraw({ ...scoped, identity: attestedDvmIdentity(dvm.anchor),
+      receipts: [{ ...entry, endpoint: "https://alias.example" }] })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling" },
+    });
+    expect(planProbeDraw({ ...scoped, identity: attestedDvmIdentity(attestedDvm("wordcount").anchor),
+      receipts: [entry] }).mode).toBe("draw");
+  });
+
+  it("does not treat non-USD credit history or quotes as USD", () => {
+    expect(planProbeDraw({ ...scoped, stored: stored({ currency: "eur" }),
+      quote: { ...fixed(830_000), upfront: { amount: 0.83, currency: "eur" } },
+      receipts: [drawn(830_000)] }).mode).toBe("draw");
   });
 });
 

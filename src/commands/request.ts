@@ -568,6 +568,45 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
       ...(opts.requestId ? { request_id: opts.requestId } : {}),
     };
     signing = { privkey: signer.privkey, pubkey: signer.pubkey, unsignedData, domain: authDomain };
+  }
+
+  // Start the job clock AFTER warmup so cold-start latency doesn't eat the budget.
+  const deadlineMs = Date.now() + timeout;
+
+  const envelopeBase = buildJobEnvelope({
+    capability,
+    input: inputText,
+    params: opts.param,
+    data,
+    outputType: opts.outputType,
+    bidMsats: budgetMsats,
+  });
+
+  // Quote before a free or credit-draw submit can start the job without a 402.
+  // Advisory pricing must not turn quote availability into a submit requirement.
+  let previewQuotes: Quote[] = [];
+  if (policy.maxTotalMsats > 0 || policy.autoPayBelowMsats > 0) {
+    try {
+      const quoteData = signing
+        ? signDvmRequestData(signing.privkey, signing.unsignedData, signedRequestDomain({
+            provider: providerInfo, endpoint, method: "POST", path: "v1/quote", capability,
+          }))
+        : data;
+      previewQuotes = await transport.quote(ref, { ...envelopeBase, data: quoteData }, {
+        // Leave the rest of the job deadline available for submission and work.
+        timeoutMs: Math.min(1_000, Math.max(1, Math.floor(timeout / 10))),
+        btcRate,
+      });
+    } catch { /* Older providers may support submit without a quote endpoint. */ }
+  }
+  const pricing = providerInfo.capabilities?.[capability]?.pricing as { max?: unknown } | undefined;
+  const warningLimits = { budget: effectiveBudget, autoPayBelow: effectiveAutoPayBelow };
+  const previewWarnings = autoPayWarnings(previewQuotes, warningLimits, pricing?.max ?? providerInfo.pricing?.max, btcRate);
+  addOutputWarnings(previewWarnings, opts.human);
+
+  if (signing) {
+    const signer = signing;
+    const unsignedData = signing.unsignedData;
     // Draw-first: when a live credit is held at this DVM, the
     // initial signed submit carries {credit_id, draw_id} and the job clears
     // in one round trip with no payment attach.
@@ -588,10 +627,10 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
       opts.strictPerCall || opts.creditOnly
         ? []
         : loadImplicitCredits(endpoint, signer.pubkey, attestedIdentity);
-    if (storedCredit?.lastPriceMicro !== undefined && btcRate === 0) {
-      // The price proxy compares the last drawn amount against the caller's
-      // ceiling in fiat — resolve a rate best-effort when none was needed for
-      // flag parsing. Without one the proxy stands down, never blocks.
+    if (storedCredit && btcRate === 0 &&
+        (policy.maxTotalMsats > 0 || policy.autoPayBelowMsats > 0)) {
+      // Quotes and receipt history use fiat; millisat-only limits still need a
+      // best-effort rate for the draw gate. Without one the proxy stands down.
       btcRate = (await tryResolveBtcUsdRate())?.rate ?? 0;
     }
     // The ceiling for a draw is what the caller declared for the whole job: an
@@ -614,14 +653,15 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
             source: opts.autoPayBelow !== undefined ? "auto_pay_below" : "config_threshold",
           }
         : { msats: policy.maxTotalMsats, source: "budget" };
-    const drawStored =
-      opts.creditOnly && storedCredit
-        ? (({ lastPriceMicro: _lastPriceMicro, ...credit }) => credit)(storedCredit)
-        : storedCredit;
     probePlan = opts.strictPerCall
       ? { mode: "none" }
       : planProbeDraw({
-          stored: drawStored,
+          stored: storedCredit,
+          capability,
+          ...(opts.creditOnly ? {} : {
+            quote: previewQuotes[0],
+            receipts: storedCredit && drawCeiling.msats > 0 ? loadReceipts() : [],
+          }),
           implicit: implicitCredits,
           drawCeilingMsats: drawCeiling.msats,
           drawCeilingSource: drawCeiling.source,
@@ -664,7 +704,7 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
             ...(drawRequestId ? { request_id: drawRequestId } : {}),
           }
         : unsignedData;
-    data = signDvmRequestData(signer.privkey, probeData, authDomain);
+    data = signDvmRequestData(signer.privkey, probeData, signing.domain);
     if (opts.human) info(`Signed as ${signer.pubkey}.`);
     if (opts.human && probePlan.mode === "draw") {
       info(
@@ -687,39 +727,7 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
     }
   }
 
-  // Start the job clock AFTER warmup so cold-start latency doesn't eat the budget.
-  const deadlineMs = Date.now() + timeout;
-
-  let envelope = buildJobEnvelope({
-    capability,
-    input: inputText,
-    params: opts.param,
-    data,
-    outputType: opts.outputType,
-    bidMsats: budgetMsats,
-  });
-
-  // Quote before a free or credit-draw submit can start the job without a 402.
-  // Advisory pricing must not turn quote availability into a submit requirement.
-  let previewQuotes: Quote[] = [];
-  if (policy.maxTotalMsats > 0 || policy.autoPayBelowMsats > 0) {
-    try {
-      const quoteData = signing
-        ? signDvmRequestData(signing.privkey, signing.unsignedData, signedRequestDomain({
-            provider: providerInfo, endpoint, method: "POST", path: "v1/quote", capability,
-          }))
-        : data;
-      previewQuotes = await transport.quote(ref, { ...envelope, data: quoteData }, {
-        // Leave the rest of the job deadline available for submission and work.
-        timeoutMs: Math.min(1_000, Math.max(1, Math.floor(timeout / 10))),
-        btcRate,
-      });
-    } catch { /* Older providers may support submit without a quote endpoint. */ }
-  }
-  const pricing = providerInfo.capabilities?.[capability]?.pricing as { max?: unknown } | undefined;
-  const warningLimits = { budget: effectiveBudget, autoPayBelow: effectiveAutoPayBelow };
-  const previewWarnings = autoPayWarnings(previewQuotes, warningLimits, pricing?.max ?? providerInfo.pricing?.max, btcRate);
-  addOutputWarnings(previewWarnings, opts.human);
+  let envelope: JobEnvelope = { ...envelopeBase, data };
 
   // The ID the submitted job is recorded and reported under: the caller's own,
   // else the one generated for the draw leg that ends up accepted.
