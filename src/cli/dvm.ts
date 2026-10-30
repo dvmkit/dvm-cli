@@ -284,7 +284,7 @@ export function buildProgram(): Command {
       "-d, --dvm <identifier>",
       "Qualified DVM or DVM/capability identifier (e.g. `dvmkit--narrate`, `dvmkit--cast/add-episode`). Alternative to --endpoint."
     )
-    .option("--endpoint <url>", "Provider HTTPS endpoint URL (alternative to -d)")
+    .option("--endpoint <url>", "Provider HTTPS base URL or URL/capability (alternative to -d)")
     .option("-i, --input <text>", "Input text (primitive-input DVMs)")
     .option(
       "--data <json>",
@@ -324,7 +324,7 @@ export function buildProgram(): Command {
       "-d, --dvm <identifier>",
       "Qualified DVM or DVM/capability identifier (e.g. `dvmkit--narrate`, `dvmkit--cast/add-episode`). Alternative to --endpoint."
     )
-    .option("--endpoint <url>", "Provider HTTPS endpoint URL (alternative to -d)")
+    .option("--endpoint <url>", "Provider HTTPS base URL or URL/capability (alternative to -d)")
     .option("-i, --input <text>", "Input text (primitive-input DVMs)")
     .option(
       "--param <key=value>",

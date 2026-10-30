@@ -10,10 +10,11 @@ import {
   json,
 } from "../lib/output";
 
-import { resolveDvmReference } from "../lib/dvm-identifier";
+import { capabilityQuoteCommand, resolveCapability, resolveDvmReference } from "../lib/dvm-identifier";
 import { resolveEndpoint } from "../lib/favorites";
 import { progressNotice } from "../lib/progress-notice";
 import { createDvmTransport } from "../lib/transport";
+import { resolveProviderEndpoint } from "../lib/resolve-provider-endpoint";
 
 export interface DescribeOptions {
   human?: boolean;
@@ -37,10 +38,17 @@ export async function describe(input: string, opts: DescribeOptions): Promise<vo
     qualifiedDvmId = resolved.qualified?.dvmId;
   }
   const transport = createDvmTransport();
-  const ref = { endpoint };
 
   progressNotice("Fetching provider info...", opts.human);
-  const providerInfo = await transport.describe(ref);
+  const resolved = await resolveProviderEndpoint(transport, endpoint, {
+    capabilityPath: input.startsWith("@") || /^https?:\/\//.test(input),
+    maxAttempts: 1,
+  });
+  endpoint = resolved.endpoint;
+  const providerInfo = resolved.info;
+  if (resolved.capability !== undefined) {
+    resolveCapability(providerInfo, resolved.capability, qualifiedDvmId, endpoint);
+  }
 
   if (opts.human) {
     info(providerInfo.name ?? "(unnamed)");
@@ -98,7 +106,7 @@ function renderCapabilitiesHuman(
       : undefined;
     const quoteCommand = identifier
       ? `dvm quote -d ${identifier}`
-      : `dvm quote --endpoint ${endpoint}`;
+      : capabilityQuoteCommand(endpoint, capName);
 
     const priceLine = formatCapabilityPrice(cap.pricing, quoteCommand);
     if (priceLine) info(`    ${priceLine}`);

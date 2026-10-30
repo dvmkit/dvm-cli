@@ -32,8 +32,8 @@ const MAX_BACKOFF_MS = 4_000;
  * exponential backoff so a resume race is transparent to the caller.
  *
  * Retrying is always safe here: this is the pre-payment probe (`GET /v1/info`,
- * idempotent) with no money at stake. `unsupported_version` is terminal —
- * retrying can't resolve a protocol mismatch — and a genuinely dead endpoint
+ * idempotent) with no money at stake. A protocol mismatch or missing descriptor
+ * is terminal; retrying cannot resolve either. A genuinely dead endpoint
  * still fails fast (attempts are bounded) with the same `endpoint_unreachable`.
  * The wrapped error messages match the single-shot behaviour they replace.
  */
@@ -59,8 +59,7 @@ export async function warmupProvider(
       return await transport.describe(ref, { timeoutMs });
     } catch (err) {
       lastErr = err;
-      // A protocol mismatch can't be retried away — surface it immediately.
-      if (err instanceof DvmError && err.code === "unsupported_version") throw err;
+      if (err instanceof DvmError && ["unsupported_version", "not_a_dvm_endpoint"].includes(err.code)) throw err;
       const budgetLeft = deadline - Date.now();
       if (attempt >= maxAttempts || budgetLeft <= 0) break;
       const futureAttempts = maxAttempts - attempt;

@@ -129,6 +129,14 @@ export class HttpsTransport implements Transport {
       throw err;
     }
 
+    if (res.status === 404) {
+      await res.body?.cancel();
+      throw new DvmError(
+        "not_a_dvm_endpoint",
+        `No DVM descriptor was found at ${url}.`,
+        "Check the DVM base URL: it must serve /v1/info. A capability URL must end in a name advertised by its parent DVM."
+      );
+    }
     if (!res.ok) {
       throw providerResponseError(
         "provider_error",

@@ -8,6 +8,8 @@ Reuse an endpoint or favourite the user already chose. Run `dvm fav list` when t
 
 Use the qualified `identifier` returned by discovery with `-d`. Use `--endpoint` for an actual URL or a saved `@alias`; never invent a URL from an unqualified name. Confirm that the selected capability accepts the input and provides the result the user needs.
 
+For a service URL the user already has, including an unlisted service, inspect it directly with `dvm describe https://example.com`. Select a capability by appending its advertised name: `dvm quote --endpoint https://example.com/ask --input "your question"`, then use the same URL with `dvm request`. `dvm describe https://example.com/ask` also accepts this form. A working base path takes precedence: the final segment is treated as a capability only when that URL's `/v1/info` returns 404 and its immediate parent advertises capabilities. An unknown name returns `unknown_capability`; a base URL with several choices returns `ambiguous_capability`. Both errors list `available_capabilities` and give a direct retry without discovery. `not_a_dvm_endpoint` means `/v1/info` returned 404; check the service base URL.
+
 To remember a chosen service, save its verified endpoint:
 
 ```bash
