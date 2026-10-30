@@ -1,4 +1,4 @@
-import { CAPABILITY_NAME_RE, DvmError, type ProviderInfo } from "@dvmkit/sdk/internal";
+import { CAPABILITY_NAME_RE, DvmError, shellQuoteArg, type ProviderInfo } from "@dvmkit/sdk/internal";
 
 import { loadFavorites } from "./favorites";
 
@@ -158,13 +158,14 @@ function isValidHandle(handle: string): boolean {
  * advertise capabilities (pre- server), `unknown_capability` when the
  * caller typed a slash form that doesn't match, and `ambiguous_capability`
  * when the caller did not specify a capability against a multi-capability
- * DVM. Hints list slash-form retries only when the caller supplied a qualified
- * identifier; endpoint-only calls never invent one from provider metadata.
+ * DVM. Retry commands use caller addressing information and validated capability
+ * tokens, never identifiers inferred from provider metadata.
  */
 export function resolveCapability(
   info: ProviderInfo,
   requested: string | undefined,
-  dvmId: string | undefined
+  dvmId: string | undefined,
+  endpoint?: string
 ): string {
   const caps = info.capabilities ? Object.keys(info.capabilities) : [];
   const reference = dvmId ?? "this endpoint";
@@ -180,9 +181,7 @@ export function resolveCapability(
     throw new DvmError(
       "unknown_capability",
       `"${requested}" is not a capability of ${reference}.`,
-      dvmId
-        ? `Pass -d ${dvmId}/<capability> using a name from available_capabilities.`
-        : "Choose a name from available_capabilities. Run `dvm search` to find a qualified identifier.",
+      capabilityRetryHint(caps, dvmId, endpoint),
       { available_capabilities: caps, _provider_fields: ["available_capabilities"] }
     );
   }
@@ -190,9 +189,38 @@ export function resolveCapability(
   throw new DvmError(
     "ambiguous_capability",
     `${reference} has multiple capabilities; specify one from available_capabilities.`,
-    dvmId
-      ? `Pass -d ${dvmId}/<capability> using a name from available_capabilities.`
-      : "Run `dvm search` to find a qualified identifier for the capability you need.",
+    capabilityRetryHint(caps, dvmId, endpoint),
     { available_capabilities: caps, _provider_fields: ["available_capabilities"] }
   );
+}
+
+export function capabilityQuoteCommand(endpoint: string, capability: string, dvmId?: string): string {
+  const target = dvmId
+    ? `-d ${shellQuoteArg(formatIdentifier(dvmId, capability))}`
+    : `--endpoint ${shellQuoteArg(`${endpoint.replace(/\/+$/, "")}/${encodeURIComponent(capability)}`)}`;
+  return `dvm quote ${target}`;
+}
+
+function capabilityRetryHint(caps: string[], dvmId?: string, endpoint?: string): string {
+  const capability = caps.find((name) => TAG_NAME_RE.test(name));
+  if (!capability || (!dvmId && !endpoint)) {
+    return endpoint
+      ? `Inspect the available_capabilities with \`dvm describe ${shellQuoteArg(endpoint)}\`.`
+      : "Choose a name from available_capabilities and append /<capability> to your DVM reference.";
+  }
+  const command = capabilityQuoteCommand(endpoint ?? "", capability, dvmId);
+  let alternate = "";
+  if (endpoint && !dvmId) {
+    const url = new URL(endpoint);
+    if (url.protocol === "https:" && !url.port && (url.pathname === "/" || url.pathname === "") && url.hostname.endsWith(".dvmkit.ai")) {
+      const hostId = url.hostname.slice(0, -".dvmkit.ai".length);
+      try {
+        parseDvmIdentifier(hostId);
+        alternate = ` Or \`${capabilityQuoteCommand(endpoint, capability, hostId)} --data '{}'\`.`;
+      } catch {
+        // Only a valid owner-qualified hostname supports the -d alternative.
+      }
+    }
+  }
+  return `Try \`${command} --data '{}'\` using a name from available_capabilities. Replace --data '{}' with the input for that capability.${alternate}`;
 }

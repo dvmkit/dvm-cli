@@ -42,7 +42,7 @@ import { buildJobEnvelope, paramsToData } from "../lib/job-envelope";
 import { progressNotice } from "../lib/progress-notice";
 import { applyJsonSchemaDefaults, formatAppliedDefaults } from "../lib/schema-defaults";
 import { createDvmTransport } from "../lib/transport";
-import { warmupProvider } from "../lib/warmup-provider";
+import { resolveProviderEndpoint } from "../lib/resolve-provider-endpoint";
 import { dvmIdentity } from "./dvm-identity";
 
 export interface QuoteOptions {
@@ -132,7 +132,6 @@ async function quoteWithWarnings(opts: QuoteOptions): Promise<void> {
   }
 
   const transport = createDvmTransport();
-  const ref = { endpoint };
 
   // fetch /v1/info to pin the capability before quoting. /v1/quote
   // rejects requests without `capability`, so the CLI must resolve it the
@@ -148,17 +147,24 @@ async function quoteWithWarnings(opts: QuoteOptions): Promise<void> {
   // the same budget (safe — GET, no money).
   let providerInfo;
   try {
-    providerInfo = await warmupProvider(transport, ref, { budgetMs: WARMUP_TIMEOUT_MS });
+    const resolved = await resolveProviderEndpoint(transport, endpoint, {
+      budgetMs: WARMUP_TIMEOUT_MS,
+      capabilityPath: !opts.dvm,
+    });
+    endpoint = resolved.endpoint;
+    requestedCapability ??= resolved.capability;
+    providerInfo = resolved.info;
   } catch (err) {
     transport.close();
     throw err;
   }
+  const ref = { endpoint };
   const warmupMs = Date.now() - warmupStart;
   if (opts.human && warmupMs > 1000) {
     info(`Provider woke up in ${(warmupMs / 1000).toFixed(1)}s.`);
   }
   const dvmId = canonicalDvmId;
-  const capability = resolveCapability(providerInfo, requestedCapability, dvmId);
+  const capability = resolveCapability(providerInfo, requestedCapability, dvmId, endpoint);
   const identifier = dvmId ? formatIdentifier(dvmId, capability) : endpoint;
   if (opts.human) info(`Quoting ${identifier}...`);
 

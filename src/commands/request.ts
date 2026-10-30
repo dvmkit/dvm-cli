@@ -179,7 +179,7 @@ import {
   tempoNetworkLabel,
 } from "../lib/tempo-network";
 import { groupProofsByMint } from "../lib/wallet-agent/balance";
-import { warmupProvider } from "../lib/warmup-provider";
+import { resolveProviderEndpoint } from "../lib/resolve-provider-endpoint";
 import { type DvmIdentity, dvmIdentity } from "./dvm-identity";
 import { serializeMessageForOutput } from "./messages";
 import { formatMessageHuman } from "../lib/message-human";
@@ -430,7 +430,6 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
   }
 
   const transport = createDvmTransport();
-  const ref: ProviderRef = { endpoint };
 
   // Wake the machine if auto-stopped (Fly auto-start). On warm machines this
   // completes in <50ms; on cold starts it absorbs the boot latency so the
@@ -443,9 +442,14 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
   // and come back truncated / non-JSON / 502. warmupProvider retries within
   // the same budget (safe —
   // GET, no money at stake).
-  const providerInfo: ProviderInfo = await warmupProvider(transport, ref, {
+  const resolvedEndpoint = await resolveProviderEndpoint(transport, endpoint, {
     budgetMs: WARMUP_TIMEOUT_MS,
+    capabilityPath: !opts.dvm,
   });
+  endpoint = resolvedEndpoint.endpoint;
+  requestedCapability ??= resolvedEndpoint.capability;
+  const providerInfo = resolvedEndpoint.info;
+  const ref: ProviderRef = { endpoint };
   if (opts.requestId && providerInfo.requestRecovery !== true) {
     transport.close();
     throw new DvmError(
@@ -464,7 +468,7 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
   // owner-qualified caller input instead of turning provider metadata (which
   // may be a bare display name) into a callable identifier.
   const dvmId = canonicalDvmId;
-  const capability = resolveCapability(providerInfo, requestedCapability, dvmId);
+  const capability = resolveCapability(providerInfo, requestedCapability, dvmId, endpoint);
   const identity: DvmIdentity = { dvmId, capability };
   const identifier = dvmId ? formatIdentifier(dvmId, capability) : endpoint;
   if (opts.human) info(`Targeting ${identifier}.`);
