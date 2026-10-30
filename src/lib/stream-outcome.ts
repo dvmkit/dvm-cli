@@ -1,10 +1,12 @@
-import { type TerminalJobStatus } from "./next-action";
-import { completionFromMessages, type JobCompletion } from "./completion-hints";
+import { isTerminalJobStatus, type TerminalJobStatus } from "./next-action";
+import { completionFromMessages, completionSnapshot, type JobCompletion } from "./completion-hints";
 import {
+  type JobStatus,
   type Message,
 } from "@dvmkit/sdk/internal";
 import {
   type JobRecord,
+  loadJob,
   markJobTerminal,
   updateJob,
 } from "./job-store";
@@ -15,7 +17,12 @@ export type TerminalExtra = Partial<
   Omit<JobRecord, "id" | "status" | "completedAt" | "completion">
 >;
 
-export interface StreamOutcome {
+export interface StreamStatusContext {
+  providerStatus?: Partial<JobStatus>;
+  callerCancelled?: boolean;
+}
+
+export interface StreamOutcome extends StreamStatusContext {
   jobId: string;
   messages: Message[];
   cursor: number;
@@ -26,30 +33,33 @@ export interface StreamOutcome {
 
 /**
  * Persist what a read of the message log taught us about the job, and return the
- * terminal snapshot it recorded. A log that ran to `complete` / `cancel` is these
- * paths' only signal the job is over, so snapshot the terminal payload off the
- * log — `dvm status` replays that snapshot rather than re-reading a finished job
- * Non-terminal reads just advance the cursor.
+ * terminal snapshot it recorded. Prefer a provider status read when available;
+ * otherwise derive the outcome from the log and local cancellation evidence.
+ * `dvm status` replays the snapshot without re-reading a finished job.
  *
- * The snapshot is only recorded when the full log is in hand: `completionFromMessages`
+ * A stream-derived snapshot requires the full log: `completionFromMessages`
  * counts artifacts, so a partial batch would undercount them. A cursor-started read
  * whose local log can't be proven whole falls back to advancing the cursor alone —
  * the next `dvm status` then reads the provider, as it does today.
  *
- * **Returns** the recorded completion, or `undefined` when the read wasn't
- * terminal or the log couldn't be proven whole. Callers render it into their own
- * JSON payload: a job that finishes on a mid-job payment has no transport
- * receipt to read `summary` / `has_artifacts` off, so this is the only place
- * those fields exist on that arc. Returning `undefined` rather than a
- * partial completion is deliberate — an undercounted `artifact_count` is worse
- * than an absent one, since an agent can't tell a wrong count from a right one.
+ * A provider terminal status can still be saved without a whole log; only its
+ * supplied completion fields are used, so missing artifacts are not guessed.
  */
 export function persistStreamOutcome(outcome: StreamOutcome): JobCompletion | undefined {
-  const { jobId, messages, cursor, afterSeq, extra } = outcome;
-  const terminal = streamTerminalStatus(messages);
+  const { jobId, messages, cursor, afterSeq, extra, providerStatus } = outcome;
+  const stored = loadJob(jobId);
+  const callerCancelled = outcome.callerCancelled ?? stored?.callerCancelled;
+  const terminal = streamTerminalStatus(messages, { providerStatus, callerCancelled });
   const log = terminal ? fullMessageLog(jobId, messages, afterSeq) : undefined;
-  if (terminal && log) {
-    const completion = completionFromMessages(log);
+  const providerTerminal = providerStatus?.status && isTerminalJobStatus(providerStatus.status);
+  if (terminal && (log || providerTerminal)) {
+    const completion = {
+      ...(stored?.status === terminal ? stored.completion : {}),
+      ...(log?.some((m) => m.type === "complete" || m.type === "cancel") ? completionFromMessages(log) : {}),
+      ...(terminal === "cancelled" && callerCancelled && stored?.completion?.message !== undefined
+        ? { message: stored.completion.message } : {}),
+      ...(providerTerminal ? completionSnapshot(providerStatus) : {}),
+    };
     markJobTerminal(jobId, terminal, completion, {
       messageCursor: cursor,
       ...extra,
@@ -60,10 +70,15 @@ export function persistStreamOutcome(outcome: StreamOutcome): JobCompletion | un
   return undefined;
 }
 
-export function streamTerminalStatus(messages: Message[]): TerminalJobStatus | undefined {
+export function streamTerminalStatus(messages: Message[], context: StreamStatusContext = {}): TerminalJobStatus | undefined {
+  const providerStatus = context.providerStatus?.status;
+  if (providerStatus && isTerminalJobStatus(providerStatus)) return providerStatus;
   const last = messages.findLast((m) => m.type === "complete" || m.type === "cancel");
   if (!last) return undefined;
-  return last.type === "complete" ? "completed" : "cancelled";
+  if (last.type === "complete") return "completed";
+  // Older SDKs use the same wire event for ctx.fail and caller cancellation.
+  // A sender label alone is not evidence that this caller requested a cancel.
+  return context.callerCancelled ? "cancelled" : "failed";
 }
 
 /**

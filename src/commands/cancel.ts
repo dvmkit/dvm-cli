@@ -42,10 +42,8 @@ async function cancelWithAccess(
   await transport.cancel(jobId, opts.reason, ref, { jobToken });
   transport.close();
 
-  // A caller-initiated cancel carries no provider outcome to snapshot — the
-  // empty snapshot is still what `dvm status` replays, so the job answers
-  // `cancelled` locally forever rather than re-reading a dead job.
-  if (!access.endpointOverridden) markJobTerminal(jobId, "cancelled", {});
+  if (!access.endpointOverridden) markJobTerminal(jobId, "cancelled",
+    opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true });
 
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
 

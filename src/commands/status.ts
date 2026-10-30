@@ -90,14 +90,21 @@ async function statusWithAccess(
     // re-verify the snapshotted receipt rather than replaying a
     // cached verdict — a tampered `jobs.json` must answer `invalid`.
     let receipt = replayStoredReceipt(stored);
+    let terminalStatus = stored.status;
+    let completion = stored.completion;
     const transport = createDvmTransport();
 
     // a terminal snapshot can predate the receipt that the DVM now
     // serves. Spend one best-effort read only when the DVM advertised receipts
-    // and the local record has none; the saved completion remains authoritative
-    // even when that read fails or returns no proof.
+    // and the local record has none. Reconcile any terminal provider status;
+    // retain the saved completion fields when the read has no content.
     if (stored.receiptsSupported && receipt.status === "absent") {
       const fetched = await fetchMissingJobReceipt(jobId, transport, ref);
+      if (fetched.status && isTerminalJobStatus(fetched.status)) {
+        terminalStatus = fetched.status;
+        completion = { ...completion, ...completionSnapshot(fetched) };
+        markJobTerminal(jobId, terminalStatus, completion);
+      }
       if (fetched.receipt || fetched.receiptParseError) {
         if (fetched.receipt && !stored.builderAnchor) {
           await backfillTrustAnchor(jobId, transport, ref);
@@ -108,7 +115,7 @@ async function statusWithAccess(
     await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
     transport.close();
 
-    renderStatus(jobId, stored, stored.status, stored.completion, "local", null, opts, {
+    renderStatus(jobId, stored, terminalStatus, completion, "local", null, opts, {
       receipt,
     });
     return;

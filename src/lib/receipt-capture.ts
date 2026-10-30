@@ -14,6 +14,7 @@ import { receiptDisplay, receiptFailureDetail, receiptHint } from "./receipt-ver
 import { type ReceiptTrustAnchor, type ReceiptVerification, type ReceiptVerifyResult, verifyFundingReceiptChain, verifyJobReceipt } from "@dvmkit/sdk/internal";
 import type { JobStatus, ProviderInfo, ProviderRef, ReceiptParseError, Transport } from "@dvmkit/sdk/internal";
 import { captureDrawFundingReceipts } from "./draw-funding";
+import { completionSnapshot } from "./completion-hints";
 
 /** Verify and persist a funding receipt; callers may anchor state only on a sound verdict. */
 export function captureFundingReceipt(args: {
@@ -194,7 +195,7 @@ export async function fetchMissingJobReceipt(
   jobId: string,
   transport: Transport,
   ref: ProviderRef
-): Promise<Pick<JobStatus, "receipt" | "receiptParseError" | "drawFundingReceipts" | "drawFundingReceiptParseError">> {
+): Promise<Partial<JobStatus>> {
   const job = loadJob(jobId);
   if (!job?.receiptsSupported) return {};
   // Already collected (a resumed stream, a prior `dvm status`): skip the GET
@@ -206,6 +207,8 @@ export async function fetchMissingJobReceipt(
     const status = await transport.status(jobId, ref, { jobToken: job.jobToken });
     captureDrawFundingReceipts(jobId, status.drawFundingReceipts, { endpoint: ref.endpoint });
     return {
+      status: status.status,
+      ...completionSnapshot(status),
       ...(status.receipt ? { receipt: status.receipt } : {}),
       ...(status.receiptParseError ? { receiptParseError: status.receiptParseError } : {}),
       ...(status.drawFundingReceipts ? { drawFundingReceipts: status.drawFundingReceipts } : {}),

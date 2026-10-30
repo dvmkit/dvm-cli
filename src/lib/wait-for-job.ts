@@ -47,6 +47,7 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
     const snapshot = await readWithRetry(() => opts.transport.status(opts.jobId, opts.provider, readOptions()));
     if (!snapshot) break;
     if (isTerminalJobStatus(snapshot.status)) {
+      result.providerStatus = snapshot;
       result.nextAction = null;
       const history = await readWithRetry(() => opts.transport.getMessages(opts.jobId, result.cursor, opts.provider, readOptions()));
       if (!history) break;

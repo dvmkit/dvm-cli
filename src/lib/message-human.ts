@@ -88,7 +88,7 @@ export function formatMessageHuman(
       renderProgressLine(msg.content, msg.seq);
       break;
     case "cancel":
-      info(`[${msg.seq}] Cancelled${msg.content.reason ? `: ${msg.content.reason}` : ""}`);
+      info(`[${msg.seq}] Job ended${msg.content.reason ? `: ${msg.content.reason}` : ""}`);
       break;
     default:
       info(`[${seq}] ${prefix} sent a message of type "${type}".`);
