@@ -327,9 +327,9 @@ export interface CreditDrawSkipped {
   credit_id: string;
   reason: DrawSkip["reason"];
   balance_micro: number;
-  /** The job ceiling the last drawn price was measured against. `price_above_ceiling` only. */
+  /** The job ceiling the capability price was measured against. `price_above_ceiling` only. */
   ceiling_micro?: number;
-  /** The last drawn amount that exceeded it. `price_above_ceiling` only. */
+  /** Compatibility name: the quoted or capability-specific historical price that exceeded it. */
   last_price_micro?: number;
   /** Which knob set that ceiling — the one {@link hint} names. `price_above_ceiling` only. */
   ceiling_source?: DrawCeilingSource;
@@ -922,7 +922,7 @@ export function buildCreditDrawSkipped(args: {
         const ceiling = `$${formatUsd((skip.ceilingMicro ?? 0) / 1_000_000)}`;
         return {
           display:
-            `${parked}, but the last job here drew ${last}, above the ${ceiling} ceiling this request declared — ` +
+            `${parked}, but this capability's quoted or last drawn price is ${last}, above the ${ceiling} ceiling this request declared — ` +
             `so it was left undrawn and this job pays per-call instead.`,
           hint: raiseCeilingHint(skip.ceilingSource, last),
         };

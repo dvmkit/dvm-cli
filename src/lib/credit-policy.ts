@@ -26,8 +26,9 @@ import {
 import { offersTempoCreditFunding } from "@dvmkit/sdk/internal";
 import type { StoredReceipt } from "@dvmkit/sdk/internal";
 import { type AttestedDvmIdentity, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
-import type { CreditMenu } from "@dvmkit/sdk/internal";
+import type { CreditMenu, Quote } from "@dvmkit/sdk/internal";
 import { offersX402CreditFunding } from "@dvmkit/sdk/internal";
+import { hasKnownUpfrontPrice } from "./quote-upfront";
 
 /**
  * A multi-job credit purchase the consent posture held back.
@@ -160,7 +161,7 @@ export interface DrawSkip {
   remainingMicro: number;
   /** The ceiling the price proxy was measured against. `price_above_ceiling` only. */
   ceilingMicro?: number;
-  /** The last drawn amount that exceeded it. `price_above_ceiling` only. */
+  /** Compatibility name: the quoted or capability-specific historical price that exceeded it. */
   lastPriceMicro?: number;
   /** Which knob set that ceiling, so the hint names it. `price_above_ceiling` only. */
   ceilingSource?: DrawCeilingSource;
@@ -790,10 +791,10 @@ export function planCreditForQuote(args: {
 
 /**
  * Decide whether the *initial* signed submit should draw on a credit already
- * held at this DVM — one round trip, no payment attach. The job price is
- * unknowable pre-probe, so the consent gate runs against the last drawn
- * amount: a DVM that hiked its price past the caller's threshold surfaces as
- * `insufficient_credit` or as a visible receipt line, both recoverable.
+ * held at this DVM, with no payment attach. Prefer this capability's upfront
+ * quote; otherwise use its latest completed draw on this credit. A DVM-wide
+ * last price cannot price a different capability. With neither source, leave
+ * the estimate unknown and let the provider settle the draw.
  *
  * A draw is deliberately **not** gated on the caller's per-call payment
  * consent (`--auto-pay`). Drawing attaches no payment: the money left the
@@ -814,6 +815,9 @@ export function planCreditForQuote(args: {
  */
 export function planProbeDraw(args: {
   stored: StoredCredit | undefined;
+  capability: string;
+  quote?: Quote;
+  receipts?: StoredReceipt[];
   /** Receipt-backed per-call balances at this DVM, already scoped to this caller. */
   implicit?: readonly StoredImplicitCredit[];
   drawCeilingMsats: number;
@@ -878,17 +882,45 @@ export function planProbeDraw(args: {
   // the DVM's own figures), where a local skip only defers the question.
   if (stored.remainingMicro <= 0 && !stored.provisional) return skip("exhausted");
   if (stored.expiryMs > 0 && stored.expiryMs <= now) return skip("expired");
-  if (stored.lastPriceMicro !== undefined && args.btcRate > 0) {
+  if (args.drawCeilingMsats > 0 && args.btcRate > 0) {
+    const priceMicro = probePriceMicro(args);
     const ceilingMicro = msatsToMicro(args.drawCeilingMsats, args.btcRate);
-    if (ceilingMicro > 0 && stored.lastPriceMicro > ceilingMicro) {
+    if (priceMicro !== undefined && ceilingMicro > 0 && priceMicro > ceilingMicro) {
       return skip("price_above_ceiling", {
         ceilingMicro,
-        lastPriceMicro: stored.lastPriceMicro,
+        lastPriceMicro: priceMicro,
         ceilingSource: args.drawCeilingSource,
       });
     }
   }
   return { mode: "draw", creditId: stored.creditId, drawId: randomUUID(), source: "prepaid" };
+}
+
+function probePriceMicro(args: {
+  stored?: StoredCredit;
+  capability: string;
+  quote?: Quote;
+  receipts?: StoredReceipt[];
+  identity?: AttestedDvmIdentity;
+}): number | undefined {
+  const quote = args.quote;
+  // A metered quote's upfront zero is not the eventual job price.
+  if (quote && hasKnownUpfrontPrice(quote) && quote.shape !== "rate" && quote.upfront.currency === "usd") {
+    const micro = quote.upfront.amount_micro ?? Math.round(quote.upfront.amount * 1_000_000);
+    if (Number.isSafeInteger(micro) && micro >= 0) return micro;
+  }
+  const stored = args.stored;
+  // Receipt amounts have no currency field. Only this credit's denomination
+  // is known; do not infer a price from a different credit or assume USD.
+  if (!stored || stored.currency !== "usd") return undefined;
+  const candidates = (args.receipts ?? []).filter(({ receipt }) =>
+    receipt.capability === args.capability && receipt.credit?.credit_id === stored.creditId
+  );
+  const latest = completedReceiptsFor(
+    candidates, stored.endpoint, stored.callerPubkey, args.identity
+  ).sort((a, b) => (b.receipt.credit?.ledger_seq ?? 0) - (a.receipt.credit?.ledger_seq ?? 0))[0];
+  const amount = latest?.receipt.credit?.amount;
+  return amount !== undefined && Number.isSafeInteger(amount) && amount >= 0 ? amount : undefined;
 }
 
 export function needsTopup(balanceMicro: number, targetMicro: number): boolean {
