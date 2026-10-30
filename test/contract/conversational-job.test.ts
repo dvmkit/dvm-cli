@@ -243,19 +243,21 @@ it("drives a conversational metered job across CLI processes, from quote to veri
 
     const final = JSON.parse((await run(["status", jobId])).stdout);
     expect(final).toMatchObject({ status: "completed", next_action: null, receipt_verified: "verified",
-      spend: { total_msats: 1_400_000, payments: 7, max_payments: 8, total_display: "$1.40 USD (1,400 sats)",
-        budget_display: "$3.00 USD (3,000 sats)", receipt_total_display: "~$1.40 (1,400 sats)", receipt_mismatch: false, log_mismatch: false } });
+      spend: { total_msats: 1_400_000, payments: 7, max_payments: 8, total_display: "$1.40 USD (1,400 sats) (BTC valuation)",
+        budget_display: "$3.00 USD (3,000 sats)", receipt_total_display: "~$1.40 (1,400 sats) (BTC valuation)", log_mismatch: false } });
+    expect(final.spend).not.toHaveProperty("receipt_mismatch");
     expect(final.spend.charges.map((entry: { seq: number; amount_msats: number; approval: string; rail: string }) =>
       [entry.seq, entry.amount_msats, entry.approval, entry.rail])).toEqual([
       [3, 100_000, "auto", "credit"], [5, 200_000, "auto", "credit"],
       [7, 300_000, "auto", "credit"], [9, 100_000, "auto", "x402"],
       [11, 100_000, "auto", "credit"], [13, 100_000, "auto", "credit"], [18, 500_000, "explicit", "credit"],
     ]);
-    expect(final.spend.display).toBe("Paid $1.40 USD (1,400 sats) over 7 charges, budget $3.00 USD (3,000 sats).");
+    expect(final.spend.display).toContain("Paid $1.40 USD (1,400 sats) (BTC valuation) over 7 charges, budget $3.00 USD (3,000 sats).");
+    expect(final.spend.display).toContain("comparison is unknown");
     const humanBill = await run(["status", jobId, "--human"]);
     expect(humanBill.stdout).toBe("Observation complete\n");
-    expect(humanBill.stderr).toContain("Paid $1.40 USD (1,400 sats) over 7 charges, budget $3.00 USD (3,000 sats).");
-    expect(humanBill.stderr).toContain("Receipt total: ~$1.40 (1,400 sats)");
+    expect(humanBill.stderr).toContain(final.spend.display);
+    expect(humanBill.stderr).toContain("Receipt total: ~$1.40 (1,400 sats) (BTC valuation)");
 
     const file = join(root, "report.txt");
     const delivered = completed.messages.find((message: Message) => message.type === "artifact");
