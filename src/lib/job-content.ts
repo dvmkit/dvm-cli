@@ -56,14 +56,14 @@ export async function observeJobContent(
   transport: Transport,
   ref: ProviderRef,
   options: { timeoutMs: number; jobToken?: string }
-): Promise<Partial<JobContentMetadata> | undefined> {
+): Promise<ContentStatus | undefined> {
   try {
     const status: ContentStatus = await transport.status(jobId, ref, {
       ...options,
       timeoutMs: options.timeoutMs > 0 ? Math.min(options.timeoutMs, 5000) : 5000,
     });
     captureDrawFundingReceipts(jobId, status.drawFundingReceipts, { endpoint: ref.endpoint });
-    return parseJobContent(status as unknown as Record<string, unknown>);
+    return status;
   } catch {
     return undefined;
   }

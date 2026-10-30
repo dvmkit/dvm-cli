@@ -7,6 +7,7 @@ import {
   info,
 } from "../lib/output";
 
+import { markJobTerminal } from "../lib/job-store";
 import { takeCreditNoticeFields } from "../lib/credit-notice";
 import { takeFeedbackNoticeFields } from "../lib/feedback-notice";
 import { noteFeedbackAfterTerminal } from "../lib/feedback-nudges";
@@ -75,6 +76,8 @@ async function messageWithAccess(
   // anonymous-flow per-job token threaded through the POST and the
   // follow-up streamLoop's reads.
   await transport.sendMessage(jobId, outbound, ref, { jobToken });
+  if (msgType === "cancel" && !access.endpointOverridden)
+    markJobTerminal(jobId, "cancelled", { message: text }, { callerCancelled: true });
 
   const timeoutMs = opts.timeout ? Number(opts.timeout) * 1000 : undefined;
   const afterSeq = access.endpointOverridden ? 0 : (stored?.messageCursor ?? 0);
@@ -89,16 +92,11 @@ async function messageWithAccess(
     persistLocalState: !access.endpointOverridden,
   });
 
-  // an answer that runs the handler through to `complete` is this
-  // path's only signal the job is over — record the terminal status and its
-  // snapshot so `dvm status` answers from the local record.
-  if (!access.endpointOverridden) {
-    persistStreamOutcome({ jobId, messages: result.messages, cursor: result.cursor, afterSeq });
-  }
-  // an answer that runs the handler through to `complete` ends the
-  // job right here, so this is a job-terminal emission like the request arcs.
-  const streamedTerminal =
-    result.nextAction === null ? streamTerminalStatus(result.messages) : undefined;
+  const providerStatus = await observeJobContent(jobId, transport, ref, { timeoutMs: timeoutMs ?? 5000, jobToken });
+  const outcome = { jobId, messages: result.messages, cursor: result.cursor, afterSeq, providerStatus,
+    callerCancelled: msgType === "cancel" || stored?.callerCancelled };
+  if (!access.endpointOverridden) persistStreamOutcome(outcome);
+  const streamedTerminal = streamTerminalStatus(result.messages, outcome);
   if (streamedTerminal && stored && !access.endpointOverridden) {
     noteFeedbackAfterTerminal({
       jobId,
@@ -108,11 +106,7 @@ async function messageWithAccess(
       human: opts.human,
     });
   }
-  const content = jobContentFields(
-    jobId,
-    await observeJobContent(jobId, transport, ref, { timeoutMs: timeoutMs ?? 5000, jobToken }),
-    opts.human
-  );
+  const content = jobContentFields(jobId, providerStatus, opts.human);
   transport.close();
 
   if (opts.human) {

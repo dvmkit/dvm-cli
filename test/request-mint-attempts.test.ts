@@ -135,6 +135,22 @@ function terminal(): Record<string, unknown> {
 }
 
 describe("successful request mint diagnostics", () => {
+  it("reports a provider refusal after paying and streaming without changing booked spend", async () => {
+    const healthy = mintWallet();
+    seams.getWallet.mockResolvedValue(healthy);
+    seams.submit.mockImplementation(async (_ref, _envelope, payment?: Payment) => payment
+      ? { jobId: "job", status: "processing" }
+      : { jobId: "", status: "payment-required", quotes: [{ priceMsats: 5_000 }] });
+    seams.stream.mockResolvedValue({ messages: [{ seq: 1, from: "provider", timestamp: 1,
+      type: "cancel", content: { reason: "No coverage" } }], lastSeq: 1 });
+
+    await paidRequest();
+
+    expect(terminal()).toMatchObject({ status: "failed", message: "No coverage", paidWith: "cashu_p2pk", next_action: null });
+    expect(loadJob("job")).toMatchObject({ status: "failed", completion: { message: "No coverage" }, totalPaidMsats: 5_000 });
+    assertSingleSpend(healthy);
+  });
+
   it("reports an unreachable first mint through real spend preparation and successful JSON", async () => {
     const healthy = mintWallet();
     seams.getWallet.mockImplementation(async (mint: string) => {

@@ -84,6 +84,9 @@ export function completionFromMessages(messages: Message[]): JobCompletion {
     payloadIn: artifactCount > 0 ? "messages" : "summary",
   };
   if (summary !== undefined) out.summary = summary;
+  const terminal = messages.findLast((m) => m.type === "complete" || m.type === "cancel");
+  if (terminal?.type === "cancel" && terminal.content.reason !== undefined)
+    out.message = terminal.content.reason;
   if (artifactCount > 0) out.artifactCount = artifactCount;
   return out;
 }

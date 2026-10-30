@@ -19,6 +19,7 @@ import {
   loadX402Wallet,
 } from "../lib/x402/wallet";
 import {
+  loadJob,
   updateJob,
 } from "../lib/job-store";
 
@@ -221,7 +222,7 @@ async function payWithAccess(
   // snapshot so `dvm status` answers from the local record, as `dvm request` does.
   // The spend itself is already booked by `handlePaymentRequest` (addPayment).
   const streamedTerminal =
-    streamResult.nextAction === null ? streamTerminalStatus(streamResult.messages) : undefined;
+    streamResult.nextAction === null ? streamTerminalStatus(streamResult.messages, { callerCancelled: !access.endpointOverridden && loadJob(jobId)?.callerCancelled }) : undefined;
   const completion = access.endpointOverridden
     ? streamedTerminal
       ? completionFromMessages(streamResult.messages)

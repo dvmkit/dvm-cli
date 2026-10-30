@@ -6,6 +6,7 @@ import {
   isAbortError,
   shellQuoteArg,
   type JobPolicy,
+  type JobStatus,
   type Message,
   type MessagePollOptions,
   type PaymentRequestContent,
@@ -59,6 +60,7 @@ export interface StreamLoopOptions {
 }
 
 export interface StreamLoopResult {
+  providerStatus?: JobStatus;
   messages: Message[];
   /**
    * Provider-facing payment-request reasons that the CLI auto-paid during this

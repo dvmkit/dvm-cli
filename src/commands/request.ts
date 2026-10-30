@@ -156,7 +156,7 @@ import {
   normalizeLocalCorrelationId,
   prepareLocalCorrelationId,
 } from "../lib/local-correlation";
-import { appendMessages, createMessageAppendSession } from "../lib/messages";
+import { appendMessages, createMessageAppendSession, maxSeq } from "../lib/messages";
 import { applyMintPin } from "../lib/mint-pin";
 import { selectRailOrder } from "../lib/payment-rails/select";
 import { finalizeProgressLine } from "../lib/progress-bar";
@@ -1038,18 +1038,13 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
         },
         deadlineMs
       );
-      const completion = persistStreamOutcome(streamOutcome(receipt.jobId, result));
-      // the streamed arc learns the job is over from the message log,
-      // and the receipt only rides on the job read — so collect it with one
-      // extra GET, spent only when the job actually finished (`nextAction ===
-      // null`) and only against a DVM that advertised receipts.
-      const captured =
-        result.nextAction === null
-          ? captureTransportReceipt(
-              receipt.jobId,
-              await fetchMissingJobReceipt(receipt.jobId, transport, ref)
-            )
-          : undefined;
+      const providerStatus = result.nextAction === null
+        ? await fetchMissingJobReceipt(receipt.jobId, transport, ref) : undefined;
+      const outcome = { ...streamOutcome(receipt.jobId, result), providerStatus,
+        callerCancelled: loadJob(receipt.jobId)?.callerCancelled };
+      const completion = persistStreamOutcome(outcome);
+      const captured = providerStatus
+        ? captureTransportReceipt(receipt.jobId, providerStatus) : undefined;
       if (captured && !opts.strictPerCall) {
         await settleCreditAfterJob({
           capture: captured,
@@ -1066,7 +1061,7 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
       // the terminal it reports is where the nudge attaches. Cancelled streams
       // reach the same call and nudge nothing.
       const streamedTerminal =
-        result.nextAction === null ? streamTerminalStatus(result.messages) : undefined;
+        streamTerminalStatus(result.messages, outcome);
       if (streamedTerminal) {
         noteFeedbackAfterTerminal({
           jobId: receipt.jobId,
@@ -1079,6 +1074,8 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
       transport.close();
 
       if (opts.human) {
+        if (streamedTerminal === "failed" || streamedTerminal === "cancelled")
+          info(`Status: ${streamedTerminal}${completion?.message ? `: ${completion.message}` : ""}`);
         for (const msg of result.messages) {
           if (msg.type === "progress") continue; // already rendered live
           formatMessageHuman(msg, receipt.jobId, artifactSession);
@@ -1098,12 +1095,18 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
           ...transactionOutputFields(receipt),
           ...dvmIdentity(dvmId, capability),
           messages: result.messages.map(serializeMessageForOutput),
+          ...(streamedTerminal ? { status: streamedTerminal } : {}),
+          ...(completion?.message !== undefined ? { message: completion.message } : {}),
           // A job that streams to `complete` — including one auto-paid through a
           // mid-job `requestPayment` — has no receipt carrying the outcome, so
           // these come off the streamed log instead. Without them this arc
           // returned `next_action: null` and nothing else: no summary, and no
           // signal that a payload was waiting in artifacts.
-          ...(completion?.summary !== undefined ? { summary: completion.summary, _provider_fields: ["summary"] } : {}),
+          ...(completion?.summary !== undefined ? { summary: completion.summary } : {}),
+          _provider_fields: [
+            ...(completion?.summary !== undefined ? ["summary"] : []),
+            ...(completion?.message !== undefined ? ["message"] : []),
+          ],
           ...(completion ? buildCompletionHintFields(receipt.jobId, completion) : {}),
           ...(captured ? receiptJsonFields(captured) : {}),
           ...takeCreditNoticeFields(),
@@ -1116,8 +1119,9 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
       return;
     }
 
-    case "failed": {
-      markJobTerminal(receipt.jobId, "failed", completionSnapshot(receipt));
+    case "failed":
+    case "cancelled": {
+      const terminalStatus = receipt.status;
       // A synchronous terminal response carries status + receipt, not the
       // provider's message log. Fetch it before closing so recovery artifacts
       // reach default JSON on the prepaid-credit path too. This is
@@ -1126,6 +1130,13 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
         .getMessages(receipt.jobId, 0, ref, { jobToken: receipt.jobToken })
         .catch(() => [] as Message[]);
       appendMessages(receipt.jobId, failureMessages);
+      const completion = persistStreamOutcome({
+        jobId: receipt.jobId,
+        messages: failureMessages,
+        cursor: maxSeq(failureMessages, 0),
+        afterSeq: 0,
+        providerStatus: { status: terminalStatus, ...completionSnapshot(receipt) },
+      });
       // "Took the money and the job failed" is exactly the case a receipt is
       // evidence for, so it rides out on the error rather than only landing in
       // the store — `DvmError.data` is spread into the error payload, and this
@@ -1151,7 +1162,7 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
         jobId: receipt.jobId,
         dvmId,
         endpoint,
-        status: "failed",
+        status: terminalStatus,
         human: opts.human,
       });
       transport.close();
@@ -1161,12 +1172,13 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
         }
         renderReceiptHuman(captured);
       }
-      throw new DvmError("job_failed", "Job failed.", undefined, {
+      throw new DvmError(terminalStatus === "failed" ? "job_failed" : "cancelled", completion?.message ?? `Job ${terminalStatus}.`, undefined, {
+        status: terminalStatus,
         ...receiptJsonFields(captured),
         ...(failureMessages.length > 0
           ? { messages: failureMessages.map(serializeMessageForOutput) }
           : {}),
-      });
+      }, undefined, completion?.message !== undefined ? { message: "provider" } : undefined);
     }
   }
 }
@@ -3933,17 +3945,15 @@ async function streamAfterPayment(args: {
     deadlineMs
   );
 
-  const completion = persistStreamOutcome(
-    streamOutcome(jobId, result, { costMsats: chosen.priceMsats, paymentMethod })
-  );
-  // same as the unpaid streamed arc — the receipt only rides on a job
-  // read, which this path never makes. One gated GET collects it, and only on a
-  // job that actually finished. The SSE-drop branch below skips this entirely —
-  // it captures off the status read it makes anyway.
-  const captured =
-    result.nextAction === null
-      ? captureTransportReceipt(jobId, await fetchMissingJobReceipt(jobId, transport, ref))
-      : undefined;
+  const providerStatus = result.nextAction === null
+    ? await fetchMissingJobReceipt(jobId, transport, ref) : undefined;
+  const outcome = {
+    ...streamOutcome(jobId, result, { costMsats: chosen.priceMsats, paymentMethod }),
+    providerStatus,
+    callerCancelled: loadJob(jobId)?.callerCancelled,
+  };
+  const completion = persistStreamOutcome(outcome);
+  const captured = providerStatus ? captureTransportReceipt(jobId, providerStatus) : undefined;
   // fold the countersigned credit block into the local projection
   // and refill at this healthy moment. Never throws, never changes outcome.
   if (captured && !args.strictPerCall) {
@@ -3960,7 +3970,7 @@ async function streamAfterPayment(args: {
   // same as the unpaid streamed arc — the streamed log is where
   // this path learns the job is over.
   const streamedTerminal =
-    result.nextAction === null ? streamTerminalStatus(result.messages) : undefined;
+    streamTerminalStatus(result.messages, outcome);
   if (streamedTerminal) {
     noteFeedbackAfterTerminal({
       jobId,
@@ -4018,6 +4028,8 @@ async function streamAfterPayment(args: {
   }
 
   if (human) {
+    if (streamedTerminal === "failed" || streamedTerminal === "cancelled")
+      info(`Status: ${streamedTerminal}${completion?.message ? `: ${completion.message}` : ""}`);
     for (const msg of result.messages) {
       if (msg.type === "progress") continue; // already rendered live
       formatMessageHuman(msg, jobId, artifactSession);
@@ -4034,10 +4046,16 @@ async function streamAfterPayment(args: {
       jobId,
       ...dvmFields,
       messages: result.messages.map(serializeMessageForOutput),
+      ...(streamedTerminal ? { status: streamedTerminal } : {}),
+      ...(completion?.message !== undefined ? { message: completion.message } : {}),
       // Same as the unpaid arc above: the outcome is only knowable from the
       // streamed log here, so render it rather than leaving the agent to dig
       // the summary out of `messages` and guess about artifacts.
-      ...(completion?.summary !== undefined ? { summary: completion.summary, _provider_fields: ["summary"] } : {}),
+      ...(completion?.summary !== undefined ? { summary: completion.summary } : {}),
+      _provider_fields: [
+        ...(completion?.summary !== undefined ? ["summary"] : []),
+        ...(completion?.message !== undefined ? ["message"] : []),
+      ],
       ...(completion ? buildCompletionHintFields(jobId, completion) : {}),
       ...(captured ? receiptJsonFields(captured) : {}),
       ...takeCreditNoticeFields(),

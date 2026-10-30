@@ -78,10 +78,11 @@ async function messagesWithAccess(
     return action;
   }
 
-  async function resolveNextAction(action: NextAction, messages: Message[]): Promise<NextAction> {
+  async function resolveNextAction(action: NextAction, messages: Message[], observedStatus?: string): Promise<NextAction> {
     if (action?.type === "refund") return action;
+    if (observedStatus && isTerminalJobStatus(observedStatus)) return null;
     if (streamTerminalStatus(messages) || (!access.endpointOverridden && stored && isTerminalJobStatus(stored.status))) return null;
-    if (!opts.human) return action;
+    if (!opts.human || opts.wait) return action;
     // Terminal status takes precedence over actions from an older message.
     // Empty incremental batches can still have a pending question in history.
     try {
@@ -138,22 +139,16 @@ async function messagesWithAccess(
     }
     if (!access.endpointOverridden) appendMessages(jobId, msgs);
     const newCursor = maxSeq(msgs, after);
-    // a batch that ends on `complete` / `cancel` tells us the job is
-    // over — record the terminal status and its snapshot, not just the cursor.
+    const providerStatus = await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken });
     if (!access.endpointOverridden) {
-      persistStreamOutcome({ jobId, messages: msgs, cursor: newCursor, afterSeq: after });
+      persistStreamOutcome({ jobId, messages: msgs, cursor: newCursor, afterSeq: after, providerStatus });
     }
 
-    // Auto-claim inbound Cashu payments (refund/change) into the local wallet.
     const refunds = access.endpointOverridden ? [] : await claimInboundPayments(jobId, msgs);
     const nextAction = withRefundNextAction(jobId, actionFromMessages(msgs) ??
-      (streamTerminalStatus(msgs) || isTerminal ? null : pollNextAction(jobId)), refunds);
-    const content = jobContentFields(
-      jobId,
-      await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken }),
-      opts.human
-    );
-    const resolvedAction = await resolveNextAction(nextAction, msgs);
+      (streamTerminalStatus(msgs, { providerStatus }) || isTerminal ? null : pollNextAction(jobId)), refunds);
+    const content = jobContentFields(jobId, providerStatus, opts.human);
+    const resolvedAction = await resolveNextAction(nextAction, msgs, providerStatus?.status);
     transport.close();
 
     if (opts.human) {
@@ -211,25 +206,23 @@ async function messagesWithAccess(
     throw err;
   }
 
+  const providerStatus = waitDeadline !== undefined && Date.now() >= waitDeadline ? undefined
+    : await observeJobContent(jobId, transport, ref, {
+      timeoutMs: waitDeadline === undefined ? (opts.timeout ? Number(opts.timeout) * 1000 : 5000)
+        : Math.max(1, Math.min(streamOptions.timeoutMs, waitDeadline - Date.now())),
+      jobToken,
+    });
   if (!access.endpointOverridden) {
     persistStreamOutcome({
       jobId,
       messages: result.messages,
       cursor: result.cursor,
       afterSeq: after,
+      providerStatus: providerStatus ?? result.providerStatus,
     });
   }
-  const content = jobContentFields(
-    jobId,
-    waitDeadline !== undefined && Date.now() >= waitDeadline ? undefined
-      : await observeJobContent(jobId, transport, ref, {
-        timeoutMs: waitDeadline === undefined ? (opts.timeout ? Number(opts.timeout) * 1000 : 5000)
-          : Math.max(1, Math.min(streamOptions.timeoutMs, waitDeadline - Date.now())),
-        jobToken,
-      }),
-    opts.human
-  );
-  const resolvedAction = opts.wait ? result.nextAction : await resolveNextAction(result.nextAction, result.messages);
+  const content = jobContentFields(jobId, providerStatus, opts.human);
+  const resolvedAction = await resolveNextAction(result.nextAction, result.messages, providerStatus?.status ?? result.providerStatus?.status);
   transport.close();
 
   if (opts.human) {
@@ -348,7 +341,7 @@ function serialize(msg: Message): Record<string, unknown> {
       return { ...base, content, display };
     }
     case "cancel": {
-      const display = `Cancelled${msg.content.reason ? `: ${msg.content.reason}` : ""}`;
+      const display = `Job ended${msg.content.reason ? `: ${msg.content.reason}` : ""}`;
       const content: Record<string, unknown> = { ...msg.content };
       if (fromProvider && msg.content.reason !== undefined) {
         content.reason = asProviderText(msg.content.reason);

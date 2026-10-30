@@ -54,9 +54,9 @@ describe("completionFromMessages", () => {
     });
   });
 
-  it("omits the summary when the terminal message carries none (e.g. a cancel)", () => {
+  it("retains a cancel reason without inventing a summary", () => {
     expect(
       completionFromMessages([msg(1, "cancel", { reason: "caller changed their mind" })])
-    ).toEqual({ hasArtifacts: false, payloadIn: "summary" });
+    ).toEqual({ message: "caller changed their mind", hasArtifacts: false, payloadIn: "summary" });
   });
 });

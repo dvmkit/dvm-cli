@@ -90,14 +90,24 @@ async function statusWithAccess(
     // re-verify the snapshotted receipt rather than replaying a
     // cached verdict — a tampered `jobs.json` must answer `invalid`.
     let receipt = replayStoredReceipt(stored);
+    let terminalStatus = stored.status;
+    let completion = stored.completion;
     const transport = createDvmTransport();
 
     // a terminal snapshot can predate the receipt that the DVM now
     // serves. Spend one best-effort read only when the DVM advertised receipts
-    // and the local record has none; the saved completion remains authoritative
-    // even when that read fails or returns no proof.
+    // and the local record has none. Reconcile any terminal provider status;
+    // retain the saved completion fields when the read has no content.
     if (stored.receiptsSupported && receipt.status === "absent") {
       const fetched = await fetchMissingJobReceipt(jobId, transport, ref);
+      if (fetched.status && isTerminalJobStatus(fetched.status)) {
+        const saved = stored.status === fetched.status ? completion : undefined;
+        terminalStatus = fetched.status;
+        completion = fetched.content_available === false && saved
+          ? saved
+          : { ...saved, ...completionSnapshot(fetched) };
+        markJobTerminal(jobId, terminalStatus, completion);
+      }
       if (fetched.receipt || fetched.receiptParseError) {
         if (fetched.receipt && !stored.builderAnchor) {
           await backfillTrustAnchor(jobId, transport, ref);
@@ -108,7 +118,7 @@ async function statusWithAccess(
     await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
     transport.close();
 
-    renderStatus(jobId, stored, stored.status, stored.completion, "local", null, opts, {
+    renderStatus(jobId, stored, terminalStatus, completion, "local", null, opts, {
       receipt,
     });
     return;
@@ -143,6 +153,15 @@ async function statusWithAccess(
   // Update job store if we learned something new. A terminal read snapshots the
   // outcome so every later `dvm status` replays this exact payload.
   const completion = completionSnapshot(result);
+  const reasonUnavailable = completion.message === undefined ||
+    (result.content_available === false && completion.message === "");
+  if (reasonUnavailable && (result.status === "failed" || result.status === "cancelled")) {
+    const savedReason = !access.endpointOverridden && stored?.status === result.status
+      ? stored.completion?.message : undefined;
+    const terminal = msgs.findLast((message) => message.type === "complete" || message.type === "cancel");
+    const reason = savedReason ?? (terminal?.type === "cancel" ? terminal.content.reason : undefined);
+    if (reason !== undefined) completion.message = reason;
+  }
   let receipt: ReceiptCapture | undefined;
   if (isTerminalJobStatus(result.status)) {
     if (stored && !access.endpointOverridden) {
