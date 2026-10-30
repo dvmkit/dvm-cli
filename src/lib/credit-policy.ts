@@ -28,6 +28,7 @@ import type { StoredReceipt } from "@dvmkit/sdk/internal";
 import { type AttestedDvmIdentity, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
 import type { CreditMenu, Quote } from "@dvmkit/sdk/internal";
 import { offersX402CreditFunding } from "@dvmkit/sdk/internal";
+import { hasKnownUpfrontPrice } from "./quote-upfront";
 
 /**
  * A multi-job credit purchase the consent posture held back.
@@ -904,7 +905,7 @@ function probePriceMicro(args: {
 }): number | undefined {
   const quote = args.quote;
   // A metered quote's upfront zero is not the eventual job price.
-  if (quote && quote.shape !== "rate" && quote.upfront.currency === "usd") {
+  if (quote && hasKnownUpfrontPrice(quote) && quote.shape !== "rate" && quote.upfront.currency === "usd") {
     const micro = quote.upfront.amount_micro ?? Math.round(quote.upfront.amount * 1_000_000);
     if (Number.isSafeInteger(micro) && micro >= 0) return micro;
   }

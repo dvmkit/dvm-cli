@@ -3,6 +3,7 @@ import { callerMessageRecognizer, rememberCallerMessage } from "../message-owner
 import { loadJob } from "../job-store";
 import { providerFields } from "../provider-output";
 import { parseUpfrontPayment } from "../upfront-payment";
+import { unknownUpfrontPrice } from "../quote-upfront";
 import {
   type CancelOptions,
   type CreditOpResult,
@@ -1541,10 +1542,8 @@ function parseLightningOffer(raw: unknown): LightningFundingOffer | undefined {
 /**
  * Parse the `upfront` envelope from a `/v1/quote` response. New servers send
  * `{ upfront: { amount, currency } }`; some older servers send
- * `{ price_msats }` only — we synthesise an upfront
- * via the local fx fetcher when the new field is missing. When neither is
- * available, returns `{ amount: 0, currency: "usd" }` so the CLI can still
- * render something meaningful.
+ * `{ price_msats }` only. Missing upfront prices keep a zero-USD display
+ * placeholder, marked internally as unknown so policy cannot treat it as free.
  *
  * `amount_micro` rides through verbatim when the provider states it
  * — the exact integer a fund-and-draw must value against, which is not always
@@ -1564,9 +1563,7 @@ function parseUpfront(data: Record<string, unknown>): Quote["upfront"] {
       };
     }
   }
-  // Legacy fallback — recompute USD from price_msats locally. The CLI uses
-  // this for display only; the binding sats arrives via the 402 handshake.
-  return { amount: 0, currency: "usd" };
+  return unknownUpfrontPrice();
 }
 
 /**
