@@ -129,17 +129,86 @@ it("renders a recorded upfront credit draw in JSON and human bills offline", asy
   expect(human.stderr).toContain("Upfront: $0.0060 USD (6 sats)");
 });
 
-it.each([4000, 6000])("neutrally compares a signed %i-msat receipt with 5000 msats paid", async (receiptTotal) => {
+it.each((["cashu", "lightning"] as const).flatMap((rail) =>
+  [4000, 5000, 6000].map((receiptTotal) => ({ rail, receiptTotal }))
+))("compares a signed $rail $receiptTotal-msat receipt with 5000 msats paid", async ({ rail, receiptTotal }) => {
   const dvm = attestedDvm();
-  const receipt = dvm.sign({ job_id: "bill", paid: { ...unsignedReceipt().paid, msats: receiptTotal } });
+  const receipt = dvm.sign({ job_id: "bill", paid: { ...unsignedReceipt().paid, rail, msats: receiptTotal } });
   const root = seed({ totalPaidMsats: 5000, paymentsHonoured: 1,
-    costMsats: 5000, paymentMethod: "cashu", receipt, builderAnchor: dvm.anchor });
+    costMsats: 5000, ...(rail === "cashu" ? { paymentMethod: "cashu" } : {}), receipt, builderAnchor: dvm.anchor });
   const spend = JSON.parse((await run(root)).stdout).spend;
-  expect(spend.receipt_mismatch).toBe(true);
+  expect(spend.receipt_mismatch).toBe(receiptTotal !== 5000);
   expect(spend).not.toHaveProperty("receipt_shortfall_display");
-  expect(spend.display).toContain(`Receipt total ${receiptTotal / 1000} sats differs from local total 5 sats; mint fees, returned change, or a payment not recorded locally can explain the difference.`);
+  if (receiptTotal !== 5000) {
+    expect(spend.display).toContain(`Receipt total ${receiptTotal / 1000} sats differs from local total 5 sats; mint fees, returned change, or a payment not recorded locally can explain the difference.`);
+  } else {
+    expect(spend.display).not.toContain("differs");
+  }
   expect(spend.display).not.toMatch(/exceeds|disagrees/);
   const human = await run(root, ["--human"]);
   expect(human.code).toBe(0);
   expect(human.stderr).toContain(spend.display);
+});
+
+it.each((["tempo", "x402"] as const).flatMap((rail) =>
+  [12697, 13000].map((total) => ({ rail, total }))
+))("keeps native $rail receipt comparison unknown with a $total-msat local valuation", async ({ rail, total }) => {
+  const dvm = attestedDvm();
+  const receipt = dvm.sign({ job_id: "bill", paid: { msats: 13000, rail,
+    native_amount: 10000, native_asset: "USDC", tx_hash: null, mint: null } });
+  const root = seed({ paymentMethod: rail, upfrontRailPayment: { method: rail, amountMsats: total },
+    totalPaidMsats: total, costMsats: total, paymentsHonoured: 1, receipt, builderAnchor: dvm.anchor });
+  const result = await run(root);
+  expect(result.code).toBe(0);
+  const output = JSON.parse(result.stdout);
+  expect(output.receipt_verified).toBe("verified");
+  expect(output.spend).toMatchObject({ total_msats: total, payments: 1, log_mismatch: false });
+  expect(output.spend).not.toHaveProperty("receipt_mismatch");
+  expect(output.spend.total_display).toContain("BTC valuation");
+  expect(output.spend.receipt_total_display).toContain("BTC valuation");
+  expect(output.spend.display).toContain("comparison is unknown");
+  expect(output.spend.display).toContain("native settlement amounts");
+  expect(output.spend.display).not.toMatch(/differs from|mint fees|returned change/);
+  const human = await run(root, ["--human"]);
+  expect(human.code).toBe(0);
+  expect(human.stderr).toContain(output.spend.display);
+  expect(human.stderr).toContain(`Receipt total: ${output.spend.receipt_total_display}`);
+});
+
+it.each((["tempo", "x402"] as const).flatMap((rail) =>
+  ["local", "receipt"].map((evidence) => ({ rail, evidence }))
+))("keeps $rail comparison unknown with only $evidence rail evidence", async ({ rail, evidence }) => {
+  const dvm = attestedDvm();
+  const receipt = dvm.sign({ job_id: "bill", paid: { msats: 13000,
+    rail: evidence === "receipt" ? rail : null,
+    native_amount: null, native_asset: null, tx_hash: null, mint: null } });
+  const result = await run(seed({ totalPaidMsats: 12697, costMsats: 12697, paymentsHonoured: 1,
+    ...(evidence === "local" ? { paymentMethod: rail } : {}), receipt, builderAnchor: dvm.anchor }));
+  expect(result.code).toBe(0);
+  const output = JSON.parse(result.stdout);
+  expect(output.receipt_verified).toBe("verified");
+  expect(output.spend).not.toHaveProperty("receipt_mismatch");
+  expect(output.spend.display).toContain("comparison is unknown");
+});
+
+it.each(["tempo", "x402"] as const)("does not compare a mixed bill with an earlier %s charge in msats", async (rail) => {
+  const dvm = attestedDvm();
+  const receipt = dvm.sign({ job_id: "bill", paid: { ...unsignedReceipt().paid, msats: 13000 } });
+  const root = seed({ totalPaidMsats: 12697, paymentsHonoured: 2, upfrontRailPayment: "free",
+    receipt, builderAnchor: dvm.anchor }, [
+    { seq: 1, from: "provider", type: "payment-request", content: { amount_msats: 11697,
+      fiat_amount: { amount: 0.01, currency: "usd" }, reason: "Compute" } },
+    { seq: 2, from: "requester", type: "payment", content: { amount_msats: 11697,
+      ...(rail === "tempo" ? { tempo_credential: "redacted" } : { x402_payment: "redacted" }) } },
+    { seq: 3, from: "provider", type: "payment-request", content: { amount_msats: 1000, reason: "Finish" } },
+    { seq: 4, from: "requester", type: "payment", content: { amount_msats: 1000, cashu_token: "redacted" } },
+  ]);
+  const result = await run(root);
+  expect(result.code).toBe(0);
+  const output = JSON.parse(result.stdout);
+  expect(output.receipt_verified).toBe("verified");
+  expect(output.spend).toMatchObject({ log_mismatch: false, payments: 2,
+    charges: [{ rail }, { rail: "cashu_p2pk" }] });
+  expect(output.spend).not.toHaveProperty("receipt_mismatch");
+  expect(output.spend.display).toContain("comparison is unknown");
 });

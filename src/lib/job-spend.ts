@@ -48,7 +48,14 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   // charge is present; do not extrapolate an upfront price from later charges.
   const fiat = upfront === 0 && currency && charges.every((charge) => charge.fiat_amount?.currency === currency)
     ? { currency, amount: charges.reduce((sum, charge) => sum + charge.fiat_amount!.amount, 0) } : undefined;
-  const totalDisplay = formatPaymentAmount(total, fiat, { anchor: false });
+  // Receipt rail names only the latest credit; earlier stablecoin charges
+  // still make an aggregate msat total an exchange-rate valuation.
+  const converted = [job.paymentMethod, job.upfrontPayment?.rail, receipt?.paid.rail,
+    typeof job.upfrontRailPayment === "object" ? job.upfrontRailPayment?.method : undefined,
+    ...charges.map((charge) => charge.rail),
+  ].some((rail) => rail === "tempo" || rail === "x402");
+  const valuationLabel = converted ? " (BTC valuation)" : "";
+  const totalDisplay = formatPaymentAmount(total, fiat, { anchor: false }) + valuationLabel;
   // The policy stores only msats. Express its ceiling at the bill's aggregate
   // fiat/msat ratio, without consulting a different, current exchange rate.
   const budgetDisplay = job.policy
@@ -59,10 +66,11 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
     || payments !== charges.length + (upfront > 0 ? 1 : 0)
     || (knownCredit ? total !== chargeTotal + upfront
       : job.costMsats !== undefined && total - chargeTotal !== job.costMsats));
-  // Credit receipts reflect settlement; local counters retain the original hold.
-  const receiptMismatch = receipt && job.paymentMethod !== "credit" ? receipt.paid.msats !== total : undefined;
+  // Credit counters retain the original hold. Stablecoin records lack the
+  // comparable native settlement amounts needed to check principal or fees.
+  const receiptMismatch = receipt && job.paymentMethod !== "credit" && !converted ? receipt.paid.msats !== total : undefined;
   const receiptTotalDisplay = receipt
-    ? formatPaymentAmount(receipt.paid.msats, undefined, { anchor: false }) : undefined;
+    ? formatPaymentAmount(receipt.paid.msats, undefined, { anchor: false }) + valuationLabel : undefined;
   let display = job.paymentMethod === "credit" && !knownCredit
     ? "Paid from prepaid credit; the upfront amount is not recorded locally"
       + (total > 0 ? `; recorded conversation payments: ${totalDisplay} over ${payments} charge${payments === 1 ? "" : "s"}` : "")
@@ -74,6 +82,7 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   display += ".";
   if (logMismatch) display += " Local payment log disagrees with the job record.";
   if (receipt && job.paymentMethod === "credit" && !knownCredit) display += " The receipt total includes the unrecorded credit draw.";
+  if (receipt && converted) display += " Receipt comparison is unknown: local records lack comparable native settlement amounts for Tempo/x402 payments. Converted BTC totals can differ with exchange rates and do not establish a difference in token principal or fees.";
   // Rounded labels can match while the msat totals differ, so fall back to exact msats.
   const [receiptLabel, localLabel] = receiptTotalDisplay === totalDisplay
     ? [`${receipt!.paid.msats} msats`, `${total} msats`] : [receiptTotalDisplay, totalDisplay];
