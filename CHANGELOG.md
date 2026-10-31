@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.1](https://github.com/dvmkit/dvm-cli/compare/v0.12.0...v0.12.1) (2026-10-31)
+
+
+### Bug Fixes
+
+* **credit:** scope draw price checks to capabilities ([1ffd9bd](https://github.com/dvmkit/dvm-cli/commit/1ffd9bd1e1c00a66226aeab3d9f9e0ba91933cf0))
+* distinguish provider failures from caller cancellations ([52f59b5](https://github.com/dvmkit/dvm-cli/commit/52f59b5aae0e8ace98bfb6a97f0a4ea7ab94130c))
+* **payments:** keep stablecoin receipt comparisons unknown ([f6cb230](https://github.com/dvmkit/dvm-cli/commit/f6cb23050413ca365b0174b198ef8ccaf388a85c))
+* resolve capability URLs against provider endpoints ([9e44fde](https://github.com/dvmkit/dvm-cli/commit/9e44fde8dc8e805ac8f3f5d82804bee8accb395b))
+
 ## [0.12.0](https://github.com/dvmkit/dvm-cli/compare/v0.11.3...v0.12.0) (2026-10-30)
 
 
