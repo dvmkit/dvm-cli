@@ -54,7 +54,7 @@ import { assertTempoChallengeNetwork, resolveTempoNetworkSelection } from "./tem
 import { captureDrawFundingReceipts } from "./draw-funding";
 import { loadRequestIntent } from "./request-intent-store";
 import { pollNextAction } from "./next-action";
-import { providerFields } from "./provider-output";
+import { guidanceJobArg, providerFields } from "./provider-output";
 
 export interface PaidPaymentResult {
   status: "paid";
@@ -108,7 +108,7 @@ export async function handlePaymentRequest(
     }
     const command = requestId
       ? `dvm request-result ${shellQuoteArg(requestId)}`
-      : `dvm status ${shellQuoteArg(jobId)}`;
+      : `dvm status ${guidanceJobArg(jobId)}`;
     const recovery = `The job was already accepted. Inspect it with \`${command}\` before submitting a replacement. This read cannot submit a job or send payment.`;
     error.data = providerFields({
       ...error.data,
