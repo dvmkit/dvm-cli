@@ -125,14 +125,29 @@ describe("re-run after a card top-up's challenge has expired", () => {
     expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)).toBeUndefined();
   });
 
-  it("keeps the entry when the status check fails on the caller's own signature", async () => {
+  it("retires the entry on a reason-less payment_invalid, which the DVM sends only after its booked-fund lookup", async () => {
     journal(Date.now() - 1_000);
     const post = vi
       .fn<CardFundDeps["post"]>()
-      .mockRejectedValue(new DvmError("auth_invalid", "The request signature was not accepted."));
+      .mockRejectedValue(new DvmError("payment_invalid", "This DVM does not offer card funding for prepaid credit."));
+
+    await fundOverStripe(args(), "fund-new", deps(post));
+
+    expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)).toBeUndefined();
+  });
+
+  // Each of these can come before the DVM looks the fund id up, so none proves the fund unbooked.
+  it.each([
+    ["auth_error", "The request signature was not accepted."],
+    ["provider_error", "The DVM returned an unexpected response (502)."],
+    ["credit_not_supported", "This DVM does not advertise prepaid credit."],
+  ])("keeps the entry when the status check is refused with %s", async (code, message) => {
+    journal(Date.now() - 1_000);
+    const post = vi.fn<CardFundDeps["post"]>().mockRejectedValue(new DvmError(code, message));
 
     const outcome = await fundOverStripe(args(), "fund-new", deps(post));
 
+    expect(outcome.display).toContain("may or may not have been charged");
     expect(outcome.hint).toContain("--credit-id <new id>");
     expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)?.fundId).toBe("fund-earlier");
   });

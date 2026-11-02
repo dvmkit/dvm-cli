@@ -50,6 +50,10 @@ const LINK_MAX_CENTS = 50_000;
 const STRANDED_CHARGE =
   "If the card was charged and the charge was never booked, a DVM that keeps its ledger in Postgres refunds it to the card after its stranded-charge sweep (about 30 minutes); otherwise the DVM's operator can find and refund it from the fund id.";
 
+/** The way past a journal entry the DVM won't settle: the journal is keyed by credit. */
+const STUCK_WAY_OUT =
+  "If this repeats, fund a separate credit with --credit-id <new id>; this record stays until the DVM answers.";
+
 /** Retryable card refusals: nothing was decided, and the same credential may still book. */
 const RESENDABLE_REASONS = new Set(["unavailable", "indeterminate", "booking_failed"]);
 /** Card refusals that will be the same on every resend of this credential, when this send was the first. */
@@ -248,11 +252,26 @@ function expiredUnbooked(
   };
 }
 
-/** Refusals of the unpaid probe that come from the fund handler having looked at this fund id. */
+/**
+ * Refusals the SDK's fund handler (v0.22.0) can only send after its
+ * booked-fund-id lookup, which answers a booked fund with 200 first: sizing
+ * (`credit_below_min`, `below_rail_minimum`, `credit_over_max`), the target
+ * credit's state (`credit_closed`), and `payment_invalid` without a reason
+ * (card funding not offered, or the credit bound to another rail). An
+ * allow-list, because anything else (an auth or proxy error, a credit
+ * surface switched off) can come before that lookup and proves nothing.
+ */
+const UNBOOKED_AFTER_LOOKUP = new Set([
+  "credit_closed",
+  "credit_over_max",
+  "credit_below_min",
+  "below_rail_minimum",
+]);
+
 function refusalProvesUnbooked(err: unknown): boolean {
-  if (!(err instanceof DvmError)) return false;
-  if (isTransient(err)) return false;
-  return !["auth_invalid", "invalid_request", "invalid_argument", "rate_limited"].includes(err.code);
+  if (!(err instanceof DvmError) || isTransient(err)) return false;
+  if (UNBOOKED_AFTER_LOOKUP.has(err.code)) return true;
+  return err.code === "payment_invalid" && err.data?.reason === undefined;
 }
 
 /**
@@ -566,8 +585,8 @@ function unknownOutcome(
   const ask = !probe
     ? ""
     : mapped && !isTransient(mapped)
-      ? `The DVM refused the status check for it (${mapped.code}), so whether it was booked is not known yet. If this repeats, fund a separate credit with --credit-id <new id>; this record stays until the DVM answers or its window closes. `
-      : `The DVM could not be reached to ask about it (${mapped?.code ?? "no answer"}). `;
+      ? `The DVM refused the status check for it (${mapped.code}), so whether it was booked is not known yet. ${STUCK_WAY_OUT} `
+      : `The DVM could not be reached to ask about it (${mapped?.code ?? "no answer"}). ${STUCK_WAY_OUT} `;
   const resend = cardChallengeLive(pending)
     ? `Re-run this same command with the same --spt before ${pending.challengeExpires ?? "the five-minute window closes"}: it resends the same approval under fund ${pending.fundId}, so a charge that happened is booked once and one that didn't is charged once.`
     : `Re-run 'dvm credit fund ${shellQuoteArg(args.ref.endpoint)}' to ask the DVM whether fund ${pending.fundId} was booked, and check the card statement.`;
