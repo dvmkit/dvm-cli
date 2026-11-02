@@ -203,8 +203,14 @@ async function resumeCardFunding(
     return booked(resumedArgs, pending, deps.settled(base, replay));
   } catch (err) {
     if (!(err instanceof DvmError) || !stripeChallenge(err)) {
-      // The probe is unpaid: whatever refused it says nothing about the earlier send.
-      return unknownOutcome(resumedArgs, base, err, pending, true);
+      // While the challenge is live the earlier send may still book, so an
+      // unpaid probe's refusal proves nothing. After expiry nothing can book
+      // it, and the DVM answers a booked fund id with 200 before any other
+      // check, so a considered refusal means this fund was never booked.
+      if (cardChallengeLive(pending) || !refusalProvesUnbooked(err)) {
+        return unknownOutcome(resumedArgs, base, err, pending, true);
+      }
+      return expiredUnbooked(args, base, pending, err);
     }
   }
 
@@ -216,13 +222,65 @@ async function resumeCardFunding(
       hint: `Re-run this command with the same --spt before ${pending.challengeExpires ?? "its window closes"}: it resends the same card approval, which books the earlier charge if it happened and charges once if it didn't. Do not ask your human for a new approval while this is unresolved.`,
     };
   }
+  return expiredUnbooked(args, base, pending, undefined);
+}
+
+/**
+ * The challenge expired and the DVM shows no booking for the fund id: no
+ * credit can come of it any more, so the journal is retired. The card itself
+ * may still have been charged; that is for the statement to show.
+ */
+function expiredUnbooked(
+  args: FundCreditArgs,
+  base: CardFundBase,
+  pending: PendingCardFunding,
+  refusal: unknown
+): CreditFundOutcome {
   clearPendingCardFunding(pending);
+  const display = `An earlier card top-up of $${usd(pending.amountMicro)} (fund ${pending.fundId}) was never confirmed by the DVM, and its five-minute window to finish has passed. No credit was added for it, and the card may or may not have been charged.`;
+  const hint = `${STRANDED_CHARGE} Check 'dvm credit balance ${shellQuoteArg(args.ref.endpoint)}' and the card statement; ask your human for a new approval only once the statement shows this top-up was not charged, or that it was refunded.`;
   return {
     ...base,
     status: "refused",
-    display: `An earlier card top-up of $${usd(pending.amountMicro)} (fund ${pending.fundId}) was never confirmed by the DVM, and its five-minute window to finish has passed. No credit was added for it, and the card may or may not have been charged.`,
-    hint: `${STRANDED_CHARGE} Check 'dvm credit balance ${shellQuoteArg(args.ref.endpoint)}' and the card statement; ask your human for a new approval only once the statement shows this top-up was not charged, or that it was refunded.`,
+    display,
+    hint,
+    error: chargeUnknownError(display, hint, pending, refusal, false),
   };
+}
+
+/** Refusals of the unpaid probe that come from the fund handler having looked at this fund id. */
+function refusalProvesUnbooked(err: unknown): boolean {
+  if (!(err instanceof DvmError)) return false;
+  if (isTransient(err)) return false;
+  return !["auth_invalid", "invalid_request", "invalid_argument", "rate_limited"].includes(err.code);
+}
+
+/**
+ * The structured error for an outcome where the card charge is not known.
+ * The last refusal's own `reason` and `retryable` would read as a final
+ * answer, so they are kept only under `last_error`.
+ */
+function chargeUnknownError(
+  display: string,
+  hint: string,
+  pending: PendingCardFunding,
+  last: unknown,
+  retryable: boolean
+): DvmError {
+  const mapped = last instanceof DvmError ? last : undefined;
+  return new DvmError("card_charge_unknown", display, hint, {
+    card_charge: "unknown",
+    retryable,
+    fund_id: pending.fundId,
+    ...(mapped
+      ? {
+          last_error: {
+            code: mapped.code,
+            ...(typeof mapped.data?.reason === "string" ? { reason: mapped.data.reason } : {}),
+          },
+        }
+      : {}),
+  });
 }
 
 async function present(
@@ -505,18 +563,23 @@ function unknownOutcome(
   probe: boolean
 ): CreditFundOutcome {
   const mapped = err instanceof DvmError ? err : undefined;
-  const ask = probe
-    ? `The DVM could not be asked about it (${mapped?.code ?? "no answer"}). `
-    : "";
+  const ask = !probe
+    ? ""
+    : mapped && !isTransient(mapped)
+      ? `The DVM refused the status check for it (${mapped.code}), so whether it was booked is not known yet. If this repeats, fund a separate credit with --credit-id <new id>; this record stays until the DVM answers or its window closes. `
+      : `The DVM could not be reached to ask about it (${mapped?.code ?? "no answer"}). `;
   const resend = cardChallengeLive(pending)
     ? `Re-run this same command with the same --spt before ${pending.challengeExpires ?? "the five-minute window closes"}: it resends the same approval under fund ${pending.fundId}, so a charge that happened is booked once and one that didn't is charged once.`
     : `Re-run 'dvm credit fund ${shellQuoteArg(args.ref.endpoint)}' to ask the DVM whether fund ${pending.fundId} was booked, and check the card statement.`;
+  const display = `The card top-up of $${usd(pending.amountMicro)} (fund ${pending.fundId}) was sent, but the DVM hasn't confirmed it, so the card may or may not have been charged. No credit has been confirmed yet.`;
+  const hint = `${ask}${resend} ${STRANDED_CHARGE} Do not ask your human for a new approval until the outcome is known.`;
+  // Retryable: re-running the same command is the next step either way.
   return {
     ...base,
     status: "refused",
-    ...(mapped ? { error: mapped } : {}),
-    display: `The card top-up of $${usd(pending.amountMicro)} (fund ${pending.fundId}) was sent, but the DVM hasn't confirmed it, so the card may or may not have been charged. No credit has been confirmed yet.`,
-    hint: `${ask}${resend} ${STRANDED_CHARGE} Do not ask your human for a new approval until the outcome is known.`,
+    error: chargeUnknownError(display, hint, pending, err, true),
+    display,
+    hint,
   };
 }
 

@@ -78,6 +78,23 @@ describe("re-run of a card top-up whose first send went unanswered", () => {
     expect(outcome.display).not.toMatch(/nothing was charged/i);
     expect(outcome.hint).not.toMatch(/approve a new top-up/);
     expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)?.fundId).toBe(pending.fundId);
+    // The last refusal's reason would read as final to an agent branching on it.
+    expect(outcome.error?.code).toBe("card_charge_unknown");
+    expect(outcome.error?.data).toMatchObject({ card_charge: "unknown", retryable: true });
+    expect(outcome.error?.data?.reason).toBeUndefined();
+  });
+
+  it("keeps a live entry when the DVM refuses the status check, and names --credit-id as the way past it", async () => {
+    const post = vi
+      .fn<CardFundDeps["post"]>()
+      .mockRejectedValue(new DvmError("payment_invalid", "This DVM does not offer card funding."));
+
+    const outcome = await fundOverStripe(args(), "fund-new", deps(post));
+
+    expect(outcome.hint).toContain("--credit-id <new id>");
+    expect(outcome.hint).toContain("refused the status check");
+    expect(outcome.hint).not.toContain("could not be reached");
+    expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)?.fundId).toBe(pending.fundId);
   });
 
   it("still retires the journal on a decline, which Stripe replays for the same charge", async () => {
@@ -89,6 +106,35 @@ describe("re-run of a card top-up whose first send went unanswered", () => {
 
     expect(outcome.display).toContain("declined");
     expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)).toBeUndefined();
+  });
+});
+
+describe("re-run after a card top-up's challenge has expired", () => {
+  it("retires the entry when the DVM refuses the status check, since nothing can book that fund any more", async () => {
+    journal(Date.now() - 1_000);
+    const post = vi
+      .fn<CardFundDeps["post"]>()
+      .mockRejectedValue(new DvmError("credit_closed", "This credit is closed."));
+
+    const outcome = await fundOverStripe(args(), "fund-new", deps(post));
+
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(outcome.display).toContain("five-minute window to finish has passed");
+    expect(outcome.display).toContain("may or may not have been charged");
+    expect(outcome.error?.data).toMatchObject({ card_charge: "unknown", retryable: false });
+    expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)).toBeUndefined();
+  });
+
+  it("keeps the entry when the status check fails on the caller's own signature", async () => {
+    journal(Date.now() - 1_000);
+    const post = vi
+      .fn<CardFundDeps["post"]>()
+      .mockRejectedValue(new DvmError("auth_invalid", "The request signature was not accepted."));
+
+    const outcome = await fundOverStripe(args(), "fund-new", deps(post));
+
+    expect(outcome.hint).toContain("--credit-id <new id>");
+    expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)?.fundId).toBe("fund-earlier");
   });
 });
 
