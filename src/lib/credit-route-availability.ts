@@ -73,6 +73,10 @@ export function localCreditRouteAvailability(args: {
           ? { rail, available: true, source: "tempo_wallet" }
           : { rail, available: false };
       }
+      case "stripe":
+        // A card top-up needs a fresh approval from the caller's human in
+        // Stripe Link every time, so nothing local can make it available.
+        return { rail, available: false };
     }
   });
 }

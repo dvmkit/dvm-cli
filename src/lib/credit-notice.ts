@@ -1235,6 +1235,8 @@ function settledRouteDisplay(
         return "funded from your Tempo stablecoin wallet through its reusable custody channel";
       }
       return "funded from your Tempo stablecoin wallet";
+    case "stripe":
+      return "paid by card through Stripe Link";
   }
 }
 
@@ -1264,6 +1266,8 @@ function inFlightRouteDisplay(
         return "your Tempo wallet is funding its reusable custody channel";
       }
       return "your Tempo wallet is funding prepaid credit";
+    case "stripe":
+      return "a card top-up your human approved in Stripe Link is being charged";
   }
 }
 

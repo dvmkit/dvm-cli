@@ -8,7 +8,15 @@ import {
   probeRailLabel,
   railLabelAtSentenceStart,
 } from "../src/lib/rail-labels";
-const CALLER_RAIL_NOUN = { cashu: "ecash", lightning: "Lightning", x402: "x402 stablecoin", tempo: "Tempo stablecoin" };
+const CALLER_RAIL_NOUN = {
+  cashu: "ecash",
+  lightning: "Lightning",
+  x402: "x402 stablecoin",
+  tempo: "Tempo stablecoin",
+  stripe: "card (Stripe Link)",
+};
+// A card is approved per top-up, never held, so it has no wallet-status row.
+const PROBE_RAILS = CREDIT_FUND_RAILS.filter((rail) => rail !== "stripe");
 const PROBE_LIGHTNING_NOUN = "Lightning float";
 
 describe("rail-labels", () => {
@@ -29,7 +37,7 @@ describe("rail-labels", () => {
   });
 
   it("keeps the probe register identical except for the Lightning float", () => {
-    for (const rail of CREDIT_FUND_RAILS) {
+    for (const rail of PROBE_RAILS) {
       if (rail === "lightning") {
         expect(probeRailLabel(rail)).toBe(PROBE_LIGHTNING_NOUN);
         continue;
@@ -40,7 +48,7 @@ describe("rail-labels", () => {
 
   it("capitalizes a gloss that opens a sentence, bar the one styled lowercase", () => {
     const sentenceNouns = { cashu: "Ecash", lightning: "Lightning float", x402: "x402 stablecoin", tempo: "Tempo stablecoin" };
-    for (const rail of CREDIT_FUND_RAILS) {
+    for (const rail of PROBE_RAILS) {
       expect(railLabelAtSentenceStart(probeRailLabel(rail))).toBe(sentenceNouns[rail]);
     }
   });

@@ -5331,7 +5331,7 @@ describe("pickCreditFundRail", () => {
 
   it("is the single declaration of which rails exist", () => {
 
-    expect([...CREDIT_FUND_RAILS]).toEqual(["cashu", "lightning", "x402", "tempo"]);
+    expect([...CREDIT_FUND_RAILS]).toEqual(["cashu", "lightning", "x402", "tempo", "stripe"]);
     for (const rail of CREDIT_FUND_RAILS) expect(isCreditFundRail(rail)).toBe(true);
     for (const junk of ["bolt12", "", "CASHU", undefined, null, 1]) {
       expect(isCreditFundRail(junk)).toBe(false);

@@ -37,6 +37,8 @@ export function fundingRailLabel(rail: CreditFundRail): string {
       return "x402 stablecoin";
     case "tempo":
       return "Tempo stablecoin";
+    case "stripe":
+      return "card (Stripe Link)";
   }
 }
 
