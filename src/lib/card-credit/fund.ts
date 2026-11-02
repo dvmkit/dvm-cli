@@ -574,7 +574,7 @@ function cardRefusalDisplay(err: DvmError, reason: string): string {
     case "declined":
       return `The card was declined${suffix}, so nothing was charged and no credit was added.`;
     case "token_unusable":
-      return `The approval from Stripe Link can't be used for this top-up${suffix}: it was already used, is for a smaller amount, or has lapsed. Nothing was charged.`;
+      return `The approval from Stripe Link can't be used for this top-up${suffix}: it was already used, is for a smaller amount, or has lapsed. Nothing was charged by this run.`;
     case "requires_action":
       return "The card needs an extra verification step that can't be done here, so nothing was charged.";
     case "mismatch":

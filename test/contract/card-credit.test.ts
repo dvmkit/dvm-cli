@@ -200,6 +200,9 @@ describe("an interrupted card top-up", () => {
     expect(rerun.code).toBe(1);
     const error = JSON.parse(rerun.stdout).error;
     expect(error.reason).toBe("token_unusable");
+    // Without the journal the CLI cannot know about the first run's charge,
+    // so the display speaks only for this run.
+    expect(error.display).toContain("Nothing was charged by this run.");
     expect(error.hint).toContain("check 'dvm credit balance' and the card statement first");
     expect((await snapshot()).intents.length - before.intents.length).toBe(1);
   }, SLOW);
