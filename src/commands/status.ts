@@ -1,5 +1,6 @@
 import { providerJobJson } from "../lib/provider-output";
 import { jobSpend, renderSpendHuman } from "../lib/job-spend";
+import { terminalSettlementFields } from "../lib/job-settlement";
 import { formatMessageHuman } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
 import { finalizeProgressLine } from "../lib/progress-bar";
@@ -275,7 +276,10 @@ function renderStatus(
   const msgs = fetched?.msgs ?? [];
   const receipt = fetched?.receipt;
   const content = jobContentFields(jobId, fetched?.content, opts.human);
-  const spend = stored ? jobSpend(loadJob(jobId) ?? stored, receipt?.receipt) : undefined;
+  const spend = stored ? jobSpend({ ...(loadJob(jobId) ?? stored),
+    status: jobStatus as JobRecord["status"] }, receipt?.receipt) : undefined;
+  const settlement = terminalSettlementFields(jobId, { status: jobStatus, receipt: receipt?.receipt,
+    persistLocalState: !!stored });
 
   if (opts.human) {
     if (jobStatus === "completed" && completion.summary) {
@@ -296,6 +300,7 @@ function renderStatus(
     const traceId = getOutputTraceId();
     if (traceId) info(`Trace: ${traceId}`);
     if (spend) renderSpendHuman(spend, info);
+    else if (settlement.settlement) info(settlement.settlement.display);
     if (receipt) renderReceiptHuman(receipt);
     printNextActionHuman(nextAction);
     return;
@@ -318,6 +323,7 @@ function renderStatus(
     // terminal responses only. On a still-running job "absent" would
     // read as "this DVM doesn't issue receipts" rather than "not yet".
     ...(receipt ? receiptJsonFields(receipt) : {}),
+    ...settlement,
     // `dvm status` is a job-terminal emission for `--no-stream`
     // jobs, so it drains the deferred-notice sinks like the request terminals
     // do. Both spread blind and are absent when nothing was stashed.

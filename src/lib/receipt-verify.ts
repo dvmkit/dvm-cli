@@ -4,6 +4,7 @@ import { costAnchor } from "./currency";
 import { formatUsd, msatsToUsd } from "@dvmkit/sdk/internal";
 
 import { type JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
+import { receiptSettlement } from "./job-settlement";
 
 /**
  * Pre-rendered line an intermediary agent can relay verbatim about a set of
@@ -66,7 +67,11 @@ export function receiptDisplay(
 ): string {
   const what = `${receipt.dvm}/${receipt.capability} (DVM ID ${receipt.dvm_id})`;
   const when = receiptIssuedAtIso(receipt)?.slice(0, 10);
-  return `${VERDICT_PREFIX[status]}: paid ${formatPaid(receipt.paid.msats, rate)} for ${what}, ${receipt.outcome}${when ? ` ${when}` : ""}.`;
+  const settlement = receiptSettlement(receipt, status, rate);
+  const payment = settlement.status === "settled" ? `Settled ${formatPaid(receipt.paid.msats, rate)}`
+    : settlement.status === "free" ? "free job"
+    : settlement.display.replace(/\.$/, "");
+  return `${VERDICT_PREFIX[status]}: ${payment} for ${what}, ${receipt.outcome}${when ? ` ${when}` : ""}.`;
 }
 
 /**

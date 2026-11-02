@@ -4,6 +4,17 @@ import { drainReceiptsDisplay, epochMsToIso, receiptDisplay, receiptIssuedAtIso 
 import { attestedDvm } from "./fixtures/receipt-fixture";
 
 describe("receiptDisplay", () => {
+  it("describes the released draw rather than the receipt's credited amount as paid", () => {
+    const receipt = attestedDvm().sign({ outcome: "cancelled", reason: "Job timed out (idle)",
+      credit: { credit_id: "credit", draw_id: "draw", amount: 19000, balance_after: 50000, ledger_seq: 2 } });
+    const display = receiptDisplay(receipt, "verified", 100_000);
+    expect(display).toContain("Released");
+    expect(display).not.toMatch(/\bpaid\b/i);
+    expect(display).toContain("19 sats");
+    expect(display).toContain("~$0.02");
+    expect(receiptDisplay(receipt, "verified", 0)).not.toContain("$");
+  });
+
   it("leads with dollars an agent can relay to a non-Bitcoiner", () => {
     const dvm = attestedDvm("scrape");
     const line = receiptDisplay(dvm.sign({ capability: "fetch" }), "verified", 100_000);

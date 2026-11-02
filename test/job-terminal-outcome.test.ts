@@ -18,6 +18,7 @@ import { cancel } from "../src/commands/cancel";
 import { message } from "../src/commands/message";
 import { messages } from "../src/commands/messages";
 import { loadJob, saveJob } from "../src/lib/job-store";
+import { attestedDvm } from "../src/lib/__tests__/fixtures/receipt-fixture";
 
 const endpoint = "https://provider.example";
 const jobId = "terminal-job";
@@ -207,4 +208,36 @@ it.each([false, true])("persists terminal status even when the message tail is e
   expect(output().next_action).toBeNull();
   expect(loadJob(jobId)).toMatchObject({ status: "failed", completion: { message: reason } });
   expect(loadJob(jobId)?.completion?.hasArtifacts).toBeUndefined();
+});
+
+it.each(["batch", "stream", "wait", "message"])("reports a released idle-expired draw through %s and offline status", async (path) => {
+  const dvm = attestedDvm();
+  const receipt = dvm.sign({ job_id: jobId, outcome: "cancelled", reason: "Job timed out (idle)",
+    credit: { credit_id: "credit", draw_id: "draw", amount: 19000, balance_after: 50000, ledger_seq: 2 } });
+  saveJob({ id: jobId, endpoint, status: "processing", submittedAt: 1, paymentMethod: "credit",
+    totalPaidMsats: 19000, paymentsHonoured: 1, builderAnchor: dvm.anchor });
+  wire.status.mockResolvedValue({ jobId, status: "cancelled", receipt, message: "Job timed out (idle)" });
+  if (path === "message") await message(jobId, "continue", {});
+  else await messages(jobId, path === "batch" ? { stream: false } : path === "wait" ? { wait: true } : {});
+  expect(output()).toMatchObject({ settlement: { status: "released", settled_msats: 0, released_msats: 19000 } });
+  wire.status.mockRejectedValue(new Error("Provider offline"));
+  await status(jobId, { human: true });
+  expect(wire.info.mock.calls.flat().join("\n")).toContain("Released 19 sats");
+  await status(jobId, {});
+  expect(output()).toMatchObject({ source: "local", settlement: { status: "released", settled_msats: 0 } });
+});
+
+it.each(["completed", "failed", "cancelled"] as const)("reports synchronous %s settlement from a signed receipt", async (terminal) => {
+  const dvm = attestedDvm();
+  const receipt = dvm.sign({ job_id: jobId, outcome: terminal,
+    credit: { credit_id: "credit", draw_id: "draw", amount: 19000, balance_after: 50000, ledger_seq: 2 } });
+  wire.submit.mockResolvedValue({ jobId, status: terminal, receipt });
+  if (terminal === "completed") {
+    await request({ endpoint, input: "work", stream: false });
+    expect(output()).toMatchObject({ settlement: { status: "settled", settled_msats: 19000 } });
+  } else {
+    await expect(request({ endpoint, input: "work", stream: false })).rejects.toMatchObject({
+      data: { settlement: { status: "released", settled_msats: 0 } },
+    });
+  }
 });

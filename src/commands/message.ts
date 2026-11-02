@@ -1,3 +1,4 @@
+import { observedSettlementFields } from "../lib/receipt-capture";
 import { providerJobJson } from "../lib/provider-output";
 import {
   DvmError,
@@ -107,9 +108,11 @@ async function messageWithAccess(
     });
   }
   const content = jobContentFields(jobId, providerStatus, opts.human);
+  const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden);
   transport.close();
 
   if (opts.human) {
+    if (settlement.settlement) info(settlement.settlement.display);
     info(String(content.content_hint));
     info(`Message sent (type: ${msgType}).`);
     for (const msg of result.messages) {
@@ -120,6 +123,7 @@ async function messageWithAccess(
     json({
       jobId,
       ...content,
+      ...settlement,
       sent: { type: outbound.type, content: outbound.content },
       messages: result.messages.map(serializeMessageForOutput),
       ...takeCreditNoticeFields(),

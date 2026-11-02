@@ -53,7 +53,7 @@ it("renders ordered charges, approval provenance, budget, change, and a signed r
   const human = await run(root, ["--human"]);
   expect(human.code).toBe(0);
   expect(human.stderr).toContain(output.spend.display);
-  expect(human.stderr).toContain("[2] $0.02 USD (1 sats) (Cashu, paid automatically): Stage 1");
+  expect(human.stderr).toContain("[2] $0.02 USD (1 sats) (Cashu, sent automatically): Stage 1");
   expect(human.stderr).toContain("[10] $0.02 USD (1 sats) (Cashu, you approved): Stage 5");
   expect(human.stderr).toContain("Receipt total: 5 sats");
 
@@ -62,6 +62,7 @@ it("renders ordered charges, approval provenance, budget, change, and a signed r
   const tampered = JSON.parse((await run(root)).stdout);
   expect(tampered.spend).toMatchObject({ total_msats: 9000, total_display: "9 sats",
     receipt_total_display: "5 sats", log_mismatch: true, receipt_mismatch: true });
+  expect(tampered.spend.display).toContain("Settled 5 sats");
 });
 
 it("labels free jobs and keeps legacy approvals unknown", async () => {
@@ -106,7 +107,7 @@ it.each([0, 1000])("leaves receipt comparison unknown for prepaid credit with %i
   const receipt = dvm.sign({ job_id: "bill", paid: { ...unsignedReceipt().paid, msats: 5000 } });
   const spend = JSON.parse((await run(seed({ paymentMethod: "credit", totalPaidMsats: total,
     paymentsHonoured: total ? 1 : 0, receipt, builderAnchor: dvm.anchor }))).stdout).spend;
-  expect(spend.display).toContain("Paid from prepaid credit");
+  expect(spend.display).toContain("Drawn from prepaid credit");
   expect(spend.display).toContain("amount is not recorded locally");
   expect(spend.display).toContain("receipt total includes the unrecorded credit draw");
   expect(spend.display).not.toMatch(/free|refund|exceeds/);
@@ -138,6 +139,7 @@ it.each((["cashu", "lightning"] as const).flatMap((rail) =>
     costMsats: 5000, ...(rail === "cashu" ? { paymentMethod: "cashu" } : {}), receipt, builderAnchor: dvm.anchor });
   const spend = JSON.parse((await run(root)).stdout).spend;
   expect(spend.receipt_mismatch).toBe(receiptTotal !== 5000);
+  expect(spend.display).toContain(`Settled ${receiptTotal / 1000} sats`);
   expect(spend).not.toHaveProperty("receipt_shortfall_display");
   if (receiptTotal !== 5000) {
     expect(spend.display).toContain(`Receipt total ${receiptTotal / 1000} sats differs from local total 5 sats; mint fees, returned change, or a payment not recorded locally can explain the difference.`);
@@ -211,4 +213,56 @@ it.each(["tempo", "x402"] as const)("does not compare a mixed bill with an earli
     charges: [{ rail }, { rail: "cashu_p2pk" }] });
   expect(output.spend).not.toHaveProperty("receipt_mismatch");
   expect(output.spend.display).toContain("comparison is unknown");
+});
+
+
+it.each([
+  { status: "completed", reason: null, settlement: "settled", settled: 6000 },
+  { status: "failed", reason: "Provider failed", settlement: "released", settled: 0 },
+  { status: "cancelled", reason: "Caller cancelled", settlement: "released", settled: 0 },
+  { status: "cancelled", reason: "Job timed out (idle)", settlement: "released", settled: 0 },
+] as const)("reports $status / $reason settlement after an upfront draw and a mid-job ask offline", async (scenario) => {
+  const dvm = attestedDvm();
+  const receipt = dvm.sign({ job_id: "bill", outcome: scenario.status, reason: scenario.reason,
+    paid: { ...unsignedReceipt().paid, msats: 6000 },
+    credit: { credit_id: "credit", draw_id: "draw", amount: 6000,
+      balance_after: scenario.status === "completed" ? 4000 : 10000, ledger_seq: 2 } });
+  const root = seed({ status: scenario.status, paymentMethod: "credit", totalPaidMsats: 6000, paymentsHonoured: 2,
+    costMsats: 4000, upfrontCreditBooked: true, upfrontPayment: { amount_msats: 4000, amount_micro: 4000,
+      currency: "usd", credit_id: "credit", draw_id: "draw" }, receipt, builderAnchor: dvm.anchor }, [
+    { seq: 1, from: "provider", type: "payment-request", content: { amount_msats: 2000, reason: "More work" } },
+    { seq: 2, from: "requester", type: "payment", content: { amount_msats: 2000 } },
+  ]);
+  const result = await run(root);
+  expect(result.code).toBe(0);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ status: scenario.status, source: "local", receipt_verified: "verified",
+    settlement: { status: scenario.settlement, settled_msats: scenario.settled },
+    spend: { total_msats: 6000, payments: 2, log_mismatch: false,
+      settlement: { status: scenario.settlement, settled_msats: scenario.settled } } });
+  const human = await run(root, ["--human"]);
+  expect(human.code).toBe(0);
+  expect(human.stderr).toContain(scenario.settlement === "released" ? "Released" : "Settled");
+  if (scenario.settlement === "released") {
+    expect(output.spend.display).not.toMatch(/\bpaid\b/i);
+    expect(output.receipt_display).not.toMatch(/\bpaid\b/i);
+    expect(human.stderr).not.toMatch(/\bpaid\b/i);
+  }
+});
+
+it.each([true, false])("reports a wallet-confirmed refund separately from an unclaimed refund (claimed=%s)", async (claimed) => {
+  const root = seed({ status: "failed", paymentMethod: "cashu", totalPaidMsats: 6000, paymentsHonoured: 1,
+    ...(claimed ? { claimedPaymentSeqs: [1], claimedPaymentAmountsMsats: { 1: 6000 } } : {}) }, [
+    { seq: 1, from: "provider", type: "payment", content: { amount_msats: 999999,
+      reason: "refund", cashu_token: "untrusted-token" } },
+  ]);
+  const result = await run(root);
+  expect(result.code).toBe(0);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ settlement: { status: claimed ? "refunded" : "pending",
+    rail: "cashu", refunded_msats: claimed ? 6000 : 0 }, spend: { total_msats: 6000 } });
+  const human = await run(root, ["--human"]);
+  expect(human.code).toBe(0);
+  expect(human.stderr).toContain(claimed ? "Refunded 6 sats via cashu" : "Refund pending via cashu");
+  expect(human.stderr).not.toMatch(/\bpaid\b/i);
 });

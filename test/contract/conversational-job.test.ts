@@ -252,7 +252,7 @@ it("drives a conversational metered job across CLI processes, from quote to veri
       [7, 300_000, "auto", "credit"], [9, 100_000, "auto", "x402"],
       [11, 100_000, "auto", "credit"], [13, 100_000, "auto", "credit"], [18, 500_000, "explicit", "credit"],
     ]);
-    expect(final.spend.display).toContain("Paid $1.40 USD (1,400 sats) (BTC valuation) over 7 charges, budget $3.00 USD (3,000 sats).");
+    expect(final.spend.display).toContain("Settled $1.40 USD (1,400 sats) (BTC valuation) over 7 charges, budget $3.00 USD (3,000 sats).");
     expect(final.spend.display).toContain("comparison is unknown");
     const humanBill = await run(["status", jobId, "--human"]);
     expect(humanBill.stdout).toBe("Observation complete\n");

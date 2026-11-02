@@ -522,15 +522,15 @@ describe("standalone caller contract", () => {
         _provider_fields: ["seq", "from", "timestamp", "type", "content"],
         content: { credit: { credit_id: "history-credit", draw_id: "history-draw", payment_id: "history-payment",
           request_seq: 1, amount_micro: amountMicro, currency } },
-        display: `Paid: ${nativeAmount} from prepaid balance` });
+        display: `Payment sent: ${nativeAmount} from prepaid balance` });
       expect(history.slice(1).map((message: { display: string }) => message.display)).toEqual([
-        "Paid: 5 sats", "Refund sent: 2 sats", "Change sent: 1 sats",
+        "Payment sent: 5 sats", "Refund sent: 2 sats", "Change sent: 1 sats",
       ]);
     });
     it("shows the exact native amount and prepaid method with --human", async () => {
       const human = await runCli([...args(), "--human"]);
-      expect(human.stderr).toContain(`[2] You paid: ${nativeAmount} from prepaid balance\n`);
-      expect(human.stderr).toContain("[3] You paid: 5 sats\n");
+      expect(human.stderr).toContain(`[2] You sent payment: ${nativeAmount} from prepaid balance\n`);
+      expect(human.stderr).toContain("[3] You sent payment: 5 sats\n");
       expect(human.stderr).toContain("[4] Provider sent refund: 2 sats\n");
       expect(human.stderr).toContain("[5] Provider sent change: 1 sats\n");
     });
@@ -828,7 +828,7 @@ describe("standalone caller contract", () => {
       const result = await readHuman("status-messages", "human-done");
       expect(result.stderr).toContain("[1] Provider asks: Keep observing?");
       expect(result.stderr).toContain("[2] Provider requests $0.40");
-      expect(result.stderr).toContain("[3] You paid:");
+      expect(result.stderr).toContain("[3] You sent payment:");
       expect(result.stderr).toContain("[4] You answered: keep (with structured data)");
       expect(result.stderr).toContain("[5] You approved message 3: ok");
       expect(result.stderr).toContain('[6] Provider sent a message of type "unknown-event".');

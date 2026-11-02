@@ -1,5 +1,5 @@
 /**
- * Receipt failures are warnings about evidence, not failures of the paid job.
+ * Receipt failures are warnings about evidence, not changes to the job outcome.
  * Persistence errors are logged without changing the job's outcome.
  */
 
@@ -16,6 +16,8 @@ import type { JobStatus, ProviderInfo, ProviderRef, ReceiptParseError, Transport
 import { captureDrawFundingReceipts } from "./draw-funding";
 import { completionSnapshot } from "./completion-hints";
 import { parseJobContent, type ContentStatus } from "./job-content";
+import { receiptSettlement, terminalSettlementFields } from "./job-settlement";
+import { isTerminalJobStatus } from "./next-action";
 
 /** Verify and persist a funding receipt; callers may anchor state only on a sound verdict. */
 export function captureFundingReceipt(args: {
@@ -105,9 +107,6 @@ export function captureJobReceipt(
   if (result.reason !== "job_id_mismatch") persist(jobId, receipt, result.status, job);
 
   if (result.status === "invalid") {
-    // A warning, never a failure: the job ran and the caller paid regardless.
-    // Loud enough that an operator notices, quiet enough that the JSON
-    // consumer's contract is unchanged.
     info(
       `Warning: this job's receipt did not verify. ${receiptFailureDetail(result.reason ?? "signature_invalid")}`
     );
@@ -131,8 +130,10 @@ export function captureTransportReceipt(
  * Emit only on terminal responses: absent during a running job means not yet
  * issued, rather than unsupported receipts.
  */
-export function receiptJsonFields(capture: ReceiptCapture): Record<string, unknown> {
+export function receiptJsonFields(capture: ReceiptCapture, jobId?: string): Record<string, unknown> {
   const out: Record<string, unknown> = { receipt_verified: capture.status };
+  if (jobId) Object.assign(out, terminalSettlementFields(jobId, { receipt: capture.receipt }));
+  else if (capture.receipt) out.settlement = receiptSettlement(capture.receipt, capture.status);
   if (capture.status !== "absent") out.receipt_display = capture.display;
   if (capture.receipt) {
     out.receipt = capture.receipt;
@@ -142,9 +143,19 @@ export function receiptJsonFields(capture: ReceiptCapture): Record<string, unkno
   return out;
 }
 
-export function renderReceiptHuman(capture: ReceiptCapture): void {
+export function renderReceiptHuman(capture: ReceiptCapture, jobId?: string): void {
+  if (jobId) {
+    const { settlement } = terminalSettlementFields(jobId, { receipt: capture.receipt });
+    if (settlement) info(settlement.display);
+  }
   if (capture.status === "absent") return;
   info(`🧾 ${capture.display}`);
+}
+
+export function observedSettlementFields(jobId: string, response?: Partial<ContentStatus>, persistLocalState = true) {
+  if (persistLocalState && response?.status && isTerminalJobStatus(response.status)
+    && (response.receipt || response.receiptParseError)) captureTransportReceipt(jobId, response);
+  return terminalSettlementFields(jobId, { status: response?.status, receipt: response?.receipt, persistLocalState });
 }
 
 /**

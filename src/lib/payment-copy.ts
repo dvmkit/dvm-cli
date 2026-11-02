@@ -7,7 +7,7 @@ import {
 import type { PaidPaymentResult } from "./payment-responder";
 
 /**
- * The one-line confirmation a settled mid-job payment reports, shared by
+ * The one-line confirmation a sent mid-job payment reports, shared by
  * `dvm pay` and the auto-pay leg of the stream loop so the two can't drift.
  * Fiat-first on both rails: an x402 spend states its exact signed USDC figure,
  * everything else leads with the provider's own fiat price (when it priced in
@@ -21,7 +21,7 @@ export function paidConfirmationDisplay(
   result: PaidPaymentResult,
   fiat?: { amount: number; currency: string }
 ): string {
-  return `Paid ${formatPaidAmount(result, fiat)} via ${paymentRailLabel(result.rail)}.`;
+  return `${result.rail === "credit" ? "Held" : "Sent"} ${formatPaidAmount(result, fiat)} via ${paymentRailLabel(result.rail)}; final settlement follows the job outcome.`;
 }
 
 export function formatPaidAmount(

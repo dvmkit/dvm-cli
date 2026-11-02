@@ -72,7 +72,7 @@ export function formatMessageHuman(
         const noun = msg.content.reason === "change" ? "change" : "refund";
         info(`[${msg.seq}] ${prefix} sent ${noun}: ${amount}`);
       } else {
-        info(`[${msg.seq}] ${prefix} paid: ${amount}`);
+        info(`[${msg.seq}] ${prefix} sent payment: ${amount}`);
       }
       break;
     }

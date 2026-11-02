@@ -125,6 +125,7 @@ try {
           response.end(JSON.stringify({ upfront: { amount: 0, currency: "usd" }, description: "Free", shape: "fixed" }));
         } else if (route === "POST /v1/job") {
           submitted = JSON.parse(body);
+          response.statusCode = 202;
           response.end(JSON.stringify({ job_id: "runtime-job", status: "processing" }));
         } else if (route === "GET /v1/job/runtime-job") {
           response.end(JSON.stringify({ status: "completed", summary: "runtime free result" }));
@@ -147,6 +148,8 @@ try {
   const requested = JSON.parse(requestedText);
   stage = "request-job-id";
   assert.equal(requested.jobId, "runtime-job");
+  stage = "request-next-action";
+  assert.equal(requested.next_action?.type, "poll");
   stage = "request-submitted-capability";
   assert.equal(submitted.capability, "echo");
   stage = "request-submitted-input";
