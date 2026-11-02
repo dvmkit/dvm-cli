@@ -1480,8 +1480,15 @@ function withCreditErrorContext(err: DvmError, body: Record<string, unknown>): D
   // `rail` names which rail a `below_rail_minimum` refusal is about.
   // `settlement_drain_id` is the drain id a wedged channel's `settlement_pending`
   // admits — the one id that finishes the reclaim, which the CLI adopts rather
-  // than minting another into the same gate.
+  // than minting another into the same gate. A card refusal names its cause in
+  // `reason` (with Stripe's own `stripe_error_code` / `decline_code` when the
+  // card network gave one), and a stripe `drain_conflict` names the drain that
+  // holds the credit in `blocking_drain_id`, which the CLI adopts and polls.
   for (const key of [
+    "reason",
+    "stripe_error_code",
+    "decline_code",
+    "blocking_drain_id",
     "credit_id",
     "fund_id",
     "drain_id",

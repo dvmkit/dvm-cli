@@ -73,6 +73,8 @@ import {
   advisoryBtcRate,
 } from "./shared";
 import type { CreditFundOptions } from "./options";
+import { listPendingCardFundings } from "../card-credit/journal";
+import { readSecretStdin } from "../secret-input";
 
 /**
  * Load a prepaid balance at one DVM, deliberately.
@@ -101,7 +103,20 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
     );
   }
   const fundingMode = parseFundingMode(opts.fundingMode);
-  const flagRail = parseFundRail(opts.rail);
+  const cardSpt = await resolveCardSpt(opts.spt);
+  const namedRail = parseFundRail(opts.rail);
+  if (cardSpt !== undefined && namedRail && namedRail !== "stripe") {
+    throw new DvmError(
+      "invalid_argument",
+      `--spt is a card approval, so it can't fund over --rail ${namedRail}.`,
+      "Drop --rail, or use --rail stripe with --spt.",
+      {
+        display: `A shared payment token from Stripe Link pays by card, not over ${namedRail}. Nothing was charged.`,
+      }
+    );
+  }
+  // A token can only ever pay by card, so passing one names the rail.
+  const flagRail = cardSpt !== undefined ? "stripe" : namedRail;
   // Both Bitcoin rails pay once and have no reusable form, so naming one
   // alongside a mode is a contradiction rather than a preference to resolve —
   // and it is knowable here, before `/v1/info` is even asked. A
@@ -294,6 +309,8 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
       ...(opts.cashuMint ? { cashuMint: opts.cashuMint } : {}),
       ...(maxCashuPrincipalSats !== undefined ? { maxCashuPrincipalSats } : {}),
       ...(maxCashuFeeSats !== undefined ? { maxCashuFeeSats } : {}),
+      ...(cardSpt !== undefined ? { cardSpt } : {}),
+      cardApprovalSteps: true,
     });
 
     // The verb was asked for a funding. `refused` and `unavailable` both mean
@@ -426,6 +443,7 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
           ? { wallet_debit_sats: outcome.walletDebitSats }
           : {}),
         ...(outcome.spentMicro !== undefined ? { spent_micro: outcome.spentMicro } : {}),
+        ...(outcome.chargedMicro !== undefined ? { charged_micro: outcome.chargedMicro } : {}),
         ...(outcome.paymentOutcome ? { payment_outcome: outcome.paymentOutcome } : {}),
         ...(outcome.transactionHash ? { transaction_hash: outcome.transactionHash } : {}),
       // `credit_id` above is already the credit the balance landed on. This
@@ -483,7 +501,38 @@ function pendingSignedResume(args: {
     ...listResumableX402Fundings(scope),
     ...listResumableX402ExactFundings(scope),
     ...listResumableTempoChargeFundings(scope),
+    ...listPendingCardFundings(scope).map((entry) => ({
+      creditId: entry.creditId,
+      amountMicro: entry.amountMicro,
+      requestedAt: entry.presentedAt,
+    })),
   ].sort((a, b) => a.requestedAt - b.requestedAt)[0];
+}
+
+/**
+ * The shared payment token for a card top-up: `--spt -` reads it from stdin,
+ * which keeps it out of shell history and the process list. Its value is
+ * never echoed, not even in a refusal.
+ */
+async function resolveCardSpt(raw: string | undefined): Promise<string | undefined> {
+  if (raw === undefined) return undefined;
+  const value =
+    raw === "-"
+      ? await readSecretStdin({
+          kind: "shared payment token",
+          promptLabel: "Shared payment token:",
+          warningCommands: [],
+        })
+      : raw.trim();
+  if (!/^spt_[A-Za-z0-9_]+$/.test(value)) {
+    throw new DvmError(
+      "invalid_argument",
+      "The value given for --spt is not a shared payment token.",
+      "Pass the spt_… value from 'link-cli spend-request retrieve <id> --include shared_payment_token', or pipe it in with --spt -.",
+      { display: "That isn't a shared payment token from Stripe Link, so nothing was charged." }
+    );
+  }
+  return value;
 }
 
 /**

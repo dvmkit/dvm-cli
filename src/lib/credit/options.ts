@@ -67,6 +67,8 @@ export interface CreditFundOptions {
   maxCashuPrincipalSats?: string;
   /** Maximum Cashu swap fee, in sats, for this funding. */
   maxCashuFeeSats?: string;
+  /** Shared payment token from Stripe Link for a card top-up, or `-` to read it from stdin. */
+  spt?: string;
 }
 
 export interface CreditDrainOptions {

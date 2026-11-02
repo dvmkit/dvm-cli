@@ -18,6 +18,14 @@ After funding or an automatic refill, inspect every funding result, not just the
 
 When `credit_funding_skipped` reports unavailable BTC/USD pricing, relay its `display` and `hint`. Automatic funding remains enabled, and this request follows the ordinary per-call payment path; the notice does not report a prepaid purchase or authorize another one.
 
+## Card top-ups (Stripe Link)
+
+Some providers take card payments for prepaid credit (`stripe` in their funding rails). A card top-up always needs the human's approval in Stripe Link, so the CLI never makes one on its own and automatic refills skip it. Run `dvm credit fund <dvm> --rail stripe --amount '$X'` first: it charges nothing and returns `card_approval_required` with the exact `link_cli.create` and `link_cli.retrieve` commands, the amount in cents, and the provider's `network_id`. Tell the human it is a card charge that can be refunded later, less a share of Stripe's processing fee, then run the create command and wait for their approval (up to 30 minutes). Pipe the `spt_…` value the retrieve command returns into `next_command` (`--spt -`). Never pay it with `link-cli mpp pay`, and never print, log or store the token: it is a bearer approval for a card charge. Card top-ups start at $0.50 and are whole cents.
+
+If the fund result says the card may or may not have been charged, re-run the same command with the same `--spt` inside the window it names: the resend books the earlier charge or makes it once, never twice. Do not ask the human for a new approval until the CLI says the earlier top-up is closed. A decline or an unusable approval says so in `display`; relay it and ask for a new approval.
+
+Card credit is refunded only to the card: `dvm credit drain <dvm> --method stripe` (the method is chosen automatically for card-funded credit; `--address` does not apply). A `pending` drain means Stripe has not finished; re-run the same command later, which polls the same drain. A `sent` drain carries `refund_ids` and `card_refund` with the refunded amount and the fee share in dollars.
+
 ## Draw and reclaim
 
 Return to [calling](calling.md) for jobs. Keep the same signing identity. If the CLI reconciles funding onto another credit ID, inspect that named balance and follow its selection guidance before the next job; do not buy again to make the balance appear.

@@ -595,6 +595,10 @@ export function buildProgram(): Command {
       "--funding-mode <mode>",
       `Choose reusable channel collateral or, only when the DVM explicitly allows its manual refund obligation, a one-shot stablecoin payment: ${creditFundingModes}. Stablecoin rails only`
     )
+    .option(
+      "--spt <token>",
+      "Pay by card: the shared payment token (spt_…) your human approved in Stripe Link, or '-' to read it from stdin. Implies --rail stripe; without it, --rail stripe prints the link-cli approval steps"
+    )
     .option("--credit-id <id>", "Fund a specific credit id instead of the tracked one")
     .option("--as <name>", "Caller signing identity to sign the funding as")
     .option("--human", "Human-readable output instead of JSON")
@@ -614,7 +618,7 @@ export function buildProgram(): Command {
     )
     .option(
       "--method <rail>",
-      `Payout rail: ${creditDrainRails} (cashu by default; x402- and Tempo-backed credits automatically force their own rail)`
+      `Payout rail: ${creditDrainRails} (cashu by default; x402-, Tempo- and card-funded credits automatically force their own rail). stripe refunds card-funded credit to the card, less its share of Stripe's fee, and takes no --address`
     )
     .option(
       "--address <address>",
