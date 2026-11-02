@@ -5,6 +5,7 @@ import { bookedCreditPayment, sendCreditPayment, tryCreditPayment } from "./cred
 import { buildTempoCredential } from "./payment-rails/tempo-credential";
 import {
   DvmError,
+  isPublicRequestId,
   shellQuoteArg,
   type JobPolicy,
   loadAgentWallet,
@@ -51,6 +52,9 @@ import { dvmFetch } from "./http";
 import { applyMintPin } from "./mint-pin";
 import { assertTempoChallengeNetwork, resolveTempoNetworkSelection } from "./tempo-network";
 import { captureDrawFundingReceipts } from "./draw-funding";
+import { loadRequestIntent } from "./request-intent-store";
+import { pollNextAction } from "./next-action";
+import { providerFields } from "./provider-output";
 
 export interface PaidPaymentResult {
   status: "paid";
@@ -89,6 +93,31 @@ export async function handlePaymentRequest(
       },
     });
     return handleLockedPaymentRequest(jobId, request, policy, guardedTransport, provider, opts);
+  }).catch((error: unknown) => {
+    if (!(error instanceof DvmError)) throw error;
+    const job = loadJob(jobId);
+    if (!job || !provider.endpoint || !sameEndpoint(job.endpoint, provider.endpoint)) throw error;
+    let requestId: string | undefined;
+    if (job.requestId && isPublicRequestId(job.requestId)) {
+      try {
+        const intent = loadRequestIntent(job.requestId);
+        if (intent && sameEndpoint(intent.endpoint, job.endpoint)) requestId = job.requestId;
+      } catch {
+        // Unreadable recovery metadata must not replace the payment refusal.
+      }
+    }
+    const command = requestId
+      ? `dvm request-result ${shellQuoteArg(requestId)}`
+      : `dvm status ${shellQuoteArg(jobId)}`;
+    const recovery = `The job was already accepted. Inspect it with \`${command}\` before submitting a replacement. This read cannot submit a job or send payment.`;
+    error.data = providerFields({
+      ...error.data,
+      job_id: jobId,
+      ...(requestId ? { request_id: requestId } : {}),
+      next_action: providerFields({ ...pollNextAction(jobId, recovery) }, ["job_id"]),
+      next_step: [typeof error.data?.next_step === "string" ? error.data.next_step : undefined, recovery].filter(Boolean).join(" "),
+    }, ["job_id"]);
+    throw error;
   });
 }
 
