@@ -61,6 +61,7 @@ import {
 } from "../lib/receipt-capture";
 
 import { resolveEndpoint } from "../lib/favorites";
+import { receiptSettlement } from "../lib/job-settlement";
 import { loadMessages } from "../lib/messages";
 import { createDvmTransport } from "../lib/transport";
 
@@ -369,6 +370,7 @@ function listEntryJson(
     // see `receiptIssuedAtIso`. The raw number stays intact under `receipt`.
     issued_at: receiptIssuedAtIso(entry.receipt),
     paid_msats: entry.receipt.paid.msats,
+    settlement: receiptSettlement(entry.receipt, status),
     receipt_verified: status,
     display: receiptDisplay(entry.receipt, status, rate),
   };
@@ -385,6 +387,7 @@ function storedReceiptJson(
     receipt: entry.receipt,
     receipt_verified: result.status,
     receipt_checks: result.checks,
+    settlement: receiptSettlement(entry.receipt, result.status),
     ...(result.reason
       ? { receipt_error: result.reason, receipt_error_detail: receiptFailureDetail(result.reason) }
       : {}),

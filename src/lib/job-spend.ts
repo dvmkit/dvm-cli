@@ -3,8 +3,10 @@ import { formatPaymentAmount } from "./currency";
 import { hasUnknownUpfrontCredit, type JobRecord } from "./job-store";
 import { loadMessages } from "./messages";
 import { isTerminalJobStatus } from "./next-action";
+import { jobSettlement } from "./job-settlement";
 
 export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
+  const settlement = jobSettlement(job, receipt);
   const charges = [];
   const refunds = [];
   let request: { seq: number; content: PaymentRequestContent } | undefined;
@@ -71,12 +73,22 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   const receiptMismatch = receipt && job.paymentMethod !== "credit" && !converted ? receipt.paid.msats !== total : undefined;
   const receiptTotalDisplay = receipt
     ? formatPaymentAmount(receipt.paid.msats, undefined, { anchor: false }) + valuationLabel : undefined;
-  let display = job.paymentMethod === "credit" && !knownCredit
-    ? "Paid from prepaid credit; the upfront amount is not recorded locally"
+  const settled = settlement.status === "settled" || settlement.status === "free";
+  const receiptHeadline = settled && settlement.evidence === "receipt"
+    && (settlement.settled_msats !== total || (job.paymentMethod === "credit" && !knownCredit));
+  let display = receiptHeadline
+    ? `${settlement.display.replace(/\.$/, "")}; recorded payments: ${totalDisplay} over ${payments} charge${payments === 1 ? "" : "s"}`
+    : !settled && isTerminalJobStatus(job.status) ? settlement.display.replace(/\.$/, "")
+    : job.paymentMethod === "credit" && !knownCredit
+    ? "Drawn from prepaid credit; the upfront amount is not recorded locally"
       + (total > 0 ? `; recorded conversation payments: ${totalDisplay} over ${payments} charge${payments === 1 ? "" : "s"}` : "")
     : total === 0 && charges.length === 0
       ? (job.status === "completed" ? "This job was free" : "No charges yet")
-      : `Paid ${totalDisplay} over ${payments} charge${payments === 1 ? "" : "s"}`;
+      : `${settled ? "Settled" : "Sent or held"} ${totalDisplay} over ${payments} charge${payments === 1 ? "" : "s"}`;
+  if (job.paymentMethod === "credit" && !knownCredit && settlement.status === "unknown")
+    display = `Drawn from prepaid credit; the upfront amount is not recorded locally. ${display}`;
+  else if (job.paymentMethod === "credit" && !knownCredit && receiptHeadline)
+    display += "; Drawn from prepaid credit; the upfront amount is not recorded locally";
   if (budgetDisplay) display += `, budget ${budgetDisplay}`;
   if (refunds.length > 0) display += `, ${refunds.length} refund${refunds.length === 1 ? "" : "s"}`;
   display += ".";
@@ -87,7 +99,7 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   const [receiptLabel, localLabel] = receiptTotalDisplay === totalDisplay
     ? [`${receipt!.paid.msats} msats`, `${total} msats`] : [receiptTotalDisplay, totalDisplay];
   if (receiptMismatch) display += ` Receipt total ${receiptLabel} differs from local total ${localLabel}; mint fees, returned change, or a payment not recorded locally can explain the difference.`;
-  return { charges, refunds, total_msats: total, total_display: totalDisplay,
+  return { charges, refunds, total_msats: total, total_display: totalDisplay, settlement,
     ...(upfront > 0 && (job.paymentMethod !== "credit" || knownCredit) ? {
       upfront_display: formatPaymentAmount(upfront, knownCredit && job.upfrontPayment?.amount_micro !== undefined
         ? { amount: job.upfrontPayment.amount_micro / 1_000_000, currency: job.upfrontPayment.currency! } : undefined,
@@ -103,7 +115,7 @@ export function renderSpendHuman(spend: ReturnType<typeof jobSpend>, print: (tex
   print(spend.display);
   if (spend.upfront_display) print(`  Upfront: ${spend.upfront_display}`);
   const rails: Record<string, string> = { cashu_p2pk: "Cashu", tempo: "Tempo", x402: "x402", credit: "prepaid credit", unknown: "payment method not recorded" };
-  const approvals: Record<string, string> = { auto: "paid automatically", explicit: "you approved", unknown: "approval not recorded" };
+  const approvals: Record<string, string> = { auto: "sent automatically", explicit: "you approved", unknown: "approval not recorded" };
   for (const charge of spend.charges) {
     print(`  [${charge.seq}] ${charge.display} (${rails[charge.rail]}, ${approvals[charge.approval]})${charge.reason.text ? `: ${charge.reason.text}` : ""}`);
   }

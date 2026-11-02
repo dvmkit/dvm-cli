@@ -1,3 +1,4 @@
+import { observedSettlementFields } from "../lib/receipt-capture";
 import { isCallerMessage } from "../lib/message-ownership";
 import { providerFields, providerJobJson } from "../lib/provider-output";
 export { formatMessageHuman } from "../lib/message-human";
@@ -149,9 +150,11 @@ async function messagesWithAccess(
       (streamTerminalStatus(msgs, { providerStatus }) || isTerminal ? null : pollNextAction(jobId)), refunds);
     const content = jobContentFields(jobId, providerStatus, opts.human);
     const resolvedAction = await resolveNextAction(nextAction, msgs, providerStatus?.status);
+    const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden);
     transport.close();
 
     if (opts.human) {
+      if (settlement.settlement) info(settlement.settlement.display);
       info(String(content.content_hint));
       if (msgs.length === 0) {
         info("No new messages.");
@@ -166,6 +169,7 @@ async function messagesWithAccess(
       json({
         jobId,
         ...content,
+        ...settlement,
         messages: msgs.map(serialize),
         cursor: newCursor,
         next_action: resolvedAction,
@@ -223,9 +227,11 @@ async function messagesWithAccess(
   }
   const content = jobContentFields(jobId, providerStatus, opts.human);
   const resolvedAction = await resolveNextAction(result.nextAction, result.messages, providerStatus?.status ?? result.providerStatus?.status);
+  const settlement = observedSettlementFields(jobId, providerStatus ?? result.providerStatus, !access.endpointOverridden);
   transport.close();
 
   if (opts.human) {
+    if (settlement.settlement) info(settlement.settlement.display);
     info(String(content.content_hint));
     if (result.messages.length === 0) {
       info("No new messages.");
@@ -241,6 +247,7 @@ async function messagesWithAccess(
     json({
       jobId,
       ...content,
+      ...settlement,
       messages: result.messages.map(serialize),
       cursor: result.cursor,
       next_action: resolvedAction,
@@ -315,7 +322,7 @@ function serialize(msg: Message): Record<string, unknown> {
       const amount = paymentAmount(msg);
       const display = msg.from === "provider"
         ? `${msg.content.reason === "change" ? "Change" : "Refund"} sent: ${amount}`
-        : `Paid: ${amount}`;
+        : `Payment sent: ${amount}`;
       return { ...base, content: { ...msg.content }, display };
     }
     case "complete": {

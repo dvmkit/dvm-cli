@@ -4,6 +4,8 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
+import { type JobReceipt } from "@dvmkit/sdk/internal";
+import { attestedDvm, unsignedReceipt } from "../../src/lib/__tests__/fixtures/receipt-fixture";
 
 const binary = process.env.DVM_CLI_TEST_BINARY ?? resolve(import.meta.dirname, "../../dist/dvm.js");
 let root: string;
@@ -14,6 +16,8 @@ let history: unknown[];
 let posts: number;
 let creditReply: "accepted" | "refused" | undefined;
 let paymentBodies: Array<{ type: string; content: unknown }>;
+let terminalAfterPayment: "completed" | "failed" | "cancelled";
+let terminalReceipt: JobReceipt | undefined;
 const token = "ab".repeat(32);
 const ask = { seq: 5, from: "provider", timestamp: 1700000000, type: "payment-request",
   content: { amount_msats: 1500, reason: "Additional work", mints: ["https://mint.example"] } };
@@ -25,6 +29,8 @@ beforeEach(async () => {
   posts = 0;
   creditReply = undefined;
   paymentBodies = [];
+  terminalAfterPayment = "completed";
+  terminalReceipt = undefined;
   server = createServer((request, response) => {
     expect(request.headers["x-job-token"]).toBe(token);
     response.setHeader("content-type", "application/json");
@@ -38,15 +44,18 @@ beforeEach(async () => {
           response.statusCode = 402;
           response.end(JSON.stringify({ error: "insufficient_credit", remaining_micro: 1000, shortfall_micro: 500 }));
         } else {
-          state = "completed";
-          history = [{ seq: 7, from: "provider", timestamp: 1700000002, type: "complete", content: { status: "success", summary: "Done" } }];
+          state = terminalAfterPayment;
+          history = [terminalAfterPayment === "completed"
+            ? { seq: 7, from: "provider", timestamp: 1700000002, type: "complete", content: { status: "success", summary: "Done" } }
+            : { seq: 7, from: "provider", timestamp: 1700000002, type: "cancel", content: { reason: terminalReceipt?.reason ?? "Cancelled" } }];
           response.statusCode = 201;
           response.end(JSON.stringify({ seq: 6 }));
         }
       });
       return;
     }
-    response.end(JSON.stringify(request.url?.includes("/messages") ? { messages: history } : { status: state }));
+    response.end(JSON.stringify(request.url?.includes("/messages") ? { messages: history }
+      : { status: state, ...(state === terminalAfterPayment && terminalReceipt ? { receipt: terminalReceipt } : {}) }));
   });
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
   endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -60,10 +69,10 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 function run(command: string, flags: string[] = []) {
-  return new Promise<{ code: number; output: { error?: { code: string }; [key: string]: unknown } }>((done) => {
+  return new Promise<{ code: number; stderr: string; output: { error?: { code: string }; [key: string]: unknown } }>((done) => {
     execFile(process.execPath, [binary, command, "job", ...flags], {
       env: Object.fromEntries(Object.entries({ ...process.env, DVM_CONFIG_DIR: root }).filter(([key]) => !["DVM_JOB_ENDPOINT", "DVM_JOB_TOKEN", "DVM_IDENTITY_KEY"].includes(key))), timeout: 15000,
-    }, (error, stdout) => done({ code: error ? 1 : 0, output: JSON.parse(stdout) }));
+    }, (error, stdout, stderr) => done({ code: error ? 1 : 0, stderr, output: stdout.trim() ? JSON.parse(stdout) : {} }));
   });
 }
 it("ordinary status then pay reaches the wallet guard and leaves unread messages available", async () => {
@@ -148,4 +157,47 @@ it.each([
     expect((await run("pay")).output).toMatchObject({ error: { code: "no_payment_pending" } });
     expect(posts).toBe(1);
   }
+});
+
+
+it.each(([
+  { terminal: "completed", reason: null, expected: "settled", settled: 3500 },
+  { terminal: "failed", reason: "Provider failed", expected: "released", settled: 0 },
+  { terminal: "cancelled", reason: "Caller cancelled", expected: "released", settled: 0 },
+  { terminal: "cancelled", reason: "Job timed out (idle)", expected: "released", settled: 0 },
+] as const).flatMap((scenario) => [false, true].map((human) => ({ ...scenario, human }))))("reports $expected after a mid-job payment ends $terminal / $reason (human=$human)", async (scenario) => {
+  const dvm = attestedDvm();
+  terminalAfterPayment = scenario.terminal;
+  terminalReceipt = dvm.sign({ job_id: "job", outcome: terminalAfterPayment, reason: scenario.reason,
+    paid: { ...unsignedReceipt().paid, msats: 3500 },
+    credit: { credit_id: "held-credit", draw_id: "accepted-draw", amount: 3500,
+      balance_after: scenario.terminal === "completed" ? 6500 : 10000, ledger_seq: 2 } });
+  const authorization = { credit_id: "held-credit", draw_id: "accepted-draw", payment_id: "original-payment",
+    request_seq: 5, amount_micro: 1500, currency: "usd", timestamp: Math.floor(Date.now() / 1000),
+    pubkey: "cd".repeat(32), signature: "ab".repeat(64),
+    auth_statement: { audience: { dvm_id: "example-provider", builder_pubkey: "cd".repeat(32) },
+      method: "POST", path: "/v1/job/job/messages", capability: null } };
+  const request = { ...ask.content, credit: { amount_micro: 1500, currency: "usd" } };
+  const jobs = JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"));
+  Object.assign(jobs[0], { builderAnchor: dvm.anchor, totalPaidMsats: 2000, paymentsHonoured: 1,
+    pendingCreditPayment: { request, authorization, amountMsats: 1500, approval: "explicit" } });
+  writeFileSync(join(root, "jobs.json"), JSON.stringify(jobs));
+  history = [{ ...ask, content: request }];
+  creditReply = "accepted";
+  const result = await run("pay", scenario.human ? ["--human"] : []);
+  expect(result.code).toBe(0);
+  if (scenario.human) {
+    expect(result.stderr).toContain(scenario.expected === "settled" ? "Settled" : "Released");
+    expect(result.stderr).not.toMatch(/\bpaid\b/i);
+  } else {
+    expect(result.output).toMatchObject({ paid: { rail: "credit", msats: 1500 },
+      settlement: { status: scenario.expected, settled_msats: scenario.settled, evidence: "receipt" } });
+  }
+  expect(posts).toBe(1);
+  const saved = JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0];
+  expect(saved).toMatchObject({ status: scenario.terminal, totalPaidMsats: 3500, paymentsHonoured: 2 });
+  const replay = await run("status");
+  expect(replay.code).toBe(0);
+  expect(replay.output).toMatchObject({ source: "local", receipt_verified: "verified",
+    settlement: { status: scenario.expected, settled_msats: scenario.settled } });
 });

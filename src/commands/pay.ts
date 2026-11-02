@@ -1,3 +1,5 @@
+import { observedSettlementFields } from "../lib/receipt-capture";
+import { observeJobContent } from "../lib/job-content";
 import { providerJobJson } from "../lib/provider-output";
 import { type PaymentRailKey, paymentRailLabel } from "../lib/rail-labels";
 import { formatPaymentAmount } from "../lib/currency";
@@ -217,12 +219,12 @@ async function payWithAccess(
     persistLocalState: !access.endpointOverridden,
   });
 
-  // a payment that resumes the handler through to `complete` is this
-  // path's only signal the job is over — record the terminal status and its
-  // snapshot so `dvm status` answers from the local record, as `dvm request` does.
-  // The spend itself is already booked by `handlePaymentRequest` (addPayment).
+  const providerStatus = await observeJobContent(jobId, transport, ref, { timeoutMs: timeoutMs ?? 5000, jobToken });
+
+  // Provider status distinguishes cancellation from the generic stream event.
+  // The responder already booked the payment; snapshot only the job outcome.
   const streamedTerminal =
-    streamResult.nextAction === null ? streamTerminalStatus(streamResult.messages, { callerCancelled: !access.endpointOverridden && loadJob(jobId)?.callerCancelled }) : undefined;
+    streamResult.nextAction === null ? streamTerminalStatus(streamResult.messages, { providerStatus, callerCancelled: !access.endpointOverridden && loadJob(jobId)?.callerCancelled }) : undefined;
   const completion = access.endpointOverridden
     ? streamedTerminal
       ? completionFromMessages(streamResult.messages)
@@ -232,6 +234,7 @@ async function payWithAccess(
         messages: streamResult.messages,
         cursor: streamResult.cursor,
         afterSeq,
+        providerStatus,
       });
   // a payment that runs the handler through to `complete` ends the
   // job right here, so this is a job-terminal emission like the request arcs.
@@ -244,11 +247,13 @@ async function payWithAccess(
       human: opts.human,
     });
   }
+  const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden);
   transport.close();
 
   const identifier = stored.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
 
   if (opts.human) {
+    if (settlement.settlement) info(settlement.settlement.display);
     info(`${paid.display}${identifier ? ` [${identifier}]` : ""}`);
     for (const msg of streamResult.messages) {
       // `jobId` is what lets an artifact in the resumed stream reach disk —
@@ -265,12 +270,9 @@ async function payWithAccess(
       jobId,
       ...dvmIdentity(stored.dvmId, stored.capability),
       paid,
+      ...settlement,
       messages: streamResult.messages.map(serializeMessageForOutput),
-      // A payment that resumes the handler through to `complete` ends the job
-      // here, and this path has no transport receipt to read the outcome off —
-      // so without these an agent that pays sees `next_action: null` and can't
-      // tell whether the payload is the summary or artifacts it must go fetch
-      // Mirrors what `dvm request` renders on the upfront-paid arc.
+      // Retain delivery hints when the payment resumes work through completion.
       ...(completion?.summary !== undefined ? { summary: completion.summary, _provider_fields: ["summary"] } : {}),
       ...(completion ? buildCompletionHintFields(jobId, completion) : {}),
       ...takeCreditNoticeFields(),
