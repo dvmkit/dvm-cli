@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/dvmkit/dvm-cli/compare/v0.12.1...v0.13.0) (2026-11-02)
+
+
+### Features
+
+* **credit:** fund and refund prepaid credit by card through Stripe Link ([#50](https://github.com/dvmkit/dvm-cli/issues/50)) ([531c505](https://github.com/dvmkit/dvm-cli/commit/531c505b0489bb2be9f4c4508a7a750f491dbbc9))
+
 ## [0.12.1](https://github.com/dvmkit/dvm-cli/compare/v0.12.0...v0.12.1) (2026-11-02)
 
 
