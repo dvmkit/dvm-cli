@@ -75,6 +75,7 @@ import {
 import type { CreditFundOptions } from "./options";
 import { listPendingCardFundings } from "../card-credit/journal";
 import { readSecretStdin } from "../secret-input";
+import { info } from "../output";
 
 /**
  * Load a prepaid balance at one DVM, deliberately.
@@ -516,6 +517,14 @@ function pendingSignedResume(args: {
  */
 async function resolveCardSpt(raw: string | undefined): Promise<string | undefined> {
   if (raw === undefined) return undefined;
+  if (raw !== "-") {
+    // Not the generic "rotate it" warning: a token is charged at most once,
+    // up to the amount the human approved, so the risk is someone else
+    // spending this approval first.
+    info(
+      "WARNING: passing the shared payment token on the command line leaks it to your shell history and process listings, where anyone who reads it can spend this approval first. Pipe it in instead: --spt -"
+    );
+  }
   const value =
     raw === "-"
       ? await readSecretStdin({

@@ -134,6 +134,7 @@ describe("card top-up with an approval", () => {
     expect(run.code).toBe(1);
     const error = JSON.parse(run.stdout).error;
     expect(error).toMatchObject({ code: "payment_invalid", reason: "declined", decline_code: "insufficient_funds" });
+    expect(run.stderr).toContain("WARNING: passing the shared payment token on the command line");
     expect(error.display).toBe(
       "The card was declined (decline code insufficient_funds, Stripe code card_declined), so nothing was charged and no credit was added."
     );

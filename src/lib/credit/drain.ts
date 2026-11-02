@@ -624,12 +624,18 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
     if (
       err instanceof DvmError &&
       (err.code === "card_credit_not_drainable" ||
-        (drain.method === "stripe" && err.code === "invalid_request"))
+        (drain.method === "stripe" && err.code === "invalid_request") ||
+        (err.code === "credit_closed" && mintedThisRun))
     ) {
       // Refused before any drain row exists: card credit only drains to the
-      // card, and a card drain was malformed or aimed at non-card credit. The
-      // recorded drain would otherwise pin this method on every re-run.
+      // card, a card drain was malformed or aimed at non-card credit, or the
+      // card credit is closed (its expired balance already went back to the
+      // card, or a dispute froze it). The recorded drain would otherwise be
+      // re-posted into the same refusal on every re-run.
       clearPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
+      if (err.code === "credit_closed") {
+        err.hint = `${err.hint ? `${err.hint} ` : ""}If this balance expired, the DVM already refunded it to the card: 'dvm credit balance ${shellQuoteArg(endpoint)}' shows its refund_drain_id, which can be polled with 'dvm credit drain ${shellQuoteArg(endpoint)} --credit-id ${shellQuoteArg(creditId)} --drain-id <refund_drain_id> --method stripe'.`;
+      }
     } else if (err instanceof DvmError && err.data?.drain_id_retired === true) {
       clearPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
     } else if (
