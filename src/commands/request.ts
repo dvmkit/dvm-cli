@@ -2738,6 +2738,11 @@ function normalizedLocalCorrelationId(opts: RequestOptions): string | undefined 
 }
 
 function requestOutcomeUnknown(requestId: string, cause: unknown): DvmError {
+  // A later payment refusal does not make an already accepted submit unknown.
+  if (cause instanceof DvmError && typeof cause.data?.job_id === "string" &&
+      loadJob(cause.data.job_id)?.requestId === requestId) {
+    return cause;
+  }
   const ambiguityId =
     isIdentityFailure(cause) && typeof cause.data?.ambiguity_id === "string"
       ? cause.data.ambiguity_id
