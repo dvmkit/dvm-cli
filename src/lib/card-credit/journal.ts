@@ -20,8 +20,8 @@ import {
   fsyncSync,
   openSync,
   readdirSync,
+  linkSync,
   readFileSync,
-  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -55,11 +55,17 @@ export function sha256Hex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-/** Written before the paid POST: the response is what goes missing, so a write after it can't help. */
-export function recordPendingCardFunding(entry: PendingCardFunding): void {
+/**
+ * Written before the paid POST: the response is what goes missing, so a write
+ * after it can't help. Exclusive: returns false when another run already holds
+ * an entry for this credit, so two overlapping top-ups can never overwrite
+ * each other's record. The entry is complete on disk before it appears under
+ * its name (hard link of a synced temp file), so a reader never sees half.
+ */
+export function recordPendingCardFunding(entry: PendingCardFunding): boolean {
   ensureConfigSubdir(CARD_FUNDINGS_DIR);
   const target = entryPath(entry.endpoint, entry.callerPubkey, entry.creditId);
-  const temp = `${target}.${String(process.pid)}.tmp`;
+  const temp = `${target}.${String(process.pid)}.${entry.fundId}.tmp`;
   const fd = openSync(temp, "w", 0o600);
   try {
     writeFileSync(fd, JSON.stringify(entry, null, 2) + "\n");
@@ -67,8 +73,24 @@ export function recordPendingCardFunding(entry: PendingCardFunding): void {
   } finally {
     closeSync(fd);
   }
-  renameSync(temp, target);
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        linkSync(temp, target);
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        // An unreadable entry protects nothing (no run can resume from it) and
+        // would otherwise block this credit's card top-ups for good.
+        if (attempt > 0 || readEntry(target) !== undefined) return false;
+        rmSync(target, { force: true });
+      }
+    }
+  } finally {
+    rmSync(temp, { force: true });
+  }
   fsyncDirectory(CARD_FUNDINGS_DIR);
+  return true;
 }
 
 export function loadPendingCardFunding(
@@ -98,10 +120,13 @@ export function listPendingCardFundings(scope: {
     .sort((a, b) => a.presentedAt - b.presentedAt);
 }
 
+/** Retire this entry, and only this one: a different fund id on disk belongs to another run. */
 export function clearPendingCardFunding(
-  entry: Pick<PendingCardFunding, "endpoint" | "callerPubkey" | "creditId">
+  entry: Pick<PendingCardFunding, "endpoint" | "callerPubkey" | "creditId" | "fundId">
 ): void {
-  rmSync(entryPath(entry.endpoint, entry.callerPubkey, entry.creditId), { force: true });
+  const path = entryPath(entry.endpoint, entry.callerPubkey, entry.creditId);
+  if (readEntry(path)?.fundId !== entry.fundId) return;
+  rmSync(path, { force: true });
 }
 
 /** True while the DVM would still accept a credential built on this entry's challenge. */

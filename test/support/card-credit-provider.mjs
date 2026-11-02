@@ -32,6 +32,8 @@ const control = {
 const calls = [];
 const intents = new Map();
 const intentByKey = new Map();
+/** Shared payment token → the idempotency key of the one PaymentIntent it may create. */
+const keyBySpt = new Map();
 const refunds = new Map();
 const refundByKey = new Map();
 const jobs = [];
@@ -63,6 +65,16 @@ const stripeFetch = async (input, init) => {
     }
     const idem = key ?? `anon-${calls.length}`;
     const replayed = intentByKey.has(idem);
+    const token = calls.at(-1).spt;
+    // A shared payment token charges once: Stripe refuses a second
+    // PaymentIntent on it under any other idempotency key.
+    if (!replayed && token && keyBySpt.has(token) && keyBySpt.get(token) !== idem) {
+      return Response.json(
+        { error: { type: "invalid_request_error", code: "shared_payment_granted_token_already_used", message: "This shared payment token has already been used." } },
+        { status: 400 }
+      );
+    }
+    if (token && !keyBySpt.has(token)) keyBySpt.set(token, idem);
     if (!replayed) {
       const id = `pi_test_${intents.size + 1}`;
       intents.set(id, { id, amount: Number(body.get("amount")), currency: body.get("currency") ?? "usd", refunded: 0, created: Math.floor(Date.now() / 1000), metadata: {} });

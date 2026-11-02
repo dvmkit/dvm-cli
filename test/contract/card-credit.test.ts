@@ -185,16 +185,23 @@ describe("an interrupted card top-up", () => {
     expectNoSecretOnDisk(configRoot);
   }, SLOW);
 
-  it("would charge twice without the journal, which is the hazard it closes", async () => {
+  it("without the journal, a re-run can't book the lost charge and is told to check before a new approval", async () => {
     startTest();
     const before = await snapshot();
     await control({ dropPaidResponses: 3 });
     await dvm(["credit", "fund", endpoint, "--amount", "$1", "--over-trust", "--spt", spt]);
     rmSync(join(configRoot, "card-fundings"), { recursive: true, force: true });
 
+    // Stripe refuses the used approval under the re-run's new fund id, so the
+    // CLI can't learn that the first run charged. The journal is what avoids
+    // this misreport; without it the hint must not send the agent straight
+    // to a second approval.
     const rerun = await dvm(["credit", "fund", endpoint, "--amount", "$1", "--over-trust", "--spt", spt]);
-    expect(rerun.code).toBe(0);
-    expect((await snapshot()).intents.length - before.intents.length).toBe(2);
+    expect(rerun.code).toBe(1);
+    const error = JSON.parse(rerun.stdout).error;
+    expect(error.reason).toBe("token_unusable");
+    expect(error.hint).toContain("check 'dvm credit balance' and the card statement first");
+    expect((await snapshot()).intents.length - before.intents.length).toBe(1);
   }, SLOW);
 });
 
@@ -271,17 +278,35 @@ async function dvm(
     child.on("close", (code) => done({ stdout, stderr, code }));
     child.stdin.end(stdin ?? "");
   });
-  // The token is a bearer approval for a card charge: no output may carry it.
-  expect(result.stdout).not.toContain(spt);
-  expect(result.stderr).not.toContain(spt);
+  // The token is a bearer approval for a card charge, and the MPP credential
+  // carries it base64url-encoded: no output may carry either.
+  expectNoSecret(result.stdout, "stdout");
+  expectNoSecret(result.stderr, "stderr");
   expect(result.stdout + result.stderr).not.toMatch(/spt_test_[0-9a-f]{24}/);
   return result;
 }
 
 function expectNoSecretOnDisk(root: string): void {
-  for (const file of filesUnder(root)) {
-    expect(readFileSync(file, "utf8"), file).not.toContain(spt);
-  }
+  for (const file of filesUnder(root)) expectNoSecret(readFileSync(file, "utf8"), file);
+}
+
+function expectNoSecret(text: string, where: string): void {
+  expect(text, where).not.toContain(spt);
+  expect(text, where).not.toMatch(/Payment [A-Za-z0-9_-]{16,}/);
+  for (const encoded of base64urlForms(spt)) expect(text, where).not.toContain(encoded);
+}
+
+/**
+ * The token's base64url text at each of the three byte alignments it can take
+ * inside a longer encoded value (the credential's JSON), trimmed to the
+ * characters that depend on the token's bytes alone.
+ */
+function base64urlForms(secret: string): string[] {
+  return [0, 1, 2].map((offset) => {
+    const encoded = Buffer.concat([Buffer.alloc(offset), Buffer.from(secret)]).toString("base64url");
+    const start = [0, 2, 3][offset]!;
+    return encoded.slice(start, encoded.length - 3);
+  });
 }
 
 function filesUnder(root: string): string[] {
