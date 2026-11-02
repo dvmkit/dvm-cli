@@ -244,7 +244,12 @@ interface CreditRefillUnavailableBase extends CreditRefillNoticeBase {
 }
 
 interface CreditRefillBindingUnavailable extends CreditRefillUnavailableBase {
-  code: "credit_refill_rail_unavailable" | "credit_refill_instrument_unavailable";
+  code:
+    | "credit_refill_rail_unavailable"
+    | "credit_refill_instrument_unavailable"
+    | "credit_refill_card_approval_required";
+  /** The fund command that starts a card top-up's approval, on the card arm only. */
+  fund_command?: string;
   /**
    * The x402 instrument the credit is bound to, in the server's own vocabulary
    * — the same words a funding refusal names as `credit_instrument`. Instrument
@@ -634,6 +639,26 @@ export function buildCreditRefillUnavailable(args: {
 }): CreditRefillUnavailable {
   const { drainCommand, balanceRemedy } = refillBalanceRemedy(args.dvm, args.balanceMicro);
   const rail = fundingRailLabel(args.boundRail);
+  if (args.boundRail === "stripe") {
+    // Not a missing rail: a card top-up needs a fresh approval in Stripe Link
+    // every time, so no refill can ever be automatic. Draining is not the
+    // remedy either; it costs a share of the card fee the balance still covers.
+    const balance = `$${formatUsd(Math.max(args.balanceMicro, 0) / 1_000_000)}`;
+    const fundCommand = `dvm credit fund ${shellQuoteArg(args.dvm)} --rail stripe --amount '$X'`;
+    return {
+      code: "credit_refill_card_approval_required",
+      dvm: args.dvm,
+      endpoint: args.endpoint,
+      credit_id: args.creditId,
+      bound_rail: args.boundRail,
+      balance_micro: args.balanceMicro,
+      currency: args.currency,
+      drain_command: drainCommand,
+      fund_command: fundCommand,
+      display: `The prepaid credit at ${args.dvm} was paid by card, and every card top-up has to be approved in Stripe Link, so it is not refilled automatically. Its ${balance} balance is still spendable.`,
+      hint: `To top it up, run '${fundCommand}' with the amount to add: it charges nothing and returns the link-cli approval steps for your human.`,
+    };
+  }
   return {
     code: "credit_refill_rail_unavailable",
     dvm: args.dvm,
@@ -1235,6 +1260,8 @@ function settledRouteDisplay(
         return "funded from your Tempo stablecoin wallet through its reusable custody channel";
       }
       return "funded from your Tempo stablecoin wallet";
+    case "stripe":
+      return "paid by card through Stripe Link";
   }
 }
 
@@ -1264,6 +1291,8 @@ function inFlightRouteDisplay(
         return "your Tempo wallet is funding its reusable custody channel";
       }
       return "your Tempo wallet is funding prepaid credit";
+    case "stripe":
+      return "a card top-up your human approved in Stripe Link is being charged";
   }
 }
 

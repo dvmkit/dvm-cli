@@ -231,3 +231,26 @@ describe("credit settlement on receipt reads", () => {
     expect(wire.credit).not.toHaveBeenCalled();
   });
 });
+
+describe("refill of a card-funded credit after a job", () => {
+  it("stops at the card approval with the fund command instead of calling the rail unavailable", async () => {
+    seed({ receipt: undefined });
+    const credits = JSON.parse(readFileSync(CREDITS_FILE, "utf8"));
+    credits.credits[0] = { ...credits.credits[0], rail: "stripe",
+      menu: { ...credits.credits[0].menu, funding: ["stripe"] } };
+    writeFileSync(CREDITS_FILE, JSON.stringify(credits));
+    const { captureJobReceipt } = await import("../src/lib/receipt-capture");
+    const { takeCreditNoticeFields } = await import("../src/lib/credit-notice");
+    takeCreditNoticeFields();
+
+    await settleCreditAfterJob({ capture: captureJobReceipt(jobId, receipt()), transport: wire as unknown as Transport,
+      ref: { endpoint }, signing: { pubkey: CALLER_A, privkey: secret }, refillPocket: async () => undefined,
+      config: { posture: "auto" } });
+
+    const refill = takeCreditNoticeFields().credit_refill;
+    expect(refill).toMatchObject({ code: "credit_refill_card_approval_required", bound_rail: "stripe",
+      fund_command: expect.stringContaining("--rail stripe") });
+    expect(refill?.display).toContain("approved in Stripe Link");
+    expect(wire.credit).not.toHaveBeenCalled();
+  });
+});

@@ -97,6 +97,13 @@ import { renderCreditDrain, renderCreditReceipts } from "../../commands/credit/r
 import { providerCopyHint, describeCreditProvider, discoverCreditDvmIdentity, resolveCreditEndpoint, creditOp, otherCreditDrains, pendingDrainJson } from "./shared";
 import { completedCreditHistory, completedDrainMatches, completedServiceMatches, completedOriginsOverlap } from "../completed-credit-history";
 import type { CreditDrainOptions, CreditReceiptsOptions } from "./options";
+import {
+  assertCardDrainId,
+  cardDrainCopy,
+  cardRefundOf,
+  postCardDrain,
+  refundIdsOf,
+} from "./drain-stripe";
 
 /**
  * Request, poll, or pick up a drain of the credit held at one DVM. Re-running
@@ -153,11 +160,14 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
     opts.method ??
     ((stored?.creditId === creditId && stored.rail === "tempo") || tempoSession
       ? "tempo"
-      : stored?.creditId === creditId &&
+      : stored?.creditId === creditId && stored.rail === "stripe"
+        ? "stripe"
+        : stored?.creditId === creditId &&
           (stored.rail === "x402" || stored.x402Instrument !== undefined)
-        ? "x402"
-        : "cashu")
+          ? "x402"
+          : "cashu")
   ).toLowerCase();
+  if (method === "stripe" && opts.drainId) assertCardDrainId(opts.drainId);
   if (
     opts.recoverFromReceipts &&
     (method !== "x402" || !opts.creditId || !opts.drainId || opts.address !== undefined)
@@ -439,6 +449,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
   // response: the DVM's `sent` is a claim about the escrow, and the record it
   // would retire is the caller's only way back to the collateral if it is wrong
   let mppAssociation: TempoChannelAssociation | undefined;
+  let cardAdoptedFrom: string | undefined;
   try {
     // Re-derived per post rather than captured once: the x402 fallback below
     // rewrites the payout mid-flight, and the body it signs must follow.
@@ -452,7 +463,8 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
         // an mpp `payout` that is merely *present* as a promise to carry an
         // address — so an empty one is omitted rather than sent as `{}`. A
         // charge-funded credit does carry its address here.
-        ...(drain.method === "tempo" && Object.keys(drain.payout).length === 0
+        ...((drain.method === "tempo" || drain.method === "stripe") &&
+        Object.keys(drain.payout).length === 0
           ? {}
           : { payout: drain.payout }),
       },
@@ -572,6 +584,21 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
           result = await closeChannel();
         }
       }
+    } else if (drain.method === "stripe") {
+      const card = await postCardDrain({
+        drainId: () => drain.drainId,
+        post: () => creditOp(transport, endpoint, signCredit(unsignedBody())),
+        adopt: (blocking) => {
+          // The DVM allows one card refund per credit at a time and named the
+          // one in flight. Following it is the reclaim; the id this run posted
+          // was refused before anything was recorded under it.
+          clearPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
+          drain = { ...drain, drainId: blocking, creditId };
+          recordPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
+        },
+      });
+      result = card.result;
+      cardAdoptedFrom = card.adoptedFrom;
     } else {
       result = await creditOp(transport, endpoint, signCredit(unsignedBody()));
     }
@@ -594,7 +621,22 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
     // shut. Never `forgetCredit`: the credit is still there and still holds
     // money, and `clearPendingDrain` leaves `drainEvidence` alone, so any
     // signed receipt this drain earned survives its id.
-    if (err instanceof DvmError && err.data?.drain_id_retired === true) {
+    if (
+      err instanceof DvmError &&
+      (err.code === "card_credit_not_drainable" ||
+        (drain.method === "stripe" && err.code === "invalid_request") ||
+        (err.code === "credit_closed" && mintedThisRun))
+    ) {
+      // Refused before any drain row exists: card credit only drains to the
+      // card, a card drain was malformed or aimed at non-card credit, or the
+      // card credit is closed (its expired balance already went back to the
+      // card, or a dispute froze it). The recorded drain would otherwise be
+      // re-posted into the same refusal on every re-run.
+      clearPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
+      if (err.code === "credit_closed") {
+        err.hint = `${err.hint ? `${err.hint} ` : ""}If this balance expired, the DVM already refunded it to the card: 'dvm credit balance ${shellQuoteArg(endpoint)}' shows its refund_drain_id, which can be polled with 'dvm credit drain ${shellQuoteArg(endpoint)} --credit-id ${shellQuoteArg(creditId)} --drain-id <refund_drain_id> --method stripe'.`;
+      }
+    } else if (err instanceof DvmError && err.data?.drain_id_retired === true) {
       clearPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
     } else if (
       // The mirror image, and the reason the two are separate fields: this
@@ -751,7 +793,20 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
   }
 
   // Unknown status strings require upgrade guidance rather than generic polling.
-  const local = localDrainCopy(wireDrain, drain, exitRecovery);
+  const local =
+    (drain.method === "stripe"
+      ? cardDrainCopy({
+          status: wireDrain.status,
+          amountMicro: wireDrain.amount_micro,
+          drain: wireDrain,
+          endpoint,
+          creditId,
+          drainId: drain.drainId,
+          ...(cardAdoptedFrom ? { adoptedFrom: cardAdoptedFrom } : {}),
+        })
+      : undefined) ?? localDrainCopy(wireDrain, drain, exitRecovery);
+  const cardRefund = drain.method === "stripe" ? cardRefundOf(wireDrain) : undefined;
+  const refundIds = drain.method === "stripe" ? refundIdsOf(wireDrain) : undefined;
 
   // A parked token is locked to the wallet's own key — redeem on sight.
   let claimedSats: number | undefined;
@@ -908,6 +963,9 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
       endpoint,
       drain: wireDrain,
       ...(result.credit ? { credit: result.credit } : {}),
+      ...(refundIds ? { refund_ids: refundIds } : {}),
+      ...(cardRefund ? { card_refund: cardRefund } : {}),
+      ...(cardAdoptedFrom ? { adopted_drain_id: drain.drainId, posted_drain_id: cardAdoptedFrom } : {}),
       ...(unclaimed.length > 0
         ? {
             unclaimed_drains: unclaimed.map(pendingDrainJson),
@@ -1636,9 +1694,13 @@ async function drainPayout(
     throw new DvmError(
       "invalid_argument",
       `--address is an EVM refund destination and does not apply to --method ${method}.`,
-      "A cashu refund is locked to your agent wallet's key, which the CLI supplies. Drop --address."
+      method === "stripe"
+        ? "A card refund always goes back to the card that paid for the credit. Drop --address."
+        : "A cashu refund is locked to your agent wallet's key, which the CLI supplies. Drop --address."
     );
   }
+  // The card that paid is the only destination a card refund has.
+  if (method === "stripe") return {};
   if (method === "cashu") {
     const wallet = loadAgentWallet();
     if (!wallet) {
@@ -1698,7 +1760,7 @@ async function drainPayout(
   throw new DvmError(
     "invalid_argument",
     `Unsupported drain method "${method}".`,
-    "Use --method cashu to be paid as ecash, --method x402 for an x402-funded credit, or --method tempo for a Tempo-funded credit."
+    "Use --method cashu to be paid as ecash, --method x402 for an x402-funded credit, --method tempo for a Tempo-funded credit, or --method stripe to refund card-funded credit to the card."
   );
 }
 

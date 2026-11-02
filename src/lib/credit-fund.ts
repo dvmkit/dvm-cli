@@ -1,4 +1,9 @@
 import { buildTempoCredential } from "./payment-rails/tempo-credential";
+import {
+  type CardFundDeps,
+  fundOverStripe,
+  pendingCardFundingForCredit,
+} from "./card-credit/fund";
 /**
  * Funds prepaid credit over Cashu, Lightning, x402 or Tempo. Before payment, an unavailable rail
  * may fall back; a funding refusal stops the cascade. Once money or signed authority has been
@@ -293,6 +298,8 @@ export interface CreditFundOutcome {
   walletDebitSats?: number | null;
   /** Stablecoin micro-units committed through a Tempo charge or session. */
   spentMicro?: number;
+  /** US-dollar micro-units charged to the human's card for a card top-up. */
+  chargedMicro?: number;
   /** How the Lightning payment resolved — `reconciled` means it was not re-sent. */
   paymentOutcome?: "paid" | "reconciled" | "republished";
   /**
@@ -397,6 +404,19 @@ export interface FundCreditArgs {
   tempoAccount?: TempoAccount | null;
   /** Test seam for the challenge's Tempo chain client. */
   tempoGetClient?: TempoSessionClientResolver;
+  /**
+   * The shared payment token (`spt_…`) a human approved in Stripe Link for a
+   * card top-up. A secret: it goes into one MPP credential and nowhere else.
+   */
+  cardSpt?: string;
+  /**
+   * Answer a card top-up without a token by reading the DVM's challenge and
+   * returning the `link-cli` approval steps. Only the explicit fund verb sets
+   * it; an automatic refill just reports that a human has to approve.
+   */
+  cardApprovalSteps?: boolean;
+  /** Test seam for the card leg's resend backoff. */
+  cardSleep?: (ms: number) => Promise<void>;
   /** Test seam around mppx's challenge-aware fetch lifecycle. */
   tempoFetch?: (args: {
     fetch: typeof globalThis.fetch;
@@ -495,6 +515,12 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
     return tempoChargePendingOutcome(args, tempoChargePending, Boolean(account));
   }
 
+  // A journalled card top-up may already have charged the card; it is finished
+  // under its own fund id before any rail is chosen, whatever was requested.
+  if (pendingCardFundingForCredit(args)) {
+    return fundOverStripe(args, args.fundId ?? randomUUID(), cardFundDeps(args));
+  }
+
   const pending = loadPendingFunding(args.ref.endpoint, args.signing.pubkey, args.creditId);
   if (pending) {
     if (!pendingFundingExpired(pending)) {
@@ -512,9 +538,10 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
   // set rather than reordering it: answering `--funding-mode
   // reusable` by quietly paying over ecash would drop the only thing the flag
   // asked for. Every refusal below this line is reached before a rail leg runs.
+  const railArgs = { ...args, cardForced: args.rail === "stripe" };
   const eligible = args.fundingMode
-    ? availableRails(args).filter(isStablecoinFundRail)
-    : availableRails(args);
+    ? availableRails(railArgs).filter(isStablecoinFundRail)
+    : availableRails(railArgs);
 
   const x402Network = loadX402Wallet()?.network;
   const x402Binding = boundX402Binding(args);
@@ -584,7 +611,9 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
           ? await fundOverLightning(args, fundId)
           : rail === "x402"
             ? await fundOverX402Rail(args, fundId, x402Binding)
-            : await fundOverMppRail(args, fundId);
+            : rail === "stripe"
+              ? await fundOverStripe(args, fundId, cardFundDeps(args))
+              : await fundOverMppRail(args, fundId);
     // The pick is what the *funding* was routed by, so it rides every outcome —
     // including a fallback's, where "why Lightning was tried first" is exactly
     // what makes the ecash that followed legible.
@@ -744,6 +773,12 @@ export function availableRails(args: {
   providerInfo?: ProviderInfo;
   float?: Float | null;
   tempoAccount?: TempoAccount | null;
+  /**
+   * A card top-up needs a human's approval each time, so the card is a
+   * candidate only when the caller asked for it by name, never a step in the
+   * automatic order.
+   */
+  cardForced?: boolean;
 }): CreditFundRail[] {
   const advertised = args.menu?.funding;
   const offers = (rail: CreditFundRail): boolean => !advertised || advertised.includes(rail);
@@ -766,7 +801,16 @@ export function availableRails(args: {
   if (offers("tempo") && offersTempoCreditFunding(args.menu) && hasConnectedTempoWallet(args)) {
     rails.push("tempo");
   }
+  if (args.cardForced && offers("stripe")) rails.push("stripe");
   return rails;
+}
+
+function cardFundDeps(args: FundCreditArgs): CardFundDeps {
+  return {
+    post: (body, payment) => postCredit(args, body, payment),
+    settled: (base, result) => settled(args, base, result),
+    ...(args.cardSleep ? { sleep: args.cardSleep } : {}),
+  };
 }
 
 /**
@@ -4322,7 +4366,9 @@ function unavailableDisplay(args: { ref: ProviderRef }, rail?: CreditFundRail): 
         ? "with ecash"
         : rail === "x402"
           ? "over x402"
-          : "";
+          : rail === "stripe"
+            ? "by card"
+            : "";
   return `No way to fund a prepaid credit at ${args.ref.endpoint}${what ? ` ${what}` : ""} right now.`;
 }
 
