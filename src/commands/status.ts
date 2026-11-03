@@ -42,6 +42,7 @@ import {
 import { type ContentStatus, jobContentFields } from "../lib/job-content";
 import { takeCreditNoticeFields } from "../lib/credit-notice";
 import { settleCreditAfterRead } from "../lib/credit-topup";
+import { providerCurrency } from "../lib/provider-currency";
 import { captureDrawFundingReceipts } from "../lib/draw-funding";
 import { formatIdentifier } from "../lib/dvm-identifier";
 import { takeFeedbackNoticeFields } from "../lib/feedback-notice";
@@ -164,6 +165,7 @@ async function statusWithAccess(
     if (reason !== undefined) completion.message = reason;
   }
   let receipt: ReceiptCapture | undefined;
+  let currency: string | undefined;
   if (isTerminalJobStatus(result.status)) {
     if (stored && !access.endpointOverridden) {
       // Provider redaction must not erase an output snapshot already saved here.
@@ -187,10 +189,12 @@ async function statusWithAccess(
     // Receipt capture persists the endpoint association. With no record, or
     // when this read deliberately targets another endpoint, keep the override
     // request-scoped instead of filing proof under stale local metadata.
+    currency = stored && !access.endpointOverridden ? undefined
+      : await providerCurrency({ receipt: result.receipt, status: result, messages: msgs, transport, ref });
     receipt =
       stored && !access.endpointOverridden
         ? captureTransportReceipt(jobId, result)
-        : transientReceiptCapture(jobId, result);
+        : transientReceiptCapture(jobId, result, currency);
     if (stored && !access.endpointOverridden) {
       await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
     }
@@ -222,13 +226,15 @@ async function statusWithAccess(
     cursor: newCursor,
     receipt,
     content: result,
+    currency,
   });
 }
 
 /** Verify receipt output without filing an override endpoint or token in local state. */
 function transientReceiptCapture(
   jobId: string,
-  response: Pick<JobStatus, "receipt" | "receiptParseError">
+  response: Pick<JobStatus, "receipt" | "receiptParseError">,
+  currency?: string
 ): ReceiptCapture {
   if (response.receiptParseError) {
     return {
@@ -249,7 +255,8 @@ function transientReceiptCapture(
     display: receiptDisplay(
       response.receipt,
       result.status,
-      getLastKnownBtcRate()?.rate ?? 0
+      getLastKnownBtcRate()?.rate ?? 0,
+      currency
     ),
   };
 }
@@ -269,7 +276,7 @@ function renderStatus(
   source: "local" | "provider",
   nextAction: NextAction,
   opts: StatusOptions,
-  fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: ContentStatus }
+  fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: ContentStatus; currency?: string }
 ): void {
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
   const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, opts.human);
@@ -279,7 +286,7 @@ function renderStatus(
   const spend = stored ? jobSpend({ ...(loadJob(jobId) ?? stored),
     status: jobStatus as JobRecord["status"] }, receipt?.receipt) : undefined;
   const settlement = terminalSettlementFields(jobId, { status: jobStatus, receipt: receipt?.receipt,
-    persistLocalState: !!stored });
+    persistLocalState: !!stored, currency: fetched?.currency });
 
   if (opts.human) {
     if (jobStatus === "completed" && completion.summary) {

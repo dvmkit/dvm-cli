@@ -7,6 +7,7 @@ import { loadJob } from "./job-store";
 import { isTerminalJobStatus } from "./next-action";
 import { formatMicro } from "./piece-settlement";
 import { progressNotice } from "./progress-notice";
+import { providerCurrency } from "./provider-currency";
 import { captureTransportReceipt } from "./receipt-capture";
 
 /** A cancel or decline landing while a payment is verified is retried this many times in all. */
@@ -64,8 +65,10 @@ export async function readEnding(args: {
     const job = loadJob(args.jobId);
     if (job) await settleCreditAfterRead({ job, capture, transport: args.transport, human: args.human });
   }
+  const currency = args.persistLocalState ? undefined
+    : await providerCurrency({ receipt: status.receipt, status, transport: args.transport, ref: args.ref });
   const { settlement } = terminalSettlementFields(args.jobId, {
-    status: status.status, receipt: status.receipt, persistLocalState: args.persistLocalState,
+    status: status.status, receipt: status.receipt, persistLocalState: args.persistLocalState, currency,
   });
   return { status, ...(settlement?.charged_micro !== undefined ? { settlement } : {}) };
 }

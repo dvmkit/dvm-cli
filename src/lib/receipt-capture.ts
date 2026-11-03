@@ -126,10 +126,13 @@ export function captureJobReceipt(
 function warnPieceOvercharge(jobId: string, receipt: SignedJobReceipt, job: JobRecord | null): void {
   const pieces = pieceSettlement(receipt, { job, messages: loadMessages(jobId) });
   if (!pieces?.overcharged || pieces.ceiling_micro === undefined) return;
+  const ceiling = formatMicro(pieces.ceiling_micro, pieces.currency);
+  const basis = pieces.ceiling_basis === "payments"
+    ? `the ${ceiling} of finished pieces this CLI paid for`
+    : `the ${ceiling} its own pieces add up to`;
   info(
     `Warning: the signed receipt for job ${jobId} charges ${formatMicro(pieces.charged_micro, pieces.currency)}, ` +
-      `more than the ${formatMicro(pieces.ceiling_micro, pieces.currency)} of finished pieces this CLI paid for. ` +
-      `Keep the receipt as evidence ('dvm receipts show ${jobId}') and raise it with the provider.`
+      `more than ${basis}. Keep the receipt as evidence ('dvm receipts show ${jobId}') and raise it with the provider.`
   );
 }
 
@@ -170,10 +173,10 @@ export function renderReceiptHuman(capture: ReceiptCapture, jobId?: string): voi
   info(`🧾 ${capture.display}`);
 }
 
-export function observedSettlementFields(jobId: string, response?: Partial<ContentStatus>, persistLocalState = true) {
+export function observedSettlementFields(jobId: string, response?: Partial<ContentStatus>, persistLocalState = true, currency?: string) {
   if (persistLocalState && response?.status && isTerminalJobStatus(response.status)
     && (response.receipt || response.receiptParseError)) captureTransportReceipt(jobId, response);
-  return terminalSettlementFields(jobId, { status: response?.status, receipt: response?.receipt, persistLocalState });
+  return terminalSettlementFields(jobId, { status: response?.status, receipt: response?.receipt, persistLocalState, currency });
 }
 
 /**

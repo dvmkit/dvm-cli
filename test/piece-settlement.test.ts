@@ -49,12 +49,33 @@ describe("piece settlement ceiling", () => {
     { name: "a charge its own pieces do not add up to", outcome: "completed", charged: 360_000,
       pieces: [piece(0, UPFRONT, "finished"), piece(2, 200_000, "finished", 140_000)],
       messages: [askOne, payOne], record: job(), ceiling: 300_000, overcharged: true },
+    { name: "a completed job whose payment echo never reached the log", outcome: "completed", charged: 360_000, pieces: honest,
+      messages: [askOne], record: job(), ceiling: 360_000, overcharged: false },
+    { name: "a completed job with an empty log", outcome: "completed", charged: 360_000, pieces: honest,
+      messages: [], record: job(), ceiling: 360_000, overcharged: false },
+    { name: "this caller's cancel whose payment echo never reached the log", outcome: "cancelled", charged: 360_000,
+      pieces: [piece(0, UPFRONT, "finished"), piece(2, 200_000, "stopped")],
+      messages: [askOne], record: job({ callerCancelled: true }), ceiling: 360_000, overcharged: false },
+    { name: "this caller's cancel with an empty log", outcome: "cancelled", charged: 360_000,
+      pieces: [piece(0, UPFRONT, "finished"), piece(2, 200_000, "stopped")],
+      messages: [], record: job({ callerCancelled: true }), ceiling: 360_000, overcharged: false },
     { name: "an upfront price not recorded locally", outcome: "completed", charged: 360_000, pieces: honest,
       messages: [askOne, payOne], record: job({ upfrontPayment: undefined }), ceiling: 360_000, overcharged: false },
   ] as const)("$name", ({ outcome, charged, pieces, messages, record, ceiling, overcharged }) => {
     const result = pieceSettlement(receipt(outcome, charged, [...pieces]), { job: record, messages: [...messages] });
     expect(result).toMatchObject({ charged_micro: charged, currency: "usd", ceiling_micro: ceiling, overcharged });
-    expect(result?.display.includes("exceeds the finished pieces")).toBe(overcharged);
+    expect(result?.display.includes("This charge exceeds")).toBe(overcharged);
+  });
+
+  it("words the flag for the basis that set the ceiling", () => {
+    const listed = pieceSettlement(receipt("completed", 360_000, [piece(0, UPFRONT, "finished"), piece(2, 200_000, "finished", 140_000)]),
+      { job: job(), messages: [] });
+    expect(listed).toMatchObject({ ceiling_basis: "receipt_pieces", overcharged: true });
+    expect(listed?.display).toContain("This charge exceeds what the receipt's own pieces add up to ($0.30 USD).");
+    const paid = pieceSettlement(receipt("cancelled", 360_000, honest),
+      { job: job({ callerCancelled: true, callerDeclined: true }), messages: [askOne, payOne, askTwo(100_000)] });
+    expect(paid).toMatchObject({ ceiling_basis: "payments", overcharged: true });
+    expect(paid?.display).toContain("This charge exceeds the finished pieces this CLI paid for (at most $0.10 USD).");
   });
 
   it("states the charge, hold and release in the job's currency", () => {

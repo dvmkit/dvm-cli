@@ -21,6 +21,8 @@ export interface JobSettlement {
   currency?: string | null;
   /** Most the ending may charge from this CLI's payments and the asks it saw, when every price is recorded. */
   ceiling_micro?: number;
+  /** `payments` (this CLI's payments and the asks it saw) or `receipt_pieces` (the receipt's own pieces). */
+  ceiling_basis?: "payments" | "receipt_pieces";
   /** The receipt charges more than `ceiling_micro`. */
   overcharged?: boolean;
   display: string;
@@ -57,7 +59,7 @@ export function receiptSettlement(
       refunded_msats: 0, rail, evidence: "receipt",
       held_micro: pieces.held_micro, charged_micro: pieces.charged_micro, released_micro: pieces.released_micro,
       stopped_micro: pieces.stopped_micro, currency: pieces.currency,
-      ...(pieces.ceiling_micro !== undefined ? { ceiling_micro: pieces.ceiling_micro } : {}),
+      ...(pieces.ceiling_micro !== undefined ? { ceiling_micro: pieces.ceiling_micro, ceiling_basis: pieces.ceiling_basis } : {}),
       overcharged: pieces.overcharged,
       display: pieces.display,
     };
@@ -130,6 +132,8 @@ export function terminalSettlementFields(jobId: string, options: {
   status?: string;
   receipt?: JobReceipt;
   persistLocalState?: boolean;
+  /** The provider's credit currency; see {@link PieceContext.currency}. */
+  currency?: string;
 } = {}): { settlement?: JobSettlement } {
   const stored = options.persistLocalState === false ? null : loadJob(jobId);
   const status = options.status ?? stored?.status ?? options.receipt?.outcome;
@@ -138,7 +142,8 @@ export function terminalSettlementFields(jobId: string, options: {
   // Override reads must not borrow another endpoint's refunds or payment totals.
   return { settlement: options.persistLocalState === false
     ? options.receipt && options.receipt.outcome === status
-      ? receiptSettlement(options.receipt, verifyJobReceipt({ receipt: options.receipt, expectedJobId: jobId }).status)
+      ? receiptSettlement(options.receipt, verifyJobReceipt({ receipt: options.receipt, expectedJobId: jobId }).status,
+        undefined, { currency: options.currency })
       : unknownSettlement(null)
     : jobSettlement(job, options.receipt) };
 }

@@ -65,12 +65,13 @@ export function drainReceiptsHint(status: ReceiptVerification): string {
 export function receiptDisplay(
   receipt: SignedJobReceipt,
   status: ReceiptVerification,
-  rate = 0
+  rate = 0,
+  currency?: string
 ): string {
   const what = `${receipt.dvm}/${receipt.capability} (DVM ID ${receipt.dvm_id})`;
   const when = receiptIssuedAtIso(receipt)?.slice(0, 10);
   // The local record names the currency a piece settlement is denominated in.
-  const settlement = receiptSettlement(receipt, status, rate, { job: loadJob(receipt.job_id) });
+  const settlement = receiptSettlement(receipt, status, rate, { job: loadJob(receipt.job_id), currency });
   const payment = settlement.charged_micro !== undefined
     ? `Charged ${formatMicro(settlement.charged_micro, settlement.currency ?? null)}`
     : settlement.status === "settled" ? `Settled ${formatPaid(receipt.paid.msats, rate)}`

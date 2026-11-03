@@ -18,6 +18,11 @@ export interface PieceSettlement {
    * it saw. Absent when a needed price is not recorded locally.
    */
   ceiling_micro?: number;
+  /**
+   * What set {@link ceiling_micro}: this CLI's own payments and the asks it saw,
+   * or, when those cannot be trusted, the pieces the receipt itself lists.
+   */
+  ceiling_basis?: CeilingBasis;
   /** The receipt charges more than {@link ceiling_micro}. */
   overcharged: boolean;
   display: string;
@@ -26,6 +31,8 @@ export interface PieceSettlement {
 export interface PieceContext {
   job?: JobRecord | null;
   messages?: Message[];
+  /** The provider's credit currency, for reads with no local record of the job's prices. */
+  currency?: string;
 }
 
 /**
@@ -38,7 +45,9 @@ export interface PieceContext {
  * piece in progress, so it may charge only the pieces finished by the latest
  * ask this CLI saw (`charged_if_declined_micro`). Pieces paid after that ask
  * are allowed too unless the local log is provably whole through the job's end,
- * because an ask this CLI never saw could have finished them. Either way the
+ * because an ask this CLI never saw could have finished them. Those payments are
+ * trusted only when every piece the receipt lists was bought by a payment in the
+ * local log; otherwise the receipt is checked against itself alone. Either way the
  * charge may not exceed what the receipt's own finished and stopped pieces sum to.
  */
 export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {}): PieceSettlement | undefined {
@@ -46,7 +55,7 @@ export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {})
   if (!isSettlement(settlement)) return undefined;
   const job = context.job ?? undefined;
   const messages = [...(context.messages ?? [])].sort((a, b) => a.seq - b.seq);
-  const currency = settlementCurrency(receipt, job, messages);
+  const currency = settlementCurrency(receipt, job, messages, context.currency);
   const stopped = settlement.pieces
     .filter((piece) => piece.state === "stopped")
     .reduce((sum, piece) => sum + piece.charged, 0);
@@ -59,23 +68,32 @@ export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {})
   const listed = settlement.pieces.length > 0 ? settlement.pieces
     .filter((piece) => piece.state === "finished" || piece.state === "stopped")
     .reduce((sum, piece) => sum + Math.min(piece.charged, piece.amount), 0) : undefined;
-  const ceiling = paid === undefined ? listed : listed === undefined ? paid : Math.min(paid, listed);
+  const basis = paid !== undefined && (listed === undefined || paid <= listed) ? "payments"
+    : listed !== undefined ? "receipt_pieces" : undefined;
+  const ceiling = basis === "payments" ? paid : listed;
   const overcharged = ceiling !== undefined && settlement.charged > ceiling;
   const money = (micro: number) => formatMicro(micro, currency);
   let display = `Charged ${money(settlement.charged)} of ${money(settlement.held)} held, ${money(settlement.released)} released.`;
-  if (overcharged) {
-    display += ` This charge exceeds the finished pieces this CLI paid for (at most ${money(ceiling)}).`;
-  }
+  if (overcharged) display += ` ${overchargeClause(basis!, money(ceiling!))}`;
   return {
     held_micro: settlement.held,
     charged_micro: settlement.charged,
     released_micro: settlement.released,
     stopped_micro: stopped,
     currency,
-    ...(ceiling !== undefined ? { ceiling_micro: ceiling } : {}),
+    ...(ceiling !== undefined ? { ceiling_micro: ceiling, ceiling_basis: basis! } : {}),
     overcharged,
     display,
   };
+}
+
+export type CeilingBasis = "payments" | "receipt_pieces";
+
+/** Why a charge above its ceiling is wrong, worded for the basis that set it. */
+export function overchargeClause(basis: CeilingBasis, ceiling: string): string {
+  return basis === "payments"
+    ? `This charge exceeds the finished pieces this CLI paid for (at most ${ceiling}).`
+    : `This charge exceeds what the receipt's own pieces add up to (${ceiling}).`;
 }
 
 /** Money in the credit's currency; bare micro-units only when no record names it. */
@@ -98,6 +116,11 @@ function paidCeiling(
     // An upfront piece exists, but its price is not recorded here.
     return undefined;
   }
+  // A payment missing from the local log (a stream that died before its echo)
+  // would understate what was paid; only the receipt's own pieces are checked then.
+  const logged = new Set(messages.filter((message) => message.from === "requester" && message.type === "payment")
+    .map((message) => message.seq));
+  if (settlement.pieces.some((piece) => piece.paid_seq !== 0 && !logged.has(piece.paid_seq))) return undefined;
   let paid = upfront;
   let finished: number | undefined;
   let afterAsk = upfront;
@@ -136,12 +159,13 @@ function wholeThroughEnd(messages: Message[]): boolean {
  * The receipt names no currency, so take it from local records of this job's
  * prices. Only a plain ISO code is used: it reaches relayed display text.
  */
-function settlementCurrency(receipt: JobReceipt, job: JobRecord | undefined, messages: Message[]): string | null {
+function settlementCurrency(receipt: JobReceipt, job: JobRecord | undefined, messages: Message[], hint?: string): string | null {
   const candidates: (string | undefined)[] = [job?.upfrontPayment?.currency];
   for (const message of [...messages].reverse()) {
     if (message.type === "payment-request" && message.from === "provider") candidates.push(message.content.credit?.currency);
     if (message.type === "payment" && message.from === "requester") candidates.push(message.content.credit?.currency);
   }
+  candidates.push(hint);
   const creditId = receipt.credit?.credit_id;
   if (creditId) candidates.push(safeCredits().find((credit) => credit.creditId === creditId)?.currency);
   const found = candidates.find((currency) => typeof currency === "string" && currency.length > 0);
