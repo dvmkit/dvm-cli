@@ -1,7 +1,8 @@
 import { guidanceJobArg } from "./provider-output";
 import { answeredYieldSeqs } from "./yield-state";
 import { formatPaymentAmount } from "./currency";
-import type { JobPolicy, Message } from "@dvmkit/sdk/internal";
+import { formatFiat } from "@dvmkit/sdk";
+import type { JobPolicy, Message, PaymentRequestContent } from "@dvmkit/sdk/internal";
 import { asProviderText, type ProviderText } from "@dvmkit/sdk/internal";
 
 export type NextAction =
@@ -38,7 +39,17 @@ export interface NextActionPay {
    * against the figure the human is actually being asked to approve.
    */
   fiat_amount?: { amount: number; currency: string };
-  _provider_fields?: "fiat_amount"[];
+  /**
+   * The ask's price in integer micro-units of the job's credit currency. Present
+   * only beside {@link charged_if_declined_micro}, so older DVMs keep the old shape.
+   */
+  credit?: { amount_micro: number; currency: string };
+  /**
+   * What declining this ask costs: the finished pieces of work, in integer
+   * micro-units of `credit.currency`. Present only when a piece-charging DVM states it.
+   */
+  charged_if_declined_micro?: number;
+  _provider_fields?: ("fiat_amount" | "credit" | "charged_if_declined_micro")[];
   /** Earliest pending caller deadline for the job, in Unix milliseconds. */
   expires_at_ms?: number;
   display: string;
@@ -117,7 +128,7 @@ export function paymentInFlightHint(jobId: string): string {
 }
 
 /** Message types that signal the end of a provider's turn. */
-const YIELD_TYPES = new Set(["prompt", "payment-request", "working", "complete", "cancel"]);
+const YIELD_TYPES = new Set(["prompt", "payment-request", "working", "complete", "cancel", "decline"]);
 
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set<TerminalJobStatus>([
   "completed",
@@ -146,6 +157,7 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
     switch (msg.type) {
       case "complete":
       case "cancel":
+      case "decline":
         return null;
 
       case "prompt": {
@@ -189,17 +201,28 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           (context?.totalPaidMsats ?? 0) + c.amount_msats <= policy.maxTotalMsats &&
           (policy.maxIncrementMsats === 0 || c.amount_msats <= policy.maxIncrementMsats)
           ? ` For the next run, use --auto-pay-below ${c.amount_msats} within your approved budget; other payment limits still apply.` : "";
+        const stopping = declineTerms(c);
+        const providerFields: NonNullable<NextActionPay["_provider_fields"]> = [];
+        // Mirror only a fiat figure the display actually led with: echoing a
+        // zero amount would tell an agent doing budget math the charge is free.
+        if (c.fiat_amount && c.fiat_amount.amount > 0) providerFields.push("fiat_amount");
+        if (stopping?.credit) providerFields.push("credit");
+        if (stopping) providerFields.push("charged_if_declined_micro");
+        const declineHint = stopping
+          ? ` If your human does not approve, run \`dvm decline ${guidanceJobArg(jobId)}\`: ${stopping.clause} Letting the deadline pass also ends the job.`
+          : "";
         return {
           type: "pay",
           job_id: jobId,
           amount_msats: c.amount_msats,
-          // Mirror only a fiat figure the display actually led with: echoing a
-          // zero amount would tell an agent doing budget math the charge is free.
-          ...(c.fiat_amount && c.fiat_amount.amount > 0 ? { fiat_amount: c.fiat_amount, _provider_fields: ["fiat_amount"] } : {}),
+          ...(c.fiat_amount && c.fiat_amount.amount > 0 ? { fiat_amount: c.fiat_amount } : {}),
+          ...(stopping?.credit ? { credit: stopping.credit } : {}),
+          ...(stopping ? { charged_if_declined_micro: stopping.micro } : {}),
+          ...(providerFields.length ? { _provider_fields: providerFields } : {}),
           ...(expiresAtMs !== undefined ? { expires_at_ms: expiresAtMs } : {}),
-          display: withDeadline(display, deadline),
+          display: withDeadline(stopping ? `${withPeriod(display)} ${stopping.clause}` : display, deadline),
           reason: asProviderText(c.reason),
-          hint: expired ? deadline : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.`, deadline) + thresholdHint,
+          hint: expired ? deadline : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.${declineHint}`, deadline) + thresholdHint,
         };
       }
 
@@ -217,6 +240,36 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
   }
 
   return null;
+}
+
+/**
+ * What stopping at this ask costs, from a piece-charging DVM's
+ * `charged_if_declined_micro`. Undefined when the ask does not state it (older
+ * DVMs), so their pay action keeps its previous shape and copy.
+ */
+function declineTerms(ask: PaymentRequestContent): {
+  micro: number;
+  credit?: { amount_micro: number; currency: string };
+  clause: string;
+} | undefined {
+  const micro = ask.charged_if_declined_micro;
+  if (typeof micro !== "number" || !Number.isSafeInteger(micro) || micro < 0) return undefined;
+  const price = ask.credit;
+  const credit = price && Number.isSafeInteger(price.amount_micro) && price.amount_micro >= 0 &&
+    typeof price.currency === "string" ? { amount_micro: price.amount_micro, currency: price.currency } : undefined;
+  // The currency is provider text; only a plain ISO code goes into relayed copy.
+  const amount = credit && /^[A-Z]{3}$/i.test(credit.currency)
+    ? formatFiat(micro / 1_000_000, credit.currency) : undefined;
+  const clause = micro === 0
+    ? "Declining ends the job with no charge for finished work."
+    : amount
+      ? `Declining ends the job and charges ${amount} for the work already finished.`
+      : "Declining ends the job and charges for the work already finished (next_action.charged_if_declined_micro).";
+  return { micro, ...(credit ? { credit } : {}), clause };
+}
+
+function withPeriod(text: string): string {
+  return /[.!?]$/.test(text) ? text : `${text}.`;
 }
 
 function pendingDeadline(messages: Message[], answered: Set<number>): number | undefined {

@@ -10,7 +10,8 @@ export function nextActionHuman(action: NextAction): string | null {
     case "respond":
     case "pay": {
       const display = action.display.replace(/`dvm status '<job_id>'`/g, () => `\`dvm status ${shellQuoteArg(action.job_id)}\``);
-      const template = action.hint.match(/`(dvm[\s\S]*)`/)?.[1]
+      // The first quoted command is the one to run; a pay hint may name `dvm decline` after it.
+      const template = action.hint.match(/`(dvm[^`]*)`/)?.[1]
         ?.replace(/^(dvm (?:message|pay|status)) '<job_id>'/, (_, prefix: string) => `${prefix} ${shellQuoteArg(action.job_id)}`);
       const command = action.type === "respond"
         ? template?.replace("--prompt-id '<prompt_id>'", () => `--prompt-id ${shellQuoteArg(action.prompt_id)}`)
@@ -20,7 +21,9 @@ export function nextActionHuman(action: NextAction): string | null {
         return `Next: ${display} Provider is waiting for your input. ${command ? `Run \`${command}\`.` : action.hint}`;
       }
       const thresholdHint = action.hint.match(/ For the next run, use --auto-pay-below .+$/)?.[0] ?? "";
-      return `Next: Payment required to continue: ${display}${display.endsWith(".") ? "" : "."} Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.${thresholdHint}`;
+      const decline = action.charged_if_declined_micro !== undefined && command?.startsWith("dvm pay ")
+        ? ` To stop instead, run \`dvm decline ${shellQuoteArg(action.job_id)}\`.` : "";
+      return `Next: Payment required to continue: ${display}${display.endsWith(".") ? "" : "."} Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.${decline}${thresholdHint}`;
     }
     case "poll": {
       const hint = typeof action.hint === "string" ? action.hint : action.hint.text;
