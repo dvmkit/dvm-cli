@@ -37,4 +37,19 @@ describe("headroom trust cap by rail", () => {
     expect(statusOf(held, "cashu")).toBe("blocked_by_trust_cap");
     expect(statusOf(held, "stripe")).not.toBe("blocked_by_trust_cap");
   });
+
+  it("still blocks the card route above the room the DVM's maximum leaves", () => {
+    const over = computeHeadroom({
+      ...base,
+      balanceMicro: 49_000_000,
+      routeAmountMicro: 2_000_000,
+    });
+    const within = computeHeadroom({
+      ...base,
+      balanceMicro: 49_000_000,
+      routeAmountMicro: 1_000_000,
+    });
+    expect(statusOf(over, "stripe")).toBe("blocked_by_trust_cap");
+    expect(statusOf(within, "stripe")).toBe("compatible");
+  });
 });

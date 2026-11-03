@@ -165,6 +165,9 @@ export function computeHeadroom(args: {
     menu,
     routeAmountMicro,
     fundableNowMicro,
+    menuRoomMicro: menu
+      ? Math.max(menu.max_micro - Math.max(args.balanceMicro ?? 0, 0), 0)
+      : undefined,
     availability: args.routeAvailability,
   });
   const pin = effectiveFundingRail(args.config, args.endpoint, args.identity);
@@ -426,6 +429,8 @@ function compatibilityFor(args: {
   menu: CreditMenu | undefined;
   routeAmountMicro: number | undefined;
   fundableNowMicro: number | undefined;
+  /** What the builder's `max_micro` leaves after the held balance; no trust level lifts it. */
+  menuRoomMicro: number | undefined;
   availability: CreditRouteAvailability[] | undefined;
 }): CreditRouteCompatibility[] {
   if (!args.menu || args.routeAmountMicro === undefined) return [];
@@ -441,11 +446,11 @@ function compatibilityFor(args: {
     let status: CreditRouteCompatibilityStatus;
     // Card is never trust-capped: the human approves the exact amount in Stripe
     // Link first, so reporting a cap here would send an agent after
-    // `--over-trust` it does not need.
+    // `--over-trust` it does not need. The builder's own maximum still binds it.
+    const bound = rail === "stripe" ? args.menuRoomMicro : args.fundableNowMicro;
     if (
-      rail !== "stripe" &&
-      args.fundableNowMicro !== undefined &&
-      (routeAmountMicro > args.fundableNowMicro || minimum > args.fundableNowMicro)
+      bound !== undefined &&
+      (routeAmountMicro > bound || (rail !== "stripe" && minimum > bound))
     ) {
       status = "blocked_by_trust_cap";
     } else if (routeAmountMicro < minimum) {
