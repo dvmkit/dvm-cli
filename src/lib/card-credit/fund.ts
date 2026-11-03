@@ -468,7 +468,7 @@ async function approvalSteps(
     "--spt -",
   ].join(" ");
   const display = `This is a card top-up of $${usd(args.amountMicro)}, so it has to be approved in Stripe Link first. Nothing has been charged. The card is charged when the approved top-up is sent to the DVM, and any credit left unspent can be refunded to the card later, less its share of Stripe's processing fee.`;
-  const hint = `Run '${create}' and ask your human to approve it in Link (they have 30 minutes). Then run '${retrieve}' with the spend request id the first command printed, and pipe the shared_payment_token.id value from its JSON into '${fund}': that command charges the card. Never pay this with 'link-cli mpp pay': a signed dvm request expires long before an approval arrives.`;
+  const hint = `Run '${create}' and ask your human to approve it in Link (they have 30 minutes). Then run '${retrieve}' with the spend request id the first command printed, and pipe the shared_payment_token.id value from its JSON into '${fund}': that command charges the card. Never pay this with 'link-cli mpp pay': a signed dvm request expires long before an approval arrives. Link connects agents only in some regions (the US and Canada as of November 2026). If Link says your region isn't supported, fund over another rail with --rail.`;
   return {
     ...base,
     status: "unavailable",
