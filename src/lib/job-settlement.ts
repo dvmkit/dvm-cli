@@ -21,8 +21,11 @@ export interface JobSettlement {
   currency?: string | null;
   /** Most the ending may charge from this CLI's payments and the asks it saw, when every price is recorded. */
   ceiling_micro?: number;
-  /** `payments` (this CLI's payments and the asks it saw) or `receipt_pieces` (the receipt's own pieces). */
-  ceiling_basis?: "payments" | "receipt_pieces";
+  /**
+   * `payments` (this CLI's payments and the asks it saw), `declined_ask` (the
+   * last ask's stated cost of stopping) or `receipt_pieces` (the receipt's own pieces).
+   */
+  ceiling_basis?: "payments" | "declined_ask" | "receipt_pieces";
   /** The receipt charges more than `ceiling_micro`. */
   overcharged?: boolean;
   display: string;

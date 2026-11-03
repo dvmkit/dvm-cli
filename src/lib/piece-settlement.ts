@@ -1,6 +1,7 @@
 import { formatFiat } from "@dvmkit/sdk";
 import { listCredits, type JobReceipt, type Message } from "@dvmkit/sdk/internal";
 import type { JobRecord } from "./job-store";
+import { answeredYieldSeqs } from "./yield-state";
 
 type ReceiptSettlement = NonNullable<JobReceipt["settlement"]>;
 
@@ -45,10 +46,16 @@ export interface PieceContext {
  * piece in progress, so it may charge only the pieces finished by the latest
  * ask this CLI saw (`charged_if_declined_micro`). Pieces paid after that ask
  * are allowed too unless the local log is provably whole through the job's end,
- * because an ask this CLI never saw could have finished them. Those payments are
- * trusted only when every piece the receipt lists was bought by a payment in the
- * local log; otherwise the receipt is checked against itself alone. Either way the
- * charge may not exceed what the receipt's own finished and stopped pieces sum to.
+ * because an ask this CLI never saw could have finished them.
+ *
+ * A receipt piece bought by a payment missing from the local log is ambiguous
+ * while the log has a gap (a payment echo lost with a dropped stream), so the
+ * payments are then not used as a ceiling. Once the log is whole through the
+ * job's end, such a piece is provably not a payment this CLI made, and the
+ * payments ceiling stands. On those other endings the latest ask's
+ * `charged_if_declined_micro` caps the charge whatever the log shows, plus that
+ * ask's price when this CLI paid it. The charge may never exceed what the
+ * receipt's own finished and stopped pieces sum to.
  */
 export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {}): PieceSettlement | undefined {
   const settlement = receipt.settlement;
@@ -68,9 +75,14 @@ export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {})
   const listed = settlement.pieces.length > 0 ? settlement.pieces
     .filter((piece) => piece.state === "finished" || piece.state === "stopped")
     .reduce((sum, piece) => sum + Math.min(piece.charged, piece.amount), 0) : undefined;
-  const basis = paid !== undefined && (listed === undefined || paid <= listed) ? "payments"
-    : listed !== undefined ? "receipt_pieces" : undefined;
-  const ceiling = basis === "payments" ? paid : listed;
+  const declined = ending === "release" && job ? declineCap(job, messages) : undefined;
+  // Ties go to the earlier basis: the CLI's own record before the provider's statements.
+  const bounds = ([["payments", paid], ["declined_ask", declined], ["receipt_pieces", listed]] as const)
+    .filter((entry): entry is readonly [CeilingBasis, number] => entry[1] !== undefined);
+  const lowest = bounds.reduce<readonly [CeilingBasis, number] | undefined>(
+    (best, entry) => best === undefined || entry[1] < best[1] ? entry : best, undefined);
+  const basis = lowest?.[0];
+  const ceiling = lowest?.[1];
   const overcharged = ceiling !== undefined && settlement.charged > ceiling;
   const money = (micro: number) => formatMicro(micro, currency);
   let display = `Charged ${money(settlement.charged)} of ${money(settlement.held)} held, ${money(settlement.released)} released.`;
@@ -87,13 +99,15 @@ export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {})
   };
 }
 
-export type CeilingBasis = "payments" | "receipt_pieces";
+export type CeilingBasis = "payments" | "declined_ask" | "receipt_pieces";
 
 /** Why a charge above its ceiling is wrong, worded for the basis that set it. */
 export function overchargeClause(basis: CeilingBasis, ceiling: string): string {
   return basis === "payments"
     ? `This charge exceeds the finished pieces this CLI paid for (at most ${ceiling}).`
-    : `This charge exceeds what the receipt's own pieces add up to (${ceiling}).`;
+    : basis === "declined_ask"
+      ? `This charge exceeds what the job's last ask said stopping would cost (at most ${ceiling}).`
+      : `This charge exceeds what the receipt's own pieces add up to (${ceiling}).`;
 }
 
 /** Money in the credit's currency; bare micro-units only when no record names it. */
@@ -116,11 +130,12 @@ function paidCeiling(
     // An upfront piece exists, but its price is not recorded here.
     return undefined;
   }
-  // A payment missing from the local log (a stream that died before its echo)
-  // would understate what was paid; only the receipt's own pieces are checked then.
+  // A payment missing from a log with gaps (a stream that died before its echo)
+  // would understate what was paid. A whole log leaves no room for one.
   const logged = new Set(messages.filter((message) => message.from === "requester" && message.type === "payment")
     .map((message) => message.seq));
-  if (settlement.pieces.some((piece) => piece.paid_seq !== 0 && !logged.has(piece.paid_seq))) return undefined;
+  if (!wholeThroughEnd(messages) &&
+      settlement.pieces.some((piece) => piece.paid_seq !== 0 && !logged.has(piece.paid_seq))) return undefined;
   let paid = upfront;
   let finished: number | undefined;
   let afterAsk = upfront;
@@ -146,6 +161,25 @@ function paidCeiling(
   }
   if (ending !== "release") return paid;
   return wholeThroughEnd(messages) ? (finished ?? 0) : (finished ?? 0) + afterAsk;
+}
+
+/**
+ * What the latest ask this CLI saw said stopping would cost, plus its price
+ * when this CLI paid it (an ask it never saw could then have finished that
+ * piece). The job record keeps paid asks even when the payment's echo never
+ * reached the log. Micro-units of the job's credit currency, as the ask states.
+ */
+function declineCap(job: JobRecord, messages: Message[]): number | undefined {
+  const ask = messages.findLast((message): message is Extract<Message, { type: "payment-request" }> =>
+    message.from === "provider" && message.type === "payment-request");
+  if (!ask || !validMicro(ask.content.charged_if_declined_micro)) return undefined;
+  const paidAsk = answeredYieldSeqs(messages).has(ask.seq) ||
+    job.paidPaymentRequestSeqs?.includes(ask.seq) ||
+    job.inFlightPaymentRequestSeqs?.includes(ask.seq) ||
+    job.bookedCreditPayments?.some((payment) => payment.authorization.request_seq === ask.seq);
+  if (!paidAsk) return ask.content.charged_if_declined_micro;
+  const price = ask.content.credit?.amount_micro;
+  return validMicro(price) ? ask.content.charged_if_declined_micro + price : undefined;
 }
 
 /** Contiguous from the first seq and ending in a terminal message: no ask went unseen. */

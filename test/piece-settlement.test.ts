@@ -11,6 +11,8 @@ const payOne: Message = { seq: 2, from: "requester", timestamp: 1, type: "paymen
   content: { credit: { amount_micro: 200_000, currency: "usd", request_seq: 1 } } as never };
 const askTwo = (declined = 360_000): Message => ({ seq: 3, from: "provider", timestamp: 1, type: "payment-request",
   content: { amount_msats: 300_000, reason: "Block 3", credit: { amount_micro: 300_000, currency: "usd" }, charged_if_declined_micro: declined } });
+const declinedAt = (seq: number): Message => ({ seq, from: "requester", timestamp: 1, type: "decline", content: {} });
+const completedAt = (seq: number): Message => ({ seq, from: "provider", timestamp: 1, type: "complete", content: { summary: "Done" } });
 const ended = (seq: number): Message => ({ seq, from: "provider", timestamp: 1, type: "cancel", content: { reason: "Provider failed" } });
 
 const job = (extra: Partial<JobRecord> = {}): JobRecord => ({ id: "job", endpoint: "https://provider.example", status: "cancelled",
@@ -21,6 +23,8 @@ const receipt = (outcome: JobReceipt["outcome"], charged: number, pieces: Return
   outcome, settlement: { held: Math.max(charged, 360_000), charged, released: Math.max(charged, 360_000) - charged, pieces },
 } as unknown as JobReceipt);
 const honest = [piece(0, UPFRONT, "finished"), piece(2, 200_000, "finished")];
+// A third piece "bought" at seq 5, which this CLI never paid.
+const invented = [piece(0, UPFRONT, "finished"), piece(2, 200_000, "finished"), piece(5, 300_000, "finished")];
 
 describe("piece settlement ceiling", () => {
   it.each([
@@ -59,11 +63,26 @@ describe("piece settlement ceiling", () => {
     { name: "this caller's cancel with an empty log", outcome: "cancelled", charged: 360_000,
       pieces: [piece(0, UPFRONT, "finished"), piece(2, 200_000, "stopped")],
       messages: [], record: job({ callerCancelled: true }), ceiling: 360_000, overcharged: false },
+    { name: "a decline with the whole log, charging an invented piece", outcome: "cancelled", charged: 660_000, pieces: invented,
+      messages: [askOne, payOne, askTwo(), declinedAt(4)], record: job({ callerCancelled: true, callerDeclined: true }),
+      ceiling: 360_000, basis: "payments", overcharged: true },
+    { name: "a decline with a gapped log, charging an invented piece", outcome: "cancelled", charged: 660_000, pieces: invented,
+      messages: [askOne, payOne, askTwo()], record: job({ callerCancelled: true, callerDeclined: true }),
+      ceiling: 360_000, basis: "declined_ask", overcharged: true },
+    { name: "a completed job with the whole log, charging an invented piece", outcome: "completed", charged: 660_000, pieces: invented,
+      messages: [askOne, payOne, completedAt(3)], record: job(), ceiling: 360_000, basis: "payments", overcharged: true },
+    { name: "a completed job with a gapped log, listing a piece bought at an unlogged seq", outcome: "completed", charged: 660_000,
+      pieces: invented, messages: [askOne, payOne], record: job(), ceiling: 660_000, basis: "receipt_pieces", overcharged: false },
+    { name: "a decline whose paid ask's echo never reached the log", outcome: "cancelled", charged: 360_000, pieces: honest,
+      messages: [askOne], record: job({ callerCancelled: true, callerDeclined: true, paidPaymentRequestSeqs: [1] }),
+      ceiling: 360_000, overcharged: false },
     { name: "an upfront price not recorded locally", outcome: "completed", charged: 360_000, pieces: honest,
       messages: [askOne, payOne], record: job({ upfrontPayment: undefined }), ceiling: 360_000, overcharged: false },
-  ] as const)("$name", ({ outcome, charged, pieces, messages, record, ceiling, overcharged }) => {
+  ] as const)("$name", (row) => {
+    const { outcome, charged, pieces, messages, record, ceiling, overcharged } = row;
     const result = pieceSettlement(receipt(outcome, charged, [...pieces]), { job: record, messages: [...messages] });
-    expect(result).toMatchObject({ charged_micro: charged, currency: "usd", ceiling_micro: ceiling, overcharged });
+    expect(result).toMatchObject({ charged_micro: charged, currency: "usd", ceiling_micro: ceiling, overcharged,
+      ...("basis" in row ? { ceiling_basis: row.basis } : {}) });
     expect(result?.display.includes("This charge exceeds")).toBe(overcharged);
   });
 

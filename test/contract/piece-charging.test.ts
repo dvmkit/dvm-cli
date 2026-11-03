@@ -133,12 +133,12 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-function seed(status: string, messages: unknown[]) {
+function seed(status: string, messages: unknown[], record: Record<string, unknown> = {}) {
   writeFileSync(join(root, "jobs.json"), JSON.stringify([{ id: "job", endpoint, jobToken: token, status, submittedAt: 1,
     messageCursor: 0, builderAnchor: dvm.anchor, receiptsSupported: true, paymentMethod: "credit", upfrontCreditBooked: true,
     upfrontPayment: { amount_msats: UPFRONT, amount_micro: UPFRONT, currency: "usd", credit_id: "credit", draw_id: "draw" },
     totalPaidMsats: UPFRONT + 200_000, paymentsHonoured: 2,
-    policy: { maxTotalMsats: 10_000_000, maxIncrementMsats: 10_000_000, autoPayBelowMsats: 1000, maxPayments: 10 } }]));
+    policy: { maxTotalMsats: 10_000_000, maxIncrementMsats: 10_000_000, autoPayBelowMsats: 1000, maxPayments: 10 }, ...record }]));
   mkdirSync(join(root, "messages"), { recursive: true });
   writeFileSync(join(root, "messages/job.jsonl"), messages.map((message) => JSON.stringify(message)).join("\n") + "\n");
 }
@@ -295,9 +295,25 @@ it("flags a receipt charging more than the finished pieces this CLI paid for", a
   expect(status.output.spend.display).toContain("This charge exceeds the finished pieces this CLI paid for (at most $0.16 USD).");
 });
 
+it("flags a receipt charging for a piece this CLI never paid for", async () => {
+  history = [askOne, payOne, askTwo(Date.now() + 3_600_000)] as Message[];
+  seed("awaiting-input", history);
+  endingReceipt = () => settled("cancelled", 660_000, [
+    { amount: UPFRONT, charged: UPFRONT, paid_seq: 0, state: "finished" },
+    { amount: 200_000, charged: 200_000, paid_seq: 2, state: "finished" },
+    { amount: 300_000, charged: 300_000, paid_seq: 4, state: "finished" }]);
+  const result = await run("decline", ["--human"]);
+  expect(result.code).toBe(0);
+  expect(result.stderr).toContain("Warning: the signed receipt for job job charges $0.66 USD, more than the $0.36 USD the job's last ask said stopping would cost.");
+  const status = await run("status");
+  expect(status.output.spend.settlement).toMatchObject({ charged_micro: 660_000, ceiling_micro: 360_000, overcharged: true });
+  expect(status.output.spend.display).toContain("This charge exceeds");
+});
+
 it("does not flag an honest receipt whose payment never reached the local log", async () => {
   history = [askOne, payOne, askTwo(Date.now() + 3_600_000)] as Message[];
-  seed("awaiting-input", [askOne]);
+  // The send recorded the paid ask; only its echo in the message log was lost.
+  seed("awaiting-input", [askOne], { paidPaymentRequestSeqs: [1] });
   const result = await run("decline", ["--human"]);
   expect(result.code).toBe(0);
   expect(result.stderr).not.toContain("Warning: the signed receipt");

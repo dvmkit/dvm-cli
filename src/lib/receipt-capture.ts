@@ -129,7 +129,9 @@ function warnPieceOvercharge(jobId: string, receipt: SignedJobReceipt, job: JobR
   const ceiling = formatMicro(pieces.ceiling_micro, pieces.currency);
   const basis = pieces.ceiling_basis === "payments"
     ? `the ${ceiling} of finished pieces this CLI paid for`
-    : `the ${ceiling} its own pieces add up to`;
+    : pieces.ceiling_basis === "declined_ask"
+      ? `the ${ceiling} the job's last ask said stopping would cost`
+      : `the ${ceiling} its own pieces add up to`;
   info(
     `Warning: the signed receipt for job ${jobId} charges ${formatMicro(pieces.charged_micro, pieces.currency)}, ` +
       `more than ${basis}. Keep the receipt as evidence ('dvm receipts show ${jobId}') and raise it with the provider.`
