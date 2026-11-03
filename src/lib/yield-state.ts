@@ -18,6 +18,10 @@ export function answeredYieldSeqs(messages: Message[]): Set<number> {
     } else if (message.type === "response") {
       const seq = prompts.get(message.content.prompt_id);
       if (seq !== undefined) answered.add(seq);
+    } else if (message.type === "decline") {
+      // A decline ends the job at its open ask or prompt: neither may be paid or answered later.
+      if (paymentRequest !== undefined) answered.add(paymentRequest);
+      for (const seq of prompts.values()) answered.add(seq);
     } else if (message.type === "payment") {
       // Balance authorizations identify the ask explicitly. Older rail messages
       // answer the preceding charge; provider payments are refunds, not answers.
@@ -36,8 +40,8 @@ function latestProviderPaymentRequest(messages: Message[]): Message | undefined 
 export function pendingPaymentRequest(messages: Message[], answered = answeredYieldSeqs(messages)): Message | undefined {
   const latest = latestProviderPaymentRequest(messages);
   if (!latest || answered.has(latest.seq)) return undefined;
-  if (messages.some((message) => message.from === "provider" && message.seq > latest.seq &&
-    (message.type === "complete" || message.type === "cancel" || message.type === "working"))) return undefined;
+  if (messages.some((message) => message.seq > latest.seq && (message.type === "decline" ||
+    (message.from === "provider" && (message.type === "complete" || message.type === "cancel" || message.type === "working"))))) return undefined;
   return latest;
 }
 

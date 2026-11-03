@@ -159,8 +159,8 @@ async function statusWithAccess(
   if (reasonUnavailable && (result.status === "failed" || result.status === "cancelled")) {
     const savedReason = !access.endpointOverridden && stored?.status === result.status
       ? stored.completion?.message : undefined;
-    const terminal = msgs.findLast((message) => message.type === "complete" || message.type === "cancel");
-    const reason = savedReason ?? (terminal?.type === "cancel" ? terminal.content.reason : undefined);
+    const terminal = msgs.findLast((message) => message.type === "complete" || message.type === "cancel" || message.type === "decline");
+    const reason = savedReason ?? (terminal?.type === "cancel" || terminal?.type === "decline" ? terminal.content.reason : undefined);
     if (reason !== undefined) completion.message = reason;
   }
   let receipt: ReceiptCapture | undefined;

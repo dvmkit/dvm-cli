@@ -13,6 +13,7 @@ import {
   resolveJobAccess,
   withJobTokenRedaction,
 } from "../lib/job-access";
+import { cancelledDisplay, readEnding, retryWhilePaymentInProgress } from "../lib/job-ending";
 import { progressNotice } from "../lib/progress-notice";
 import { createDvmTransport } from "../lib/transport";
 import { dvmIdentity } from "./dvm-identity";
@@ -39,22 +40,29 @@ async function cancelWithAccess(
   progressNotice("Cancelling job...", opts.human);
   // thread the anonymous-flow per-job token through the cancel POST
   // so anonymous callers' cancels don't 404 at the SDK gate.
-  await transport.cancel(jobId, opts.reason, ref, { jobToken });
-  transport.close();
+  await retryWhilePaymentInProgress(() => transport.cancel(jobId, opts.reason, ref, { jobToken }), { human: opts.human });
 
   if (!access.endpointOverridden) markJobTerminal(jobId, "cancelled",
     opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true });
 
+  // A piece-charging DVM charges the work in progress on a cancel; its receipt says how much.
+  const { settlement } = await readEnding({ jobId, transport, ref, jobToken,
+    persistLocalState: !access.endpointOverridden, human: opts.human });
+  transport.close();
+
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
+  const display = settlement ? cancelledDisplay(settlement) : undefined;
 
   if (opts.human) {
     info(`Job ${jobId}${identifier ? ` [${identifier}]` : ""} cancelled.`);
+    if (display) info(display);
   } else {
     json({
       jobId,
       ...dvmIdentity(stored?.dvmId, stored?.capability),
       status: "cancelled",
       ...(opts.reason ? { reason: opts.reason } : {}),
+      ...(settlement ? { settlement, display } : {}),
       next_action: null,
     });
   }

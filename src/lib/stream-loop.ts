@@ -333,7 +333,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
 
   if (persistLocalState) for (const seq of loadAnsweredYieldSeqs(jobId)) answeredSeqs.add(seq);
   for (const seq of answeredYieldSeqs(allMessages)) answeredSeqs.add(seq);
-  const terminal = allMessages.some((msg) => msg.type === "complete" || msg.type === "cancel");
+  const terminal = allMessages.some((msg) => msg.type === "complete" || msg.type === "cancel" || msg.type === "decline");
   const yieldAction = computeNextAction(jobId, allMessages.filter((message) => !answeredSeqs.has(message.seq)), undefined, policy ? { policy, totalPaidMsats: loadJob(jobId)?.totalPaidMsats } : undefined)
     ?? (terminal ? null : pendingAction);
   let nextAction = withRefundNextAction(jobId, yieldAction ?? (terminal ? null : pollNextAction(jobId)), refunds);
@@ -363,7 +363,7 @@ function isMessagePollTimeout(err: unknown): boolean {
 }
 
 function findLastYield(messages: Message[]): Message | undefined {
-  const yieldTypes = new Set(["prompt", "payment-request", "working", "complete", "cancel"]);
+  const yieldTypes = new Set(["prompt", "payment-request", "working", "complete", "cancel", "decline"]);
   for (let i = messages.length - 1; i >= 0; i--) {
     if (yieldTypes.has(messages[i].type)) return messages[i];
   }
