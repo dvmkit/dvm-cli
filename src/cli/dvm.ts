@@ -10,6 +10,8 @@ import type { BudgetSetOptions, BudgetStatusOptions } from "../commands/budget";
 import { budgetSet, budgetStatus } from "../commands/budget";
 import type { CancelOptions } from "../commands/cancel";
 import { cancel } from "../commands/cancel";
+import type { DeclineOptions } from "../commands/decline";
+import { decline } from "../commands/decline";
 import type { ConfigResetOptions, ConfigRollbackOptions } from "../commands/config";
 import { configReset, configRollback } from "../commands/config";
 import type { ConvertOptions } from "../commands/convert";
@@ -705,8 +707,23 @@ export function buildProgram(): Command {
     });
 
   program
+    .command("decline <job-id>")
+    .description(
+      "Decline a job's open payment request or prompt. The job ends; finished work is charged, and nothing was in progress at the ask. Use this to stop a job and keep the finished pieces' results."
+    )
+    .option("--endpoint <url>", "Provider URL override (env: DVM_JOB_ENDPOINT)")
+    .option("--job-token <hex>", "Job bearer token override (env: DVM_JOB_TOKEN)")
+    .option("--reason <text>", "Reason for declining")
+    .option("--human", "Human-readable output instead of JSON")
+    .action((jobId: string, opts: DeclineOptions) => {
+      return catchErrors(() => decline(jobId, opts), opts.human);
+    });
+
+  program
     .command("cancel <job-id>")
-    .description("Cancel a running job")
+    .description(
+      "Stop a running job now. The work in progress is charged on a DVM that charges by the piece; to stop and keep only finished work, decline at the next ask instead."
+    )
     .option("--endpoint <url>", "Provider URL override (env: DVM_JOB_ENDPOINT)")
     .option("--job-token <hex>", "Job bearer token override (env: DVM_JOB_TOKEN)")
     .option("--reason <text>", "Reason for cancellation")

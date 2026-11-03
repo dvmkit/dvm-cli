@@ -46,7 +46,22 @@ export function loadAnsweredYieldSeqs(jobId: string): Set<number> {
   const job = loadJob(jobId);
   for (const seq of job?.paidPaymentRequestSeqs ?? []) answered.add(seq);
   for (const payment of job?.bookedCreditPayments ?? []) answered.add(payment.authorization.request_seq);
+  if (job?.callerDeclined) for (const seq of declinedYieldSeqs(loadMessages(jobId))) answered.add(seq);
   return answered;
+}
+
+/**
+ * The ask and prompts a caller's decline answered. Only for a decline the
+ * provider confirmed by ending the job: a DVM that predates decline keeps the
+ * job open, and its ask must stay payable.
+ */
+function declinedYieldSeqs(messages: Message[]): number[] {
+  const sorted = [...messages].sort((a, b) => a.seq - b.seq);
+  const decline = sorted.findLast((message) => message.from === "requester" && message.type === "decline");
+  if (!decline) return [];
+  const before = sorted.filter((message) => message.from === "provider" && message.seq < decline.seq);
+  const ask = before.findLast((message) => message.type === "payment-request");
+  return [...(ask ? [ask.seq] : []), ...before.filter((message) => message.type === "prompt").map((message) => message.seq)];
 }
 
 /** Only fresh provider history can resolve a send whose reply was lost. */

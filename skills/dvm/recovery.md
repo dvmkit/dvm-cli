@@ -14,6 +14,9 @@ Cold starts do not justify replaying an arbitrary command. The CLI already retri
 | A request ID exists but the job outcome is unknown | Use `dvm request-result <request-id>` with the original caller state. Follow the returned recovery guidance, including `dvm request-resume <request-id>` when appropriate. Missing state or a not-found response does not authorize a new payment. |
 | The CLI reports committed or uncertain wallet spend, including `spend_committed` or `float_payment_unknown` | Run `dvm wallet show` to reconcile and inspect the result before any retry. |
 | Credit funding or a refund remains pending | Preserve its funding or credit ID and follow the CLI's named reconcile action. Do not create a second funding while the first may settle. |
+| A job is waiting on a charge nobody approved | Relay the `pay` action's `display`, including its deadline and what stopping costs. To stop and keep the finished work, run `dvm decline <job-id>`; run `dvm cancel <job-id>` only to halt the work now, which charges the work in progress. Do not cancel to get money back. |
+| `cancel` or `decline` returned `payment_in_progress` | Nothing changed and a payment is still being verified. Run the same command again in a few seconds; do not pay again. |
+| A receipt `settlement` shows `overcharged: true`, or the CLI warns of a credit balance mismatch | Keep the receipt (`dvm receipts show <job-id>`) and the credit record. Report the charge and the stated ceiling to the human. Do not pay further charges from that provider without new approval. |
 
 Use a structured resubmit action only after its conditions establish that resubmission is appropriate and its spending is authorized. Do not infer that a failed job permits every payment path to be replayed. The [CLI reference](https://dvmkit.com/docs/dvm-cli.md) owns each recovery command's prerequisites.
 

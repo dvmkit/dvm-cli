@@ -1,4 +1,5 @@
 import { observedSettlementFields } from "../lib/receipt-capture";
+import { providerCurrency } from "../lib/provider-currency";
 import { isCallerMessage } from "../lib/message-ownership";
 import { providerFields, providerJobJson } from "../lib/provider-output";
 export { formatMessageHuman } from "../lib/message-human";
@@ -150,7 +151,9 @@ async function messagesWithAccess(
       (streamTerminalStatus(msgs, { providerStatus }) || isTerminal ? null : pollNextAction(jobId)), refunds);
     const content = jobContentFields(jobId, providerStatus, opts.human);
     const resolvedAction = await resolveNextAction(nextAction, msgs, providerStatus?.status);
-    const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden);
+    const currency = access.endpointOverridden
+      ? await providerCurrency({ receipt: providerStatus?.receipt, status: providerStatus, messages: msgs, transport, ref }) : undefined;
+    const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden, currency);
     transport.close();
 
     if (opts.human) {
@@ -227,7 +230,10 @@ async function messagesWithAccess(
   }
   const content = jobContentFields(jobId, providerStatus, opts.human);
   const resolvedAction = await resolveNextAction(result.nextAction, result.messages, providerStatus?.status ?? result.providerStatus?.status);
-  const settlement = observedSettlementFields(jobId, providerStatus ?? result.providerStatus, !access.endpointOverridden);
+  const observed = providerStatus ?? result.providerStatus;
+  const currency = access.endpointOverridden
+    ? await providerCurrency({ receipt: observed?.receipt, status: observed, messages: result.messages, transport, ref }) : undefined;
+  const settlement = observedSettlementFields(jobId, observed, !access.endpointOverridden, currency);
   transport.close();
 
   if (opts.human) {

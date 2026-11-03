@@ -18,6 +18,8 @@ import { completionSnapshot } from "./completion-hints";
 import { parseJobContent, type ContentStatus } from "./job-content";
 import { receiptSettlement, terminalSettlementFields } from "./job-settlement";
 import { isTerminalJobStatus } from "./next-action";
+import { loadMessages } from "./messages";
+import { formatMicro, pieceSettlement } from "./piece-settlement";
 
 /** Verify and persist a funding receipt; callers may anchor state only on a sound verdict. */
 export function captureFundingReceipt(args: {
@@ -110,9 +112,30 @@ export function captureJobReceipt(
     info(
       `Warning: this job's receipt did not verify. ${receiptFailureDetail(result.reason ?? "signature_invalid")}`
     );
+  } else if (result.reason !== "job_id_mismatch") {
+    warnPieceOvercharge(jobId, receipt, job);
   }
 
   return toCapture(receipt, result);
+}
+
+/**
+ * Flag a signed settlement that charges more than the finished pieces this CLI
+ * paid for. The receipt stays stored as evidence; nothing is paid or refused.
+ */
+function warnPieceOvercharge(jobId: string, receipt: SignedJobReceipt, job: JobRecord | null): void {
+  const pieces = pieceSettlement(receipt, { job, messages: loadMessages(jobId) });
+  if (!pieces?.overcharged || pieces.ceiling_micro === undefined) return;
+  const ceiling = formatMicro(pieces.ceiling_micro, pieces.currency);
+  const basis = pieces.ceiling_basis === "payments"
+    ? `the ${ceiling} of finished pieces this CLI paid for`
+    : pieces.ceiling_basis === "declined_ask"
+      ? `the ${ceiling} the job's last ask said stopping would cost`
+      : `the ${ceiling} its own pieces add up to`;
+  info(
+    `Warning: the signed receipt for job ${jobId} charges ${formatMicro(pieces.charged_micro, pieces.currency)}, ` +
+      `more than ${basis}. Keep the receipt as evidence ('dvm receipts show ${jobId}') and raise it with the provider.`
+  );
 }
 
 export function captureTransportReceipt(
@@ -152,10 +175,10 @@ export function renderReceiptHuman(capture: ReceiptCapture, jobId?: string): voi
   info(`🧾 ${capture.display}`);
 }
 
-export function observedSettlementFields(jobId: string, response?: Partial<ContentStatus>, persistLocalState = true) {
+export function observedSettlementFields(jobId: string, response?: Partial<ContentStatus>, persistLocalState = true, currency?: string) {
   if (persistLocalState && response?.status && isTerminalJobStatus(response.status)
     && (response.receipt || response.receiptParseError)) captureTransportReceipt(jobId, response);
-  return terminalSettlementFields(jobId, { status: response?.status, receipt: response?.receipt, persistLocalState });
+  return terminalSettlementFields(jobId, { status: response?.status, receipt: response?.receipt, persistLocalState, currency });
 }
 
 /**

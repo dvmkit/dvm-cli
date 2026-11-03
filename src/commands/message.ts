@@ -1,4 +1,5 @@
 import { observedSettlementFields } from "../lib/receipt-capture";
+import { providerCurrency } from "../lib/provider-currency";
 import { providerJobJson } from "../lib/provider-output";
 import {
   DvmError,
@@ -108,7 +109,9 @@ async function messageWithAccess(
     });
   }
   const content = jobContentFields(jobId, providerStatus, opts.human);
-  const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden);
+  const currency = access.endpointOverridden
+    ? await providerCurrency({ receipt: providerStatus?.receipt, status: providerStatus, messages: result.messages, transport, ref }) : undefined;
+  const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden, currency);
   transport.close();
 
   if (opts.human) {

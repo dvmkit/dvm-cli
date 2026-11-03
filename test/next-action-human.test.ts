@@ -69,3 +69,20 @@ describe("human next actions", () => {
     expect(output).not.toContain("Next:");
   });
 });
+
+describe("human pay line for a piece-charging ask", () => {
+  it("offers the decline command beside the pay command", () => {
+    const action = computeNextAction("job; two", [{ seq: 1, from: "provider", timestamp: 1, type: "payment-request",
+      content: { amount_msats: 5000, reason: "Work", charged_if_declined_micro: 360_000,
+        credit: { amount_micro: 5000, currency: "usd" } } } as Message]);
+    const line = nextActionHuman(action)!;
+    expect(line).toContain("Declining ends the job and charges $0.36 USD for the work already finished.");
+    expect(line).toContain("Run `dvm pay 'job; two'`. To stop instead, run `dvm decline 'job; two'`.");
+  });
+
+  it("names no decline for an older DVM's ask", () => {
+    const action = computeNextAction("job", [{ seq: 1, from: "provider", timestamp: 1, type: "payment-request",
+      content: { amount_msats: 5000, reason: "Work", credit: { amount_micro: 5000, currency: "usd" } } } as Message]);
+    expect(nextActionHuman(action)).not.toContain("decline");
+  });
+});

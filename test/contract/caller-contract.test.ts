@@ -570,6 +570,8 @@ describe("standalone caller contract", () => {
       },
       { method: "GET", path: "/v1/job/portable-message", jobToken: portableToken },
       { method: "DELETE", path: "/v1/job/portable-cancel", jobToken: portableToken },
+      // The cancel reads the job once more for the receipt that says what it charged.
+      { method: "GET", path: "/v1/job/portable-cancel", jobToken: portableToken },
     ]);
     expect(existsSync(join(configRoot, "jobs.json"))).toBe(false);
   });

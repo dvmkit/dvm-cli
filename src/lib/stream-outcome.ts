@@ -20,6 +20,8 @@ export type TerminalExtra = Partial<
 export interface StreamStatusContext {
   providerStatus?: Partial<ContentStatus>;
   callerCancelled?: boolean;
+  /** Set only after the provider's status confirmed the decline ended the job. */
+  callerDeclined?: boolean;
 }
 
 export interface StreamOutcome extends StreamStatusContext {
@@ -49,12 +51,13 @@ export function persistStreamOutcome(outcome: StreamOutcome): JobCompletion | un
   const { jobId, messages, cursor, afterSeq, extra, providerStatus } = outcome;
   const stored = loadJob(jobId);
   const callerCancelled = outcome.callerCancelled ?? stored?.callerCancelled;
-  const terminal = streamTerminalStatus(messages, { providerStatus, callerCancelled });
+  const terminal = streamTerminalStatus(messages, { providerStatus, callerCancelled,
+    callerDeclined: outcome.callerDeclined ?? stored?.callerDeclined });
   const log = terminal ? fullMessageLog(jobId, messages, afterSeq) : undefined;
   const providerTerminal = providerStatus?.status && isTerminalJobStatus(providerStatus.status);
   if (terminal && (log || providerTerminal)) {
     const saved = stored?.status === terminal ? stored.completion : undefined;
-    const fromLog = log?.some((m) => m.type === "complete" || m.type === "cancel") ? completionFromMessages(log) : undefined;
+    const fromLog = log?.some((m) => m.type === "complete" || m.type === "cancel" || m.type === "decline") ? completionFromMessages(log) : undefined;
     const retained = saved ?? fromLog;
     // Unavailable provider content cannot disprove retained artifact evidence.
     const completion = providerStatus?.content_available === false && retained ? retained : {
@@ -77,9 +80,13 @@ export function persistStreamOutcome(outcome: StreamOutcome): JobCompletion | un
 export function streamTerminalStatus(messages: Message[], context: StreamStatusContext = {}): TerminalJobStatus | undefined {
   const providerStatus = context.providerStatus?.status;
   if (providerStatus && isTerminalJobStatus(providerStatus)) return providerStatus;
-  const last = messages.findLast((m) => m.type === "complete" || m.type === "cancel");
+  // A decline in the log ends the job only once the provider confirmed it; an
+  // older DVM accepts the message and keeps the job open.
+  const last = messages.findLast((m) => m.type === "complete" || m.type === "cancel" ||
+    (m.type === "decline" && context.callerDeclined === true));
   if (!last) return undefined;
   if (last.type === "complete") return "completed";
+  if (last.type === "decline") return "cancelled";
   // Older SDKs use the same wire event for ctx.fail and caller cancellation.
   // A sender label alone is not evidence that this caller requested a cancel.
   return context.callerCancelled ? "cancelled" : "failed";

@@ -115,6 +115,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   // and the payment-rail helpers (payWithLightning / payWithCashu) reach the
   // token without manually threading it down four call levels.
   const jobToken = opts.jobToken ?? loadJob(jobId)?.jobToken;
+  // A decline the provider confirmed ended the job, even when its message is not in this batch.
+  const declined = () => persistLocalState && loadJob(jobId)?.callerDeclined === true;
   function recordAutoPayment(result: PaidPaymentResult, request: PaymentRequestContent, seq: number): void {
     autoPayments.push({
       amount_msats: result.amountMsats,
@@ -251,7 +253,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           break;
         }
       }
-      if (lastYield?.type === "payment-request" && lastYield.seq === pendingPayment?.seq && policy) {
+      if (lastYield?.type === "payment-request" && lastYield.seq === pendingPayment?.seq && policy && !declined()) {
         const req = lastYield.content;
         if (
           req.amount_msats <= policy.autoPayBelowMsats &&
@@ -333,7 +335,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
 
   if (persistLocalState) for (const seq of loadAnsweredYieldSeqs(jobId)) answeredSeqs.add(seq);
   for (const seq of answeredYieldSeqs(allMessages)) answeredSeqs.add(seq);
-  const terminal = allMessages.some((msg) => msg.type === "complete" || msg.type === "cancel");
+  const terminal = allMessages.some((msg) => msg.type === "complete" || msg.type === "cancel") || declined();
   const yieldAction = computeNextAction(jobId, allMessages.filter((message) => !answeredSeqs.has(message.seq)), undefined, policy ? { policy, totalPaidMsats: loadJob(jobId)?.totalPaidMsats } : undefined)
     ?? (terminal ? null : pendingAction);
   let nextAction = withRefundNextAction(jobId, yieldAction ?? (terminal ? null : pollNextAction(jobId)), refunds);

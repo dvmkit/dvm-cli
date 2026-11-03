@@ -39,6 +39,7 @@ import {
   ROUTER_FEEDBACK_CLAIM_HEADER,
   type SendMessageOptions,
   type SendMessageResult,
+  shellQuoteArg,
   type JobReceipt as SignedJobReceipt,
   type StatusOptions,
   type StreamOptions,
@@ -816,6 +817,8 @@ export class HttpsTransport implements Transport {
         error.data = { ...error.data, http_status: res.status };
         throw error;
       }
+      const conflict = jobEndingConflict(jobId, body, res.headers.get("retry-after"));
+      if (conflict) throw conflict;
       // the job went terminal (completed/cancelled) before this POST
       // landed — the mid-job-payment race. Map it to a structured error with a
       // hint so an agent following a stale next_action self-recovers in one
@@ -911,6 +914,10 @@ export class HttpsTransport implements Transport {
 
     if (!res.ok) {
       const text = await res.text();
+      if (res.status === 409) {
+        const conflict = jobEndingConflict(jobId, parseJsonObject(text), res.headers.get("retry-after"));
+        if (conflict) throw conflict;
+      }
       const credentialErr = jobCredentialError(res.status, text);
       if (credentialErr) throw credentialErr;
       throw providerResponseError("provider_error", `Cancel failed (${res.status}): ${text}`);
@@ -1353,6 +1360,40 @@ function routerProse(structured: DvmError): {
 } {
   const display = typeof structured.data?.display === "string" ? structured.data.display : undefined;
   return display !== undefined ? { display, proseSources: { display: "provider" } } : {};
+}
+
+/**
+ * A 409 from a job-ending write (cancel, decline) that names why it did not
+ * land. These codes are SDK contract, so the copy is the CLI's own.
+ */
+function jobEndingConflict(jobId: string, body: Record<string, unknown> | null, retryAfter: string | null): DvmError | undefined {
+  const job = shellQuoteArg(jobId);
+  if (body?.error === "payment_in_progress") {
+    return new DvmError("payment_in_progress",
+      "A payment for this job is still being verified, so the job cannot end yet.",
+      `Nothing changed. Retry the same command in a few seconds; the payment will either pay the job's request or be held as balance on your credit. Check the job with \`dvm status ${job}\`.`,
+      { retryable: true, retry_after_ms: retryAfterMs(retryAfter) });
+  }
+  if (body?.error === "no_open_ask") {
+    return new DvmError("no_open_ask",
+      "The job has no open payment request or prompt to decline.",
+      `Decline answers an open ask. To stop at the next one, wait for it with \`dvm messages ${job} --wait\` and decline then. To halt the work now, run \`dvm cancel ${job}\`; the work in progress is charged.`);
+  }
+  if (body?.error === "decline_unavailable") {
+    // The job is still live: this DVM's job store cannot end a job at a decline.
+    return new DvmError("decline_unavailable",
+      "This DVM cannot end this job at a decline; the job is still running.",
+      `Pay the open ask with \`dvm pay ${job}\`, let it expire, or stop the work now with \`dvm cancel ${job}\`; the work in progress is charged.`);
+  }
+  return undefined;
+}
+
+/** `Retry-After` as delta-seconds or an HTTP date, in milliseconds; 2 s when absent or unreadable. */
+function retryAfterMs(header: string | null, nowMs = Date.now()): number {
+  const value = header?.trim();
+  if (value && /^\d+$/.test(value)) return Number(value) * 1000;
+  const date = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(date) ? Math.max(0, date - nowMs) : 2000;
 }
 
 function parseJsonObject(body: string): Record<string, unknown> | null {

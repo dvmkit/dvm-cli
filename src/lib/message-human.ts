@@ -90,6 +90,9 @@ export function formatMessageHuman(
     case "cancel":
       info(`[${msg.seq}] Job ended${msg.content.reason ? `: ${msg.content.reason}` : ""}`);
       break;
+    case "decline":
+      info(`[${msg.seq}] ${prefix} declined; the job ended${msg.content.reason ? `: ${msg.content.reason}` : ""}`);
+      break;
     default:
       info(`[${seq}] ${prefix} sent a message of type "${type}".`);
   }
