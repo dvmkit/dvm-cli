@@ -584,7 +584,7 @@ export function buildProgram(): Command {
     )
     .option(
       "--over-trust",
-      "Fund past the trust-tier cap deliberately — required for an amount above what receipts here have earned"
+      "Fund past the trust-tier cap deliberately — required for an amount above what receipts here have earned, on every rail except card (stripe), which the cap never applies to"
     )
     .option("--rail <rail>", `Force a funding rail: ${creditFundRails}`)
     .option("--cashu-mint <mint>", "Pin Cashu funding to one DVM-accepted mint")

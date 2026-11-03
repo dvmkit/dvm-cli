@@ -276,7 +276,12 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
     // more on deposit here than earned trust warrants has to name itself, so a
     // confused agent following an injected "fund $200 at this machine" leaves a
     // greppable trace rather than a silent transfer.
-    if (!pending && !signedPending && (explicitMicro !== undefined || targetJobs !== undefined)) {
+    //
+    // A card top-up is exempt: the human approves the exact amount in Stripe
+    // Link before anything is charged, which is a stronger check than the cap.
+    // The exemption keys on the resolved rail, so every other rail is still
+    // held to it.
+    if (rail !== "stripe" && !pending && !signedPending && (explicitMicro !== undefined || targetJobs !== undefined)) {
       await enforceTrustTier({
         endpoint,
         amountMicro: fundMicro,

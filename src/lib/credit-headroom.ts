@@ -439,7 +439,11 @@ function compatibilityFor(args: {
         : menu.min_micro;
     const local = availability.get(rail);
     let status: CreditRouteCompatibilityStatus;
+    // Card is never trust-capped: the human approves the exact amount in Stripe
+    // Link first, so reporting a cap here would send an agent after
+    // `--over-trust` it does not need.
     if (
+      rail !== "stripe" &&
       args.fundableNowMicro !== undefined &&
       (routeAmountMicro > args.fundableNowMicro || minimum > args.fundableNowMicro)
     ) {
