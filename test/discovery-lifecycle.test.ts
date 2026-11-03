@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { rmSync } from "node:fs";
+import { DvmError, JOBS_FILE } from "@dvmkit/sdk/internal";
 
 const seams = vi.hoisted(() => ({
   close: vi.fn(),
@@ -32,10 +34,12 @@ import * as favorites from "../src/lib/favorites";
 import type { DiscoveryOwner } from "../src/lib/discovery-rows";
 import { browse } from "../src/commands/browse";
 import { search } from "../src/commands/search";
+import { loadJob } from "../src/lib/job-store";
+import { resolveJobAccess } from "../src/lib/job-access";
 
 interface CommandFixture {
   name: "search" | "browse";
-  invoke: (opts?: { human?: boolean; timeout?: string }) => Promise<void>;
+  invoke: (opts?: { human?: boolean; timeout?: string; endpoint?: string }) => Promise<void>;
   summary: string;
   emptyJson: Record<string, unknown>;
   emptyHuman: string;
@@ -100,11 +104,68 @@ function complete(seq: number, summary: string) {
 }
 
 beforeEach(() => {
+  rmSync(JOBS_FILE, { force: true });
   vi.clearAllMocks();
   seams.describe.mockResolvedValue({});
 });
 
 describe.each(commands)("$name discovery lifecycle", (fixture) => {
+  it.each([undefined, "ab".repeat(32)])("persists accepted access before polling and retains it after timeout (%s)", async (jobToken) => {
+    const jobId = `${fixture.name}-resumable`;
+    const endpoint = "https://discovery.example/custom";
+    seams.submit.mockResolvedValue({ status: "processing", jobId, jobToken });
+    seams.getMessages.mockImplementation(async () => {
+      expect(resolveJobAccess(jobId, {}).ref).toEqual({ endpoint });
+      expect(resolveJobAccess(jobId, {}).jobToken).toBe(jobToken);
+      expect(loadJob(jobId)).toMatchObject({ capability: fixture.name, status: "submitted", submittedAt: 10_000 });
+      return [working(3)];
+    });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    try {
+      const invocation = fixture.invoke({ endpoint, timeout: "0.1" });
+      const rejection = expect(invocation).rejects.toMatchObject({
+        code: "timeout", message: fixture.timeoutMessage,
+        hint: expect.stringContaining(`dvm messages ${jobId} --wait`),
+      });
+      await vi.runAllTimersAsync();
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(loadJob(jobId)).toMatchObject({ endpoint, capability: fixture.name, messageCursor: 3, status: "submitted" });
+    expect(resolveJobAccess(jobId, {}).ref).toEqual({ endpoint });
+    expect(resolveJobAccess(jobId, {}).jobToken).toBe(jobToken);
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["read", "cancel", "hint"])("redacts the accepted token from %s errors", async (source) => {
+    const jobToken = "cd".repeat(32);
+    seams.submit.mockResolvedValue({ status: "processing", jobId: "redacted-job", jobToken });
+    if (source === "read") {
+      seams.getMessages.mockRejectedValue(new DvmError("provider_error", `Failed ${jobToken}`, `Retry ${jobToken}`, { token: jobToken }));
+    } else if (source === "cancel") {
+      seams.getMessages.mockResolvedValue([{ seq: 1, type: "cancel", from: "provider", timestamp: 1, content: { reason: `upstream_failed: Failed ${jobToken}` } }]);
+    } else {
+      seams.getMessages.mockResolvedValue([{ ...working(1), content: { hint: `Wait ${jobToken}` } }]);
+    }
+    vi.useFakeTimers();
+    try {
+      const invocation = fixture.invoke({ timeout: "0.1" });
+      const rejection = invocation.catch((error: DvmError) => error);
+      await vi.runAllTimersAsync();
+      const error = await rejection;
+      expect(error).toBeInstanceOf(DvmError);
+      if (!(error instanceof DvmError)) throw new Error("Expected a discovery error");
+      const serialized = JSON.stringify({ message: error.message, hint: error.hint, data: error.data });
+      expect(serialized).not.toContain(jobToken);
+      expect(serialized).toContain("[REDACTED]");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("renders an immediately completed receipt as command-specific JSON", async () => {
     seams.submit.mockResolvedValue({ status: "completed", summary: fixture.summary });
 
@@ -171,6 +232,7 @@ describe.each(commands)("$name discovery lifecycle", (fixture) => {
     );
     expect(seams.json).toHaveBeenCalledExactlyOnceWith(fixture.emptyJson);
     expect(seams.close).toHaveBeenCalledExactlyOnceWith();
+    expect(loadJob(`${fixture.name}-job`)).toMatchObject({ status: "completed", messageCursor: 7, completion: { summary: fixture.summary } });
   });
 
   it("stops after an empty follow-up poll and preserves the command timeout", async () => {
@@ -243,6 +305,7 @@ describe.each(commands)("$name discovery lifecycle", (fixture) => {
       code: "upstream_failed",
       message: "Provider failed",
     });
+    expect(loadJob("cancel-job")).toMatchObject({ status: "failed", messageCursor: 1 });
     expect(seams.close).toHaveBeenCalledExactlyOnceWith();
   });
 

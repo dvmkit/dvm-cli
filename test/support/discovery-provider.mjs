@@ -1,13 +1,30 @@
 import { createServer } from "node:http";
 
-import { configureDVM } from "@dvmkit/sdk";
-import { createDVMServer, MemoryKVStore } from "@dvmkit/sdk/internal";
-import { secp256k1Auth } from "@dvmkit/sdk/server";
-import { z } from "zod";
+import { createRequire } from "node:module";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+// Package smoke resolves the provider from the installed dependency tree.
+const require = createRequire(process.argv[2] ? join(process.argv[2], "package.json") : import.meta.url);
+const { configureDVM } = await import(pathToFileURL(require.resolve("@dvmkit/sdk")).href);
+const { createDVMServer, MemoryKVStore } = await import(pathToFileURL(require.resolve("@dvmkit/sdk/internal")).href);
+const { secp256k1Auth } = await import(pathToFileURL(require.resolve("@dvmkit/sdk/server")).href);
+const { z } = await import(pathToFileURL(require.resolve("zod")).href);
 
 const jobs = [];
 const submissions = [];
 const providers = [];
+const requests = [];
+const pending = [];
+let deferred = false;
+
+async function finish(ctx, summary) {
+  if (deferred) {
+    ctx.working(0);
+    await new Promise((resolve) => pending.push(resolve));
+  }
+  ctx.complete(summary);
+}
 
 async function provider(auth) {
   const envelope = auth ? {
@@ -22,18 +39,18 @@ async function provider(auth) {
     capabilities: {
       search: {
         input: searchSchema,
-        onJob(ctx) {
+        async onJob(ctx) {
           const input = searchSchema.parse(ctx.input);
           jobs.push({ capability: "search", input: ctx.input, pubkey: ctx.auth?.pubkey });
-          ctx.complete(JSON.stringify({ results: [], query: input.query, mode: input.mode, total: 0 }));
+          await finish(ctx, JSON.stringify({ results: [], query: input.query, mode: input.mode, total: 0 }));
         },
       },
       browse: {
         input: browseSchema,
-        onJob(ctx) {
+        async onJob(ctx) {
           const input = browseSchema.parse(ctx.input);
           jobs.push({ capability: "browse", input: ctx.input, pubkey: ctx.auth?.pubkey });
-          ctx.complete(JSON.stringify({ entries: [], total: 0, offset: input.offset, limit: input.limit }));
+          await finish(ctx, JSON.stringify({ entries: [], total: 0, offset: input.offset, limit: input.limit }));
         },
       },
     },
@@ -42,6 +59,7 @@ async function provider(auth) {
   const server = createServer(async (incoming, outgoing) => {
     const chunks = [];
     for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
+    requests.push({ method: incoming.method, path: incoming.url, authenticated: auth });
     if (incoming.method === "POST" && incoming.url === "/v1/job") {
       submissions.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
     }
@@ -65,8 +83,16 @@ const authenticated = await provider(true);
 const anonymous = await provider(false);
 process.on("message", async (message) => {
   if (message === "snapshot") {
-    process.send({ type: "snapshot", jobs, submissions });
+    process.send({ type: "snapshot", jobs, submissions, requests });
+  } else if (message === "defer") {
+    deferred = true;
+    process.send({ type: "deferred" });
+  } else if (message === "release") {
+    deferred = false;
+    for (const release of pending.splice(0)) release();
+    process.send({ type: "released" });
   } else if (message === "shutdown") {
+    for (const release of pending.splice(0)) release();
     for (const { server, shutdown } of providers) {
       server.closeAllConnections();
       await new Promise((done, reject) => server.close((err) => err ? reject(err) : done()));
