@@ -141,6 +141,7 @@ describe("portable job access", () => {
 
     const redacted = redactJobTokenFromError(providerError, FLAG_TOKEN) as DvmError;
 
+    expect(redacted.code).toBe("credential_rejected");
     expect(JSON.stringify(redacted)).not.toContain(FLAG_TOKEN);
     expect(redacted.message).toContain("[REDACTED]");
     expect(redacted.data).toEqual({ nested: { display: "Leaked [REDACTED]" } });

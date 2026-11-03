@@ -140,13 +140,15 @@ describe.each(commands)("$name discovery lifecycle", (fixture) => {
     expect(seams.submit).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["read", "cancel", "hint"])("redacts the accepted token from %s errors", async (source) => {
+  it.each(["read", "cancel", "cancel-code", "hint"])("redacts the accepted token from %s errors", async (source) => {
     const jobToken = "cd".repeat(32);
     seams.submit.mockResolvedValue({ status: "processing", jobId: "redacted-job", jobToken });
     if (source === "read") {
       seams.getMessages.mockRejectedValue(new DvmError("provider_error", `Failed ${jobToken}`, `Retry ${jobToken}`, { token: jobToken }));
     } else if (source === "cancel") {
       seams.getMessages.mockResolvedValue([{ seq: 1, type: "cancel", from: "provider", timestamp: 1, content: { reason: `upstream_failed: Failed ${jobToken}` } }]);
+    } else if (source === "cancel-code") {
+      seams.getMessages.mockResolvedValue([{ seq: 1, type: "cancel", from: "provider", timestamp: 1, content: { reason: `upstream_${jobToken}: failed` } }]);
     } else {
       seams.getMessages.mockResolvedValue([{ ...working(1), content: { hint: `Wait ${jobToken}` } }]);
     }
@@ -158,9 +160,10 @@ describe.each(commands)("$name discovery lifecycle", (fixture) => {
       const error = await rejection;
       expect(error).toBeInstanceOf(DvmError);
       if (!(error instanceof DvmError)) throw new Error("Expected a discovery error");
-      const serialized = JSON.stringify({ message: error.message, hint: error.hint, data: error.data });
+      const serialized = JSON.stringify({ code: error.code, message: error.message, hint: error.hint, data: error.data, display: error.display });
       expect(serialized).not.toContain(jobToken);
       expect(serialized).toContain("[REDACTED]");
+      if (source === "cancel-code") expect(error.code).toBe("upstream_[REDACTED]");
     } finally {
       vi.useRealTimers();
     }
