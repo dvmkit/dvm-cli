@@ -5,6 +5,8 @@ import { formatUsd, msatsToUsd } from "@dvmkit/sdk/internal";
 
 import { type JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
 import { receiptSettlement } from "./job-settlement";
+import { loadJob } from "./job-store";
+import { formatMicro } from "./piece-settlement";
 
 /**
  * Pre-rendered line an intermediary agent can relay verbatim about a set of
@@ -67,8 +69,11 @@ export function receiptDisplay(
 ): string {
   const what = `${receipt.dvm}/${receipt.capability} (DVM ID ${receipt.dvm_id})`;
   const when = receiptIssuedAtIso(receipt)?.slice(0, 10);
-  const settlement = receiptSettlement(receipt, status, rate);
-  const payment = settlement.status === "settled" ? `Settled ${formatPaid(receipt.paid.msats, rate)}`
+  // The local record names the currency a piece settlement is denominated in.
+  const settlement = receiptSettlement(receipt, status, rate, { job: loadJob(receipt.job_id) });
+  const payment = settlement.charged_micro !== undefined
+    ? `Charged ${formatMicro(settlement.charged_micro, settlement.currency ?? null)}`
+    : settlement.status === "settled" ? `Settled ${formatPaid(receipt.paid.msats, rate)}`
     : settlement.status === "free" ? "free job"
     : settlement.display.replace(/\.$/, "");
   return `${VERDICT_PREFIX[status]}: ${payment} for ${what}, ${receipt.outcome}${when ? ` ${when}` : ""}.`;

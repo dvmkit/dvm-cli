@@ -30,6 +30,11 @@ export interface CreditPaymentIntent {
 export interface JobRecord {
   /** A successful local cancel send; legacy terminal statuses do not establish caller intent. */
   callerCancelled?: true;
+  /**
+   * The caller's end was a decline at an open ask, which releases the piece in
+   * progress; a cancel charges it. Set beside {@link callerCancelled}.
+   */
+  callerDeclined?: true;
   /** Hashes of locally sent message payloads; remote sender labels are not ownership evidence. */
   callerMessageHashes?: string[];
   /** Booked upfront rail price, a free start, or unresolved accounting. */

@@ -13,6 +13,7 @@ import { settleCreditAfterJob } from "../src/lib/credit-topup";
 import { requestResult } from "../src/commands/request-result";
 import { saveRequestIntent } from "../src/lib/request-intent-store";
 import { planProbeDraw } from "../src/lib/credit-policy";
+import { info } from "../src/lib/output";
 
 const wire = vi.hoisted(() => ({
   status: vi.fn(), describe: vi.fn(), getMessages: vi.fn(), credit: vi.fn(),
@@ -79,6 +80,27 @@ describe("credit settlement on receipt reads", () => {
     expect(loadJob(jobId)).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 1 });
     expect(wire.credit).not.toHaveBeenCalled();
     expect(wire.status).toHaveBeenCalledTimes(path === "stored" ? 0 : 1);
+  });
+
+  // A piece-charging DVM charges finished pieces on a decline or failure too, so
+  // the balance check runs on every ending whose settlement charged something.
+  it.each([
+    { balanceAfter: 350_000, mismatch: false },
+    { balanceAfter: 400_000, mismatch: true },
+  ])("checks a cancelled job's partial charge against the projection (balance_after $balanceAfter)", async ({ balanceAfter, mismatch }) => {
+    seed({ status: "processing", completion: undefined });
+    const signed = receipt({ outcome: "cancelled", reason: "Job declined", ended_by: "caller",
+      credit: { credit_id: bound.creditId, draw_id: bound.drawId, amount: 150_000, balance_after: balanceAfter, ledger_seq: 2 },
+      settlement: { held: 250_000, charged: 150_000, released: 100_000, pieces: [
+        { amount: 150_000, charged: 150_000, paid_seq: 0, state: "finished" },
+        { amount: 100_000, charged: 0, paid_seq: 2, state: "released" },
+      ] } });
+    wire.status.mockResolvedValue({ jobId, status: "cancelled", receipt: signed });
+    await status(jobId, {});
+    expect(loadCredit(endpoint, CALLER_A)).toMatchObject({ remainingMicro: balanceAfter, ledgerSeq: 2 });
+    expect(loadCredit(endpoint, CALLER_A)?.discrepancy).toEqual(mismatch
+      ? expect.objectContaining({ expectedMicro: 350_000, reportedMicro: 400_000, jobId }) : undefined);
+    expect(vi.mocked(info).mock.calls.some(([line]) => String(line).includes("credit balance mismatch"))).toBe(mismatch);
   });
 
   it("leaves an absent receipt and projection intact until the provider has proof", async () => {

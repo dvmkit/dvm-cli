@@ -265,6 +265,9 @@ async function settle(args: SettleCreditArgs): Promise<void> {
     jobId: receipt.job_id,
     outcome: receipt.outcome,
     credit,
+    // A piece-settled draw can charge on a failed or cancelled job too; the
+    // SDK checks every ending whose settlement charged anything.
+    ...(receipt.settlement ? { settlement: { charged: receipt.settlement.charged } } : {}),
     drawFundings: jobDrawFundings(receipt.job_id, args.ref.endpoint, callerPubkey, credit),
   });
   if (!applied.credit) return;

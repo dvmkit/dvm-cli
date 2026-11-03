@@ -18,6 +18,8 @@ import { completionSnapshot } from "./completion-hints";
 import { parseJobContent, type ContentStatus } from "./job-content";
 import { receiptSettlement, terminalSettlementFields } from "./job-settlement";
 import { isTerminalJobStatus } from "./next-action";
+import { loadMessages } from "./messages";
+import { formatMicro, pieceSettlement } from "./piece-settlement";
 
 /** Verify and persist a funding receipt; callers may anchor state only on a sound verdict. */
 export function captureFundingReceipt(args: {
@@ -110,9 +112,25 @@ export function captureJobReceipt(
     info(
       `Warning: this job's receipt did not verify. ${receiptFailureDetail(result.reason ?? "signature_invalid")}`
     );
+  } else if (result.reason !== "job_id_mismatch") {
+    warnPieceOvercharge(jobId, receipt, job);
   }
 
   return toCapture(receipt, result);
+}
+
+/**
+ * Flag a signed settlement that charges more than the finished pieces this CLI
+ * paid for. The receipt stays stored as evidence; nothing is paid or refused.
+ */
+function warnPieceOvercharge(jobId: string, receipt: SignedJobReceipt, job: JobRecord | null): void {
+  const pieces = pieceSettlement(receipt, { job, messages: loadMessages(jobId) });
+  if (!pieces?.overcharged || pieces.ceiling_micro === undefined) return;
+  info(
+    `Warning: the signed receipt for job ${jobId} charges ${formatMicro(pieces.charged_micro, pieces.currency)}, ` +
+      `more than the ${formatMicro(pieces.ceiling_micro, pieces.currency)} of finished pieces this CLI paid for. ` +
+      `Keep the receipt as evidence ('dvm receipts show ${jobId}') and raise it with the provider.`
+  );
 }
 
 export function captureTransportReceipt(

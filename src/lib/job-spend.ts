@@ -76,7 +76,11 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   const settled = settlement.status === "settled" || settlement.status === "free";
   const receiptHeadline = settled && settlement.evidence === "receipt"
     && (settlement.settled_msats !== total || (job.paymentMethod === "credit" && !knownCredit));
-  let display = receiptHeadline
+  // A piece settlement is its own sentence after the bill; see below.
+  const pieces = settlement.charged_micro !== undefined ? settlement.display : undefined;
+  let display = pieces !== undefined
+    ? `Recorded payments: ${totalDisplay} over ${payments} charge${payments === 1 ? "" : "s"}`
+    : receiptHeadline
     ? `${settlement.display.replace(/\.$/, "")}; recorded payments: ${totalDisplay} over ${payments} charge${payments === 1 ? "" : "s"}`
     : !settled && isTerminalJobStatus(job.status) ? settlement.display.replace(/\.$/, "")
     : job.paymentMethod === "credit" && !knownCredit
@@ -92,6 +96,7 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   if (budgetDisplay) display += `, budget ${budgetDisplay}`;
   if (refunds.length > 0) display += `, ${refunds.length} refund${refunds.length === 1 ? "" : "s"}`;
   display += ".";
+  if (pieces !== undefined) display += ` ${pieces}`;
   if (logMismatch) display += " Local payment log disagrees with the job record.";
   if (receipt && job.paymentMethod === "credit" && !knownCredit) display += " The receipt total includes the unrecorded credit draw.";
   if (receipt && converted) display += " Receipt comparison is unknown: local records lack comparable native settlement amounts for Tempo/x402 payments. Converted BTC totals can differ with exchange rates and do not establish a difference in token principal or fees.";
