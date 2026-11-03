@@ -66,8 +66,10 @@ export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {})
   const stopped = settlement.pieces
     .filter((piece) => piece.state === "stopped")
     .reduce((sum, piece) => sum + piece.charged, 0);
-  const ending = receipt.outcome === "completed" ? "finish"
-    : receipt.outcome === "cancelled" && job?.callerCancelled && !job.callerDeclined ? "stop" : "release";
+  // A cancel sent with an endpoint override leaves no local mark; the signed receipt still names the caller.
+  const callerStop = receipt.outcome === "cancelled" && !job?.callerDeclined &&
+    (job?.callerCancelled === true || receipt.ended_by === "caller");
+  const ending = receipt.outcome === "completed" ? "finish" : callerStop ? "stop" : "release";
   // Without the message log there are no seen payments or asks to check against.
   const paid = currency && job && context.messages !== undefined && settlement.pieces.length > 0
     ? paidCeiling(job, messages, settlement, currency, ending) : undefined;
@@ -173,10 +175,11 @@ function declineCap(job: JobRecord, messages: Message[]): number | undefined {
   const ask = messages.findLast((message): message is Extract<Message, { type: "payment-request" }> =>
     message.from === "provider" && message.type === "payment-request");
   if (!ask || !validMicro(ask.content.charged_if_declined_micro)) return undefined;
-  const paidAsk = answeredYieldSeqs(messages).has(ask.seq) ||
-    job.paidPaymentRequestSeqs?.includes(ask.seq) ||
-    job.inFlightPaymentRequestSeqs?.includes(ask.seq) ||
-    job.bookedCreditPayments?.some((payment) => payment.authorization.request_seq === ask.seq);
+  const recorded = [...(job.paidPaymentRequestSeqs ?? []), ...(job.inFlightPaymentRequestSeqs ?? []),
+    ...(job.bookedCreditPayments ?? []).map((payment) => payment.authorization.request_seq)];
+  // The record knows of a later ask than the log holds, so this ask is not the last one.
+  if (recorded.some((seq) => seq > ask.seq)) return undefined;
+  const paidAsk = answeredYieldSeqs(messages).has(ask.seq) || recorded.includes(ask.seq);
   if (!paidAsk) return ask.content.charged_if_declined_micro;
   const price = ask.content.credit?.amount_micro;
   return validMicro(price) ? ask.content.charged_if_declined_micro + price : undefined;

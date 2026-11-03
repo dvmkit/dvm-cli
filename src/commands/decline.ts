@@ -41,8 +41,13 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
     () => transport.sendMessage(jobId, { type: "decline", content }, ref, { jobToken }),
     { human: opts.human }
   );
+  // A confirmed decline releases the piece in progress; the receipt is checked with that recorded.
   const ending = await readEnding({ jobId, transport, ref, jobToken,
-    persistLocalState: !access.endpointOverridden, human: opts.human });
+    persistLocalState: !access.endpointOverridden, human: opts.human,
+    onTerminal: (status) => {
+      if (!access.endpointOverridden && isTerminalJobStatus(status.status)) markJobTerminal(jobId, status.status,
+        opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true, callerDeclined: true });
+    } });
   transport.close();
 
   const observed = ending.status?.status;
@@ -54,10 +59,6 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
       `This DVM does not end a job at a decline. Pay with \`dvm pay ${job}\`, let the ask expire, or stop the work now with \`dvm cancel ${job}\`.`,
       { jobId, status: observed }
     );
-  }
-  if (observed !== undefined && !access.endpointOverridden) {
-    markJobTerminal(jobId, observed, opts.reason !== undefined ? { message: opts.reason } : {},
-      { callerCancelled: true, callerDeclined: true });
   }
 
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;

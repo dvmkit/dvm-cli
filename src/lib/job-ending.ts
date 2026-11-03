@@ -57,8 +57,11 @@ export async function readEnding(args: {
   jobToken?: string;
   persistLocalState: boolean;
   human?: boolean;
+  /** Record how the job ended once the provider confirms it, before its receipt is judged. */
+  onTerminal?: (status: ContentStatus) => void;
 }): Promise<EndingRead> {
   const status = await observeJobContent(args.jobId, args.transport, args.ref, { timeoutMs: 5000, jobToken: args.jobToken });
+  if (status && isTerminalJobStatus(status.status)) args.onTerminal?.(status);
   if (!status || !isTerminalJobStatus(status.status) || !status.receipt?.settlement) return { status };
   if (args.persistLocalState) {
     const capture = captureTransportReceipt(args.jobId, status);

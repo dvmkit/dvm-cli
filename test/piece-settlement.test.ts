@@ -13,6 +13,7 @@ const askTwo = (declined = 360_000): Message => ({ seq: 3, from: "provider", tim
   content: { amount_msats: 300_000, reason: "Block 3", credit: { amount_micro: 300_000, currency: "usd" }, charged_if_declined_micro: declined } });
 const declinedAt = (seq: number): Message => ({ seq, from: "requester", timestamp: 1, type: "decline", content: {} });
 const completedAt = (seq: number): Message => ({ seq, from: "provider", timestamp: 1, type: "complete", content: { summary: "Done" } });
+const callerCancel = (seq: number): Message => ({ seq, from: "requester", timestamp: 1, type: "cancel", content: {} });
 const ended = (seq: number): Message => ({ seq, from: "provider", timestamp: 1, type: "cancel", content: { reason: "Provider failed" } });
 
 const job = (extra: Partial<JobRecord> = {}): JobRecord => ({ id: "job", endpoint: "https://provider.example", status: "cancelled",
@@ -76,11 +77,21 @@ describe("piece settlement ceiling", () => {
     { name: "a decline whose paid ask's echo never reached the log", outcome: "cancelled", charged: 360_000, pieces: honest,
       messages: [askOne], record: job({ callerCancelled: true, callerDeclined: true, paidPaymentRequestSeqs: [1] }),
       ceiling: 360_000, overcharged: false },
+    { name: "a failure after asks the record paid but the log never received", outcome: "failed", charged: 660_000, pieces: invented,
+      messages: [askOne, payOne], record: job({ paidPaymentRequestSeqs: [1, 3, 5] }),
+      ceiling: 660_000, basis: "receipt_pieces", overcharged: false },
+    { name: "an override cancel the signed receipt attributes to the caller", outcome: "cancelled", charged: 360_000,
+      pieces: [piece(0, UPFRONT, "finished"), piece(2, 200_000, "stopped")], endedBy: "caller",
+      messages: [askOne, payOne, callerCancel(3)], record: job(), ceiling: 360_000, overcharged: false },
+    { name: "a decline the signed receipt attributes to the caller", outcome: "cancelled", charged: 360_000, pieces: honest, endedBy: "caller",
+      messages: [askOne, payOne, askTwo(100_000)], record: job({ callerCancelled: true, callerDeclined: true }),
+      ceiling: 100_000, overcharged: true },
     { name: "an upfront price not recorded locally", outcome: "completed", charged: 360_000, pieces: honest,
       messages: [askOne, payOne], record: job({ upfrontPayment: undefined }), ceiling: 360_000, overcharged: false },
   ] as const)("$name", (row) => {
     const { outcome, charged, pieces, messages, record, ceiling, overcharged } = row;
-    const result = pieceSettlement(receipt(outcome, charged, [...pieces]), { job: record, messages: [...messages] });
+    const signed = { ...receipt(outcome, charged, [...pieces]), ...("endedBy" in row ? { ended_by: row.endedBy } : {}) } as JobReceipt;
+    const result = pieceSettlement(signed, { job: record, messages: [...messages] });
     expect(result).toMatchObject({ charged_micro: charged, currency: "usd", ceiling_micro: ceiling, overcharged,
       ...("basis" in row ? { ceiling_basis: row.basis } : {}) });
     expect(result?.display.includes("This charge exceeds")).toBe(overcharged);
