@@ -23,6 +23,7 @@ import {
   formatUsd,
   isCreditFundRail,
   normalizeCreditEndpoint,
+  shellQuoteArg,
   type StoredReceipt,
 } from "@dvmkit/sdk/internal";
 import {
@@ -36,6 +37,7 @@ import {
   trustOverrideCapMicro,
 } from "./credit-policy";
 import { pickCreditFundRail } from "./credit-fund";
+import { CARD_MIN_MICRO } from "./card-credit/fund";
 
 import type { CreditRefillUnavailable } from "./credit-notice";
 
@@ -421,8 +423,14 @@ function fundableNow(
 }
 
 function railMinimums(menu: CreditMenu | undefined): RailMinimum[] {
-  if (!menu?.lightning_min_micro) return [];
-  return [{ rail: "lightning", minMicro: menu.lightning_min_micro }];
+  const minimums: RailMinimum[] = [];
+  if (menu?.lightning_min_micro) {
+    minimums.push({ rail: "lightning", minMicro: menu.lightning_min_micro });
+  }
+  if (menu?.funding.includes("stripe")) {
+    minimums.push({ rail: "stripe", minMicro: CARD_MIN_MICRO });
+  }
+  return minimums;
 }
 
 function compatibilityFor(args: {
@@ -437,11 +445,9 @@ function compatibilityFor(args: {
   const menu = args.menu;
   const routeAmountMicro = args.routeAmountMicro;
   const availability = new Map(args.availability?.map((entry) => [entry.rail, entry]));
+  const minimums = new Map(railMinimums(menu).map((entry) => [entry.rail, entry.minMicro]));
   return menu.funding.filter(isCreditFundRail).map((rail) => {
-    const minimum =
-      rail === "lightning" && menu.lightning_min_micro !== undefined
-        ? Math.max(menu.min_micro, menu.lightning_min_micro)
-        : menu.min_micro;
+    const minimum = Math.max(menu.min_micro, minimums.get(rail) ?? 0);
     const local = availability.get(rail);
     let status: CreditRouteCompatibilityStatus;
     // Card is never trust-capped: the human approves the exact amount in Stripe
@@ -539,6 +545,14 @@ function routeDisplay(h: CreditHeadroom): string[] {
     out.push(
       "No automatic funding route is available locally: the ecash pocket cannot cover this amount and no connected funding wallet can replenish or carry it."
     );
+    const card = h.routeCompatibility.find((route) => route.rail === "stripe");
+    if (card) {
+      const separateCredit = h.boundRail !== undefined && h.boundRail !== "stripe";
+      const command = `dvm credit fund ${shellQuoteArg(h.endpoint)} --rail stripe${separateCredit ? " --credit-id <new id>" : ""} --amount '$X'`;
+      out.push(
+        `${separateCredit ? `This credit is bound to ${h.boundRail}; open a separate card-funded credit` : "This DVM accepts card top-ups"} with '${command}': replace $X with a whole-cent amount of at least ${usd(card.minMicro)}. Your human must approve the top-up in Stripe Link.`
+      );
+    }
   }
   return out;
 }
