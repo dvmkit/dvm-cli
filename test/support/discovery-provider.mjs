@@ -1,15 +1,10 @@
 import { createServer } from "node:http";
 
-import { createRequire } from "node:module";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-
-// Package smoke resolves the provider from the installed dependency tree.
-const require = createRequire(process.argv[2] ? join(process.argv[2], "package.json") : import.meta.url);
-const { configureDVM } = await import(pathToFileURL(require.resolve("@dvmkit/sdk")).href);
-const { createDVMServer, MemoryKVStore } = await import(pathToFileURL(require.resolve("@dvmkit/sdk/internal")).href);
-const { secp256k1Auth } = await import(pathToFileURL(require.resolve("@dvmkit/sdk/server")).href);
-const { z } = await import(pathToFileURL(require.resolve("zod")).href);
+import { configureDVM } from "@dvmkit/sdk";
+import { buildAttestation, createDVMServer, MemoryKVStore, receiptPubkeyFromSecret, signAttestation } from "@dvmkit/sdk/internal";
+import { secp256k1Auth } from "@dvmkit/sdk/server";
+import { MemoryJobStore } from "@dvmkit/sdk/testing";
+import { z } from "zod";
 
 const jobs = [];
 const submissions = [];
@@ -17,6 +12,13 @@ const providers = [];
 const requests = [];
 const pending = [];
 let deferred = false;
+const builderSecret = "11".repeat(32);
+const builderPubkey = receiptPubkeyFromSecret(builderSecret);
+const attestation = buildAttestation({
+  dvmId: "discovery-contract", slug: "discovery-contract", capabilities: ["search", "browse"],
+  builderPubkey, receiptPubkey: builderPubkey, deployedAt: 1_700_000_000,
+});
+const builder = { pubkey: builderPubkey, attestation, signature: signAttestation(attestation, builderSecret) };
 
 async function finish(ctx, summary) {
   if (deferred) {
@@ -55,7 +57,9 @@ async function provider(auth) {
       },
     },
   });
-  const sdk = await createDVMServer(descriptor, { env: {}, store: new MemoryKVStore(), dvmId: "discovery-contract" });
+  const sdk = await createDVMServer(descriptor, {
+    env: {}, store: new MemoryKVStore(), jobStore: new MemoryJobStore(), dvmId: "discovery-contract", builder,
+  });
   const server = createServer(async (incoming, outgoing) => {
     const chunks = [];
     for await (const chunk of incoming) chunks.push(Buffer.from(chunk));

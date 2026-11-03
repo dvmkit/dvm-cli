@@ -79,8 +79,7 @@ describe.each(commands)("$capability signed discovery", (command) => {
       const job = records.at(-1);
       expect(job).toMatchObject({ endpoint, capability: command.capability, status: "submitted", messageCursor: expect.any(Number) });
       expect(job.messageCursor).toBeGreaterThan(0);
-      if (signed) expect(job.jobToken).toBeUndefined();
-      else expect(job.jobToken).toMatch(/^[0-9a-f]{64}$/i);
+      expect(job.jobToken).toMatch(/^[0-9a-f]{64}$/i);
       const hint = /`(dvm messages [\w-]+ --wait)`/.exec(error.hint);
       expect(hint).not.toBeNull();
       const args = hint![1].split(" ").slice(1);
@@ -94,6 +93,7 @@ describe.each(commands)("$capability signed discovery", (command) => {
       expect(output.next_action).toBeNull();
       if (job.jobToken) expect(first.stdout + first.stderr + resumed.stdout + resumed.stderr).not.toContain(job.jobToken);
       const after = await snapshot();
+      expect(after.jobs.at(-1)?.pubkey).toBe(signed ? pubkey : undefined);
       expect(after.submissions.length - before.submissions.length).toBe(1);
       const requests = after.requests.slice(before.requests.length);
       expect(requests.filter((request) => request.method === "POST").map((request) => request.path)).toEqual(["/v1/job"]);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { fork, spawn } from "node:child_process";
-import { createWriteStream, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, createWriteStream, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -8,7 +8,10 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
   const diagnosticsRoot = mkdtempSync(join(tmpdir(), "dvm-discovery-diagnostics-"));
   const diagnosticsPath = join(diagnosticsRoot, "fixture.log");
   const diagnostics = createWriteStream(diagnosticsPath, { mode: 0o600 });
-  const child = fork(resolve(import.meta.dirname, "../test/support/discovery-provider.mjs"), [packageRoot], {
+  // Resolve the fixture's ESM imports from the installed dependency tree.
+  const fixture = join(packageRoot, ".discovery-provider.mjs");
+  cpSync(resolve(import.meta.dirname, "../test/support/discovery-provider.mjs"), fixture);
+  const child = fork(fixture, {
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   child.stdout.pipe(diagnostics, { end: false });
@@ -28,7 +31,12 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
       for (const capability of ["search", "browse"]) {
         const root = mkdtempSync(join(tmpdir(), "dvm-discovery-caller-"));
         roots.push(root);
-        if (signed) assert.equal((await cli(binary, root, ["init"])).code, 0);
+        let callerPubkey;
+        if (signed) {
+          const initialized = await cli(binary, root, ["init"]);
+          assert.equal(initialized.code, 0);
+          callerPubkey = JSON.parse(initialized.stdout).identity.pubkey;
+        }
         const endpoint = signed ? ready.authenticated : ready.anonymous;
         const before = await send("snapshot", "snapshot");
         await send("defer", "deferred");
@@ -42,8 +50,7 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
         assert.equal(job.capability, capability);
         assert.equal(job.status, "submitted");
         assert.ok(job.messageCursor > 0);
-        if (signed) assert.equal(job.jobToken, undefined);
-        else assert.match(job.jobToken, /^[0-9a-f]{64}$/i);
+        assert.match(job.jobToken, /^[0-9a-f]{64}$/i);
         const hint = /`(dvm messages [\w-]+ --wait)`/.exec(error.hint);
         assert.ok(hint, "timeout must advertise a continuation command");
         const args = hint[1].split(" ").slice(1);
@@ -63,6 +70,7 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
         assert.equal(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8")).at(-1).status, "completed");
         if (job.jobToken) assert.ok(!(first.stdout + first.stderr + resumed.stdout + resumed.stderr).includes(job.jobToken));
         const after = await send("snapshot", "snapshot");
+        assert.equal(after.jobs.at(-1).pubkey, callerPubkey);
         assert.equal(after.submissions.length - before.submissions.length, 1);
         const requests = after.requests.slice(before.requests.length);
         assert.deepEqual(requests.filter((request) => request.method === "POST").map((request) => request.path), ["/v1/job"]);
@@ -81,6 +89,7 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
     } finally {
       clearTimeout(timeout);
       for (const root of roots) rmSync(root, { recursive: true, force: true });
+      rmSync(fixture, { force: true });
     }
   }
   if (failed || providerCode !== 0) throw new Error("Installed discovery recovery fixture failed; diagnostics retained privately.");
