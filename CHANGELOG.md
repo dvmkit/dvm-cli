@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/dvmkit/dvm-cli/compare/v0.13.0...v0.14.0) (2026-11-03)
+
+
+### Features
+
+* hand unpaid asks to the agent and add dvm decline ([#51](https://github.com/dvmkit/dvm-cli/issues/51)) ([1371278](https://github.com/dvmkit/dvm-cli/commit/1371278a48886f9be526dd4d803ef097dae8a569))
+
 ## [0.13.0](https://github.com/dvmkit/dvm-cli/compare/v0.12.1...v0.13.0) (2026-11-02)
 
 
