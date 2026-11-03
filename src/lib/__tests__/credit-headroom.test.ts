@@ -73,7 +73,7 @@ describe("card funding headroom", () => {
 
     expect(result.effective_route).toBeNull();
     expect(result.human_funding_required).toBe(true);
-    expect(result.display).toContain(`dvm credit fund ${ENDPOINT} --rail stripe`);
+    expect(result.display).toContain(`dvm credit fund ${ENDPOINT} --rail stripe --amount '$X'`);
     expect(result.display).toContain("Stripe Link");
   });
 
@@ -81,7 +81,7 @@ describe("card funding headroom", () => {
     const result = headroom({ boundRail: "cashu" });
 
     expect(result.bound_rail).toBe("cashu");
-    expect(result.display).toContain(`dvm credit fund ${ENDPOINT} --rail stripe --credit-id <new id>`);
+    expect(result.display).toContain(`dvm credit fund ${ENDPOINT} --rail stripe --credit-id <new id> --amount '$X'`);
   });
 
   it("does not offer card funding when the menu does not accept it", () => {

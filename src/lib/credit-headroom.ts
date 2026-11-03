@@ -539,9 +539,9 @@ function routeDisplay(h: CreditHeadroom): string[] {
     const card = h.routeCompatibility.find((route) => route.rail === "stripe");
     if (card) {
       const separateCredit = h.boundRail !== undefined && h.boundRail !== "stripe";
-      const command = `dvm credit fund ${shellQuoteArg(h.endpoint)} --rail stripe${separateCredit ? " --credit-id <new id>" : ""}`;
+      const command = `dvm credit fund ${shellQuoteArg(h.endpoint)} --rail stripe${separateCredit ? " --credit-id <new id>" : ""} --amount '$X'`;
       out.push(
-        `${separateCredit ? `This credit is bound to ${h.boundRail}; open a separate card-funded credit` : "This DVM accepts card top-ups"} with '${command}', starting at ${usd(card.minMicro)} and approved by your human in Stripe Link.`
+        `${separateCredit ? `This credit is bound to ${h.boundRail}; open a separate card-funded credit` : "This DVM accepts card top-ups"} with '${command}': replace $X with a whole-cent amount of at least ${usd(card.minMicro)}. Your human must approve the top-up in Stripe Link.`
       );
     }
   }
