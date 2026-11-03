@@ -18,10 +18,6 @@ export function answeredYieldSeqs(messages: Message[]): Set<number> {
     } else if (message.type === "response") {
       const seq = prompts.get(message.content.prompt_id);
       if (seq !== undefined) answered.add(seq);
-    } else if (message.type === "decline") {
-      // A decline ends the job at its open ask or prompt: neither may be paid or answered later.
-      if (paymentRequest !== undefined) answered.add(paymentRequest);
-      for (const seq of prompts.values()) answered.add(seq);
     } else if (message.type === "payment") {
       // Balance authorizations identify the ask explicitly. Older rail messages
       // answer the preceding charge; provider payments are refunds, not answers.
@@ -40,8 +36,8 @@ function latestProviderPaymentRequest(messages: Message[]): Message | undefined 
 export function pendingPaymentRequest(messages: Message[], answered = answeredYieldSeqs(messages)): Message | undefined {
   const latest = latestProviderPaymentRequest(messages);
   if (!latest || answered.has(latest.seq)) return undefined;
-  if (messages.some((message) => message.seq > latest.seq && (message.type === "decline" ||
-    (message.from === "provider" && (message.type === "complete" || message.type === "cancel" || message.type === "working"))))) return undefined;
+  if (messages.some((message) => message.from === "provider" && message.seq > latest.seq &&
+    (message.type === "complete" || message.type === "cancel" || message.type === "working"))) return undefined;
   return latest;
 }
 
@@ -50,7 +46,22 @@ export function loadAnsweredYieldSeqs(jobId: string): Set<number> {
   const job = loadJob(jobId);
   for (const seq of job?.paidPaymentRequestSeqs ?? []) answered.add(seq);
   for (const payment of job?.bookedCreditPayments ?? []) answered.add(payment.authorization.request_seq);
+  if (job?.callerDeclined) for (const seq of declinedYieldSeqs(loadMessages(jobId))) answered.add(seq);
   return answered;
+}
+
+/**
+ * The ask and prompts a caller's decline answered. Only for a decline the
+ * provider confirmed by ending the job: a DVM that predates decline keeps the
+ * job open, and its ask must stay payable.
+ */
+function declinedYieldSeqs(messages: Message[]): number[] {
+  const sorted = [...messages].sort((a, b) => a.seq - b.seq);
+  const decline = sorted.findLast((message) => message.from === "requester" && message.type === "decline");
+  if (!decline) return [];
+  const before = sorted.filter((message) => message.from === "provider" && message.seq < decline.seq);
+  const ask = before.findLast((message) => message.type === "payment-request");
+  return [...(ask ? [ask.seq] : []), ...before.filter((message) => message.type === "prompt").map((message) => message.seq)];
 }
 
 /** Only fresh provider history can resolve a send whose reply was lost. */

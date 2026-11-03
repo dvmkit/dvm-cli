@@ -128,7 +128,7 @@ export function paymentInFlightHint(jobId: string): string {
 }
 
 /** Message types that signal the end of a provider's turn. */
-const YIELD_TYPES = new Set(["prompt", "payment-request", "working", "complete", "cancel", "decline"]);
+const YIELD_TYPES = new Set(["prompt", "payment-request", "working", "complete", "cancel"]);
 
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set<TerminalJobStatus>([
   "completed",
@@ -157,7 +157,6 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
     switch (msg.type) {
       case "complete":
       case "cancel":
-      case "decline":
         return null;
 
       case "prompt": {

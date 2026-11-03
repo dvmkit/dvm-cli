@@ -456,10 +456,11 @@ describe("asks from a piece-charging DVM", () => {
     });
   });
 
-  it("ends at a caller's decline instead of offering an older yield", () => {
+  // An older DVM accepts a decline as conversation and keeps the ask open.
+  it("keeps the ask payable when only the log shows a decline", () => {
     expect(computeNextAction("job-1", [
-      msg({ seq: 1, type: "working", content: {} }),
+      ask({ charged_if_declined_micro: 360_000 }),
       msg({ seq: 3, from: "requester", type: "decline", content: {} }),
-    ])).toBeNull();
+    ])).toMatchObject({ type: "pay", amount_msats: 300_000 });
   });
 });
