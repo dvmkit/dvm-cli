@@ -31,7 +31,7 @@ let state: string;
 let history: Message[];
 let receipt: JobReceipt | undefined;
 let endingReceipt: (kind: "decline" | "cancel") => JobReceipt | undefined;
-let declineReply: "ends" | "no_open_ask" | "ignored";
+let declineReply: "ends" | "no_open_ask" | "ignored" | "unavailable";
 let cancelConflicts: number;
 let requests: { method: string; path: string; body?: { type?: string; content?: unknown } }[];
 
@@ -69,6 +69,13 @@ beforeEach(async () => {
     let text = "";
     request.on("data", (chunk) => { text += chunk; });
     request.on("end", () => {
+      if (request.url === "/v1/info") {
+        requests.push({ method: request.method!, path: "/v1/info" });
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({ protocol_version: 1, name: "Piece provider", capabilities: {},
+          credit: { currency: "usd", funding: ["lightning"], min_micro: 100_000, max_micro: 5_000_000, ttl_ms: 86_400_000 } }));
+        return;
+      }
       expect(request.headers["x-job-token"]).toBe(token);
       const path = new URL(request.url!, "http://provider.invalid").pathname;
       const body = text ? JSON.parse(text) : undefined;
@@ -80,6 +87,11 @@ beforeEach(async () => {
       } else if (request.method === "GET" && path === "/v1/job/job") {
         response.end(JSON.stringify({ jobId: "job", status: state, ...(finished && receipt ? { receipt } : {}) }));
       } else if (request.method === "POST" && path === "/v1/job/job/messages" && body.type === "decline") {
+        if (declineReply === "unavailable") {
+          response.statusCode = 409;
+          response.end(JSON.stringify({ error: "decline_unavailable", message: "This job store cannot end a job at a decline." }));
+          return;
+        }
         if (declineReply === "no_open_ask") {
           response.statusCode = 409;
           response.end(JSON.stringify({ error: "no_open_ask", message: "The job has no open payment request or prompt to decline.",
@@ -204,12 +216,29 @@ it("explains a decline with nothing open, and one an older DVM ignores", async (
   expect(refused.output.error.hint).toContain("`dvm cancel job`");
   expect(refused.output.error.hint).toContain("`dvm messages job --wait`");
 
-  state = "awaiting-input";
+});
+
+it("keeps the ask payable after an older DVM ignores a decline", async () => {
+  mode = "legacy";
+  history = [strip(askOne), payOne, strip(askTwo(Date.now() + 3_600_000))] as Message[];
+  seed("awaiting-input", history);
   declineReply = "ignored";
   const ignored = await run("decline");
   expect(ignored.code).toBe(1);
   expect(ignored.output.error).toMatchObject({ code: "decline_unsupported" });
-  expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0].status).toBe("processing");
+  expect(ignored.output.error.hint).toContain("`dvm pay job`");
+  expect(history.at(-1)).toMatchObject({ from: "requester", type: "decline" });
+
+  const messages = await run("messages", ["--no-stream"]);
+  expect(messages.code).toBe(0);
+  expect(messages.output.next_action).toMatchObject({ type: "pay", amount_msats: 300_000 });
+  expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0]).toMatchObject({ status: "awaiting-input" });
+  expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0]).not.toHaveProperty("callerDeclined");
+
+  const paid = await run("pay");
+  // Past the pending-ask check: the payment reaches the wallet, which this test has none of.
+  expect(paid.stderr).toContain("Paying $0.30 USD (300 sats)...");
+  expect(paid.output.error).toMatchObject({ code: "payment_failed", anchor: "no_rail_matched" });
 });
 
 it("cancels at once, waits out a payment being verified, and names the work in progress charged", async () => {
@@ -252,17 +281,66 @@ it("keeps an older DVM's cancel output unchanged", async () => {
 });
 
 it("flags a receipt charging more than the finished pieces this CLI paid for", async () => {
-  history = [askOne, payOne, askTwo(Date.now() + 3_600_000)] as Message[];
+  // The open ask said declining would charge $0.16; the receipt's pieces match this CLI's log.
+  const stated = askTwo(Date.now() + 3_600_000);
+  history = [askOne, payOne, { ...stated, content: { ...stated.content, charged_if_declined_micro: 160_000 } }] as Message[];
   seed("awaiting-input", history);
-  endingReceipt = () => settled("cancelled", 660_000, [
-    { amount: UPFRONT, charged: UPFRONT, paid_seq: 0, state: "finished" },
-    { amount: 200_000, charged: 200_000, paid_seq: 2, state: "finished" },
-    { amount: 300_000, charged: 300_000, paid_seq: 4, state: "finished" }]);
   const result = await run("decline", ["--human"]);
   expect(result.code).toBe(0);
-  expect(result.stderr).toContain("Warning: the signed receipt for job job charges $0.66 USD, more than the $0.36 USD of finished pieces this CLI paid for.");
-  expect(result.stderr).toContain("This charge exceeds the finished pieces this CLI paid for (at most $0.36 USD).");
+  expect(result.stderr).toContain("Warning: the signed receipt for job job charges $0.36 USD, more than the $0.16 USD of finished pieces this CLI paid for.");
+  expect(result.stderr).toContain("This charge exceeds the finished pieces this CLI paid for (at most $0.16 USD).");
   const status = await run("status");
-  expect(status.output.spend.settlement).toMatchObject({ charged_micro: 660_000, ceiling_micro: 360_000, overcharged: true });
-  expect(status.output.spend.display).toContain("This charge exceeds the finished pieces this CLI paid for (at most $0.36 USD).");
+  expect(status.output.spend.settlement).toMatchObject({ charged_micro: 360_000, ceiling_micro: 160_000,
+    ceiling_basis: "payments", overcharged: true });
+  expect(status.output.spend.display).toContain("This charge exceeds the finished pieces this CLI paid for (at most $0.16 USD).");
+});
+
+it("does not flag an honest receipt whose payment never reached the local log", async () => {
+  history = [askOne, payOne, askTwo(Date.now() + 3_600_000)] as Message[];
+  seed("awaiting-input", [askOne]);
+  const result = await run("decline", ["--human"]);
+  expect(result.code).toBe(0);
+  expect(result.stderr).not.toContain("Warning: the signed receipt");
+  expect(result.stderr).not.toContain("This charge exceeds");
+});
+
+it("names a store that cannot decline without calling the live job ended", async () => {
+  history = [askOne, payOne, askTwo(Date.now() + 3_600_000)] as Message[];
+  seed("awaiting-input", history);
+  declineReply = "unavailable";
+  const result = await run("decline");
+  expect(result.code).toBe(1);
+  expect(result.output.error).toMatchObject({ code: "decline_unavailable" });
+  expect(result.output.error.hint).toContain("`dvm pay job`");
+  expect(result.output.error.hint).toContain("`dvm cancel job`");
+  expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0].status).toBe("awaiting-input");
+});
+
+it("says where the charge will show when a cancel's receipt is not signed yet", async () => {
+  history = [askOne, payOne] as Message[];
+  seed("processing", history);
+  endingReceipt = () => undefined;
+  const result = await run("cancel");
+  expect(result.code).toBe(0);
+  expect(result.output).toMatchObject({ status: "cancelled", next_action: null,
+    display: "Stopped. Its receipt is not available yet; `dvm status job` shows what was charged once it is." });
+  expect(result.output).not.toHaveProperty("settlement");
+  const human = await run("cancel", ["--human"]);
+  expect(human.stderr).toContain("Its receipt is not available yet");
+});
+
+it("states a portable job's charge in the provider's currency", async () => {
+  history = [askOne, payOne] as Message[];
+  const portable = ["--endpoint", endpoint, "--job-token", token];
+  const cancelled = await run("cancel", portable);
+  expect(cancelled.code).toBe(0);
+  expect(cancelled.output.display).toBe("Stopped. The $0.20 USD paid for the work in progress is not refunded. " +
+    "Charged $0.36 USD of $0.36 USD held, $0.00 USD released.");
+  expect(cancelled.output.settlement).toMatchObject({ currency: "usd", charged_micro: 360_000 });
+  expect(requests.some((entry) => entry.path === "/v1/info")).toBe(true);
+  const status = await run("status", portable);
+  expect(status.output.settlement).toMatchObject({ currency: "usd",
+    display: "Charged $0.36 USD of $0.36 USD held, $0.00 USD released." });
+  expect(status.output.receipt_display).toContain("Charged $0.36 USD for");
+  expect(JSON.stringify(status.output)).not.toContain("micro-units");
 });

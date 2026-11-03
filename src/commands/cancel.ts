@@ -1,8 +1,9 @@
-import { providerJobJson } from "../lib/provider-output";
+import { guidanceJobArg, providerJobJson } from "../lib/provider-output";
 import {
   info,
 } from "../lib/output";
 import {
+  type JobRecord,
   markJobTerminal,
 } from "../lib/job-store";
 
@@ -14,6 +15,8 @@ import {
   withJobTokenRedaction,
 } from "../lib/job-access";
 import { cancelledDisplay, readEnding, retryWhilePaymentInProgress } from "../lib/job-ending";
+import { isTerminalJobStatus } from "../lib/next-action";
+import { loadMessages } from "../lib/messages";
 import { progressNotice } from "../lib/progress-notice";
 import { createDvmTransport } from "../lib/transport";
 import { dvmIdentity } from "./dvm-identity";
@@ -46,12 +49,17 @@ async function cancelWithAccess(
     opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true });
 
   // A piece-charging DVM charges the work in progress on a cancel; its receipt says how much.
-  const { settlement } = await readEnding({ jobId, transport, ref, jobToken,
+  const { settlement, status } = await readEnding({ jobId, transport, ref, jobToken,
     persistLocalState: !access.endpointOverridden, human: opts.human });
   transport.close();
 
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
-  const display = settlement ? cancelledDisplay(settlement) : undefined;
+  // A receipt that is not signed yet still decides the charge; say where it will show.
+  const receiptPending = !settlement && status !== undefined && isTerminalJobStatus(status.status) &&
+    !status.receipt && !status.receiptParseError && !access.endpointOverridden && expectsReceipt(jobId, stored);
+  const display = settlement ? cancelledDisplay(settlement)
+    : receiptPending ? `Stopped. Its receipt is not available yet; \`dvm status ${guidanceJobArg(jobId)}\` shows what was charged once it is.`
+    : undefined;
 
   if (opts.human) {
     info(`Job ${jobId}${identifier ? ` [${identifier}]` : ""} cancelled.`);
@@ -62,8 +70,16 @@ async function cancelWithAccess(
       ...dvmIdentity(stored?.dvmId, stored?.capability),
       status: "cancelled",
       ...(opts.reason ? { reason: opts.reason } : {}),
-      ...(settlement ? { settlement, display } : {}),
+      ...(settlement ? { settlement } : {}),
+      ...(display ? { display } : {}),
       next_action: null,
     });
   }
+}
+
+/** The DVM signs receipts, or this job's asks show it charges by the piece. */
+function expectsReceipt(jobId: string, stored: JobRecord | null): boolean {
+  return stored?.receiptsSupported === true || loadMessages(jobId).some((message) =>
+    message.from === "provider" && message.type === "payment-request" &&
+    typeof message.content.charged_if_declined_micro === "number");
 }

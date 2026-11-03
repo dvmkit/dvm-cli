@@ -1364,7 +1364,7 @@ function routerProse(structured: DvmError): {
 
 /**
  * A 409 from a job-ending write (cancel, decline) that names why it did not
- * land. Both codes are SDK contract, so the copy is the CLI's own.
+ * land. These codes are SDK contract, so the copy is the CLI's own.
  */
 function jobEndingConflict(jobId: string, body: Record<string, unknown> | null, retryAfter: string | null): DvmError | undefined {
   const job = shellQuoteArg(jobId);
@@ -1378,6 +1378,12 @@ function jobEndingConflict(jobId: string, body: Record<string, unknown> | null, 
     return new DvmError("no_open_ask",
       "The job has no open payment request or prompt to decline.",
       `Decline answers an open ask. To stop at the next one, wait for it with \`dvm messages ${job} --wait\` and decline then. To halt the work now, run \`dvm cancel ${job}\`; the work in progress is charged.`);
+  }
+  if (body?.error === "decline_unavailable") {
+    // The job is still live: this DVM's job store cannot end a job at a decline.
+    return new DvmError("decline_unavailable",
+      "This DVM cannot end this job at a decline; the job is still running.",
+      `Pay the open ask with \`dvm pay ${job}\`, let it expire, or stop the work now with \`dvm cancel ${job}\`; the work in progress is charged.`);
   }
   return undefined;
 }
