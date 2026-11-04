@@ -1,0 +1,514 @@
+[
+  {
+    "file": "commands/request.ts",
+    "owner": "payWithAgentWallet",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/request.ts",
+    "owner": "withCreditHeadroom",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/wallet-mpp.ts",
+    "owner": "walletMppExit",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/wallet-pair.ts",
+    "owner": "walletPairComplete",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/wallet.ts",
+    "owner": "probeWalletConnection",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit/drain.ts",
+    "owner": "runCreditDrain",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/float.ts",
+    "owner": "loadFloat",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/float.ts",
+    "owner": "payViaFloat",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/float.ts",
+    "owner": "probeOnPool",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/input-schema-hint.ts",
+    "owner": "withInputSchemaHint",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/job-access.ts",
+    "owner": "withJobTokenRedaction",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/payment-rails/tempo-credential.ts",
+    "owner": "amountRefusal",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/wallet-probe.ts",
+    "owner": "probeLightning",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/browse.ts",
+    "owner": "cancelMessageToError",
+    "expression": "/^([a-z][a-z0-9_]*):\\s*(.+)$/.exec(reason)",
+    "path": [
+      "*"
+    ],
+    "reason": "The provider cancel reason supplies this code prefix. The local search_failed/browse_failed fallback is traced separately."
+  },
+  {
+    "file": "commands/search.ts",
+    "owner": "cancelMessageToError",
+    "expression": "/^([a-z][a-z0-9_]*):\\s*(.+)$/.exec(reason)",
+    "path": [
+      "*"
+    ],
+    "reason": "The provider cancel reason supplies this code prefix. The local search_failed/browse_failed fallback is traced separately."
+  },
+  {
+    "file": "commands/upload.ts",
+    "owner": "parseBody",
+    "expression": "JSON.parse(body)",
+    "path": [
+      "code"
+    ],
+    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+  },
+  {
+    "file": "commands/wallet.ts",
+    "owner": "walletBalance",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/wallet.ts",
+    "owner": "walletBalance",
+    "expression": "err",
+    "path": [
+      "data",
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/caller-platform-client.ts",
+    "owner": "submitFeedback",
+    "expression": "res.json()",
+    "path": [
+      "error",
+      "code"
+    ],
+    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+  },
+  {
+    "file": "lib/card-credit/fund.ts",
+    "owner": "approvalSteps",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/card-credit/fund.ts",
+    "owner": "discover",
+    "expression": "deps.settled(base, replay)",
+    "path": [
+      "error",
+      "code"
+    ],
+    "local": {
+      "file": "lib/credit-fund.ts",
+      "name": "settled"
+    },
+    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback."
+  },
+  {
+    "file": "lib/card-credit/fund.ts",
+    "owner": "fundOverStripe",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/card-credit/fund.ts",
+    "owner": "present",
+    "expression": "deps.settled(base, result)",
+    "path": [
+      "error",
+      "code"
+    ],
+    "local": {
+      "file": "lib/credit-fund.ts",
+      "name": "settled"
+    },
+    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback."
+  },
+  {
+    "file": "lib/card-credit/fund.ts",
+    "owner": "present",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/card-credit/fund.ts",
+    "owner": "resumeCardFunding",
+    "expression": "deps.settled(base, replay)",
+    "path": [
+      "error",
+      "code"
+    ],
+    "local": {
+      "file": "lib/credit-fund.ts",
+      "name": "settled"
+    },
+    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "bridgeFetch",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "bridgeFetch",
+    "expression": "refusal",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "fundOverCashu",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "fundOverLightning",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "fundOverMpp",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "fundOverMppCharge",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "fundOverX402",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "fundOverX402Exact",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "fundOverX402Rail",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/payment-rails/tempo-lifecycle.ts",
+    "owner": "assertTempoWalletIdle",
+    "expression": "reconcileTempoChannelOnChain({ association })",
+    "path": [
+      "error",
+      "code"
+    ],
+    "reason": "SDK-owned result codes pass through unchanged. CLI constructors and local error objects are scanned separately; dependency source is outside this inventory."
+  },
+  {
+    "file": "lib/transport/https.ts",
+    "owner": "parseJsonObject",
+    "expression": "JSON.parse(body)",
+    "path": [
+      "error",
+      "code"
+    ],
+    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+  },
+  {
+    "file": "lib/transport/https.ts",
+    "owner": "parseJsonObject",
+    "expression": "JSON.parse(body)",
+    "path": [
+      "error"
+    ],
+    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+  },
+  {
+    "file": "lib/transport/https.ts",
+    "owner": "sendMessageWithSignal",
+    "expression": "res.json()",
+    "path": [
+      "error"
+    ],
+    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+  },
+  {
+    "file": "lib/transport/https.ts",
+    "owner": "submit",
+    "expression": "res.json()",
+    "path": [
+      "error"
+    ],
+    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+  },
+  {
+    "file": "lib/wallet-agent/spend.ts",
+    "owner": "prepareAgentSpend",
+    "expression": "coveringMintsForSpend({\n      proofs: swept.wallet.proofs,\n      mintAllowlist: args.cashuP2pk.mints,\n      amountSats: args.amountSats,\n    })",
+    "path": [
+      "error",
+      "code"
+    ],
+    "reason": "SDK-owned result codes pass through unchanged. CLI constructors and local error objects are scanned separately; dependency source is outside this inventory."
+  },
+  {
+    "file": "lib/wallet-agent/spend.ts",
+    "owner": "prepareAgentSpend",
+    "expression": "selectProofsForSpend({\n        proofs: swept.wallet.proofs,\n        mintAllowlist: [mint],\n        amountSats: args.amountSats,\n        swapReserveSats: reserveSats,\n      })",
+    "path": [
+      "error",
+      "code"
+    ],
+    "reason": "SDK-owned result codes pass through unchanged. CLI constructors and local error objects are scanned separately; dependency source is outside this inventory."
+  },
+  {
+    "file": "lib/wallet-probe.ts",
+    "owner": "probeLightning",
+    "expression": "withTimeout(probeFloat({ float, timeoutMs }), timeoutMs, \"lightning\")",
+    "path": [
+      "error",
+      "code"
+    ],
+    "argument": 0,
+    "reason": "The local timeout wrapper preserves the resolved probe result. Its rejected Error uses the internal boundary; the catch fallback is scanned separately.",
+    "guard": {
+      "file": "lib/wallet-probe.ts",
+      "name": "withTimeout",
+      "sha256": "907581a0fde69ba1a6556b84fc26ec746f0cd91540b9977218c1a0815f0a8c25"
+    }
+  },
+  {
+    "file": "commands/doctor.ts",
+    "owner": "buildNetworkChecks",
+    "expression": "checkMintHealth(url, { timeoutMs: DEFAULT_PROBE_TIMEOUT_MS, retries: 1 })",
+    "path": [
+      "error",
+      "code"
+    ],
+    "reason": "SDK-owned diagnostic result is relayed unchanged; dependency source is outside this inventory."
+  },
+  {
+    "file": "commands/doctor.ts",
+    "owner": "doctor",
+    "expression": "repairConfigDirMode()",
+    "path": [
+      "error",
+      "code"
+    ],
+    "reason": "SDK-owned diagnostic result is relayed unchanged; dependency source is outside this inventory."
+  },
+  {
+    "file": "commands/doctor.ts",
+    "owner": "railToCheck",
+    "expression": "rail",
+    "path": [
+      "error",
+      "code"
+    ],
+    "reason": "The doctor mapper relays RailProbe errors; local probe code producers are scanned separately."
+  },
+  {
+    "file": "commands/request.ts",
+    "owner": "payWithTempo",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/request.ts",
+    "owner": "payWithX402",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/request.ts",
+    "owner": "submitProbe",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "commands/wallet-cashu.ts",
+    "owner": "walletMintHealth",
+    "expression": "health",
+    "path": [
+      "error",
+      "code",
+      "code"
+    ],
+    "reason": "A scalar dependency/error code is embedded in an error diagnostic field, not a nested CLI error object."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "bridgeFetch",
+    "expression": "err",
+    "path": [
+      "code",
+      "code"
+    ],
+    "reason": "A scalar dependency/error code is embedded in an error diagnostic field, not a nested CLI error object."
+  },
+  {
+    "file": "lib/credit/balance.ts",
+    "owner": "runCreditBalance",
+    "expression": "err",
+    "path": [
+      "code",
+      "code"
+    ],
+    "reason": "A scalar dependency/error code is embedded in an error diagnostic field, not a nested CLI error object."
+  },
+  {
+    "file": "lib/wallet-probe.ts",
+    "owner": "probeMpp",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/wallet-probe.ts",
+    "owner": "probeX402",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  }
+]

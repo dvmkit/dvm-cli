@@ -50,6 +50,7 @@
   "scripts": {
     "build": "tsup --config tsup.config.ts",
     "check:package": "node scripts/package-smoke.mjs",
+    "check:error-codes": "node scripts/check-error-codes.mjs",
     "check:public-safety": "node scripts/public-safety.mjs",
     "check:release": "node scripts/check-release.mjs",
     "check:toolchain": "node scripts/check-toolchain.mjs",
@@ -60,6 +61,7 @@
     "test:contract": "vitest run --config vitest.config.ts test/contract",
     "test:unit": "vitest run --config vitest.config.ts --exclude 'test/contract/**'",
     "typecheck": "tsc --noEmit",
+    "update:error-codes": "node scripts/check-error-codes.mjs --update",
     "verify": "node scripts/verify.mjs",
     "artifact:runtime": "node scripts/runtime-artifact.mjs",
     "check:runtime": "node scripts/runtime-smoke.mjs",
