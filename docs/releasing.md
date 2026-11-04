@@ -2,6 +2,12 @@
 
 Release-please prepares the reviewed version and changelog pull request from Conventional Commits. It does not create a tag, GitHub release, or npm publication.
 
+## Compatibility and versioning
+
+The bundled [recovery guide](../skills/dvm/recovery.md#json-compatibility-contract) defines the promised action and recovery surface. Additions are allowed. Removing or renaming a promised type, field, state, or command, changing its value type, or changing its meaning or recovery prerequisites is breaking even when the JSON shape stays the same. Other output remains outside this promise, including the explicitly provisional amount fields.
+
+A breaking contract change requires a changelog entry explaining the migration and a minor version bump while the package is pre-1.0. Mark its Conventional Commit with `!` or a `BREAKING CHANGE:` footer so release-please includes it in the release notes. The configured `bump-minor-pre-major` setting makes a breaking change after `0.14.0` propose `0.15.0`, rather than `1.0.0`; release-please owns the package, lockfile, and manifest version updates.
+
 ## Verification gate
 
 `npm run verify` is the complete local and CI gate. It checks the toolchain and the repository's files, history, and optional pull-request input in the checkout, then copies only tracked and unignored source into an isolated directory and installs from the lockfile with lifecycle scripts disabled. That clean source tree runs lint, build, typecheck, the full unit and standalone contract suite, packed-package installation and upgrade checks, packed-artifact safety, and the release contract exactly once. Only after the complete gate passes does it copy the verified `dist` back to the checkout, where the release job packs it without rebuilding.

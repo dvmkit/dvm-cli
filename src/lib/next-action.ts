@@ -9,7 +9,6 @@ export type NextAction =
   | null
   | NextActionRespond
   | NextActionPay
-  | NextActionApprove
   | NextActionPoll
   | NextActionRefund;
 
@@ -32,6 +31,7 @@ export interface NextActionRespond {
 export interface NextActionPay {
   type: "pay";
   job_id: string;
+  /** Provisional: provider-requested msats; not a rail-neutral debit amount. */
   amount_msats: number;
   /**
    * The provider's own fiat price for this charge, when it priced in fiat.
@@ -59,14 +59,6 @@ export interface NextActionPay {
   hint: string;
 }
 
-/** Provider delivered something and is waiting for sign-off. */
-export interface NextActionApprove {
-  type: "approve";
-  job_id: string;
-  artifact_seq: number;
-  hint: string;
-}
-
 /**
  * Provider is working — nothing for the client to do right now.
  * `hint` is a `ProviderText` when supplied by the provider; a plain `string` is the CLI fallback.
@@ -87,6 +79,7 @@ export interface NextActionPoll {
 export interface NextActionRefund {
   type: "refund";
   job_id: string;
+  /** Provisional: wallet-claimed msats when confirmed, otherwise provider-declared msats. */
   amount_msats: number;
   display: string;
   reason: "refund" | "change";
