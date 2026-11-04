@@ -132,6 +132,7 @@ import {
   recordPendingFunding,
 } from "@dvmkit/sdk/internal";
 import { DvmError } from "@dvmkit/sdk/internal";
+import { buildCreditFundingIncomplete } from "../credit-notice";
 import {
   assertFloatBudget,
   emitFloatBudgetWarning,
@@ -617,6 +618,14 @@ describe("fundCredit over x402 batch settlement", () => {
     expect(outcome).toMatchObject({ status: "unavailable" });
     expect(outcome.error?.code).toBe("x402_voucher_pending");
     expect(outcome.hint).toContain("x402-clear-pending");
+    expect(outcome.error?.data).toMatchObject({ credit_id: "credit-1", fund_id: "fund-original" });
+    const notice = buildCreditFundingIncomplete({ code: "credit_funding_deferred", dvm: "provider", endpoint: ENDPOINT,
+      reason: "below_refill_target", amountMicro: 100_000, currency: "usd", outcome });
+    expect(notice).toMatchObject({ code: "credit_funding_deferred", credit_id: "credit-2", fund_id: "fund-1",
+      display: expect.stringContaining("credit credit-1"),
+      hint: expect.stringContaining("dvm credit fund https://wordcount.example --credit-id credit-1") });
+    expect(notice).not.toHaveProperty("spent_sats");
+    expect(notice).not.toHaveProperty("spent_micro");
     expect(createX402BatchPayment).not.toHaveBeenCalled();
     expect(mockCreditOp).not.toHaveBeenCalled();
   });
@@ -913,6 +922,12 @@ describe("fundCredit over x402 batch settlement", () => {
     expect(outcome.error?.code).toBe("x402_voucher_pending");
     expect(outcome.display).toContain("refused by the DVM but can still be submitted");
     expect(outcome.hint).toContain("Fund again after");
+    const notice = buildCreditFundingIncomplete({ code: "credit_funding_deferred", dvm: "provider", endpoint: ENDPOINT,
+      reason: "below_refill_target", amountMicro: 100_000, currency: "usd", outcome });
+    expect(notice).toMatchObject({ code: "credit_funding_deferred", credit_id: "credit-1", fund_id: "fund-1",
+      hint: expect.stringContaining("Fund again after") });
+    expect(notice).not.toHaveProperty("spent_sats");
+    expect(notice).not.toHaveProperty("spent_micro");
     expect(createX402BatchPayment).not.toHaveBeenCalled();
     expect(mockCreditOp).not.toHaveBeenCalled();
   });
