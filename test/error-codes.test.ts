@@ -102,6 +102,17 @@ describe("CLI error compatibility check", () => {
     ["loop-selected property override", 'const data: Record<string, unknown> = {}; for (const key of ["code", "hint"] as const) data[key] = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
     ["reassigned key override", 'const data: Record<string, unknown> = {}; let key = "hint"; key = "code"; data[key] = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
     ["destructured alias override", 'const holder = {data: {}}; const {data: alias} = holder; alias.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, holder.data);'],
+    ["stored shorthand alias override", 'const data: Record<string, unknown> = {}; const holder = {data}; holder.data.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["stored named alias override", 'const data: Record<string, unknown> = {}; const holder = {saved: data}; holder.saved.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["stored nested alias override", 'const data: Record<string, unknown> = {}; const holder = {nested: {data}}; holder.nested.data.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["stored array alias override", 'const data: Record<string, unknown> = {}; const holder = [data]; holder[0].code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["assigned stored alias override", 'const data: Record<string, unknown> = {}; const holder: Record<string, Record<string, unknown>> = {}; holder.data = data; holder.data.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["copied stored alias override", 'const data: Record<string, unknown> = {}; const holder: Record<string, Record<string, unknown>> = {}; Object.assign(holder, {data}); holder.data.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["computed stored alias override", 'const data: Record<string, unknown> = {}; const slot = "data"; const holder = {[slot]: data}; holder[slot].code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["spread stored alias override", 'const data: Record<string, unknown> = {}; const holder = {...{data}}; holder.data.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["returned copy alias override", 'const data: Record<string, unknown> = {}; const holder = Object.assign({}, {data}); holder.data.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["helper-stored alias override", 'const data: Record<string, unknown> = {}; function store(input: Record<string, unknown>) { return {saved: input}; } const holder = store(data); holder.saved.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["later-assigned stored alias override", 'const data: Record<string, unknown> = {}; const holder: Record<string, Record<string, unknown>> = {}; function setCode() { holder.data.code = "new_failure"; } holder.data = data; setCode(); new DvmError("invalid_input", "Failure", undefined, data);'],
   ])("rejects an unlisted %s and accepts its additive inventory entry", (_name, source) => {
     const tree = fixture(`${original}\n${source}`);
     const before = tree.inventory();
@@ -119,6 +130,8 @@ describe("CLI error compatibility check", () => {
     'const data = {code: "invalid_input"}; data.code += "_suffix";',
     'const data = {}; Object.defineProperty(data, "code", {value: "new_failure"});',
     'const data = {}; Reflect.set(data, "code", "new_failure");',
+    'const data = {}; const holder = opaqueStore(data); holder.data.code = "new_failure";',
+    'const data = {}; const holder = opaqueStore(data); Object.assign(holder.data, {code: "new_failure"});',
   ])("rejects unresolved code mutations without updating the baseline", (mutation) => {
     const tree = fixture(`${original}\n${mutation}\nnew DvmError("invalid_input", "Failure", undefined, data);`);
     const before = tree.inventory();
@@ -134,6 +147,15 @@ describe("CLI error compatibility check", () => {
     const tree = fixture(`${original}
 const data: Record<string, unknown> = {};
 for (const field of ["message", "display", "hint"] as const) data[field] = "Display prose";
+new DvmError("invalid_input", "Failure", undefined, data);`);
+    expect(discoverErrorCodes(tree.sourceRoot)).toEqual(promised);
+  });
+
+  it.each(['{...data}', 'Object.assign({}, data)'])("does not treat a copied object as a reference to the original: %s", (copy) => {
+    const tree = fixture(`${original}
+const data = {code: "invalid_input"};
+const copy = ${copy};
+copy.code = "not_emitted";
 new DvmError("invalid_input", "Failure", undefined, data);`);
     expect(discoverErrorCodes(tree.sourceRoot)).toEqual(promised);
   });

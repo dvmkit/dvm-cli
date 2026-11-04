@@ -38,9 +38,12 @@ Discovery parses production TypeScript under `src`, excluding tests, fixtures,
 test support, declarations, and dependency source. It traces constructor arguments,
 local constants and maps, helper calls, returned error objects, subclass `super`
 calls, shorthand error envelopes, and error-envelope fallbacks. Property writes
-through local variables, aliases, and helper arguments are traced when their keys
-and assigned values are known. `Object.assign` is traced; unresolved keys,
-compound mutations, and reflective writes to code fields fail the check.
+through local variables, stored object or array references, and helper arguments
+are traced when their keys and assigned values are known. References assigned to
+fields are resolved before mutation discovery, including shallow copies that
+retain references to nested objects. `Object.assign` is traced; unresolved keys
+or receiver objects, compound mutations, and reflective writes to code fields
+fail the check.
 The existing upload fallback constructs
 `http_${status.toString()}` dynamically; its `http_${number}` family is recorded
 separately from finite codes. Local `DvmError.data.code` fields are included

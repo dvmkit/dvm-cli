@@ -43,6 +43,8 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
   const calls = new Map();
   const assignments = new Map();
   const propertyWrites = new Map();
+  const referenceWrites = new Map();
+  const pendingWrites = [];
   const codes = new Set();
   const families = new Set();
   const unresolved = new Set();
@@ -135,7 +137,7 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
   function literalKeys(node, seen = new Set()) {
     if (!node || seen.has(node)) return undefined;
     seen.add(node);
-    if (ts.isStringLiteralLike(node)) return [node.text];
+    if (ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) return [node.text];
     if (ts.isAsExpression(node) || ts.isParenthesizedExpression(node)) return literalKeys(node.expression, seen);
     if (ts.isArrayLiteralExpression(node)) {
       const keys = node.elements.map((element) => literalKeys(element, new Set(seen)));
@@ -161,57 +163,117 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
     return undefined;
   }
 
-  function objectOrigins(node, seen = new Set()) {
-    if (!node || seen.has(node)) return [];
-    seen.add(node);
-    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node) || ts.isSatisfiesExpression(node)) {
-      return objectOrigins(node.expression, seen);
+  function objectOrigins(node, seen = new Map(), projection = [], followWrites = true) {
+    if (!node || seen.get(node)?.has(JSON.stringify(projection))) return [];
+    if (projection.length > MAX_PROJECTION_DEPTH) {
+      unknown(node, projection);
+      return [];
     }
+    const next = new Map(seen);
+    next.set(node, new Set([...(seen.get(node) ?? []), JSON.stringify(projection)]));
+    const origins = objectValueOrigins(node, next, projection, followWrites);
+    if (!followWrites) return origins;
+    const expanded = [...origins];
+    for (const origin of origins) {
+      for (const write of referenceWrites.get(origin.root) ?? []) {
+        if (write.path.length > origin.path.length || !write.path.every((part, index) => part === origin.path[index] || part === "*" || origin.path[index] === "*")) continue;
+        if (!write.supported || write.path.includes("*")) unknown(write.node, origin.path);
+        else if (!write.copy || write.path.length < origin.path.length) {
+          expanded.push(...objectOrigins(write.value, next, origin.path.slice(write.path.length), true));
+        }
+      }
+    }
+    const unique = new Map();
+    return expanded.filter((origin) => {
+      const paths = unique.get(origin.root) ?? new Set();
+      const key = JSON.stringify(origin.path);
+      if (paths.has(key)) return false;
+      paths.add(key);
+      unique.set(origin.root, paths);
+      return true;
+    });
+  }
+
+  function objectValueOrigins(node, seen, projection, followWrites) {
+    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node) || ts.isSatisfiesExpression(node) || ts.isAwaitExpression(node)) {
+      return objectOrigins(node.expression, seen, projection, followWrites);
+    }
+    if (ts.isConditionalExpression(node)) return [
+      ...objectOrigins(node.whenTrue, seen, projection, followWrites),
+      ...objectOrigins(node.whenFalse, seen, projection, followWrites),
+    ];
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const keys = ts.isPropertyAccessExpression(node) ? [node.name.text] : literalKeys(node.argumentExpression) ?? ["*"];
-      return objectOrigins(node.expression, seen).flatMap((origin) => keys.map((key) => ({ root: origin.root, path: [...origin.path, key] })));
+      return keys.flatMap((key) => objectOrigins(node.expression, seen, [key, ...projection], followWrites));
+    }
+    if (ts.isObjectLiteralExpression(node) && projection.length) {
+      const [head, ...rest] = projection;
+      const origins = [{ root: node, path: projection }];
+      for (const property of node.properties) {
+        if (ts.isSpreadAssignment(property)) origins.push(...objectOrigins(property.expression, seen, projection, followWrites));
+        else if (property.name) {
+          const names = ts.isComputedPropertyName(property.name) ? literalKeys(property.name.expression) : [propertyName(property.name)];
+          if (head !== "*" && names && !names.includes(head)) continue;
+          if (ts.isPropertyAssignment(property)) origins.push(...objectOrigins(property.initializer, seen, rest, followWrites));
+          else if (ts.isShorthandPropertyAssignment(property)) {
+            const target = checker.getShorthandAssignmentValueSymbol(property);
+            for (const declaration of target?.declarations ?? []) origins.push(...objectOrigins(declaration.name, seen, rest, followWrites));
+          } else unknown(property, projection);
+        }
+      }
+      return origins;
+    }
+    if (ts.isArrayLiteralExpression(node) && projection.length) {
+      const [head, ...rest] = projection;
+      const origins = [{ root: node, path: projection }];
+      for (const [index, element] of node.elements.entries()) {
+        if (head === "*" || head === String(index)) origins.push(...objectOrigins(element, seen, rest, followWrites));
+      }
+      return origins;
     }
     if (ts.isIdentifier(node)) {
       const target = symbol(node);
-      const origins = target ? [{ root: target, path: [] }] : [];
+      const origins = target ? [{ root: target, path: projection }] : [];
       for (const declaration of target?.declarations ?? []) {
         if (ts.isVariableDeclaration(declaration)) {
           for (const value of [declaration.initializer, ...(assignments.get(target) ?? [])]) {
-            origins.push(...objectOrigins(value, new Set(seen)));
+            origins.push(...objectOrigins(value, seen, projection, followWrites));
           }
         } else if (ts.isParameter(declaration)) {
           const index = declaration.parent.parameters.indexOf(declaration);
           for (const call of calls.get(declaration.parent) ?? []) {
-            origins.push(...objectOrigins(call.arguments?.[index] ?? declaration.initializer, new Set(seen)));
+            origins.push(...objectOrigins(call.arguments?.[index] ?? declaration.initializer, seen, projection, followWrites));
           }
         } else if (ts.isBindingElement(declaration) && !declaration.dotDotDotToken && ts.isObjectBindingPattern(declaration.parent)) {
           const parent = declaration.parent.parent;
           const key = propertyName(declaration.propertyName ?? declaration.name) ?? "*";
           if (ts.isVariableDeclaration(parent)) {
-            origins.push(...objectOrigins(parent.initializer, new Set(seen)).map((origin) => ({ root: origin.root, path: [...origin.path, key] })));
+            origins.push(...objectOrigins(parent.initializer, seen, [key, ...projection], followWrites));
           }
         }
       }
       return origins;
     }
     if (ts.isCallExpression(node)) {
+      if (node.expression.getText() === "Object.assign") return objectOrigins(node.arguments[0], seen, projection, followWrites);
       const declaration = functionFor(node.expression);
       if (declaration?.body && fileNames.has(resolve(declaration.getSourceFile().fileName))) {
         const origins = [];
-        if (ts.isBlock(declaration.body)) walkReturns(declaration.body, (value) => origins.push(...objectOrigins(value, new Set(seen))));
-        else origins.push(...objectOrigins(declaration.body, seen));
+        if (ts.isBlock(declaration.body)) walkReturns(declaration.body, (value) => origins.push(...objectOrigins(value, seen, projection, followWrites)));
+        else origins.push(...objectOrigins(declaration.body, seen, projection, followWrites));
         return origins;
       }
     }
-    return [{ root: node, path: [] }];
+    return [{ root: node, path: projection }];
   }
 
-  function recordPropertyWrite(target, value, node, supported, keys = []) {
-    for (const origin of objectOrigins(target)) {
-      const entries = propertyWrites.get(origin.root) ?? [];
-      entries.push({ path: [...origin.path, ...keys], value, node, supported });
-      propertyWrites.set(origin.root, entries);
-    }
+  function recordPropertyWrite(target, value, node, supported, keys = [], copy = false) {
+    pendingWrites.push({ target, value, node, supported, keys, copy });
+  }
+
+  function recordMemberWrite(target, value, node, supported) {
+    const keys = ts.isPropertyAccessExpression(target) ? [target.name.text] : literalKeys(target.argumentExpression) ?? ["*"];
+    for (const key of keys) recordPropertyWrite(target.expression, value, node, supported, [key]);
   }
 
   for (const source of sources) walk(source, (node) => {
@@ -238,15 +300,15 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
     if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
       node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
       (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))) {
-      recordPropertyWrite(node.left, node.right, node, node.operatorToken.kind === ts.SyntaxKind.EqualsToken);
+      recordMemberWrite(node.left, node.right, node, node.operatorToken.kind === ts.SyntaxKind.EqualsToken);
     }
     if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
       [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator) &&
       (ts.isPropertyAccessExpression(node.operand) || ts.isElementAccessExpression(node.operand))) {
-      recordPropertyWrite(node.operand, undefined, node, false);
+      recordMemberWrite(node.operand, undefined, node, false);
     }
     if (ts.isCallExpression(node) && node.expression.getText() === "Object.assign") {
-      for (const value of node.arguments.slice(1)) recordPropertyWrite(node.arguments[0], value, node, true);
+      for (const value of node.arguments.slice(1)) recordPropertyWrite(node.arguments[0], value, node, true, [], true);
     }
     if (ts.isCallExpression(node) && ["Object.defineProperty", "Reflect.defineProperty", "Reflect.set"].includes(node.expression.getText())) {
       for (const key of literalKeys(node.arguments[1]) ?? ["*"]) {
@@ -257,6 +319,25 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
       recordPropertyWrite(node.arguments[0], undefined, node, false);
     }
   });
+
+  // Index stored references before resolving mutation receivers, including
+  // references assigned later in source order or by a helper call.
+  for (const [index, followWrites] of [[referenceWrites, false], [propertyWrites, true]]) {
+    for (const write of pendingWrites) {
+      const origins = objectOrigins(write.target, new Map(), [], followWrites);
+      if (followWrites && (write.keys.includes("code") || write.copy || (!write.supported && !write.keys.length)) &&
+        (!origins.some((origin) => origin.path.length === 0 &&
+          (ts.isObjectLiteralExpression(origin.root) || ts.isArrayLiteralExpression(origin.root))) ||
+          origins.some((origin) => ts.isCallExpression(origin.root) || ts.isNewExpression(origin.root)))) {
+        unknown(write.node, ["code"]);
+      }
+      for (const origin of origins) {
+        const entries = index.get(origin.root) ?? [];
+        entries.push({ ...write, path: [...origin.path, ...write.keys] });
+        index.set(origin.root, entries);
+      }
+    }
+  }
 
   function evaluatePropertyWrites(node, path) {
     if (!path.length) return;
