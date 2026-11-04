@@ -729,5 +729,29 @@
       "code"
     ],
     "reason": "Existing error data is redacted and relayed. Local code producers are inventoried separately."
+  },
+  {
+    "file": "lib/error-handler.ts",
+    "owner": "catchErrors",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ],
+    "reason": "The JSON boundary relays an existing caught error. Local constructors, data overrides, and property writes are inventoried at their production sources."
+  },
+  {
+    "file": "lib/credit-fund.ts",
+    "owner": "fundOverMpp",
+    "expression": "error",
+    "path": [
+      "code"
+    ],
+    "reason": "The shorthand field preserves the caught provider/transport error for replay. Local code producers are inventoried separately."
   }
 ]

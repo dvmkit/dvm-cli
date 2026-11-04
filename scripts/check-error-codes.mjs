@@ -42,6 +42,7 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
   }
   const calls = new Map();
   const assignments = new Map();
+  const propertyWrites = new Map();
   const codes = new Set();
   const families = new Set();
   const unresolved = new Set();
@@ -135,9 +136,20 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
     if (!node || seen.has(node)) return undefined;
     seen.add(node);
     if (ts.isStringLiteralLike(node)) return [node.text];
+    if (ts.isAsExpression(node) || ts.isParenthesizedExpression(node)) return literalKeys(node.expression, seen);
+    if (ts.isArrayLiteralExpression(node)) {
+      const keys = node.elements.map((element) => literalKeys(element, new Set(seen)));
+      return keys.every((key) => key !== undefined) ? keys.flat() : undefined;
+    }
     if (ts.isIdentifier(node)) {
       const declaration = symbol(node)?.declarations?.[0];
-      if (declaration && ts.isVariableDeclaration(declaration)) return literalKeys(declaration.initializer, seen);
+      if (declaration && ts.isVariableDeclaration(declaration)) {
+        const loop = declaration.parent.parent;
+        const values = [declaration.initializer ?? (ts.isForOfStatement(loop) ? loop.expression : undefined), ...(assignments.get(symbol(node)) ?? [])].filter(Boolean);
+        if (!values.length) return undefined;
+        const keys = values.map((value) => literalKeys(value, new Set(seen)));
+        return keys.every((key) => key !== undefined) ? keys.flat() : undefined;
+      }
       if (declaration && ts.isParameter(declaration)) {
         const index = declaration.parent.parameters.indexOf(declaration);
         const callers = calls.get(declaration.parent) ?? [];
@@ -147,6 +159,59 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
       }
     }
     return undefined;
+  }
+
+  function objectOrigins(node, seen = new Set()) {
+    if (!node || seen.has(node)) return [];
+    seen.add(node);
+    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node) || ts.isSatisfiesExpression(node)) {
+      return objectOrigins(node.expression, seen);
+    }
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const keys = ts.isPropertyAccessExpression(node) ? [node.name.text] : literalKeys(node.argumentExpression) ?? ["*"];
+      return objectOrigins(node.expression, seen).flatMap((origin) => keys.map((key) => ({ root: origin.root, path: [...origin.path, key] })));
+    }
+    if (ts.isIdentifier(node)) {
+      const target = symbol(node);
+      const origins = target ? [{ root: target, path: [] }] : [];
+      for (const declaration of target?.declarations ?? []) {
+        if (ts.isVariableDeclaration(declaration)) {
+          for (const value of [declaration.initializer, ...(assignments.get(target) ?? [])]) {
+            origins.push(...objectOrigins(value, new Set(seen)));
+          }
+        } else if (ts.isParameter(declaration)) {
+          const index = declaration.parent.parameters.indexOf(declaration);
+          for (const call of calls.get(declaration.parent) ?? []) {
+            origins.push(...objectOrigins(call.arguments?.[index] ?? declaration.initializer, new Set(seen)));
+          }
+        } else if (ts.isBindingElement(declaration) && !declaration.dotDotDotToken && ts.isObjectBindingPattern(declaration.parent)) {
+          const parent = declaration.parent.parent;
+          const key = propertyName(declaration.propertyName ?? declaration.name) ?? "*";
+          if (ts.isVariableDeclaration(parent)) {
+            origins.push(...objectOrigins(parent.initializer, new Set(seen)).map((origin) => ({ root: origin.root, path: [...origin.path, key] })));
+          }
+        }
+      }
+      return origins;
+    }
+    if (ts.isCallExpression(node)) {
+      const declaration = functionFor(node.expression);
+      if (declaration?.body && fileNames.has(resolve(declaration.getSourceFile().fileName))) {
+        const origins = [];
+        if (ts.isBlock(declaration.body)) walkReturns(declaration.body, (value) => origins.push(...objectOrigins(value, new Set(seen))));
+        else origins.push(...objectOrigins(declaration.body, seen));
+        return origins;
+      }
+    }
+    return [{ root: node, path: [] }];
+  }
+
+  function recordPropertyWrite(target, value, node, supported, keys = []) {
+    for (const origin of objectOrigins(target)) {
+      const entries = propertyWrites.get(origin.root) ?? [];
+      entries.push({ path: [...origin.path, ...keys], value, node, supported });
+      propertyWrites.set(origin.root, entries);
+    }
   }
 
   for (const source of sources) walk(source, (node) => {
@@ -167,6 +232,45 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
     }
   });
 
+  // Index after calls and identifier assignments so aliases and helper
+  // parameters refer to the same possible objects as the serialized value.
+  for (const source of sources) walk(source, (node) => {
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))) {
+      recordPropertyWrite(node.left, node.right, node, node.operatorToken.kind === ts.SyntaxKind.EqualsToken);
+    }
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator) &&
+      (ts.isPropertyAccessExpression(node.operand) || ts.isElementAccessExpression(node.operand))) {
+      recordPropertyWrite(node.operand, undefined, node, false);
+    }
+    if (ts.isCallExpression(node) && node.expression.getText() === "Object.assign") {
+      for (const value of node.arguments.slice(1)) recordPropertyWrite(node.arguments[0], value, node, true);
+    }
+    if (ts.isCallExpression(node) && ["Object.defineProperty", "Reflect.defineProperty", "Reflect.set"].includes(node.expression.getText())) {
+      for (const key of literalKeys(node.arguments[1]) ?? ["*"]) {
+        recordPropertyWrite(node.arguments[0], undefined, node, false, [key]);
+      }
+    }
+    if (ts.isCallExpression(node) && node.expression.getText() === "Object.defineProperties") {
+      recordPropertyWrite(node.arguments[0], undefined, node, false);
+    }
+  });
+
+  function evaluatePropertyWrites(node, path) {
+    if (!path.length) return;
+    for (const origin of objectOrigins(node)) {
+      const projection = [...origin.path, ...path];
+      for (const write of propertyWrites.get(origin.root) ?? []) {
+        const common = Math.min(projection.length, write.path.length);
+        if (!write.path.slice(0, common).every((part, index) => part === projection[index] || part === "*" || projection[index] === "*")) continue;
+        if (!write.supported || write.path.includes("*") || write.path.length > projection.length) unknown(write.node, path);
+        else evaluate(write.value, projection.slice(write.path.length));
+      }
+    }
+  }
+
   function evaluate(node, path = []) {
     if (!node) return;
     const key = JSON.stringify(path);
@@ -177,6 +281,7 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
     paths.add(key);
     active.set(node, paths);
     try {
+      evaluatePropertyWrites(node, path);
       if (path.length && checker.getTypeAtLocation(node).flags & (ts.TypeFlags.StringLike | ts.TypeFlags.NumberLike | ts.TypeFlags.BooleanLike)) return;
       if (relay(node, path)) return;
       if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node) ||
@@ -219,7 +324,7 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
             if (ts.isPropertyAssignment(property)) evaluate(property.initializer, rest);
             else if (ts.isShorthandPropertyAssignment(property)) {
               const target = checker.getShorthandAssignmentValueSymbol(property);
-              for (const declaration of target?.declarations ?? []) evaluateDeclaration(declaration, rest);
+              for (const declaration of target?.declarations ?? []) evaluate(declaration.name, rest);
             } else unknown(property, rest);
           }
         }
@@ -380,6 +485,10 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
     }
     if (ts.isPropertyAssignment(node) && propertyName(node.name) === "error") {
       evaluate(node.initializer, ["code"]);
+    }
+    if (ts.isShorthandPropertyAssignment(node) && node.name.text === "error") {
+      const target = checker.getShorthandAssignmentValueSymbol(node);
+      for (const declaration of target?.declarations ?? []) evaluate(declaration.name, ["code"]);
     }
   });
 

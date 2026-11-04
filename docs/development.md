@@ -37,7 +37,11 @@ promise. Normal verification and CI run only the check command.
 Discovery parses production TypeScript under `src`, excluding tests, fixtures,
 test support, declarations, and dependency source. It traces constructor arguments,
 local constants and maps, helper calls, returned error objects, subclass `super`
-calls, and error-envelope fallbacks. The existing upload fallback constructs
+calls, shorthand error envelopes, and error-envelope fallbacks. Property writes
+through local variables, aliases, and helper arguments are traced when their keys
+and assigned values are known. `Object.assign` is traced; unresolved keys,
+compound mutations, and reflective writes to code fields fail the check.
+The existing upload fallback constructs
 `http_${status.toString()}` dynamically; its `http_${number}` family is recorded
 separately from finite codes. Local `DvmError.data.code` fields are included
 because the JSON boundary spreads data after the positional constructor code.

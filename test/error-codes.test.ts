@@ -91,6 +91,53 @@ describe("CLI error compatibility check", () => {
     expect(tree.inventory()).toBe(before);
   });
 
+  it.each([
+    ["shorthand envelope", 'const error = {code: "new_failure", message: "Failure"}; json({error});'],
+    ["property override", 'const data: Record<string, unknown> = {}; data.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["computed property override", 'const data: Record<string, unknown> = {}; const key = "code"; data[key] = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["aliased property override", 'const data: Record<string, unknown> = {}; const alias = data; alias.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["nested property override", 'const holder = {data: {}}; holder.data["code"] = "new_failure"; new DvmError("invalid_input", "Failure", undefined, holder.data);'],
+    ["helper property override", 'const data = {}; function setCode(target: Record<string, unknown>) { target.code = "new_failure"; } setCode(data); new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["assigned property override", 'const data = {}; Object.assign(data, {code: "new_failure"}); new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["loop-selected property override", 'const data: Record<string, unknown> = {}; for (const key of ["code", "hint"] as const) data[key] = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["reassigned key override", 'const data: Record<string, unknown> = {}; let key = "hint"; key = "code"; data[key] = "new_failure"; new DvmError("invalid_input", "Failure", undefined, data);'],
+    ["destructured alias override", 'const holder = {data: {}}; const {data: alias} = holder; alias.code = "new_failure"; new DvmError("invalid_input", "Failure", undefined, holder.data);'],
+  ])("rejects an unlisted %s and accepts its additive inventory entry", (_name, source) => {
+    const tree = fixture(`${original}\n${source}`);
+    const before = tree.inventory();
+    const rejected = tree.run();
+    expect(rejected.status).toBe(1);
+    expect(rejected.output).toContain("Unlisted CLI error codes: new_failure");
+    expect(tree.inventory()).toBe(before);
+    expect(tree.run("--update").status).toBe(0);
+    expect(JSON.parse(tree.inventory())).toEqual({ codes: ["internal", "invalid_input", "new_failure"], families: [] });
+    expect(tree.run().status).toBe(0);
+  });
+
+  it.each([
+    'const data: Record<string, unknown> = {}; data[externalKey] = "new_failure";',
+    'const data = {code: "invalid_input"}; data.code += "_suffix";',
+    'const data = {}; Object.defineProperty(data, "code", {value: "new_failure"});',
+    'const data = {}; Reflect.set(data, "code", "new_failure");',
+  ])("rejects unresolved code mutations without updating the baseline", (mutation) => {
+    const tree = fixture(`${original}\n${mutation}\nnew DvmError("invalid_input", "Failure", undefined, data);`);
+    const before = tree.inventory();
+    for (const mode of [[], ["--update"]]) {
+      const result = tree.run(...mode);
+      expect(result.status).toBe(1);
+      expect(result.output).toContain("Unclassified error-code sources");
+      expect(tree.inventory()).toBe(before);
+    }
+  });
+
+  it("does not inventory writes limited to prose fields", () => {
+    const tree = fixture(`${original}
+const data: Record<string, unknown> = {};
+for (const field of ["message", "display", "hint"] as const) data[field] = "Display prose";
+new DvmError("invalid_input", "Failure", undefined, data);`);
+    expect(discoverErrorCodes(tree.sourceRoot)).toEqual(promised);
+  });
+
   it("inventories local data.code overrides and rejects dropping their serialized source", () => {
     const source = `${original}
 const OVERRIDES = {primary: "override_error"};
