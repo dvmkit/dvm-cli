@@ -6,18 +6,23 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 const repository = resolve(import.meta.dirname, "..");
+// Recursive decorators can grow property paths forever; require classification
+// when the projection exceeds the bounded analysis instead of guessing a code.
+const MAX_PROJECTION_DEPTH = 16;
 
 export function discoverErrorCodes(sourceRoot, relays = []) {
   sourceRoot = resolve(sourceRoot);
   for (const entry of relays) {
     if (!entry || ![entry.file, entry.owner, entry.expression, entry.reason].every((value) => typeof value === "string" && value.trim()) ||
       !Array.isArray(entry.path) || entry.path.some((value) => typeof value !== "string") ||
+      (entry.alsoPaths && (!Array.isArray(entry.alsoPaths) || entry.alsoPaths.some((path) => !Array.isArray(path) || path.some((value) => typeof value !== "string")))) ||
       (entry.argument !== undefined && (!Number.isSafeInteger(entry.argument) || entry.argument < 0))) {
       throw new Error("Source classifications require file, owner, expression, path, and a reason; argument indexes must be non-negative integers.");
     }
     if (entry.argument !== undefined && (!entry.guard || !/^[a-f0-9]{64}$/u.test(entry.guard.sha256))) {
       throw new Error("An argument-flow classification requires a reviewed local function guard.");
     }
+    if (entry.callee && entry.argument === undefined) throw new Error("A callee classification must declare its guarded argument flow.");
   }
   const files = productionFiles(sourceRoot);
   const fileNames = new Set(files.map((file) => resolve(file)));
@@ -42,6 +47,7 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
   const unresolved = new Set();
   const usedRelays = new Set();
   const active = new Map();
+  const visited = new Map();
 
   function symbol(node) {
     let value = checker.getSymbolAtLocation(node);
@@ -69,8 +75,10 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
 
   function relay(node, path) {
     const location = site(node);
-    const index = relays.findIndex((entry) => entry.file === location.file && entry.owner === location.owner &&
-      entry.expression === location.expression && JSON.stringify(entry.path ?? []) === JSON.stringify(path));
+    const index = relays.findIndex((entry) => [entry.path, ...(entry.alsoPaths ?? [])].some((projection) => JSON.stringify(projection) === JSON.stringify(path)) &&
+      (entry.callee
+        ? ts.isCallExpression(node) && functionFor(node.expression) === localFunction(entry.guard)
+        : entry.file === location.file && entry.owner === location.owner && entry.expression === location.expression));
     if (index < 0) return false;
     const entry = relays[index];
     if (entry.argument === undefined && !entry.local) {
@@ -123,6 +131,24 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
     return undefined;
   }
 
+  function literalKeys(node, seen = new Set()) {
+    if (!node || seen.has(node)) return undefined;
+    seen.add(node);
+    if (ts.isStringLiteralLike(node)) return [node.text];
+    if (ts.isIdentifier(node)) {
+      const declaration = symbol(node)?.declarations?.[0];
+      if (declaration && ts.isVariableDeclaration(declaration)) return literalKeys(declaration.initializer, seen);
+      if (declaration && ts.isParameter(declaration)) {
+        const index = declaration.parent.parameters.indexOf(declaration);
+        const callers = calls.get(declaration.parent) ?? [];
+        if (!callers.length) return undefined;
+        const keys = callers.map((call) => literalKeys(call.arguments?.[index] ?? declaration.initializer, new Set(seen)));
+        return keys.every((key) => key !== undefined) ? keys.flat() : undefined;
+      }
+    }
+    return undefined;
+  }
+
   for (const source of sources) walk(source, (node) => {
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left)) {
       const target = symbol(node.left);
@@ -130,8 +156,10 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
       values.push(node.right);
       assignments.set(target, values);
     }
-    if (!ts.isCallExpression(node)) return;
-    const declaration = functionFor(node.expression);
+    if (!ts.isCallExpression(node) && !ts.isNewExpression(node)) return;
+    const declaration = ts.isNewExpression(node)
+      ? symbol(node.expression)?.declarations?.find(ts.isClassDeclaration)?.members.find(ts.isConstructorDeclaration)
+      : functionFor(node.expression);
     if (declaration && ts.isFunctionLike(declaration)) {
       const entries = calls.get(declaration) ?? [];
       entries.push(node);
@@ -142,6 +170,8 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
   function evaluate(node, path = []) {
     if (!node) return;
     const key = JSON.stringify(path);
+    if (visited.get(node)?.has(key)) return;
+    if (path.length > MAX_PROJECTION_DEPTH) return unknown(node, path);
     const paths = active.get(node) ?? new Set();
     if (paths.has(key)) return;
     paths.add(key);
@@ -179,8 +209,13 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
         const [head, ...rest] = path;
         for (const property of node.properties) {
           if (ts.isSpreadAssignment(property)) evaluate(property.expression, path);
-          else if (property.name && (head === "*" || propertyName(property.name) === head ||
-            (ts.isComputedPropertyName(property.name) && propertyName(property.name) === undefined))) {
+          else if (property.name) {
+            const names = ts.isComputedPropertyName(property.name) ? literalKeys(property.name.expression) : [propertyName(property.name)];
+            if (head !== "*" && !names) {
+              unknown(property.name, path);
+              continue;
+            }
+            if (head !== "*" && !names.includes(head)) continue;
             if (ts.isPropertyAssignment(property)) evaluate(property.initializer, rest);
             else if (ts.isShorthandPropertyAssignment(property)) {
               const target = checker.getShorthandAssignmentValueSymbol(property);
@@ -248,10 +283,13 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
       if (ts.isNewExpression(node) && path[0] === "code" && isDvmError(node.expression)) {
         return evaluate(node.arguments?.[0], path.slice(1));
       }
-      if (ts.isNewExpression(node) && path[0] === "code") {
+      if (ts.isNewExpression(node) && path[0] === "data" && isDvmError(node.expression)) {
+        return evaluate(node.arguments?.[3], path.slice(1));
+      }
+      if (ts.isNewExpression(node) && (path[0] === "code" || path[0] === "data")) {
         const declaration = symbol(node.expression)?.declarations?.find(ts.isClassDeclaration);
         if (declaration?.heritageClauses?.some((clause) => clause.types.some((type) => isDvmError(type.expression)))) {
-          evaluateSuperCodes(declaration, path.slice(1));
+          evaluateSuperCodes(declaration, path.slice(1), path[0] === "code" ? 0 : 3);
           return;
         }
       }
@@ -265,6 +303,9 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
       unknown(node, path);
     } finally {
       paths.delete(key);
+      const completed = visited.get(node) ?? new Set();
+      completed.add(key);
+      visited.set(node, completed);
     }
   }
 
@@ -288,7 +329,7 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
           !type.getProperty(path[0]) && !type.getStringIndexType()) return;
         return unknown(declaration.name, path);
       }
-      for (const call of callers) evaluate(call.arguments[index] ?? declaration.initializer, path);
+      for (const call of callers) evaluate(call.arguments?.[index] ?? declaration.initializer, path);
       return;
     }
     if (ts.isBindingElement(declaration) && ts.isObjectBindingPattern(declaration.parent)) {
@@ -315,18 +356,28 @@ export function discoverErrorCodes(sourceRoot, relays = []) {
       (ts.isVariableDeclaration(declaration) && declaration.initializer && isDvmError(declaration.initializer, seen)));
   }
 
-  function evaluateSuperCodes(declaration, path = []) {
+  function evaluateSuperCodes(declaration, path = [], argument = 0) {
     for (const member of declaration.members) {
       if (ts.isConstructorDeclaration(member) && member.body) walk(member.body, (child) => {
-        if (ts.isCallExpression(child) && child.expression.kind === ts.SyntaxKind.SuperKeyword) evaluate(child.arguments[0], path);
+        if (ts.isCallExpression(child) && child.expression.kind === ts.SyntaxKind.SuperKeyword) {
+          evaluate(child.arguments[argument], path);
+        }
       });
     }
   }
 
   for (const source of sources) walk(source, (node) => {
-    if (ts.isNewExpression(node) && isDvmError(node.expression)) evaluate(node.arguments?.[0]);
+    if (ts.isNewExpression(node) && isDvmError(node.expression)) {
+      evaluate(node.arguments?.[0]);
+      // The JSON boundary spreads data last, so a local data.code is authored
+      // output even when it overrides the positional constructor code.
+      evaluate(node.arguments?.[3], ["code"]);
+    }
     if (ts.isClassDeclaration(node) && node.heritageClauses?.some((clause) =>
-      clause.types.some((type) => isDvmError(type.expression)))) evaluateSuperCodes(node);
+      clause.types.some((type) => isDvmError(type.expression)))) {
+      evaluateSuperCodes(node);
+      evaluateSuperCodes(node, ["code"], 3);
+    }
     if (ts.isPropertyAssignment(node) && propertyName(node.name) === "error") {
       evaluate(node.initializer, ["code"]);
     }

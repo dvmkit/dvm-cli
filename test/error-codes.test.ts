@@ -91,6 +91,22 @@ describe("CLI error compatibility check", () => {
     expect(tree.inventory()).toBe(before);
   });
 
+  it("inventories local data.code overrides and rejects dropping their serialized source", () => {
+    const source = `${original}
+const OVERRIDES = {primary: "override_error"};
+function details() { return {code: OVERRIDES.primary}; }
+new DvmError("invalid_input", "Message", undefined, details());`;
+    const tree = fixture(source);
+    expect(tree.run().output).toContain("Unlisted CLI error codes: override_error");
+    expect(tree.run("--update").status).toBe(0);
+    expect(JSON.parse(tree.inventory())).toEqual({ codes: ["internal", "invalid_input", "override_error"], families: [] });
+    expect(tree.run().status).toBe(0);
+    writeFileSync(tree.sourcePath, source.replace(', undefined, details()', ''));
+    const before = tree.inventory();
+    expect(tree.run("--update").output).toContain("Removed or renamed CLI error codes: override_error");
+    expect(tree.inventory()).toBe(before);
+  });
+
   it.each([
     { codes: ["invalid_input", "internal"], families: [] },
     { codes: ["internal", "internal", "invalid_input"], families: [] },
@@ -176,6 +192,18 @@ normalize({code: "different_provider_failure"});`;
     expect(tree.run().output).toContain("Unlisted CLI error codes: unlisted_local");
   });
 
+  it("keeps relayed provider code and data.code fields outside the local promise", () => {
+    const tree = fixture(`${importError}
+function fromProvider(body: {code?: string; data?: Record<string, unknown>}) {
+  return new DvmError(body.code ?? "provider_error", "Remote", undefined, body.data);
+}
+fromProvider({code: "remote_name", data: {code: "remote_override"}});`);
+    expect(discoverErrorCodes(tree.sourceRoot, [{
+      file: "command.ts", owner: "fromProvider", expression: "body", path: ["code"], alsoPaths: [["data", "code"]],
+      reason: "Both fields are supplied by a provider, unchanged.",
+    }])).toEqual({ codes: ["provider_error"], families: [] });
+  });
+
   it("rejects unclassified dynamic sources and stale classifications", () => {
     const source = `${importError}function fail(code: string) { throw new DvmError(code.toLowerCase(), "Message"); } fail("new_code");`;
     const tree = fixture(source);
@@ -242,6 +270,22 @@ throw new DvmError((await withTimeout(probe())).code, "Message");`, { codes: ["p
     expect(tree.run().output).toContain("Classified local flow changed: command.ts#withTimeout");
     writeFileSync(tree.sourcePath, source.replace("probe_error", "changed_probe"));
     expect(tree.run().output).toContain("Removed or renamed CLI error codes: probe_error");
+  });
+
+  it("guards argument flows by helper declaration across call sites", () => {
+    const helper = "function decorate(input: Record<string, unknown>) { return {...input, marked: true}; }";
+    const relays: ErrorCodeSource[] = [{
+      file: "command.ts", owner: "decorate", expression: "decorate", path: ["code"], argument: 0, callee: true,
+      guard: { file: "command.ts", name: "decorate", sha256: createHash("sha256").update(helper).digest("hex") },
+      reason: "The reviewed metadata decorator preserves the code field.",
+    }];
+    const source = `${importError}\n${helper}
+new DvmError("base_error", "Message", undefined, decorate({code: "first_override"}));
+function run() { return new DvmError("base_error", "Message", undefined, decorate({code: "second_override"})); }`;
+    const tree = fixture(source, { codes: ["base_error", "first_override", "second_override"], families: [] }, relays);
+    expect(tree.run().status).toBe(0);
+    writeFileSync(tree.sourcePath, source.replace("marked: true", 'code: "new_hidden_override"'));
+    expect(tree.run().output).toContain("Classified local flow changed: command.ts#decorate");
   });
 
   it("tracks the dynamic HTTP family and rejects removing it or changing its construction", () => {

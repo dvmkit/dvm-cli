@@ -39,15 +39,17 @@ test support, declarations, and dependency source. It traces constructor argumen
 local constants and maps, helper calls, returned error objects, subclass `super`
 calls, and error-envelope fallbacks. The existing upload fallback constructs
 `http_${status.toString()}` dynamically; its `http_${number}` family is recorded
-separately from finite codes.
+separately from finite codes. Local `DvmError.data.code` fields are included
+because the JSON boundary spreads data after the positional constructor code.
 
 This is a bounded static analysis. An unresolved construction fails instead of
 being treated as a provider code. `scripts/error-code-relays.json` records reviewed
 remote/dependency code projections and exceptional local result flows, each bound
 to a source file, enclosing function, expression, and property path with a reason.
-The local flows trace the card settlement callback and the probe timeout's input;
-the timeout flow pins its reviewed wrapper with a SHA-256 guard, so a changed
-implementation requires review. SDK lock and pool wrappers preserve their callback
+The local flows trace the card settlement callback, the probe timeout's input,
+and the input to provider provenance marking. Argument flows pin their reviewed
+wrappers with SHA-256 guards, so a changed implementation requires review.
+SDK lock and pool wrappers preserve their callback
 results. When a construction changes, extend the analyzer or review the precise
 source classification. Do not
 exclude a local code to make the check pass. Stale classifications also fail.

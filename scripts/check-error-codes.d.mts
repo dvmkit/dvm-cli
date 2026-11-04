@@ -8,8 +8,10 @@ export interface ErrorCodeSource {
   owner: string;
   expression: string;
   path: string[];
+  alsoPaths?: string[][];
   reason: string;
   argument?: number;
+  callee?: boolean;
   local?: { file: string; name: string };
   guard?: { file: string; name: string; sha256: string };
 }

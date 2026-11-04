@@ -6,7 +6,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "commands/request.ts",
@@ -15,7 +21,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "commands/wallet-mpp.ts",
@@ -24,7 +36,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "commands/wallet-pair.ts",
@@ -33,7 +51,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "commands/wallet.ts",
@@ -42,7 +66,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit/drain.ts",
@@ -51,7 +81,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/float.ts",
@@ -60,7 +96,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/float.ts",
@@ -69,7 +111,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/float.ts",
@@ -78,7 +126,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/input-schema-hint.ts",
@@ -87,7 +141,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/job-access.ts",
@@ -114,7 +174,13 @@
     "path": [
       "code"
     ],
-    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately."
+    "reason": "Existing DvmError or dependency failure relayed by this error boundary; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "commands/browse.ts",
@@ -170,7 +236,14 @@
       "error",
       "code"
     ],
-    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+    "reason": "Code read from a remote JSON response; local fallback branches are traced separately.",
+    "alsoPaths": [
+      [
+        "error",
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/card-credit/fund.ts",
@@ -179,7 +252,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/card-credit/fund.ts",
@@ -193,7 +272,14 @@
       "file": "lib/credit-fund.ts",
       "name": "settled"
     },
-    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback."
+    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback.",
+    "alsoPaths": [
+      [
+        "error",
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/card-credit/fund.ts",
@@ -202,7 +288,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/card-credit/fund.ts",
@@ -216,7 +308,14 @@
       "file": "lib/credit-fund.ts",
       "name": "settled"
     },
-    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback."
+    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback.",
+    "alsoPaths": [
+      [
+        "error",
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/card-credit/fund.ts",
@@ -225,7 +324,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/card-credit/fund.ts",
@@ -239,7 +344,14 @@
       "file": "lib/credit-fund.ts",
       "name": "settled"
     },
-    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback."
+    "reason": "Card funding calls the local settled result callback. Trace its production body rather than promising codes from an arbitrary callback.",
+    "alsoPaths": [
+      [
+        "error",
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -248,7 +360,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -257,7 +375,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -266,7 +390,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -275,7 +405,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -284,7 +420,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -293,7 +435,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -302,7 +450,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -311,7 +465,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/credit-fund.ts",
@@ -320,7 +480,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/payment-rails/tempo-lifecycle.ts",
@@ -442,7 +608,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "commands/request.ts",
@@ -451,7 +623,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "commands/request.ts",
@@ -460,7 +638,13 @@
     "path": [
       "code"
     ],
-    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+    "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
   },
   {
     "file": "commands/wallet-cashu.ts",
@@ -510,5 +694,40 @@
       "code"
     ],
     "reason": "Caught DvmError or dependency failure is relayed; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/provider-output.ts",
+    "owner": "providerFields",
+    "expression": "providerFields",
+    "path": [
+      "code"
+    ],
+    "argument": 0,
+    "callee": true,
+    "guard": {
+      "file": "lib/provider-output.ts",
+      "name": "providerFields",
+      "sha256": "a583e09d8e4d3758bd2049e7407f5022bf639f3ccc1c1fa27bb1f4575f1f4ebe"
+    },
+    "reason": "Provider provenance marking preserves the input code field. The reviewed helper body is guarded so changed code construction requires review."
+  },
+  {
+    "file": "commands/request-result.ts",
+    "owner": "requestResult",
+    "expression": "err",
+    "path": [
+      "data",
+      "code"
+    ],
+    "reason": "Existing error data is relayed; locally authored constructor data fields are inventoried separately."
+  },
+  {
+    "file": "lib/job-access.ts",
+    "owner": "redactRecord",
+    "expression": "Object.fromEntries(\n    Object.entries(record).map(([key, value]) => [key, redactValue(value, redact)])\n  )",
+    "path": [
+      "code"
+    ],
+    "reason": "Existing error data is redacted and relayed. Local code producers are inventoried separately."
   }
 ]
