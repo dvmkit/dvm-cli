@@ -24,7 +24,15 @@ it.each([true, false])("redeems the original refund token and marks output copie
   expect(output.refund).toMatchObject({ cashu_token: token, claimed,
     _provider_fields: expect.arrayContaining(["cashu_token", "mint", "reason"]) });
   const action = refundNextAction("refund", claims);
-  expect(action).toMatchObject({ claimed, _provider_fields: expect.arrayContaining(["reason"]) });
+  expect(action).toMatchObject({ type: "refund", job_id: "refund", claimed,
+    amount_msats: claimed ? 2000 : 3000, reason: "refund", display: expect.any(String), hint: expect.any(String),
+    _provider_fields: expect.arrayContaining(["reason"]) });
+  if (claimed) {
+    expect(action).not.toHaveProperty("cashu_token");
+    expect(action).toHaveProperty("_provider_fields", expect.not.arrayContaining(["amount_msats"]));
+  } else {
+    expect(action).toHaveProperty("_provider_fields", expect.arrayContaining(["amount_msats"]));
+  }
   if (!claimed) expect(action).toMatchObject({ cashu_token: token, _provider_fields: expect.arrayContaining(["cashu_token"]) });
 });
 

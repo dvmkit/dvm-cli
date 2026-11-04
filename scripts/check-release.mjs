@@ -73,6 +73,9 @@ if (!release.includes(`node_modules/${packageJson.name}`) || !artifact.includes(
 if (releasePleaseConfig["skip-github-release"] !== true) {
   fail("release-please must not create tags or GitHub releases");
 }
+if ((releasePleaseConfig.packages?.["."]?.["bump-minor-pre-major"] ?? releasePleaseConfig["bump-minor-pre-major"]) !== true) {
+  fail("release-please must propose a minor version for pre-1.0 breaking changes");
+}
 if (
   releasePleaseConfig["include-component-in-tag"] !== false ||
   releasePleaseConfig["include-v-in-tag"] !== true ||

@@ -4,6 +4,7 @@
   "include-component-in-tag": false,
   "include-v-in-tag": true,
   "skip-github-release": true,
+  "bump-minor-pre-major": true,
   "packages": {
     ".": {
       "release-type": "node"

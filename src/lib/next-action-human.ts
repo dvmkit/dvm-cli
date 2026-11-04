@@ -36,8 +36,6 @@ export function nextActionHuman(action: NextAction): string | null {
     }
     case "refund":
       return action.claimed ? null : `Next: ${refundSummaryHuman(action)}`;
-    case "approve":
-      return `Next: ${action.hint}`;
   }
 }
 
