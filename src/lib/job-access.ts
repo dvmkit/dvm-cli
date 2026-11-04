@@ -139,7 +139,7 @@ export function redactJobTokenFromError(err: unknown, jobToken: string | undefin
   if (!jobToken || !(err instanceof DvmError)) return err;
   const redact = (value: string): string => value.replaceAll(jobToken, "[REDACTED]");
   return new DvmError(
-    err.code,
+    redact(err.code),
     redact(err.message),
     err.hint === undefined ? undefined : redact(err.hint),
     err.data === undefined ? undefined : redactRecord(err.data, redact),

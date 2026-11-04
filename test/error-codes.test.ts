@@ -357,6 +357,32 @@ function run() { return new DvmError("base_error", "Message", undefined, decorat
     expect(tree.run().output).toContain("Classified local flow changed: command.ts#decorate");
   });
 
+  it("traces a redacted code separately from prose and relayed provider codes", () => {
+    const wrapper = `function wrapError(err: {code: string; message: string}, token: string) {
+  const redact = (value: string): string => value.replaceAll(token, "[REDACTED]");
+  return new DvmError(redact(err.code), redact(err.message));
+}`;
+    const source = `${original}\n${wrapper}
+wrapError({code: "new_failure", message: "not_a_code"}, token);
+function fromProvider(body: {code: string; message: string}) { return wrapError(body, token); }
+fromProvider({code: "provider_owned", message: "also_not_a_code"});`;
+    const relays: ErrorCodeSource[] = [
+      {file: "command.ts", owner: "wrapError", expression: "redact(err.code)", path: [], argument: 0,
+        guard: {file: "command.ts", name: "wrapError", sha256: createHash("sha256").update(wrapper).digest("hex")},
+        reason: "Redaction acts on an existing code; trace its input while guarding the wrapper."},
+      {file: "command.ts", owner: "fromProvider", expression: "body", path: ["code"], reason: "Provider-owned code is relayed."},
+    ];
+    const tree = fixture(source, promised, relays);
+    const result = tree.run();
+    expect(result.status).toBe(1);
+    expect(result.output).toContain("Unlisted CLI error codes: new_failure");
+    expect(tree.run("--update").status).toBe(0);
+    expect(JSON.parse(tree.inventory())).toEqual({codes: ["internal", "invalid_input", "new_failure"], families: []});
+    expect(tree.run().status).toBe(0);
+    writeFileSync(tree.sourcePath, source.replace("redact(err.code),", 'redact(err.code) || "hidden_code",'));
+    expect(tree.run().output).toContain("Classified local flow changed: command.ts#wrapError");
+  });
+
   it("tracks the dynamic HTTP family and rejects removing it or changing its construction", () => {
     const source = `${importError}function fromHttp(status: number) { return new DvmError(\`http_\${status.toString()}\`, "HTTP error"); }`;
     const tree = fixture(source, { codes: [], families: ["http_${number}"] });

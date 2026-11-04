@@ -753,5 +753,36 @@
       "code"
     ],
     "reason": "The shorthand field preserves the caught provider/transport error for replay. Local code producers are inventoried separately."
+  },
+  {
+    "file": "lib/job-access.ts",
+    "owner": "redactJobTokenFromError",
+    "expression": "redact(err.code)",
+    "path": [],
+    "argument": 0,
+    "guard": {
+      "file": "lib/job-access.ts",
+      "name": "redactJobTokenFromError",
+      "sha256": "23e0e2cf07ed7021eedade8438bdae3a4bcc71ee63dbcf845c8a9df835d84e78"
+    },
+    "reason": "Job-token redaction transforms an existing error code rather than selecting a new local code name. Trace the original code separately from prose and guard changes to this wrapper."
+  },
+  {
+    "file": "commands/browse.ts",
+    "owner": "browse",
+    "expression": "error",
+    "path": [
+      "code"
+    ],
+    "reason": "Discovery catches and redacts an existing command or provider error. Local code producers are inventoried separately."
+  },
+  {
+    "file": "commands/search.ts",
+    "owner": "search",
+    "expression": "error",
+    "path": [
+      "code"
+    ],
+    "reason": "Discovery catches and redacts an existing command or provider error. Local code producers are inventoried separately."
   }
 ]

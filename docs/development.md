@@ -54,8 +54,10 @@ being treated as a provider code. `scripts/error-code-relays.json` records revie
 remote/dependency code projections and exceptional local result flows, each bound
 to a source file, enclosing function, expression, and property path with a reason.
 The local flows trace the card settlement callback, the probe timeout's input,
-and the input to provider provenance marking. Argument flows pin their reviewed
-wrappers with SHA-256 guards, so a changed implementation requires review.
+the input to provider provenance marking, and existing error codes passed to
+job-token redaction. The code redaction call is classified separately from prose
+redaction, so messages do not enter the code inventory. Argument flows pin their
+reviewed wrappers with SHA-256 guards, so a changed implementation requires review.
 SDK lock and pool wrappers preserve their callback
 results. When a construction changes, extend the analyzer or review the precise
 source classification. Do not

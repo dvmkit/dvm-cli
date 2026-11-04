@@ -20,6 +20,7 @@ import {
   type DiscoveryTrust,
   renderDiscoveryDisplay,
 } from "../lib/discovery-rows";
+import { redactJobTokenFromError } from "../lib/job-access";
 import { runDiscoveryLifecycle } from "../lib/discovery-lifecycle";
 import { loadFavorites, resolveEndpoint } from "../lib/favorites";
 import { parseDiscoveryInteger, parseDiscoveryTimeout } from "../lib/discovery-options";
@@ -150,6 +151,7 @@ export async function browse(opts: BrowseOptions): Promise<void> {
 
   progressNotice("Browsing catalog...", opts.human);
 
+  let jobToken: string | undefined;
   try {
     const result = await runDiscoveryLifecycle({
       transport,
@@ -158,6 +160,7 @@ export async function browse(opts: BrowseOptions): Promise<void> {
       input,
       timeoutMs: timeout,
     });
+    jobToken = result.jobToken;
     if (result.summary) {
       outputResults(result.summary, opts.human, result.nextAction);
       return;
@@ -186,6 +189,8 @@ export async function browse(opts: BrowseOptions): Promise<void> {
       "Browse did not complete in time.",
       "Try again or increase --timeout."
     );
+  } catch (error) {
+    throw redactJobTokenFromError(error, jobToken);
   } finally {
     transport.close();
   }

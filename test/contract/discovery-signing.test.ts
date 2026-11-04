@@ -11,8 +11,10 @@ const providers: Array<{ child: ChildProcess; completion: Promise<number | null>
 interface Evidence {
   jobs: Array<{ capability: string; input: unknown; pubkey?: string }>;
   submissions: Array<Record<string, unknown>>;
+  requests: Array<{ method: string; path: string; authenticated: boolean }>;
 }
 let snapshot: () => Promise<Evidence>;
+let control: (message: "defer" | "release") => Promise<void>;
 let authenticated: string;
 let anonymous: string;
 let caller: string;
@@ -25,7 +27,7 @@ function configRoot() {
 }
 
 beforeAll(async () => {
-  ({ authenticated, anonymous, snapshot } = await provider());
+  ({ authenticated, anonymous, snapshot, control } = await provider());
   caller = configRoot();
   const initialized = await runCli(["init"], caller);
   pubkey = JSON.parse(initialized.stdout).identity.pubkey;
@@ -63,6 +65,48 @@ const commands = [
 ];
 
 describe.each(commands)("$capability signed discovery", (command) => {
+  it.each([false, true])("resumes the exact timeout hint in a second process (signed: %s)", async (signed) => {
+    const root = signed ? caller : configRoot();
+    const endpoint = signed ? authenticated : anonymous;
+    const before = await snapshot();
+    await control("defer");
+    try {
+      const first = await runCli([...command.args, "--endpoint", endpoint, "--timeout", "0.1"], root);
+      expect(first.code).toBe(1);
+      const error = JSON.parse(first.stdout).error;
+      expect(error.code).toBe("timeout");
+      const records = JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"));
+      const job = records.at(-1);
+      expect(job).toMatchObject({ endpoint, capability: command.capability, status: "submitted", messageCursor: expect.any(Number) });
+      expect(job.messageCursor).toBeGreaterThan(0);
+      expect(job.jobToken).toMatch(/^[0-9a-f]{64}$/i);
+      const hint = /`(dvm messages [\w-]+ --wait)`/.exec(error.hint);
+      expect(hint).not.toBeNull();
+      const args = hint![1].split(" ").slice(1);
+      expect(args).toEqual(["messages", job.id, "--wait"]);
+      await control("release");
+      const resumed = await runCli(args, root);
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      const output = JSON.parse(resumed.stdout);
+      expect(output.jobId).toBe(job.id);
+      expect(output.messages).toEqual(expect.arrayContaining([expect.objectContaining({ type: "complete" })]));
+      const complete = output.messages.find((message: { type: string }) => message.type === "complete");
+      expect(complete.content.summary).toEqual({ _source: "provider", text: expect.any(String) });
+      expect(JSON.parse(complete.content.summary.text)).toMatchObject(command.output);
+      expect(output.next_action).toBeNull();
+      if (job.jobToken) expect(first.stdout + first.stderr + resumed.stdout + resumed.stderr).not.toContain(job.jobToken);
+      const after = await snapshot();
+      expect(after.jobs.at(-1)?.pubkey).toBe(signed ? pubkey : undefined);
+      expect(after.submissions.length - before.submissions.length).toBe(1);
+      const requests = after.requests.slice(before.requests.length);
+      expect(requests.filter((request) => request.method === "POST").map((request) => request.path)).toEqual(["/v1/job"]);
+      expect(requests.every((request) => request.authenticated === signed)).toBe(true);
+      expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8")).at(-1)).toMatchObject({ status: "completed" });
+    } finally {
+      await control("release");
+    }
+  }, 20_000);
+
   it("uses the configured identity and schema defaults through the SDK verifier", async () => {
     const identities = readFileSync(join(caller, "identities.json"), "utf8");
     const result = await runCli([...command.args, "--endpoint", authenticated], caller);
@@ -112,7 +156,7 @@ describe.each(commands)("$capability signed discovery", (command) => {
   });
 });
 
-async function provider(): Promise<{ authenticated: string; anonymous: string; snapshot: () => Promise<Evidence> }> {
+async function provider(): Promise<{ authenticated: string; anonymous: string; snapshot: () => Promise<Evidence>; control: typeof control }> {
   // SDK request spans contain raw routes that CI deliberately refuses to print.
   // Keep fixture telemetry private without intercepting test-runner diagnostics.
   const diagnostics = createWriteStream(join(mkdtempSync(join(tmpdir(), "discovery-provider-")), "fixture.log"), { mode: 0o600 });
@@ -155,6 +199,11 @@ async function provider(): Promise<{ authenticated: string; anonymous: string; s
   return {
     authenticated: ready.authenticated as string,
     anonymous: ready.anonymous as string,
+    async control(message) {
+      const response = receive(message === "defer" ? "deferred" : "released");
+      child.send(message);
+      await response;
+    },
     async snapshot() {
       const response = receive("snapshot");
       if (child.connected) child.send("snapshot");
@@ -167,7 +216,9 @@ function runCli(args: string[], root: string): Promise<{ code: number | null; st
   return new Promise((done, reject) => {
     const env: NodeJS.ProcessEnv = { ...process.env, DVM_CONFIG_DIR: root };
     delete env.DVM_IDENTITY_KEY;
-    const child = spawn(process.execPath, [binary, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    delete env.DVM_JOB_ENDPOINT;
+    delete env.DVM_JOB_TOKEN;
+    const child = spawn(process.execPath, [binary, ...args], { env, stdio: ["ignore", "pipe", "pipe"], timeout: 15_000 });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
