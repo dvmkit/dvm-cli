@@ -90,6 +90,9 @@ describe.each(commands)("$capability signed discovery", (command) => {
       const output = JSON.parse(resumed.stdout);
       expect(output.jobId).toBe(job.id);
       expect(output.messages).toEqual(expect.arrayContaining([expect.objectContaining({ type: "complete" })]));
+      const complete = output.messages.find((message: { type: string }) => message.type === "complete");
+      expect(complete.content.summary).toEqual({ _source: "provider", text: expect.any(String) });
+      expect(JSON.parse(complete.content.summary.text)).toMatchObject(command.output);
       expect(output.next_action).toBeNull();
       if (job.jobToken) expect(first.stdout + first.stderr + resumed.stdout + resumed.stderr).not.toContain(job.jobToken);
       const after = await snapshot();

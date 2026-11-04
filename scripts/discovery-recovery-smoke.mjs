@@ -22,6 +22,7 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
   const roots = [];
   let failed = false;
   let providerCode;
+  let phase = "provider startup";
   try {
     const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
     assert.equal(manifest.dependencies["@dvmkit/sdk"], expectedSdkVersion);
@@ -31,6 +32,7 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
       for (const capability of ["search", "browse"]) {
         const root = mkdtempSync(join(tmpdir(), "dvm-discovery-caller-"));
         roots.push(root);
+        phase = "caller initialization";
         let callerPubkey;
         if (signed) {
           const initialized = await cli(binary, root, ["init"]);
@@ -40,11 +42,13 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
         const endpoint = signed ? ready.authenticated : ready.anonymous;
         const before = await send("snapshot", "snapshot");
         await send("defer", "deferred");
+        phase = "discovery timeout";
         const first = await cli(binary, root, [capability, ...(capability === "search" ? ["weather"] : []), "--endpoint", endpoint, "--timeout", "0.1"]);
         assert.equal(first.code, 1);
         assert.equal(first.stderr, "");
         const error = JSON.parse(first.stdout).error;
         assert.equal(error.code, "timeout");
+        phase = "stored job access";
         const job = JSON.parse(readFileSync(join(root, "jobs.json"), "utf8")).at(-1);
         assert.equal(job.endpoint, endpoint);
         assert.equal(job.capability, capability);
@@ -56,6 +60,7 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
         const args = hint[1].split(" ").slice(1);
         assert.deepEqual(args, ["messages", job.id, "--wait"]);
         await send("release", "released");
+        phase = "job continuation";
         const resumed = await cli(binary, root, args);
         assert.equal(resumed.code, 0);
         assert.equal(resumed.stderr, "");
@@ -64,9 +69,13 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
         assert.equal(output.next_action, null);
         const complete = output.messages.find((message) => message.type === "complete");
         assert.ok(complete, "continuation must deliver the completed result");
-        const summary = JSON.parse(complete.content.summary);
+        phase = "completion summary";
+        assert.equal(complete.content.summary._source, "provider");
+        assert.equal(typeof complete.content.summary.text, "string");
+        const summary = JSON.parse(complete.content.summary.text);
         if (capability === "search") assert.equal(summary.query, "weather");
         else assert.deepEqual(summary.entries, []);
+        phase = "recovery evidence";
         assert.equal(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8")).at(-1).status, "completed");
         if (job.jobToken) assert.ok(!(first.stdout + first.stderr + resumed.stdout + resumed.stderr).includes(job.jobToken));
         const after = await send("snapshot", "snapshot");
@@ -92,7 +101,7 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
       rmSync(fixture, { force: true });
     }
   }
-  if (failed || providerCode !== 0) throw new Error("Installed discovery recovery fixture failed; diagnostics retained privately.");
+  if (failed || providerCode !== 0) throw new Error(`Installed discovery recovery fixture failed during ${phase}; diagnostics retained privately.`);
   console.log("installed discovery recovery ok: search/browse, anonymous/signed, exact timeout hints, no resubmission or payment");
 
   function receive(type) {
