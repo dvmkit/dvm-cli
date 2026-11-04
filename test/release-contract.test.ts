@@ -13,6 +13,8 @@ const temporaryRoots: string[] = [];
 describe("release automation contract", () => {
   it.each([
     ["a verification command that bypasses the orchestrator", "package.json", "node scripts/verify.mjs", "node scripts/check-release.mjs"],
+    ["an error-code check that rewrites the baseline", "package.json", '"check:error-codes": "node scripts/check-error-codes.mjs"', '"check:error-codes": "node scripts/check-error-codes.mjs --update"'],
+    ["a verification gate without error-code enforcement", "scripts/verify.mjs", '"check:error-codes"', '"update:error-codes"'],
     ["a clean source gate without its internal-mode guard", "scripts/clean-install-smoke.mjs", "DVM_CLI_CLEAN_SOURCE: \"1\"", "DVM_CLI_UNSAFE_SOURCE: \"1\""],
     ["a clean source gate that discards its verified build", "scripts/clean-install-smoke.mjs", "publishVerifiedDist(temporaryRoot);", "void temporaryRoot;"],
     ["a public-safety scanner without packed-artifact isolation", "scripts/public-safety.mjs", 'argument === "--pack-only"', 'argument === "--package-only"'],

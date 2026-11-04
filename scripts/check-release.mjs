@@ -33,6 +33,9 @@ if (packageJson.scripts?.["release:tag"] !== "node scripts/release-tag.mjs") {
 if (packageJson.scripts?.verify !== "node scripts/verify.mjs") {
   fail("verify must use the measured verification orchestrator");
 }
+if (packageJson.scripts?.["check:error-codes"] !== "node scripts/check-error-codes.mjs") {
+  fail("check:error-codes must compare the committed inventory without updating it");
+}
 for (const step of [
   'name: "lint"',
   'name: "build"',
@@ -41,6 +44,7 @@ for (const step of [
   '"check:package"',
   '"check:public-safety"',
   '"check:release"',
+  '"check:error-codes"',
   '"clean-install-smoke"',
 ]) {
   if (!gate.includes(step)) fail(`verify must retain ${step}`);
