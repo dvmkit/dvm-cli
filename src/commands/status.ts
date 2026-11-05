@@ -299,6 +299,8 @@ function renderStatus(
     if (spend) renderSpendHuman(spend, info);
     else if (settlement.settlement) info(settlement.settlement.display);
     if (receipt) renderReceiptHuman(receipt);
+    // The receipt line already explained the same unlabelled amounts.
+    if (settlement.settlement_hint && !receipt?.currencyHint) info(`  ${settlement.settlement_hint}`);
     printNextActionHuman(nextAction);
     return;
   }
@@ -321,6 +323,7 @@ function renderStatus(
     // read as "this DVM doesn't issue receipts" rather than "not yet".
     ...(receipt ? receiptJsonFields(receipt) : {}),
     ...settlement,
+    ...(receipt?.currencyHint ? { settlement_hint: undefined } : {}),
     // `dvm status` is a job-terminal emission for `--no-stream`
     // jobs, so it drains the deferred-notice sinks like the request terminals
     // do. Both spread blind and are absent when nothing was stashed.

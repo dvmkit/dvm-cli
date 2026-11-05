@@ -1,4 +1,4 @@
-import { observedSettlementFields } from "../lib/receipt-capture";
+import { observedSettlementFields, renderSettlementHuman } from "../lib/receipt-capture";
 import { providerCurrency } from "../lib/provider-currency";
 import { providerJobJson } from "../lib/provider-output";
 import {
@@ -115,7 +115,7 @@ async function messageWithAccess(
   transport.close();
 
   if (opts.human) {
-    if (settlement.settlement) info(settlement.settlement.display);
+    renderSettlementHuman(settlement);
     info(String(content.content_hint));
     info(`Message sent (type: ${msgType}).`);
     for (const msg of result.messages) {

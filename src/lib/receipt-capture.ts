@@ -16,7 +16,7 @@ import type { JobStatus, ProviderInfo, ProviderRef, ReceiptParseError, Transport
 import { captureDrawFundingReceipts } from "./draw-funding";
 import { completionSnapshot } from "./completion-hints";
 import { parseJobContent, type ContentStatus } from "./job-content";
-import { receiptSettlement, terminalSettlementFields } from "./job-settlement";
+import { receiptSettlement, type SettlementFields, terminalSettlementFields } from "./job-settlement";
 import { isTerminalJobStatus } from "./next-action";
 import { loadMessages } from "./messages";
 import { formatMicro, pieceSettlement, type PieceContext, settlementCurrencyHint } from "./piece-settlement";
@@ -161,7 +161,11 @@ export function receiptJsonFields(capture: ReceiptCapture, jobId?: string): Reco
   if (jobId) Object.assign(out, terminalSettlementFields(jobId, { receipt: capture.receipt }));
   else if (capture.receipt) out.settlement = receiptSettlement(capture.receipt, capture.status);
   if (capture.status !== "absent") out.receipt_display = capture.display;
-  if (capture.currencyHint) out.receipt_hint = capture.currencyHint;
+  // One explanation per output: the receipt line and the settlement share it.
+  if (capture.currencyHint) {
+    out.receipt_hint = capture.currencyHint;
+    delete out.settlement_hint;
+  }
   if (capture.receipt) {
     out.receipt = capture.receipt;
     if (capture.checks) out.receipt_checks = capture.checks;
@@ -171,13 +175,17 @@ export function receiptJsonFields(capture: ReceiptCapture, jobId?: string): Reco
 }
 
 export function renderReceiptHuman(capture: ReceiptCapture, jobId?: string): void {
-  if (jobId) {
-    const { settlement } = terminalSettlementFields(jobId, { receipt: capture.receipt });
-    if (settlement) info(settlement.display);
-  }
-  if (capture.status === "absent") return;
-  info(`🧾 ${capture.display}`);
-  if (capture.currencyHint) info(`  ${capture.currencyHint}`);
+  const fields = jobId ? terminalSettlementFields(jobId, { receipt: capture.receipt }) : {};
+  if (fields.settlement) info(fields.settlement.display);
+  if (capture.status !== "absent") info(`🧾 ${capture.display}`);
+  const hint = capture.status !== "absent" && capture.currencyHint ? capture.currencyHint : fields.settlement_hint;
+  if (hint) info(`  ${hint}`);
+}
+
+/** The settlement line, and below it why its amounts name no currency when they don't. */
+export function renderSettlementHuman(fields: SettlementFields): void {
+  if (fields.settlement) info(fields.settlement.display);
+  if (fields.settlement_hint) info(`  ${fields.settlement_hint}`);
 }
 
 export function observedSettlementFields(jobId: string, response?: Partial<ContentStatus>, persistLocalState = true, currency?: string) {

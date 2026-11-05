@@ -1,4 +1,4 @@
-import { observedSettlementFields } from "../lib/receipt-capture";
+import { observedSettlementFields, renderSettlementHuman } from "../lib/receipt-capture";
 import { providerCurrency } from "../lib/provider-currency";
 import { observeJobContent } from "../lib/job-content";
 import { providerJobJson } from "../lib/provider-output";
@@ -256,7 +256,7 @@ async function payWithAccess(
   const identifier = stored.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
 
   if (opts.human) {
-    if (settlement.settlement) info(settlement.settlement.display);
+    renderSettlementHuman(settlement);
     info(`${paid.display}${identifier ? ` [${identifier}]` : ""}`);
     for (const msg of streamResult.messages) {
       // `jobId` is what lets an artifact in the resumed stream reach disk —

@@ -89,17 +89,20 @@ it("labels the amount and explains why when no local record names the currency",
   expect(verified.stdout + human.stderr + JSON.stringify(listed)).not.toContain("micro-units");
 });
 
-it("flags a charge above the upfront payment this CLI recorded", async () => {
+it.each([
+  ["flags a charge above", 2_900_000, true],
+  ["accepts a charge within", 2_500_000, false],
+] as const)("%s the upfront payment this CLI recorded", async (_name, charged, overcharged) => {
   const root = mkdtempSync(join(tmpdir(), "receipt-amounts-"));
   roots.push(root);
   const dvm = attestedDvm();
-  // $2.50 paid upfront; the receipt charges $2.90, adding a piece bought at a payment this CLI never made.
+  // $2.50 paid upfront. The $2.90 charge adds a piece bought at a payment this
+  // CLI never made; the $2.50 one charges only that upfront piece.
+  const pieces = [{ amount: 2_500_000, charged: 2_500_000, paid_seq: 0, state: "finished" },
+    ...(charged > 2_500_000 ? [{ amount: charged - 2_500_000, charged: charged - 2_500_000, paid_seq: 2, state: "finished" }] : [])];
   const receipt = dvm.sign({ job_id: "piece-job", outcome: "completed",
-    paid: { ...unsignedReceipt().paid, msats: 2_900_000, rail: null, mint: null },
-    settlement: { held: 2_900_000, charged: 2_900_000, released: 0, pieces: [
-      { amount: 2_500_000, charged: 2_500_000, paid_seq: 0, state: "finished" },
-      { amount: 400_000, charged: 400_000, paid_seq: 2, state: "finished" },
-    ] } } as never);
+    paid: { ...unsignedReceipt().paid, msats: charged, rail: null, mint: null },
+    settlement: { held: charged, charged, released: 0, pieces } } as never);
   writeFileSync(join(root, "receipts.jsonl"), JSON.stringify({ receipt, builder: dvm.anchor,
     endpoint, verification: "verified", verified_at: 1 }) + "\n");
   writeFileSync(join(root, "jobs.json"), JSON.stringify([{ id: "piece-job", endpoint, status: "completed", submittedAt: 1,
@@ -109,7 +112,8 @@ it("flags a charge above the upfront payment this CLI recorded", async () => {
   writeFileSync(join(root, "messages/piece-job.jsonl"),
     JSON.stringify({ seq: 1, from: "provider", timestamp: 1, type: "complete", content: { summary: "Done" } }) + "\n");
   const output = JSON.parse((await run(root, ["verify", "piece-job"])).stdout);
-  expect(output.settlement).toMatchObject({ currency: "usd", overcharged: true, ceiling_micro: 2_500_000,
-    ceiling_basis: "payments", display: expect.stringContaining("at most $2.50 USD") });
-  expect(output.display).toContain("Charged $2.90 USD for");
+  expect(output.settlement).toMatchObject({ currency: "usd", overcharged, ceiling_micro: 2_500_000, ceiling_basis: "payments" });
+  if (overcharged) expect(output.settlement.display).toContain("at most $2.50 USD");
+  else expect(output.settlement.display).toBe("Charged $2.50 USD of $2.50 USD held, $0.00 USD released.");
+  expect(output.display).toContain(overcharged ? "Charged $2.90 USD for" : "Charged $2.50 USD for");
 });
