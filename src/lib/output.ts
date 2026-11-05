@@ -2,16 +2,36 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { AutoPayWarning } from "./auto-pay-warning";
 import { writeSync } from "node:fs";
 
-const warnings = new AsyncLocalStorage<AutoPayWarning[]>();
+export interface DrawFundingWarning {
+  code: "draw_funding_unverified";
+  job_id: string;
+  reason: string;
+  hint: string;
+  display: string;
+}
+
+export type OutputWarning = AutoPayWarning | DrawFundingWarning;
+
+const warnings = new AsyncLocalStorage<OutputWarning[]>();
 
 export function withOutputWarnings<T>(run: () => Promise<T>): Promise<T> {
   return warnings.run([], run);
 }
 
-export function addOutputWarnings(entries: AutoPayWarning[], human?: boolean): void {
+function sameWarning(prior: OutputWarning, entry: OutputWarning): boolean {
+  if (prior.code === "auto_pay_bound_exceeded" && entry.code === "auto_pay_bound_exceeded") {
+    return prior.auto_pay_below === entry.auto_pay_below && prior.source === entry.source;
+  }
+  if (prior.code === "draw_funding_unverified" && entry.code === "draw_funding_unverified") {
+    return prior.job_id === entry.job_id && prior.reason === entry.reason;
+  }
+  return false;
+}
+
+export function addOutputWarnings(entries: OutputWarning[], human?: boolean): void {
   const pending = warnings.getStore();
   for (const entry of entries) {
-    if (pending?.some((prior) => prior.auto_pay_below === entry.auto_pay_below && prior.source === entry.source)) continue;
+    if (pending?.some((prior) => sameWarning(prior, entry))) continue;
     pending?.push(entry);
     if (human) info(`Warning: ${entry.display}`);
   }

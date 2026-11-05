@@ -14,6 +14,7 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   info,
+  withOutputWarnings,
 } from "../lib/output";
 
 import {
@@ -57,7 +58,7 @@ export async function messages(jobId: string, opts: MessagesOptions): Promise<vo
     throw new DvmError("invalid_arguments", "Use --until with --wait, and --wait with streaming enabled.");
   }
   const access = resolveJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => messagesWithAccess(jobId, opts, access));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => messagesWithAccess(jobId, opts, access)));
 }
 
 async function messagesWithAccess(

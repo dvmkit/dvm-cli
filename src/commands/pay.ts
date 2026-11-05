@@ -17,6 +17,7 @@ import {
 } from "../lib/payment-rails/tempo-wallet";
 import {
   info,
+  withOutputWarnings,
 } from "../lib/output";
 import {
   loadX402Wallet,
@@ -69,7 +70,7 @@ export interface PayOptions extends JobAccessOptions {
 
 export async function pay(jobId: string, opts: PayOptions): Promise<void> {
   const access = resolveStoredJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => payWithAccess(jobId, opts, access));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => payWithAccess(jobId, opts, access)));
 }
 
 async function payWithAccess(
