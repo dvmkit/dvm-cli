@@ -25,22 +25,23 @@ const MISMATCH_FIELDS: Record<string, keyof DrawFundingReceipt> = {
 };
 
 // Receipt fields are provider-supplied and may be unverified, so they are
-// quoted in prose and shell-quoted in the command agents are told to relay.
-function nextAction(job: JobRecord, creditId: string): string {
+// quoted in prose and never reach the relayed command: `--credit-id` would
+// also select that credit for later draws.
+function nextAction(job: JobRecord): string {
   return "Nothing is owed or lost: the job's terminal receipt still decides the charge. " +
-    `Refresh this credit with \`dvm credit balance ${shellQuoteArg(job.endpoint)} --credit-id ${shellQuoteArg(creditId)}\` once the job ends; ` +
+    `Refresh your credit balances with \`dvm credit balance ${shellQuoteArg(job.endpoint)}\` once the job ends; ` +
     `if this repeats, report job ${JSON.stringify(job.id)} and the reason to the provider.`;
 }
 
 function invalidFunding(
   job: JobRecord, receipt: DrawFundingReceipt, reason: string,
-  expected: Partial<Record<keyof DrawFundingReceipt, string>>, creditId: string
+  expected: Partial<Record<keyof DrawFundingReceipt, string>>
 ): FundingCheck {
   const field: keyof DrawFundingReceipt | undefined = MISMATCH_FIELDS[reason];
   const detail = field
     ? `The provider signed ${field} ${JSON.stringify(String(receipt[field]))}; this job expects ${JSON.stringify(expected[field])}.`
     : "The provider's funding evidence failed verification.";
-  return { kind: "invalid", reason, hint: `${detail} ${nextAction(job, creditId)}` };
+  return { kind: "invalid", reason, hint: `${detail} ${nextAction(job)}` };
 }
 
 function verdictReason(verdict: ReturnType<typeof verifyDrawFundingReceiptChain>): string | undefined {
@@ -62,11 +63,11 @@ function checkFunding(job: JobRecord, receipt: unknown, fundId?: string): Fundin
         receipt, builder: job.builderAnchor, expectedJobId: job.id,
         ...(fundId ? { expectedFundId: fundId } : {}),
       }));
-      return reason ? invalidFunding(job, receipt, reason, expected, receipt.credit_id) : { kind: "not_applicable" };
+      return reason ? invalidFunding(job, receipt, reason, expected) : { kind: "not_applicable" };
     }
     return { kind: "invalid", reason: "no_bound_draw",
       hint: `The provider signed funding for credit ${JSON.stringify(receipt.credit_id)}, but this job records no draw on it, ` +
-        `so the local balance of that credit was not reconciled. ${nextAction(job, receipt.credit_id)}` };
+        `so the local balance of that credit was not reconciled. ${nextAction(job)}` };
   }
   const expected: Partial<Record<keyof DrawFundingReceipt, string>> = {
     job_id: job.id, credit_id: binding.creditId, draw_id: binding.drawId,
@@ -78,7 +79,7 @@ function checkFunding(job: JobRecord, receipt: unknown, fundId?: string): Fundin
     expectedDrawId: binding.drawId, expectedCallerPubkey: binding.callerPubkey,
     ...(fundId ? { expectedFundId: fundId } : {}),
   }));
-  return reason ? invalidFunding(job, receipt, reason, expected, binding.creditId) : { kind: "verified", receipt };
+  return reason ? invalidFunding(job, receipt, reason, expected) : { kind: "verified", receipt };
 }
 
 function verifiedFunding(job: JobRecord, receipt: unknown): DrawFundingReceipt | undefined {

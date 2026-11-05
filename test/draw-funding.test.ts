@@ -463,11 +463,12 @@ describe("mid-job funding evidence warnings", () => {
     captureDrawFundingReceipts(jobId, [funding()], { endpoint, fundId: "fund-1" });
     expect(fundingWarnings()).toEqual([expect.stringContaining("did not verify (no_bound_draw)")]);
     expect(fundingWarnings()[0]).toContain(`funding for credit "${creditId}", but this job records no draw on it`);
-    expect(fundingWarnings()[0]).toContain(`\`dvm credit balance ${endpoint} --credit-id ${creditId}\``);
+    expect(fundingWarnings()[0]).toContain(`\`dvm credit balance ${endpoint}\` once the job ends`);
+    expect(fundingWarnings()[0]).not.toContain("--credit-id");
     expect(loadJob(jobId)?.drawFundingReceipts).toBeUndefined();
   });
 
-  it("shell-quotes an unverified credit id in the relayed command", () => {
+  it("keeps an unverified credit id out of the relayed command", () => {
     seed();
     updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } });
     vi.mocked(info).mockClear();
@@ -475,7 +476,10 @@ describe("mid-job funding evidence warnings", () => {
     captureDrawFundingReceipts(jobId, [{ ...funding(), credit_id: hostile }], { endpoint, fundId: "fund-1" });
     expect(fundingWarnings()).toEqual([expect.stringContaining("did not verify (no_bound_draw)")]);
     expect(fundingWarnings()[0]).toContain(
-      `\`dvm credit balance ${endpoint} --credit-id 'x'\\''; rm -rf ~ #$(id)'\``);
+      `funding for credit ${JSON.stringify(hostile)}, but this job records no draw on it`);
+    expect(fundingWarnings()[0]).toContain(`\`dvm credit balance ${endpoint}\` once the job ends`);
+    expect(fundingWarnings()[0]).not.toContain("--credit-id");
+    expect(fundingWarnings()[0].match(/`[^`]*`/g)).toEqual([`\`dvm credit balance ${endpoint}\``]);
   });
 
   it.each([
@@ -489,7 +493,26 @@ describe("mid-job funding evidence warnings", () => {
     captureDrawFundingReceipts(jobId, [build()], { endpoint, fundId: "fund-1" });
     expect(fundingWarnings()).toEqual([expect.stringContaining(`did not verify (${reason})`)]);
     expect(fundingWarnings()[0]).toContain(hint);
-    expect(fundingWarnings()[0]).toContain("--credit-id imp:cashu:first-payment");
+    expect(fundingWarnings()[0]).not.toContain("--credit-id");
+  });
+
+  it("collapses identical evidence and keeps distinct evidence within one command", async () => {
+    seed();
+    updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } });
+    vi.mocked(info).mockClear();
+    stdout.length = 0;
+    await withOutputWarnings(async () => {
+      captureDrawFundingReceipts(jobId, [funding()], { endpoint });
+      captureDrawFundingReceipts(jobId, [funding()], { endpoint });
+      captureDrawFundingReceipts(jobId, [funding({ credit_id: "other-credit" })], { endpoint });
+      captureDrawFundingReceipts(jobId, [implicitFunding({ job_id: "other-job" })], { endpoint });
+      json({ ok: true });
+    });
+    const out = JSON.parse(stdout.join("")) as { warnings: { reason: string; hint: string }[] };
+    expect(out.warnings.map((warning) => warning.reason)).toEqual(["no_bound_draw", "no_bound_draw", "job_id_mismatch"]);
+    expect(out.warnings[0].hint).toContain(`credit "${creditId}"`);
+    expect(out.warnings[1].hint).toContain('credit "other-credit"');
+    expect(fundingWarnings()).toHaveLength(3);
   });
 
   it("stays silent for evidence that is not a draw-funding receipt", () => {
@@ -570,7 +593,7 @@ describe("Cashu top-ups on a job without a bound draw", () => {
     expect(fundingWarnings()).toEqual([expect.stringContaining("did not verify (no_bound_draw)")]);
     expect(JSON.parse(stdout.join("")).warnings).toEqual([{
       code: "draw_funding_unverified", job_id: jobId, reason: "no_bound_draw",
-      hint: expect.stringContaining(`--credit-id ${creditId}`), display: expect.stringContaining("no_bound_draw"),
+      hint: expect.stringContaining(`dvm credit balance ${endpoint}`), display: expect.stringContaining("no_bound_draw"),
     }]);
   });
 
@@ -585,7 +608,7 @@ describe("Cashu top-ups on a job without a bound draw", () => {
     const out = stdout.join("").trim().split("\n").map((line) => JSON.parse(line) as { warnings?: unknown });
     expect(out.at(-1)?.warnings).toEqual([expect.objectContaining({
       code: "draw_funding_unverified", job_id: jobId, reason: "no_bound_draw",
-      hint: expect.stringContaining(`--credit-id ${creditId}`),
+      hint: expect.stringContaining(`dvm credit balance ${endpoint}`),
     })]);
   });
 });

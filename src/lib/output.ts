@@ -23,7 +23,8 @@ function sameWarning(prior: OutputWarning, entry: OutputWarning): boolean {
     return prior.auto_pay_below === entry.auto_pay_below && prior.source === entry.source;
   }
   if (prior.code === "draw_funding_unverified" && entry.code === "draw_funding_unverified") {
-    return prior.job_id === entry.job_id && prior.reason === entry.reason;
+    // The display text carries the evidence, so identical evidence collapses and distinct evidence stays visible.
+    return prior.job_id === entry.job_id && prior.reason === entry.reason && prior.display === entry.display;
   }
   return false;
 }
