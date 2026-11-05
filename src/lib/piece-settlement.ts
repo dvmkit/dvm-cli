@@ -125,10 +125,21 @@ export function formatMicro(micro: number, currency: string | null): string {
 
 export const UNKNOWN_CURRENCY_LABEL = "(currency not recorded)";
 
+/**
+ * The hint for a piece settlement whose amounts carry {@link UNKNOWN_CURRENCY_LABEL},
+ * or `undefined` when they name a currency.
+ */
+export function settlementCurrencyHint(
+  settlement: { charged_micro?: number; currency?: string | null } | undefined,
+  endpoint?: string
+): string | undefined {
+  return settlement?.charged_micro !== undefined && !settlement.currency ? unknownCurrencyHint(endpoint) : undefined;
+}
+
 /** Why an amount carries {@link UNKNOWN_CURRENCY_LABEL}, and how to name the currency. */
 export function unknownCurrencyHint(endpoint?: string): string {
   const describe = endpoint ? `'dvm describe ${endpoint}'` : "'dvm describe <endpoint>'";
-  return "This receipt does not name the currency it was charged in, and this computer has no record of the job's prices or of its credit to tell. " +
+  return "This receipt does not name the currency it was charged in, and no local record of the job's prices or of its credit names one this CLI can show. " +
     "The amounts are in the provider's credit currency: for a US-dollar credit, 2.06 means $2.06. " +
     `Run ${describe} to see which currency this DVM's credits use.`;
 }
@@ -221,8 +232,8 @@ function settlementCurrency(receipt: JobReceipt, job: JobRecord | undefined, mes
   candidates.push(hint);
   const creditId = receipt.credit?.credit_id;
   if (creditId) candidates.push(safeCredits().find((credit) => credit.creditId === creditId)?.currency);
-  const found = candidates.find((currency) => typeof currency === "string" && currency.length > 0);
-  return found && /^[a-z]{3}$/i.test(found) ? found.toLowerCase() : null;
+  const found = candidates.find((currency) => typeof currency === "string" && /^[a-z]{3}$/i.test(currency));
+  return found ? found.toLowerCase() : null;
 }
 
 function safeCredits(): ReturnType<typeof listCredits> {

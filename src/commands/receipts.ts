@@ -64,6 +64,7 @@ import {
 
 import { resolveEndpoint } from "../lib/favorites";
 import { receiptSettlement } from "../lib/job-settlement";
+import { unknownCurrencyHint } from "../lib/piece-settlement";
 import { loadMessages } from "../lib/messages";
 import { createDvmTransport } from "../lib/transport";
 
@@ -114,10 +115,18 @@ export function receiptsList(opts: ReceiptsListOptions): void {
       info(emptyMessage(opts));
       return;
     }
+    const unnamed = new Set<string>();
     for (const { entry, status } of shown) {
-      info(`${entry.receipt.job_id}  ${receiptDisplay(entry.receipt, status, rate, receiptPieceContext(entry.receipt))}`);
+      const context = receiptPieceContext(entry.receipt);
+      info(`${entry.receipt.job_id}  ${receiptDisplay(entry.receipt, status, rate, context)}`);
+      if (receiptCurrencyHint(entry.receipt, status, context)) unnamed.add(entry.endpoint);
     }
     info(`\n${shown.length} of ${matched.length} receipt(s).`);
+    // One explanation for every "(currency not recorded)" row; name the DVM when they share one.
+    if (unnamed.size > 0) {
+      const [only] = unnamed;
+      info(unknownCurrencyHint(unnamed.size === 1 && only ? only : undefined));
+    }
     return;
   }
 

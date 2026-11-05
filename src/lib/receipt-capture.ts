@@ -10,7 +10,7 @@ import { type JobRecord, loadJob, updateJob } from "./job-store";
 import { info } from "./output";
 import { type FundingReceipt, isSignedJobReceipt, type JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
 import { appendFundingReceipt, appendReceipt } from "@dvmkit/sdk/internal";
-import { receiptDisplay, receiptFailureDetail, receiptHint } from "./receipt-verify";
+import { receiptCurrencyHint, receiptDisplay, receiptFailureDetail, receiptHint, receiptPieceContext } from "./receipt-verify";
 import { type ReceiptTrustAnchor, type ReceiptVerification, type ReceiptVerifyResult, verifyFundingReceiptChain, verifyJobReceipt } from "@dvmkit/sdk/internal";
 import type { JobStatus, ProviderInfo, ProviderRef, ReceiptParseError, Transport } from "@dvmkit/sdk/internal";
 import { captureDrawFundingReceipts } from "./draw-funding";
@@ -19,7 +19,7 @@ import { parseJobContent, type ContentStatus } from "./job-content";
 import { receiptSettlement, terminalSettlementFields } from "./job-settlement";
 import { isTerminalJobStatus } from "./next-action";
 import { loadMessages } from "./messages";
-import { formatMicro, pieceSettlement } from "./piece-settlement";
+import { formatMicro, pieceSettlement, type PieceContext, settlementCurrencyHint } from "./piece-settlement";
 
 /** Verify and persist a funding receipt; callers may anchor state only on a sound verdict. */
 export function captureFundingReceipt(args: {
@@ -77,6 +77,8 @@ export interface ReceiptCapture {
   reason?: ReceiptVerifyResult["reason"] | ReceiptParseError;
   /** Pre-rendered line an intermediary agent can relay verbatim. */
   display: string;
+  /** Why {@link display} names no currency, when it carries the "(currency not recorded)" label. */
+  currencyHint?: string;
 }
 
 /**
@@ -134,7 +136,8 @@ function warnPieceOvercharge(jobId: string, receipt: SignedJobReceipt, job: JobR
       : `the ${ceiling} its own pieces add up to`;
   info(
     `Warning: the signed receipt for job ${jobId} charges ${formatMicro(pieces.charged_micro, pieces.currency)}, ` +
-      `more than ${basis}. Keep the receipt as evidence ('dvm receipts show ${jobId}') and raise it with the provider.`
+      `more than ${basis}. Keep the receipt as evidence ('dvm receipts show ${jobId}') and raise it with the provider.` +
+      (pieces.currency ? "" : ` ${settlementCurrencyHint(pieces, job?.endpoint)}`)
   );
 }
 
@@ -158,6 +161,7 @@ export function receiptJsonFields(capture: ReceiptCapture, jobId?: string): Reco
   if (jobId) Object.assign(out, terminalSettlementFields(jobId, { receipt: capture.receipt }));
   else if (capture.receipt) out.settlement = receiptSettlement(capture.receipt, capture.status);
   if (capture.status !== "absent") out.receipt_display = capture.display;
+  if (capture.currencyHint) out.receipt_hint = capture.currencyHint;
   if (capture.receipt) {
     out.receipt = capture.receipt;
     if (capture.checks) out.receipt_checks = capture.checks;
@@ -173,6 +177,7 @@ export function renderReceiptHuman(capture: ReceiptCapture, jobId?: string): voi
   }
   if (capture.status === "absent") return;
   info(`🧾 ${capture.display}`);
+  if (capture.currencyHint) info(`  ${capture.currencyHint}`);
 }
 
 export function observedSettlementFields(jobId: string, response?: Partial<ContentStatus>, persistLocalState = true, currency?: string) {
@@ -338,13 +343,20 @@ function unparseableCapture(reason: ReceiptParseError): ReceiptCapture {
  * rate fetch. With no cached rate the line falls back to sats rather than
  * inventing a dollar figure.
  */
-function toCapture(receipt: SignedJobReceipt, result: ReceiptVerifyResult): ReceiptCapture {
+export function toCapture(
+  receipt: SignedJobReceipt,
+  result: ReceiptVerifyResult,
+  context: PieceContext = receiptPieceContext(receipt),
+  endpoint = context.job?.endpoint
+): ReceiptCapture {
+  const currencyHint = receiptCurrencyHint(receipt, result.status, context, endpoint || undefined);
   return {
     status: result.status,
     receipt,
     checks: result.checks,
     ...(result.reason ? { reason: result.reason } : {}),
-    display: receiptDisplay(receipt, result.status, getLastKnownBtcRate()?.rate ?? 0),
+    display: receiptDisplay(receipt, result.status, getLastKnownBtcRate()?.rate ?? 0, context),
+    ...(currencyHint ? { currencyHint } : {}),
   };
 }
 

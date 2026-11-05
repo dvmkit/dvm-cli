@@ -82,5 +82,34 @@ it("labels the amount and explains why when no local record names the currency",
   expect(human.stderr).toContain("does not name the currency");
   const listed = JSON.parse((await run(root, ["list"])).stdout);
   expect(listed.entries[0].hint).toContain("does not name the currency");
+  const humanList = await run(root, ["list", "--human"]);
+  expect(humanList.stderr).toContain("Charged 2.06 (currency not recorded) for");
+  expect(humanList.stderr.split("does not name the currency")).toHaveLength(2);
+  expect(humanList.stderr).toContain(`dvm describe ${endpoint}`);
   expect(verified.stdout + human.stderr + JSON.stringify(listed)).not.toContain("micro-units");
+});
+
+it("flags a charge above the upfront payment this CLI recorded", async () => {
+  const root = mkdtempSync(join(tmpdir(), "receipt-amounts-"));
+  roots.push(root);
+  const dvm = attestedDvm();
+  // $2.50 paid upfront; the receipt charges $2.90, adding a piece bought at a payment this CLI never made.
+  const receipt = dvm.sign({ job_id: "piece-job", outcome: "completed",
+    paid: { ...unsignedReceipt().paid, msats: 2_900_000, rail: null, mint: null },
+    settlement: { held: 2_900_000, charged: 2_900_000, released: 0, pieces: [
+      { amount: 2_500_000, charged: 2_500_000, paid_seq: 0, state: "finished" },
+      { amount: 400_000, charged: 400_000, paid_seq: 2, state: "finished" },
+    ] } } as never);
+  writeFileSync(join(root, "receipts.jsonl"), JSON.stringify({ receipt, builder: dvm.anchor,
+    endpoint, verification: "verified", verified_at: 1 }) + "\n");
+  writeFileSync(join(root, "jobs.json"), JSON.stringify([{ id: "piece-job", endpoint, status: "completed", submittedAt: 1,
+    paymentMethod: "credit", builderAnchor: dvm.anchor,
+    upfrontPayment: { amount_msats: 2_500_000, amount_micro: 2_500_000, currency: "usd" } }]));
+  mkdirSync(join(root, "messages"));
+  writeFileSync(join(root, "messages/piece-job.jsonl"),
+    JSON.stringify({ seq: 1, from: "provider", timestamp: 1, type: "complete", content: { summary: "Done" } }) + "\n");
+  const output = JSON.parse((await run(root, ["verify", "piece-job"])).stdout);
+  expect(output.settlement).toMatchObject({ currency: "usd", overcharged: true, ceiling_micro: 2_500_000,
+    ceiling_basis: "payments", display: expect.stringContaining("at most $2.50 USD") });
+  expect(output.display).toContain("Charged $2.90 USD for");
 });
