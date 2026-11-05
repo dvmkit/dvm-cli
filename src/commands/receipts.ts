@@ -43,10 +43,12 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   epochMsToIso,
+  receiptCurrencyHint,
   receiptDisplay,
   receiptFailureDetail,
   receiptHint,
   receiptIssuedAtIso,
+  receiptPieceContext,
 } from "../lib/receipt-verify";
 import {
   info,
@@ -113,7 +115,7 @@ export function receiptsList(opts: ReceiptsListOptions): void {
       return;
     }
     for (const { entry, status } of shown) {
-      info(`${entry.receipt.job_id}  ${receiptDisplay(entry.receipt, status, rate)}`);
+      info(`${entry.receipt.job_id}  ${receiptDisplay(entry.receipt, status, rate, receiptPieceContext(entry.receipt))}`);
     }
     info(`\n${shown.length} of ${matched.length} receipt(s).`);
     return;
@@ -148,7 +150,7 @@ export function receiptsShow(jobId: string, opts: ReceiptsShowOptions): void {
 
   json({
     ...storedReceiptJson(entry, result, rate),
-    hint: receiptHint(result.status, jobId),
+    hint: verdictHint(entry, result, jobId),
   });
 }
 
@@ -197,7 +199,7 @@ export async function receiptsVerify(jobId: string, opts: ReceiptsVerifyOptions)
     ...storedReceiptJson(entry, result, rate),
     ...(opts.file?.length ? { files } : {}),
     anchor_source: opts.endpoint ? "refetched" : "stored",
-    hint: receiptHint(result.status, jobId),
+    hint: verdictHint(entry, result, jobId),
   });
 }
 
@@ -360,6 +362,8 @@ function listEntryJson(
   status: ReceiptVerification,
   rate: number
 ): Record<string, unknown> {
+  const context = receiptPieceContext(entry.receipt);
+  const currencyHint = receiptCurrencyHint(entry.receipt, status, context, entry.endpoint || undefined);
   return {
     job_id: entry.receipt.job_id,
     dvm_id: entry.receipt.dvm_id,
@@ -370,9 +374,10 @@ function listEntryJson(
     // see `receiptIssuedAtIso`. The raw number stays intact under `receipt`.
     issued_at: receiptIssuedAtIso(entry.receipt),
     paid_msats: entry.receipt.paid.msats,
-    settlement: receiptSettlement(entry.receipt, status),
+    settlement: receiptSettlement(entry.receipt, status, undefined, context),
     receipt_verified: status,
-    display: receiptDisplay(entry.receipt, status, rate),
+    display: receiptDisplay(entry.receipt, status, rate, context),
+    ...(currencyHint ? { hint: currencyHint } : {}),
   };
 }
 
@@ -381,13 +386,14 @@ function storedReceiptJson(
   result: ReceiptVerifyResult,
   rate: number
 ): Record<string, unknown> {
+  const context = receiptPieceContext(entry.receipt);
   return {
     job_id: entry.receipt.job_id,
     endpoint: entry.endpoint,
     receipt: entry.receipt,
     receipt_verified: result.status,
     receipt_checks: result.checks,
-    settlement: receiptSettlement(entry.receipt, result.status),
+    settlement: receiptSettlement(entry.receipt, result.status, undefined, context),
     ...(result.reason
       ? { receipt_error: result.reason, receipt_error_detail: receiptFailureDetail(result.reason) }
       : {}),
@@ -400,12 +406,21 @@ function storedReceiptJson(
     // caller the proof it is attached to.
     collected_at: epochMsToIso(entry.verified_at),
     ...(entry.builder ? { builder: entry.builder } : {}),
-    display: receiptDisplay(entry.receipt, result.status, rate),
+    display: receiptDisplay(entry.receipt, result.status, rate, context),
   };
 }
 
+/** The proof's next step, preceded by why an amount names no currency when none is recorded. */
+function verdictHint(entry: StoredReceipt, result: ReceiptVerifyResult, jobId: string): string {
+  const currency = receiptCurrencyHint(entry.receipt, result.status, receiptPieceContext(entry.receipt), entry.endpoint || undefined);
+  return [currency, receiptHint(result.status, jobId)].filter(Boolean).join(" ");
+}
+
 function renderVerdictHuman(entry: StoredReceipt, result: ReceiptVerifyResult, rate: number): void {
-  info(receiptDisplay(entry.receipt, result.status, rate));
+  const context = receiptPieceContext(entry.receipt);
+  info(receiptDisplay(entry.receipt, result.status, rate, context));
+  const currencyHint = receiptCurrencyHint(entry.receipt, result.status, context, entry.endpoint || undefined);
+  if (currencyHint) info(`  ${currencyHint}`);
   if (result.reason) info(`  ${receiptFailureDetail(result.reason)}`);
   if (entry.receipt.reason) info(`  Provider reason: ${entry.receipt.reason}`);
 }

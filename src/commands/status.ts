@@ -256,7 +256,8 @@ function transientReceiptCapture(
       response.receipt,
       result.status,
       getLastKnownBtcRate()?.rate ?? 0,
-      currency
+      // An override read must not borrow another endpoint's local record.
+      { currency }
     ),
   };
 }
