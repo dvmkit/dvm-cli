@@ -1,5 +1,5 @@
 import {
-  isDrawFundingReceipt, verifyDrawFundingReceiptChain,
+  isDrawFundingReceipt, shellQuoteArg, verifyDrawFundingReceiptChain,
   type DrawFundingReceipt, type ReceiptCredit,
 } from "@dvmkit/sdk/internal";
 import { sameEndpoint } from "./job-access";
@@ -24,10 +24,28 @@ const MISMATCH_FIELDS: Record<string, keyof DrawFundingReceipt> = {
   caller_pubkey_mismatch: "caller_pubkey",
 };
 
+// Receipt fields are provider-supplied and may be unverified, so they are
+// quoted in prose and shell-quoted in the command agents are told to relay.
 function nextAction(job: JobRecord, creditId: string): string {
   return "Nothing is owed or lost: the job's terminal receipt still decides the charge. " +
-    `Refresh this credit with 'dvm credit balance ${job.endpoint} --credit-id ${creditId}' once the job ends; ` +
-    `if this repeats, report job ${job.id} and the reason to the provider.`;
+    `Refresh this credit with \`dvm credit balance ${shellQuoteArg(job.endpoint)} --credit-id ${shellQuoteArg(creditId)}\` once the job ends; ` +
+    `if this repeats, report job ${JSON.stringify(job.id)} and the reason to the provider.`;
+}
+
+function invalidFunding(
+  job: JobRecord, receipt: DrawFundingReceipt, reason: string,
+  expected: Partial<Record<keyof DrawFundingReceipt, string>>, creditId: string
+): FundingCheck {
+  const field: keyof DrawFundingReceipt | undefined = MISMATCH_FIELDS[reason];
+  const detail = field
+    ? `The provider signed ${field} ${JSON.stringify(String(receipt[field]))}; this job expects ${JSON.stringify(expected[field])}.`
+    : "The provider's funding evidence failed verification.";
+  return { kind: "invalid", reason, hint: `${detail} ${nextAction(job, creditId)}` };
+}
+
+function verdictReason(verdict: ReturnType<typeof verifyDrawFundingReceiptChain>): string | undefined {
+  if (verdict.status === "verified" || verdict.status === "verified_unattested") return undefined;
+  return (verdict.status === "invalid" ? verdict.reason : undefined) ?? verdict.status;
 }
 
 function checkFunding(job: JobRecord, receipt: unknown, fundId?: string): FundingCheck {
@@ -35,30 +53,32 @@ function checkFunding(job: JobRecord, receipt: unknown, fundId?: string): Fundin
   if (!isDrawFundingReceipt(receipt)) return { kind: "not_applicable" };
   const binding = job.creditBinding;
   if (!binding || "unbound" in binding) {
-    // A rail-paid job runs on an implicit credit the provider opened, and each
-    // later payment tops up that credit's draw. Its funding is never compared locally.
-    if (isImplicitCreditId(receipt.credit_id)) return { kind: "not_applicable" };
+    if (isImplicitCreditId(receipt.credit_id)) {
+      // A rail-paid job runs on an implicit credit the provider opened, and each
+      // later payment tops up that credit's draw. The caller holds no binding to
+      // compare it with, but the receipt must still be this payment's, signed.
+      const expected = { job_id: job.id, ...(fundId ? { fund_id: fundId } : {}) };
+      const reason = verdictReason(verifyDrawFundingReceiptChain({
+        receipt, builder: job.builderAnchor, expectedJobId: job.id,
+        ...(fundId ? { expectedFundId: fundId } : {}),
+      }));
+      return reason ? invalidFunding(job, receipt, reason, expected, receipt.credit_id) : { kind: "not_applicable" };
+    }
     return { kind: "invalid", reason: "no_bound_draw",
-      hint: `The provider signed funding for credit ${receipt.credit_id}, but this job records no draw on it, ` +
+      hint: `The provider signed funding for credit ${JSON.stringify(receipt.credit_id)}, but this job records no draw on it, ` +
         `so the local balance of that credit was not reconciled. ${nextAction(job, receipt.credit_id)}` };
   }
   const expected: Partial<Record<keyof DrawFundingReceipt, string>> = {
     job_id: job.id, credit_id: binding.creditId, draw_id: binding.drawId,
     caller_pubkey: binding.callerPubkey, ...(fundId ? { fund_id: fundId } : {}),
   };
-  const verdict = verifyDrawFundingReceiptChain({
+  const reason = verdictReason(verifyDrawFundingReceiptChain({
     receipt, builder: job.builderAnchor,
     expectedJobId: job.id, expectedCreditId: binding.creditId,
     expectedDrawId: binding.drawId, expectedCallerPubkey: binding.callerPubkey,
     ...(fundId ? { expectedFundId: fundId } : {}),
-  });
-  if (verdict.status === "verified" || verdict.status === "verified_unattested") return { kind: "verified", receipt };
-  const reason: string = (verdict.status === "invalid" ? verdict.reason : undefined) ?? verdict.status;
-  const field: keyof DrawFundingReceipt | undefined = MISMATCH_FIELDS[reason];
-  const detail = field
-    ? `The provider signed ${field} ${String(receipt[field])}; this job expects ${expected[field]}.`
-    : "The provider's funding evidence failed verification.";
-  return { kind: "invalid", reason, hint: `${detail} ${nextAction(job, binding.creditId)}` };
+  }));
+  return reason ? invalidFunding(job, receipt, reason, expected, binding.creditId) : { kind: "verified", receipt };
 }
 
 function verifiedFunding(job: JobRecord, receipt: unknown): DrawFundingReceipt | undefined {
@@ -82,8 +102,9 @@ export function captureDrawFundingReceipts(
         if (check.kind === "not_applicable") continue;
         if (check.kind === "invalid") {
           const display = `mid-job funding evidence did not verify (${check.reason}); credit comparisons remain unchanged. Hint: ${check.hint}`;
-          info(`Warning: ${display}`);
-          addOutputWarnings([{ code: "draw_funding_unverified", job_id: job.id, reason: check.reason, hint: check.hint, display }]);
+          // One command can read the same evidence more than once; report it once.
+          const added = addOutputWarnings([{ code: "draw_funding_unverified", job_id: job.id, reason: check.reason, hint: check.hint, display }]);
+          if (added.length) info(`Warning: ${display}`);
           continue;
         }
         const { receipt } = check;

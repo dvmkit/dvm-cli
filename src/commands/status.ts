@@ -27,6 +27,7 @@ import {
 import {
   getOutputTraceId,
   info,
+  withOutputWarnings,
 } from "../lib/output";
 import {
   type JobRecord,
@@ -68,7 +69,7 @@ export interface StatusOptions extends JobAccessOptions {
 
 export async function status(jobId: string, opts: StatusOptions): Promise<void> {
   const access = resolveJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => statusWithAccess(jobId, opts, access));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => statusWithAccess(jobId, opts, access)));
 }
 
 async function statusWithAccess(

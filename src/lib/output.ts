@@ -28,13 +28,17 @@ function sameWarning(prior: OutputWarning, entry: OutputWarning): boolean {
   return false;
 }
 
-export function addOutputWarnings(entries: OutputWarning[], human?: boolean): void {
+/** Returns the entries not already recorded for this command. */
+export function addOutputWarnings(entries: OutputWarning[], human?: boolean): OutputWarning[] {
   const pending = warnings.getStore();
+  const added: OutputWarning[] = [];
   for (const entry of entries) {
     if (pending?.some((prior) => sameWarning(prior, entry))) continue;
     pending?.push(entry);
+    added.push(entry);
     if (human) info(`Warning: ${entry.display}`);
   }
+  return added;
 }
 
 /**

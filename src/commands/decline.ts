@@ -9,7 +9,7 @@ import {
 import { readEnding, retryWhilePaymentInProgress } from "../lib/job-ending";
 import { markJobTerminal } from "../lib/job-store";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
-import { info } from "../lib/output";
+import { info, withOutputWarnings } from "../lib/output";
 import { guidanceJobArg, providerJobJson } from "../lib/provider-output";
 import { progressNotice } from "../lib/progress-notice";
 import { createDvmTransport } from "../lib/transport";
@@ -26,7 +26,7 @@ export interface DeclineOptions extends JobAccessOptions {
  */
 export async function decline(jobId: string, opts: DeclineOptions): Promise<void> {
   const access = resolveJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => declineWithAccess(jobId, opts, access));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => declineWithAccess(jobId, opts, access)));
 }
 
 async function declineWithAccess(jobId: string, opts: DeclineOptions, access: ResolvedJobAccess): Promise<void> {

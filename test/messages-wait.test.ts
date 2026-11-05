@@ -16,7 +16,7 @@ vi.mock("../src/lib/refund-claim", async (original) => ({
   refundJsonField: async (claims: unknown[]) => claims.length ? { refund: claims.at(-1) } : {},
 }));
 vi.mock("../src/lib/output", () => ({
-  info: seams.info, json: seams.json, addOutputWarnings: () => undefined,
+  info: seams.info, json: seams.json, addOutputWarnings: (entries: unknown[]) => entries,
   withOutputWarnings: <T>(run: () => Promise<T>) => run(),
 }));
 vi.mock("../src/lib/job-content", async (original) => ({
