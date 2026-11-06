@@ -705,7 +705,9 @@ async function requestWithWarnings(
       throw new DvmError(
         "credit_only_unavailable",
         `Prepaid credit ${opts.creditOnly} is not drawable under the current caller state.`,
-        "Reconcile that exact credit with 'dvm credit balance <dvm> --credit-id <id>'; this request did not fall back to a wallet payment.",
+        probePlan.mode === "none" && probePlan.drawSkipped?.reason === "posture_off"
+          ? buildCreditDrawSkipped({ dvm: identity.dvmId ?? endpoint, endpoint, skip: probePlan.drawSkipped }).hint
+          : "Reconcile that exact credit with 'dvm credit balance <dvm> --credit-id <id>'; this request did not fall back to a wallet payment.",
         {
           credit_id: opts.creditOnly,
           ...(probePlan.mode === "none" && probePlan.drawSkipped
