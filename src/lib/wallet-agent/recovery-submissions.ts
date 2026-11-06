@@ -211,8 +211,11 @@ export interface SubmissionSweepResult {
  * the money, but the wallet does not hold the new proofs yet. The next sweep
  * restores them from the intent file without swapping again.
  */
+/** How long an intent with unspent inputs is presumed to belong to a live swap. */
+const RECLAIM_IN_FLIGHT_MS = 2 * 60_000;
+
 export const RECLAIM_UNSAVED_REASON =
-  "the reclaim swap went through at the mint but its result could not be saved to the wallet; run `dvm wallet show` to recover it";
+  "the reclaim swap may have gone through at the mint but its result is not saved to the wallet yet; run `dvm wallet show` to recover it";
 
 export interface SubmissionSweepOptions {
   /**
@@ -358,14 +361,29 @@ async function commitReclaim(
   failed: (requestId: string, stage: SweepWriteFailure["stage"], error: unknown) => void
 ): Promise<SubmissionSweepOutcome | null> {
   const requestId = outcome.entry.request_id;
+  let alreadySaved = false;
   try {
     await withWalletLock(() => {
       const fresh = loadAgentWallet() ?? wallet;
+      // Sweeps are not serialized. Another one may have restored and saved this
+      // same intent first; saving again would hold the proofs twice.
+      if (!fresh.pending_submissions.some((s) => s.request_id === requestId)) {
+        alreadySaved = true;
+        return;
+      }
       saveAgentWallet(applyOutcome(fresh, outcome, now));
     });
   } catch (error) {
     failed(requestId, "wallet_save", error);
     return { kind: "reclaim_skipped", entry: outcome.entry, reason: RECLAIM_UNSAVED_REASON, terminal: false };
+  }
+  if (alreadySaved) {
+    return {
+      kind: "reclaim_skipped",
+      entry: outcome.entry,
+      reason: "another sweep already saved this reclaim",
+      terminal: false,
+    };
   }
   // The save landed. Journal the verdict from the intent and drop it; a failure
   // here is retried by every later read of a held ask.
@@ -903,6 +921,7 @@ async function reclaimEntry(
   // The swap spends the inputs at the mint the moment it succeeds and the new
   // proofs exist nowhere else, so persist what rebuilds them first. If this
   // write fails nothing has moved and the next sweep simply tries again.
+  const createdAt = new Date().toISOString();
   try {
     recordReclaimIntent({
       requestId: entry.request_id,
@@ -913,7 +932,7 @@ async function reclaimEntry(
       inputSecrets: unspent.map((p) => p.secret),
       spentSats,
       verdict: reclaimVerdict(entry, spentSats),
-      createdAt: new Date().toISOString(),
+      createdAt,
     });
   } catch (err) {
     return skipped(`could not record the reclaim before sending it to the mint, so nothing was swapped: ${errorText(err)}`);
@@ -927,7 +946,7 @@ async function reclaimEntry(
     // A refusal means the mint did not commit the swap, so the intent is moot.
     // Any other failure is ambiguous: the mint may have committed it, and the
     // intent lets the next sweep find out without swapping a second time.
-    if (err instanceof MintOperationError || diagnostic !== null) discardReclaimIntent(entry.request_id);
+    if (err instanceof MintOperationError || diagnostic !== null) discardReclaimIntent(entry.request_id, createdAt);
     return skipped(diagnostic ?? errorText(err), diagnostic !== null);
   }
 
@@ -949,8 +968,8 @@ function reclaimedOutcome(
   };
 }
 
-function discardReclaimIntent(requestId: string): void {
-  try { clearReclaimIntent(requestId); } catch { /* a stale intent is re-checked on the next sweep */ }
+function discardReclaimIntent(requestId: string, createdAt: string): void {
+  try { clearReclaimIntent(requestId, createdAt); } catch { /* a stale intent is re-checked on the next sweep */ }
 }
 
 /**
@@ -982,15 +1001,22 @@ async function recoverReclaimIntent(
       : skipped("the mint restored only part of the reclaim swap's outputs");
   }
 
-  // Nothing to restore: either the swap never reached the mint, or the mint
-  // cannot hand its outputs back. Only inputs still UNSPENT prove the former.
+  // Nothing to restore. If the mint answered (no error), it never signed our
+  // outputs, so the swap did not commit and any SPENT input is the provider's
+  // redemption: drop the intent and let the ordinary path book it. If the
+  // restore itself failed we cannot tell, so spent inputs keep the entry waiting.
   const secrets = new Set(intent.inputSecrets);
   try {
     const states = await cashuWallet.groupProofsByState(
       toCashuProofs(entry.output_proofs.filter((proof) => secrets.has(proof.secret)))
     );
-    if (states.spent.length === 0 && states.pending.length === 0) {
-      clearReclaimIntent(entry.request_id);
+    if (states.pending.length === 0 && (states.spent.length === 0 || restoreError === undefined)) {
+      // A fresh intent with unspent inputs may be another sweep's swap that has
+      // not reached the mint yet; clearing it would strand that sweep's outputs.
+      if (states.spent.length === 0 && Date.now() - Date.parse(intent.createdAt) < RECLAIM_IN_FLIGHT_MS) {
+        return skipped("another reclaim of this payment may still be in flight; the next sweep checks again");
+      }
+      clearReclaimIntent(entry.request_id, intent.createdAt);
       return null;
     }
   } catch (err) {

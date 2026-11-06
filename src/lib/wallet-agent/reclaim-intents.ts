@@ -42,9 +42,15 @@ export function allReclaimIntents(): ReclaimIntent[] {
   return intents.read();
 }
 
-export function clearReclaimIntent(requestId: string): void {
-  if (!loadReclaimIntent(requestId)) return;
-  intents.withLock(() => intents.write(intents.read().filter((held) => held.requestId !== requestId)));
+/**
+ * Drop a request's intent. With `createdAt`, drop only that exact intent: a
+ * concurrent sweep may have replaced it with its own, which must survive.
+ */
+export function clearReclaimIntent(requestId: string, createdAt?: string): void {
+  const matches = (held: ReclaimIntent) =>
+    held.requestId === requestId && (createdAt === undefined || held.createdAt === createdAt);
+  if (!intents.read().some(matches)) return;
+  intents.withLock(() => intents.write(intents.read().filter((held) => !matches(held))));
 }
 
 /** Request ids whose reclaim result the wallet may not hold yet. */

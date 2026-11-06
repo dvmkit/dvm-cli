@@ -61,7 +61,7 @@ import {
 import { saveJob } from "../../job-store";
 import lockfile from "proper-lockfile";
 import { applySubmissionVerdicts, recordSubmissionVerdicts } from "../submission-verdicts";
-import { clearReclaimIntent, loadReclaimIntent, reclaimIntentIds } from "../reclaim-intents";
+import { clearReclaimIntent, loadReclaimIntent, reclaimIntentIds, recordReclaimIntent } from "../reclaim-intents";
 import { describePendingSubmissions } from "../submissions-view";
 import { settleRecordedPayments } from "../../yield-state";
 import { readFileSync, rmSync } from "node:fs";
@@ -1748,8 +1748,9 @@ describe("refund-clause reclaim", () => {
       busy.mockRestore();
 
       // The swap is committed, the entry is still in the wallet, and the mint
-      // reads its proofs as spent. The mint cannot hand the outputs back yet.
-      const unrestorable = cashuStub({ spentSecrets: ["out-1"], restore: "nothing" });
+      // reads its proofs as spent. Its NUT-09 endpoint is failing, so whether
+      // those spends are ours cannot be told yet.
+      const unrestorable = cashuStub({ spentSecrets: ["out-1"], restore: "unsupported" });
       const second = await sweepPendingSubmissions(sweepOpts(unrestorable));
 
       expect(second.outcomes[0]).toMatchObject({ kind: "reclaim_skipped" });
@@ -1780,12 +1781,76 @@ describe("refund-clause reclaim", () => {
       expect(loadReclaimIntent(REQUEST_ID)).toBeDefined();
 
       // Nothing was restorable and every input is still UNSPENT.
+      ageIntent(REQUEST_ID);
       const fresh = cashuStub({ restore: "nothing" });
       const second = await sweepPendingSubmissions(sweepOpts(fresh));
 
       expect(second.outcomes[0]).toMatchObject({ kind: "reclaimed" });
       expect(fresh.completeSwap).toHaveBeenCalledTimes(1);
       expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["back-1"]);
+      expect(reclaimIntentIds().size).toBe(0);
+    });
+
+    function ageIntent(requestId: string): void {
+      const intent = loadReclaimIntent(requestId);
+      if (intent) recordReclaimIntent({ ...intent, createdAt: new Date(Date.now() - 10 * 60_000).toISOString() });
+    }
+
+    it("leaves a just-written intent alone while its inputs are unspent", async () => {
+      persistentWallet(baseWallet([claused()]));
+      await sweepPendingSubmissions(sweepOpts(cashuStub({ sendError: new Error("socket hang up") })));
+      const intent = loadReclaimIntent(REQUEST_ID);
+
+      // A second sweep cannot tell this from another sweep's swap that has not
+      // reached the mint yet, so it must not delete that sweep's recovery record.
+      const other = cashuStub({ restore: "nothing" });
+      const result = await sweepPendingSubmissions(sweepOpts(other));
+
+      expect(result.outcomes[0]).toMatchObject({ kind: "reclaim_skipped" });
+      expect(other.prepare).not.toHaveBeenCalled();
+      expect(loadReclaimIntent(REQUEST_ID)).toEqual(intent);
+    });
+
+    it("books the provider's redemption when the mint never signed our outputs", async () => {
+      persistentWallet(baseWallet([claused()]));
+      const failing = { value: true };
+      failSavesWhile(failing);
+      await sweepPendingSubmissions(sweepOpts(cashuStub({ sendError: new Error("socket hang up") })));
+      failing.value = false;
+
+      // The swap never reached the mint; the provider then redeemed the token.
+      // NUT-09 answered with nothing signed, so the spent inputs are theirs.
+      const redeemed = cashuStub({ spentSecrets: ["out-1"], restore: "nothing" });
+      const result = await sweepPendingSubmissions(sweepOpts(redeemed));
+
+      expect(result.outcomes[0]).toMatchObject({ kind: "already_accepted" });
+      expect(redeemed.completeSwap).not.toHaveBeenCalled();
+      expect(loadAgentWallet()?.pending_submissions).toEqual([]);
+      expect(reclaimIntentIds().size).toBe(0);
+    });
+
+    it("saves a recovered intent once when two sweeps restore it at the same time", async () => {
+      persistentWallet(baseWallet([claused()]));
+      const failing = { value: true };
+      failSavesWhile(failing);
+      await sweepPendingSubmissions(sweepOpts(cashuStub()));
+      failing.value = false;
+
+      const committed = { spentSecrets: ["out-1"], committed: DEFAULT_BACK };
+      const inner = cashuStub({ ...committed, restore: "signed" });
+      const outer = cashuStub({ ...committed, restore: "signed" });
+      const realRestore = outer.restore.getMockImplementation() as (req: { outputs: { B_: string }[] }) => Promise<unknown>;
+      // The other sweep restores and saves while this one waits on the mint.
+      outer.restore.mockImplementationOnce(async (req: { outputs: { B_: string }[] }) => {
+        await sweepPendingSubmissions(sweepOpts(inner));
+        return realRestore(req);
+      });
+
+      const result = await sweepPendingSubmissions(sweepOpts(outer));
+
+      expect(result.outcomes[0]).toMatchObject({ kind: "reclaim_skipped" });
+      expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["back-1"]);
+      expect(loadAgentWallet()?.pending_submissions).toEqual([]);
       expect(reclaimIntentIds().size).toBe(0);
     });
 

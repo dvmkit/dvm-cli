@@ -94,6 +94,6 @@ export function finalizeLandedReclaims(): void {
   for (const intent of intents) {
     if (held.has(intent.requestId)) continue;
     recordSubmissionVerdicts([intent.verdict]);
-    clearReclaimIntent(intent.requestId);
+    clearReclaimIntent(intent.requestId, intent.createdAt);
   }
 }

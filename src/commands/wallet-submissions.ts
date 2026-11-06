@@ -28,7 +28,7 @@ import {
   info,
   json,
 } from "../lib/output";
-import { reclaimIntentIds } from "../lib/wallet-agent/reclaim-intents";
+import { clearReclaimIntent, reclaimIntentIds } from "../lib/wallet-agent/reclaim-intents";
 import { abandonPendingSubmission } from "../lib/wallet-agent/spend";
 import { createInterface } from "node:readline";
 
@@ -189,10 +189,12 @@ async function forgetSubmission(requestId: string, opts: WalletSubmissionsOption
     );
   }
 
-  refuseIfReclaimUnsaved(view);
+  refuseIfReclaimUnsaved(view, opts);
   refuseIfSelfHealing(view, opts);
   await confirmForget(view, opts);
   await abandonPendingSubmission({ requestId });
+  // Otherwise the next held-ask read would take the missing entry for a saved reclaim.
+  clearReclaimIntent(requestId);
 
   const abandoned = view.at_risk ? view.amount_sats : 0;
   const heldFor = heldCashuSubmissionAsks(new Set([requestId]));
@@ -230,6 +232,22 @@ async function forgetSubmission(requestId: string, opts: WalletSubmissionsOption
 }
 
 /**
+ * Refuse to forget an entry whose reclaim swap may already have happened at the
+ * mint. The intent file is what lets the next sweep find the new proofs, so
+ * forgetting first can lose them. `--force` overrides, because the intent can
+ * be stuck for good (the mint cannot restore the outputs) and the caller must
+ * have a way out; forgetting then drops the intent too.
+ */
+function refuseIfReclaimUnsaved(view: PendingSubmissionView, opts: WalletSubmissionsOptions): void {
+  if (opts.force || !reclaimIntentIds().has(view.request_id)) return;
+  throw new DvmError(
+    "reclaim_unsaved",
+    `Request ${view.request_id}: the reclaim swap for ${view.amount_sats} sats may already have gone through at the mint, and the new proofs have not been saved to the wallet yet.`,
+    `Run \`dvm wallet show\` to recover them. Forgetting this entry first can lose them; if the recovery keeps failing and you accept that, add --force: dvm wallet submissions --forget ${view.request_id} --yes --force`
+  );
+}
+
+/**
  * Refuse to forget an entry the wallet is going to reclaim by itself,
  * unless `--force` says otherwise.
  *
@@ -245,19 +263,6 @@ async function forgetSubmission(requestId: string, opts: WalletSubmissionsOption
  * to move them, so there is nothing on its way back to protect and making the
  * caller pass `--force` to tidy up would be theatre.
  */
-/**
- * No `--force` waives this: the mint has already swapped the proofs back, so
- * the journal entry is the only thing that lets the next sweep find them.
- */
-function refuseIfReclaimUnsaved(view: PendingSubmissionView): void {
-  if (!reclaimIntentIds().has(view.request_id)) return;
-  throw new DvmError(
-    "reclaim_unsaved",
-    `Request ${view.request_id}: the reclaim swap for ${view.amount_sats} sats went through at the mint, but the new proofs have not been saved to the wallet yet.`,
-    "Run `dvm wallet show` to recover them. Forgetting this entry first would lose them."
-  );
-}
-
 function refuseIfSelfHealing(view: PendingSubmissionView, opts: WalletSubmissionsOptions): void {
   if (opts.force) return;
   if (view.state !== "reclaimable" && view.state !== "reclaim_failed") return;
