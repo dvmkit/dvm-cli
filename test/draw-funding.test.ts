@@ -11,8 +11,9 @@ import { settleCreditAfterJob, settleCreditAfterRead } from "../src/lib/credit-t
 import { loadJob, saveJob, updateJob } from "../src/lib/job-store";
 import { captureTransportReceipt, fetchMissingJobReceipt } from "../src/lib/receipt-capture";
 import { captureDrawFundingReceipts } from "../src/lib/draw-funding";
-import { info } from "../src/lib/output";
+import { info, json, withOutputWarnings } from "../src/lib/output";
 import { handlePaymentRequest } from "../src/lib/payment-responder";
+import { status } from "../src/commands/status";
 import { HttpsTransport } from "../src/lib/transport/https";
 import { loadLedger } from "../src/lib/budget-ledger";
 import { commitAgentSpend, prepareAgentSpend } from "../src/lib/wallet-agent/spend";
@@ -29,6 +30,19 @@ vi.mock("../src/lib/wallet-agent/spend", () => ({
   abandonPendingSubmission: vi.fn(async () => undefined),
 }));
 vi.mock("../src/lib/wallet-agent/recovery-submissions", () => ({ sweepPendingSubmissions: async () => undefined }));
+
+const stdout = vi.hoisted((): string[] => []);
+vi.mock("node:fs", async (original) => {
+  const fs = await original<typeof import("node:fs")>();
+  const writeSync = ((fd: number, buffer: Buffer, offset?: number, length?: number) => {
+    if (fd !== 1) return fs.writeSync(fd, buffer, offset, length);
+    const start = offset ?? 0;
+    const end = start + (length ?? buffer.length - start);
+    stdout.push(buffer.subarray(start, end).toString("utf8"));
+    return end - start;
+  }) as typeof fs.writeSync;
+  return { ...fs, default: { ...fs, writeSync }, writeSync };
+});
 
 vi.mock("../src/lib/output", async (original) => ({
   ...await original<typeof import("../src/lib/output")>(), info: vi.fn(),
@@ -415,5 +429,186 @@ describe("signed draw funding reconciliation", () => {
     await settleCreditAfterJob({ capture, transport, ref: { endpoint }, signing,
       providerInfo: { builder: dvm.anchor }, allowTopup: false });
     expect(loadCredit(endpoint, signing.pubkey, identity)).toEqual(before);
+  });
+});
+
+function implicitFunding(overrides: Partial<DrawFundingReceipt> = {}): DrawFundingReceipt {
+  return funding({ credit_id: "imp:cashu:first-payment", draw_id: "first-payment", ...overrides });
+}
+
+function fundingWarnings(): string[] {
+  return vi.mocked(info).mock.calls.map(([line]) => line).filter((line) => line.includes("mid-job funding evidence"));
+}
+
+describe("mid-job funding evidence warnings", () => {
+  it.each([
+    ["no credit binding", () => updateJob(jobId, { creditBinding: undefined })],
+    ["an unbound job", () => updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } })],
+  ])("stays silent for implicit-credit funding on %s", (_label, unbind) => {
+    seed();
+    unbind();
+    vi.mocked(info).mockClear();
+    captureDrawFundingReceipts(jobId, [implicitFunding()], { endpoint, fundId: "fund-1" });
+    expect(fundingWarnings()).toEqual([]);
+    expect(loadJob(jobId)?.drawFundingReceipts).toBeUndefined();
+  });
+
+  it.each([
+    ["no credit binding", () => updateJob(jobId, { creditBinding: undefined })],
+    ["an unbound job", () => updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } })],
+  ])("warns no_bound_draw for prepaid-credit funding on %s", (_label, unbind) => {
+    seed();
+    unbind();
+    vi.mocked(info).mockClear();
+    captureDrawFundingReceipts(jobId, [funding()], { endpoint, fundId: "fund-1" });
+    expect(fundingWarnings()).toEqual([expect.stringContaining("did not verify (no_bound_draw)")]);
+    expect(fundingWarnings()[0]).toContain(`funding for credit "${creditId}", but this job records no draw on it`);
+    expect(fundingWarnings()[0]).toContain(`\`dvm credit balance ${endpoint}\` once the job ends`);
+    expect(fundingWarnings()[0]).not.toContain("--credit-id");
+    expect(loadJob(jobId)?.drawFundingReceipts).toBeUndefined();
+  });
+
+  it("keeps an unverified credit id out of the relayed command", () => {
+    seed();
+    updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } });
+    vi.mocked(info).mockClear();
+    const hostile = "x'; rm -rf ~ #$(id)";
+    captureDrawFundingReceipts(jobId, [{ ...funding(), credit_id: hostile }], { endpoint, fundId: "fund-1" });
+    expect(fundingWarnings()).toEqual([expect.stringContaining("did not verify (no_bound_draw)")]);
+    expect(fundingWarnings()[0]).toContain(
+      `funding for credit ${JSON.stringify(hostile)}, but this job records no draw on it`);
+    expect(fundingWarnings()[0]).toContain(`\`dvm credit balance ${endpoint}\` once the job ends`);
+    expect(fundingWarnings()[0]).not.toContain("--credit-id");
+    expect(fundingWarnings()[0].match(/`[^`]*`/g)).toEqual([`\`dvm credit balance ${endpoint}\``]);
+  });
+
+  it.each([
+    ["job_id_mismatch", () => implicitFunding({ job_id: "other-job" }), 'job_id "other-job"; this job expects "job-funded"'],
+    ["fund_id_mismatch", () => implicitFunding({ fund_id: "other-payment" }), 'fund_id "other-payment"; this job expects "fund-1"'],
+    ["signature_invalid", () => ({ ...implicitFunding(), funded_micro: 60_000 }), "funding evidence failed verification"],
+  ])("still checks an implicit-credit receipt for %s", (reason, build, hint) => {
+    seed();
+    updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } });
+    vi.mocked(info).mockClear();
+    captureDrawFundingReceipts(jobId, [build()], { endpoint, fundId: "fund-1" });
+    expect(fundingWarnings()).toEqual([expect.stringContaining(`did not verify (${reason})`)]);
+    expect(fundingWarnings()[0]).toContain(hint);
+    expect(fundingWarnings()[0]).not.toContain("--credit-id");
+  });
+
+  it("collapses identical evidence and keeps distinct evidence within one command", async () => {
+    seed();
+    updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } });
+    vi.mocked(info).mockClear();
+    stdout.length = 0;
+    await withOutputWarnings(async () => {
+      captureDrawFundingReceipts(jobId, [funding()], { endpoint });
+      captureDrawFundingReceipts(jobId, [funding()], { endpoint });
+      captureDrawFundingReceipts(jobId, [funding({ credit_id: "other-credit" })], { endpoint });
+      captureDrawFundingReceipts(jobId, [implicitFunding({ job_id: "other-job" })], { endpoint });
+      json({ ok: true });
+    });
+    const out = JSON.parse(stdout.join("")) as { warnings: { reason: string; hint: string }[] };
+    expect(out.warnings.map((warning) => warning.reason)).toEqual(["no_bound_draw", "no_bound_draw", "job_id_mismatch"]);
+    expect(out.warnings[0].hint).toContain(`credit "${creditId}"`);
+    expect(out.warnings[1].hint).toContain('credit "other-credit"');
+    expect(fundingWarnings()).toHaveLength(3);
+  });
+
+  it("stays silent for evidence that is not a draw-funding receipt", () => {
+    seed();
+    vi.mocked(info).mockClear();
+    const { job_id: _job, draw_id: _draw, ...plain } = funding();
+    captureDrawFundingReceipts(jobId, [{ ...plain, kind: "credit_funding" }], { endpoint, fundId: "fund-1" });
+    expect(fundingWarnings()).toEqual([]);
+    expect(loadJob(jobId)?.drawFundingReceipts).toBeUndefined();
+  });
+
+  it("stores verified Cashu funding without a warning", () => {
+    seed();
+    vi.mocked(info).mockClear();
+    captureDrawFundingReceipts(jobId, [funding()], { endpoint, fundId: "fund-1" });
+    expect(fundingWarnings()).toEqual([]);
+    expect(loadJob(jobId)?.drawFundingReceipts).toHaveLength(1);
+  });
+
+  it.each([
+    ["credit_id_mismatch", { credit_id: "other-credit" }, 'credit_id "other-credit"; this job expects "credit-held"'],
+    ["job_id_mismatch", { job_id: "other-job" }, 'job_id "other-job"; this job expects "job-funded"'],
+    ["draw_id_mismatch", { draw_id: "other-draw" }, 'draw_id "other-draw"; this job expects "draw-funded"'],
+    ["fund_id_mismatch", { fund_id: "other-payment" }, 'fund_id "other-payment"; this job expects "fund-1"'],
+    ["caller_pubkey_mismatch", { caller_pubkey: "ab".repeat(32) }, `caller_pubkey "${"ab".repeat(32)}"; this job expects "${signing.pubkey}"`],
+  ] as const)("names the signed and expected value for %s", (reason, changes, hint) => {
+    seed();
+    vi.mocked(info).mockClear();
+    captureDrawFundingReceipts(jobId, [funding(changes)], { endpoint, fundId: "fund-1" });
+    expect(fundingWarnings()).toEqual([expect.stringContaining(`did not verify (${reason})`)]);
+    expect(fundingWarnings()[0]).toContain(`Hint: The provider signed ${hint}.`);
+    expect(loadJob(jobId)?.drawFundingReceipts).toBeUndefined();
+  });
+
+  it.each([
+    ["signature_invalid", () => ({ ...funding(), funded_micro: 60_000 })],
+    ["receipt_key_mismatch", () => {
+      const other = attestedDvm();
+      const { signature: _signature, ...unsigned } = funding();
+      return signDrawFundingReceipt({ ...unsigned, receipt_pubkey: other.receiptKey.pubkey }, other.receiptKey.secret);
+    }],
+  ])("reports the verifier reason %s", (reason, build) => {
+    seed();
+    vi.mocked(info).mockClear();
+    captureDrawFundingReceipts(jobId, [build()], { endpoint, fundId: "fund-1" });
+    expect(fundingWarnings()).toEqual([expect.stringContaining(`did not verify (${reason})`)]);
+    expect(fundingWarnings()[0]).toContain("Hint: The provider's funding evidence failed verification. Nothing is owed or lost");
+    expect(fundingWarnings()[0]).toContain(`report job "${jobId}" and the reason to the provider`);
+  });
+});
+
+describe("Cashu top-ups on a job without a bound draw", () => {
+  const payAt = (requestSeq: number) =>
+    handlePaymentRequest(jobId, ask, policy, new HttpsTransport(), { endpoint }, { rail: "cashu", requestSeq });
+
+  it("stays silent while the provider signs implicit-credit funding for each payment", async () => {
+    seed();
+    updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } });
+    wire(implicitFunding());
+    vi.mocked(info).mockClear();
+    for (const requestSeq of [4, 5, 6]) {
+      await expect(payAt(requestSeq)).resolves.toMatchObject({ status: "paid", rail: "cashu_p2pk" });
+    }
+    expect(fundingWarnings()).toEqual([]);
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4, 5, 6]);
+  });
+
+  it("warns no_bound_draw in the JSON output for prepaid-credit funding", async () => {
+    seed();
+    updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } });
+    wire(funding());
+    vi.mocked(info).mockClear();
+    stdout.length = 0;
+    await withOutputWarnings(async () => {
+      await expect(payAt(4)).resolves.toMatchObject({ status: "paid", rail: "cashu_p2pk" });
+      json({ ok: true });
+    });
+    expect(fundingWarnings()).toEqual([expect.stringContaining("did not verify (no_bound_draw)")]);
+    expect(JSON.parse(stdout.join("")).warnings).toEqual([{
+      code: "draw_funding_unverified", job_id: jobId, reason: "no_bound_draw",
+      hint: expect.stringContaining(`dvm credit balance ${endpoint}`), display: expect.stringContaining("no_bound_draw"),
+    }]);
+  });
+
+  it("surfaces the warning in status JSON", async () => {
+    seed();
+    updateJob(jobId, { creditBinding: { unbound: true, callerPubkey: signing.pubkey } });
+    wire(funding());
+    vi.mocked(info).mockClear();
+    stdout.length = 0;
+    await status(jobId, {});
+    expect(fundingWarnings()).toEqual([expect.stringContaining("did not verify (no_bound_draw)")]);
+    const out = stdout.join("").trim().split("\n").map((line) => JSON.parse(line) as { warnings?: unknown });
+    expect(out.at(-1)?.warnings).toEqual([expect.objectContaining({
+      code: "draw_funding_unverified", job_id: jobId, reason: "no_bound_draw",
+      hint: expect.stringContaining(`dvm credit balance ${endpoint}`),
+    })]);
   });
 });

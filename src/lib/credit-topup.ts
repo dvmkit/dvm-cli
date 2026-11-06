@@ -66,7 +66,7 @@ import {
 } from "./credit-policy";
 
 import { takeDeferredFunding } from "./credit-defer";
-import { jobDrawFundings } from "./draw-funding";
+import { isImplicitCreditId, jobDrawFundings } from "./draw-funding";
 import {
   buildCreditFundingIncomplete,
   buildCreditFundingReport,
@@ -173,7 +173,7 @@ export async function settleCreditAfterRead(args: {
     !receipt?.credit || receipt.job_id !== job.id ||
     receipt.requester_pubkey !== binding.callerPubkey ||
     receipt.credit.credit_id !== binding.creditId || receipt.credit.draw_id !== binding.drawId ||
-    receipt.credit.credit_id.startsWith("imp:")
+    isImplicitCreditId(receipt.credit.credit_id)
   ) return;
 
   // A status read may just have backfilled this anchor. Keep identity pooling
@@ -241,7 +241,7 @@ async function settle(args: SettleCreditArgs): Promise<void> {
     (args.capture?.status !== "verified" && args.capture?.status !== "verified_unattested") ||
     receipt.requester_pubkey !== callerPubkey
   ) return;
-  if (credit.credit_id.startsWith("imp:")) {
+  if (isImplicitCreditId(credit.credit_id)) {
     const applied = applyImplicitReceiptCredit({
       endpoint: args.ref.endpoint,
       ...settleIdentityArgs(args),

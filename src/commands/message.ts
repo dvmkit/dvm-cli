@@ -7,6 +7,7 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   info,
+  withOutputWarnings,
 } from "../lib/output";
 
 import { markJobTerminal } from "../lib/job-store";
@@ -46,7 +47,7 @@ export interface MessageOptions extends JobAccessOptions {
 export async function message(jobId: string, text: string, opts: MessageOptions): Promise<void> {
   const access = resolveJobAccess(jobId, opts);
   return withJobTokenRedaction(access.jobToken, () =>
-    messageWithAccess(jobId, text, opts, access)
+    withOutputWarnings(() => messageWithAccess(jobId, text, opts, access))
   );
 }
 

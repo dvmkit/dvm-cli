@@ -6,6 +6,7 @@ import {
   findSigningIdentityByPubkey,
 } from "../lib/cli-identity-resolve";
 
+import { withOutputWarnings } from "../lib/output";
 import { loadRequestIntent } from "../lib/request-intent-store";
 import { requestRecoveryPath } from "../lib/request-recovery-path";
 import { createDvmTransport } from "../lib/transport";
@@ -25,6 +26,10 @@ export async function requestResume(
   requestId: string,
   opts: RequestResumeOptions = {}
 ): Promise<void> {
+  return withOutputWarnings(() => resumeRequest(requestId, opts));
+}
+
+async function resumeRequest(requestId: string, opts: RequestResumeOptions): Promise<void> {
   if (!isPublicRequestId(requestId)) {
     throw new DvmError(
       "invalid_request_id",
