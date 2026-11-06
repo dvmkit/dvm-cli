@@ -94,15 +94,75 @@ describe("posture-aware credit reporting", () => {
     }
   });
 
-  it.each([true, false])("reports released per-call balances as switched off (prepaid supported: %s)", async (supported) => {
-    configure("off", "alias");
+  it.each((["prepaid", "implicit"] as const).flatMap((kind) =>
+    [true, false].map((attested) => ({ kind, attested }))
+  ))("uses the $kind row's attested identity for alias-only consent (attested: $attested)", ({ kind, attested }) => {
+    const config = JSON.stringify({ credit: { posture: "auto", perDvm: {
+      [alias]: { ...identity, posture: "off" },
+    } } });
+    writeFileSync(join(root, "config.json"), config);
+    const store = JSON.parse(readFileSync(join(root, "credits.json"), "utf8"));
+    if (kind === "implicit") {
+      store.implicitCredits = [{ ...store.credits[0], creditId: "imp:released",
+        releasedByJobId: "failed-job", releasedAt: 1 }];
+      store.credits = [];
+    }
+    const row = kind === "implicit" ? store.implicitCredits[0] : store.credits[0];
+    if (attested) row.attestedBuilderPubkey = identity.builderPubkey;
+    writeFileSync(join(root, "credits.json"), JSON.stringify(store));
+    creditList({});
+    const result = output();
+    const reported = kind === "implicit" ? result.implicit_credits[0] : result.credits[0];
+    expect(reported).toMatchObject({ drawable: !attested, remaining_micro: 750_000 });
+    if (kind === "prepaid") expect(reported.posture).toBe(attested ? "off" : "auto");
+    if (attested) {
+      expect(reported).toMatchObject({ draw_blocked_reason: "posture_off" });
+      expect(reported.display).toMatch(/held.*switched off/i);
+      expect(result.totals_by_currency[0]).toMatchObject({ drawable_micro: 0, posture_blocked_micro: 750_000 });
+    } else {
+      expect(reported).not.toHaveProperty("draw_blocked_reason");
+      expect(result.totals_by_currency[0]).toMatchObject({ drawable_micro: 750_000 });
+    }
+    expect(result.totals_by_currency[0].spendable_micro).toBe(kind === "implicit" ? 750_000 : 1_000_000);
+    creditList({ human: true });
+    if (attested) expect(seams.info.mock.calls.flat().join("\n")).toMatch(/held.*switched off/i);
+    expect(readFileSync(join(root, "config.json"), "utf8")).toBe(config);
+    expect(seams.describe).not.toHaveBeenCalled();
+  });
+
+  it("keeps human implicit summaries separate when stored DVM identities have different postures", () => {
+    const config = JSON.stringify({ credit: { posture: "auto", perDvm: {
+      [alias]: { ...identity, posture: "off" },
+    } } });
+    writeFileSync(join(root, "config.json"), config);
+    const released: StoredImplicitCredit = {
+      endpoint, dvmId: identity.dvmId, attestedBuilderPubkey: identity.builderPubkey,
+      callerPubkey: signer.pubkey, creditId: "imp:blocked", currency: "usd",
+      remainingMicro: 750_000, ledgerSeq: 1, expiryMs: expiry, status: "active",
+      releasedByJobId: "failed-job", releasedAt: 1, updatedAt: 1,
+    };
+    writeFileSync(join(root, "credits.json"), JSON.stringify({ credits: [], pendingFundings: [],
+      implicitCredits: [released, { ...released, dvmId: "replacement-dvm", creditId: "imp:enabled", remainingMicro: 250_000 }],
+    }));
+    creditList({ human: true });
+    const lines = seams.info.mock.calls.flat();
+    expect(lines).toContainEqual(expect.stringMatching(/\$0\.75.*held.*switched off/));
+    expect(lines).toContainEqual(expect.stringMatching(/\$0\.25.*next request uses/));
+    expect(readFileSync(join(root, "config.json"), "utf8")).toBe(config);
+  });
+
+  it.each(["live", "not-returned", "unsupported"])("reports released per-call balances as switched off (%s)", async (mode) => {
+    const config = configure("off", "alias");
     const store = { credits: [], pendingFundings: [], implicitCredits: [{
       endpoint, ...identity, callerPubkey: signer.pubkey, creditId: "imp:released", currency: "usd",
       remainingMicro: 125_000, ledgerSeq: 1, expiryMs: expiry, status: "active",
       releasedByJobId: "failed-job", releasedAt: 1, updatedAt: 1,
     } satisfies StoredImplicitCredit] };
     writeFileSync(join(root, "credits.json"), JSON.stringify(store));
-    if (supported) seams.credit.mockResolvedValue({ credits: [] });
+    if (mode === "live") seams.credit.mockResolvedValue({ credits: [{
+      ...primary, credit_id: "imp:released", balance_micro: 100_000, remaining_micro: 100_000, drainable: false,
+    }] });
+    else if (mode === "not-returned") seams.credit.mockResolvedValue({ credits: [] });
     else {
       const { DvmError } = await import("@dvmkit/sdk/internal");
       seams.credit.mockRejectedValue(new DvmError("credit_not_supported", "No prepaid credit"));
@@ -116,9 +176,15 @@ describe("posture-aware credit reporting", () => {
     creditList({ human: true });
     expect(seams.info.mock.calls.flat().join("\n")).toMatch(/held.*switched off/i);
     await creditBalance(endpoint, {});
+    const remaining = mode === "live" ? 100_000 : 125_000;
+    expect(output().count).toBe(1);
     expect(output().credits[0]).toMatchObject({ drawable: false, draw_blocked_reason: "posture_off",
-      drainable: false, remaining_micro: 125_000 });
+      drainable: false, remaining_micro: remaining });
+    expect(output().credits[0]).not.toHaveProperty("drain_command");
+    expect(output().credits[0].display).toMatch(/held.*switched off/i);
     expect(output().totals_by_currency[0]).toMatchObject({ drawable_micro: 0,
-      posture_blocked_micro: 125_000, spendable_micro: 125_000 });
+      posture_blocked_micro: remaining, spendable_micro: remaining });
+    expect(JSON.parse(readFileSync(join(root, "credits.json"), "utf8")).credits).toEqual([]);
+    expect(readFileSync(join(root, "config.json"), "utf8")).toBe(config);
   });
 });

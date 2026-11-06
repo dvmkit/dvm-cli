@@ -13,6 +13,7 @@ import {
   CREDIT_FUND_RAILS,
   type CreditFundRail,
   DvmError,
+  dvmLocationIdentity,
   findX402Channel,
   isCreditFundRail,
   listCredits,
@@ -439,9 +440,9 @@ export function creditList(opts: CreditListOptions): void {
   // counts, and re-reading the file per credit would repeat that work.
   const headroomOf = headroomReader();
   const identityOf = (endpoint: string) => offlineDvmIdentity(creditConfig, endpoint, headroomOf);
-  const postureOf = (endpoint: string) =>
-    effectiveCreditPosture(creditConfig, endpoint, identityOf(endpoint));
-  const postureOff = (endpoint: string) => postureOf(endpoint).posture === "off";
+  const postureOf = (row: StoredCredit | StoredImplicitCredit | StoredFundingMenuSnapshot) =>
+    effectiveCreditPosture(creditConfig, row.endpoint, dvmLocationIdentity(row) ?? identityOf(row.endpoint));
+  const postureOff = (row: StoredCredit | StoredImplicitCredit) => postureOf(row).posture === "off";
   const fundingRailOf = (endpoint: string) =>
     effectiveFundingRail(creditConfig, endpoint, identityOf(endpoint));
   const globalPosture = isCreditPosture(creditConfig?.posture)
@@ -473,7 +474,7 @@ export function creditList(opts: CreditListOptions): void {
       return;
     }
     for (const c of credits) {
-      info(`  ${humanCreditRow(c, postureOff(c.endpoint))}`);
+      info(`  ${humanCreditRow(c, postureOff(c))}`);
       for (const sibling of c.siblingCredits ?? []) {
         info(`    ${humanSiblingCreditRow(c, sibling)}`);
       }
@@ -514,19 +515,19 @@ export function creditList(opts: CreditListOptions): void {
       hint: `Pin it with 'dvm credit rail <${CREDIT_FUND_RAILS.join("|")}>' or return to the amount rule with 'dvm credit rail --clear'; add --dvm <dvm> to scope either operation.`,
     },
     credits: credits.map((c) => ({
-      ...storedCreditJson(c, headroomOf.of(headroomInputsFor(c, identityOf(c.endpoint))), postureOff(c.endpoint)),
-      ...postureFields(postureOf(c.endpoint)),
+      ...storedCreditJson(c, headroomOf.of(headroomInputsFor(c, identityOf(c.endpoint))), postureOff(c)),
+      ...postureFields(postureOf(c)),
       ...fundingRailFields(fundingRailOf(c.endpoint)),
     })),
     count: credits.length,
-    implicit_credits: implicitCredits.map((c) => implicitCreditJson(c, postureOff(c.endpoint))),
+    implicit_credits: implicitCredits.map((c) => implicitCreditJson(c, postureOff(c))),
     implicit_count: implicitCredits.length,
     credit_count: credits.length + siblingCredits.length + implicitCredits.length,
     sibling_count: siblingCredits.length,
     totals_by_currency: totals.map((total) => creditCurrencyTotalsJson(total, "local")),
     dvms: snapshots.map((snapshot) => ({
       ...cachedDvmJson(snapshot, credits, headroomOf, identityOf(snapshot.endpoint)),
-      ...postureFields(postureOf(snapshot.endpoint)),
+      ...postureFields(postureOf(snapshot)),
       ...fundingRailFields(fundingRailOf(snapshot.endpoint)),
     })),
     dvm_count: snapshots.length,
@@ -757,14 +758,14 @@ function siblingCreditJson(
 function localCreditCurrencyTotals(
   credits: StoredCredit[],
   implicitCredits: StoredImplicitCredit[],
-  postureOff: (endpoint: string) => boolean
+  postureOff: (credit: StoredCredit | StoredImplicitCredit) => boolean
 ): CreditCurrencyTotals[] {
   const totals = new Map<string, CreditCurrencyTotals>();
   for (const credit of credits) {
     const tracked = currencyTotal(totals, credit.currency);
     tracked.trackedCount += 1;
     if (credit.status === "active" && !credit.reconciliationPending) {
-      if (postureOff(credit.endpoint)) tracked.postureBlockedMicro += Math.max(credit.remainingMicro, 0);
+      if (postureOff(credit)) tracked.postureBlockedMicro += Math.max(credit.remainingMicro, 0);
       else tracked.drawableMicro += Math.max(credit.remainingMicro, 0);
     }
     for (const sibling of credit.siblingCredits ?? []) {
@@ -779,7 +780,7 @@ function localCreditCurrencyTotals(
     const total = currencyTotal(totals, credit.currency);
     total.trackedCount += 1;
     if (credit.status === "active") {
-      if (postureOff(credit.endpoint)) total.postureBlockedMicro += Math.max(credit.remainingMicro, 0);
+      if (postureOff(credit)) total.postureBlockedMicro += Math.max(credit.remainingMicro, 0);
       else total.drawableMicro += Math.max(credit.remainingMicro, 0);
     }
   }
@@ -864,8 +865,9 @@ function hasStoredIdentityBookkeepingAtEndpoint(
  * `/v1/info#builder.pubkey` copied verbatim for the trust-override
  * lookup — never an attestation. These config entries are written only by
  * `credit posture`, `credit rail` and `reconcilePerDvmIdentity`, each of which
- * stamps the output of `attestedDvmIdentity`. {@link offlineDvmIdentity} is
- * what the row-shaped surfaces use instead.
+ * stamps the output of `attestedDvmIdentity`. Row surfaces use
+ * `dvmLocationIdentity` for stored attested pairs, then
+ * {@link offlineDvmIdentity} for endpoint-scoped config or receipt evidence.
  */
 function configDvmIdentity(entry: {
   dvmId?: string;
@@ -1113,11 +1115,11 @@ function humanCreditRow(c: StoredCredit, postureOff: boolean): string {
   return `${label}  ${amount}${expiry}${flags ? ` · ${flags}` : ""}`;
 }
 
-/** Compact released-balance summary: one line per DVM/currency/state, never one per failed job. */
-function humanImplicitCreditRows(credits: StoredImplicitCredit[], postureOff: (endpoint: string) => boolean): string[] {
+/** Compact released-balance summary, grouped by DVM, currency, lifecycle and consent. */
+function humanImplicitCreditRows(credits: StoredImplicitCredit[], postureOff: (credit: StoredImplicitCredit) => boolean): string[] {
   const groups = new Map<string, StoredImplicitCredit[]>();
   for (const credit of credits) {
-    const key = `${credit.endpoint}\u0000${credit.currency}\u0000${credit.status}`;
+    const key = `${credit.endpoint}\u0000${credit.currency}\u0000${credit.status}\u0000${postureOff(credit)}`;
     const group = groups.get(key) ?? [];
     group.push(credit);
     groups.set(key, group);
@@ -1133,7 +1135,7 @@ function humanImplicitCreditRows(credits: StoredImplicitCredit[], postureOff: (e
     if (first.status === "lost") {
       return `${label}  ${amount} across ${count} · lost; no drain path is available`;
     }
-    if (postureOff(first.endpoint)) {
+    if (postureOff(first)) {
       return `${label}  ${amount} across ${count} · held but spending switched off by credit posture; no drain path is available`;
     }
     const expiry = Math.min(...group.map((credit) => credit.expiryMs));

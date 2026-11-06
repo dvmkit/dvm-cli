@@ -416,8 +416,10 @@ function wireCreditJson(
         ? "expired — balance reclaimable"
         : "spendable";
   const command = creditDrainCommand(endpoint, credit.credit_id);
-  const eligible = tracked && !credit.expired && !unbacked && !credit.reconciliation_pending;
-  const blocked = eligible && postureOff;
+  const active = !credit.expired && !unbacked && !credit.reconciliation_pending;
+  const implicit = credit.credit_id.startsWith("imp:");
+  const eligible = tracked && active;
+  const blocked = postureOff && active && (tracked || implicit);
   return {
     endpoint,
     dvm: label,
@@ -427,7 +429,7 @@ function wireCreditJson(
     ...(blocked ? { draw_blocked_reason: "posture_off" } : {}),
     ...(!tracked && credit.drainable ? { drain_command: command } : {}),
     display: blocked
-      ? `${amount} of credit is held at ${label}, but spending it is switched off by credit posture${credit.drainable ? "; balance remains reclaimable" : ""}.`
+      ? `${amount} of credit is held at ${label}, but spending it is switched off by credit posture${implicit ? "; implicit credit has no drain path" : credit.drainable ? "; balance remains reclaimable" : ""}.`
       : tracked
       ? unbacked
         ? `${amount} of former credit at ${label} (${state}; no action is available).`
