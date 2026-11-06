@@ -212,6 +212,7 @@
     "request_intent_invalid",
     "request_intent_unreadable",
     "request_not_found",
+    "request_not_submitted",
     "request_outcome_unknown",
     "request_recovery_auth_required",
     "request_recovery_unsupported",

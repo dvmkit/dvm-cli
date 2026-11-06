@@ -10,7 +10,7 @@ import { withOutputWarnings } from "../lib/output";
 import { loadRequestIntent } from "../lib/request-intent-store";
 import { requestRecoveryPath } from "../lib/request-recovery-path";
 import { createDvmTransport } from "../lib/transport";
-import { requestResult, type RequestResultOptions, signedIntentEnvelope } from "./request-result";
+import { requestNotFound, requestResult, type RequestResultOptions, signedIntentEnvelope } from "./request-result";
 
 export interface RequestResumeOptions extends RequestResultOptions {
   /** Submit timeout in seconds. */
@@ -49,11 +49,9 @@ async function resumeRequest(requestId: string, opts: RequestResumeOptions): Pro
 
   const intent = loadRequestIntent(requestId);
   if (!intent) {
-    throw new DvmError(
-      "request_not_found",
-      `No local intent exists for request ${requestId}.`,
-      "The outcome is unknown. Restore the original caller state; never submit or pay for a replacement.",
-      { request_id: requestId, status: "unknown" }
+    throw requestNotFound(
+      requestId,
+      "The outcome is unknown. Restore the original caller state; never submit or pay for a replacement."
     );
   }
   const signer = findSigningIdentityByPubkey(intent.callerPubkey);
