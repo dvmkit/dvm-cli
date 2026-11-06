@@ -21,7 +21,7 @@ vi.mock("@cashu/cashu-ts", async (importOriginal) => ({ ...(await importOriginal
     return `cashu:${token.mint}:${secrets}`;
   }),
   Amount: {
-    from: (n: number) => ({ toNumber: () => n }),
+    from: (n: number | { toNumber: () => number }) => ({ toNumber: () => (typeof n === "number" ? n : n.toNumber()) }),
   },
   CheckStateEnum: { UNSPENT: "UNSPENT", PENDING: "PENDING", SPENT: "SPENT" },
   OutputData: class {
@@ -61,6 +61,8 @@ import {
 import { saveJob } from "../../job-store";
 import lockfile from "proper-lockfile";
 import { applySubmissionVerdicts, recordSubmissionVerdicts } from "../submission-verdicts";
+import { clearReclaimIntent, loadReclaimIntent, reclaimIntentIds } from "../reclaim-intents";
+import { describePendingSubmissions } from "../submissions-view";
 import { settleRecordedPayments } from "../../yield-state";
 import { readFileSync, rmSync } from "node:fs";
 import {
@@ -72,10 +74,12 @@ function storedFundingReceipts() {
   return readFileSync(RECEIPTS_FILE, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 }
 import {
+  RECLAIM_UNSAVED_REASON,
   recoverPendingSubmission,
   RESUME_MAX_ATTEMPTS,
   sweepPendingSubmissions,
 } from "../recovery-submissions";
+import { MintOperationError } from "@cashu/cashu-ts";
 import {
   type AgentProof,
   type AgentWallet,
@@ -1385,6 +1389,11 @@ describe("refund-clause reclaim", () => {
   const CANONICAL_ID = "42";
   const EXPIRED_T = NOW_MS - 60 * 60 * 1000;
 
+  // The intent file lives in the suite's sandbox directory and outlasts a test.
+  beforeEach(() => {
+    for (const id of reclaimIntentIds()) clearReclaimIntent(id);
+  });
+
   function claused(overrides: Partial<PendingSubmission> = {}): PendingSubmission {
     return submission({
       context: undefined,
@@ -1395,34 +1404,73 @@ describe("refund-clause reclaim", () => {
     });
   }
 
+  interface BackOutput { id: string; amount: number; secret: string; C: string }
+
   interface CashuStub {
     wallet: Wallet;
     send: ReturnType<typeof vi.fn>;
     privkey: ReturnType<typeof vi.fn>;
+    prepare: ReturnType<typeof vi.fn>;
+    completeSwap: ReturnType<typeof vi.fn>;
+    restore: ReturnType<typeof vi.fn>;
   }
+
+  const DEFAULT_BACK: BackOutput[] = [{ id: "k1", amount: 5, secret: "back-1", C: "02CAFE" }];
 
   function cashuStub(
     opts: {
       spentSecrets?: string[];
       pendingSecrets?: string[];
       fee?: number;
-      outputs?: { id: string; amount: number; secret: string; C: string }[];
+      outputs?: BackOutput[];
+      /** Outputs for the 1st, 2nd, ... swap; falls back to `outputs`. */
+      outputsPerSwap?: BackOutput[][];
       sendError?: Error;
+      /** What NUT-09 hands back for the outputs of swaps this stub prepared (or `others`). */
+      restore?: "signed" | "nothing" | "unsupported";
+      /** Outputs of swaps prepared by an earlier stub, which this mint also committed. */
+      committed?: BackOutput[];
     } = {}
   ): CashuStub {
-    const run = vi.fn(() =>
-      opts.sendError
-        ? Promise.reject(opts.sendError)
-        : Promise.resolve({
-            send: opts.outputs ?? [{ id: "k1", amount: 5, secret: "back-1", C: "02CAFE" }],
-            keep: [],
-          })
+    const blinded = (out: BackOutput) => ({ amount: out.amount, B_: `02blind-${out.secret}`, id: out.id });
+    const prepared: BackOutput[] = [...(opts.committed ?? [])];
+    let swaps = 0;
+    const prepare = vi.fn(() => {
+      const outs = opts.outputsPerSwap?.[swaps] ?? opts.outputs ?? DEFAULT_BACK;
+      swaps += 1;
+      prepared.push(...outs);
+      return Promise.resolve({
+        keysetId: "k1",
+        inputs: [],
+        sendOutputs: outs.map((out) => ({
+          blindedMessage: blinded(out),
+          blindingFactor: 1n,
+          secret: new TextEncoder().encode(out.secret),
+        })),
+        __outs: outs,
+      });
+    });
+    const completeSwap = vi.fn((preview: { __outs: BackOutput[] }) =>
+      opts.sendError ? Promise.reject(opts.sendError) : Promise.resolve({ send: preview.__outs, keep: [] })
     );
-    const asP2PK = vi.fn(() => ({ run }));
+    const asP2PK = vi.fn(() => ({ prepare }));
     const privkey = vi.fn(() => ({ asP2PK }));
     const send = vi.fn(() => ({ privkey }));
+    const restore = vi.fn((req: { outputs: { B_: string }[] }) => {
+      if (opts.restore === "unsupported") return Promise.reject(new Error("NUT-09 unavailable"));
+      const known = opts.restore === "signed"
+        ? req.outputs.map((o) => prepared.find((out) => blinded(out).B_ === o.B_)).filter((o) => o !== undefined)
+        : [];
+      return Promise.resolve({
+        outputs: known.map(blinded),
+        signatures: known.map((out) => ({ id: out.id, amount: out.amount, C_: out.C })),
+      });
+    });
     const wallet = {
       ops: { send },
+      completeSwap,
+      mint: { restore },
+      keyChain: { getKeyset: vi.fn(() => ({})) },
       groupProofsByState: vi.fn(() =>
         Promise.resolve({
           spent: (opts.spentSecrets ?? []).map((secret) => ({ secret })),
@@ -1432,7 +1480,7 @@ describe("refund-clause reclaim", () => {
       ),
       getFeesForProofs: vi.fn(() => opts.fee ?? 0),
     } as unknown as Wallet;
-    return { wallet, send, privkey };
+    return { wallet, send, privkey, prepare, completeSwap, restore };
   }
 
   function sweepOpts(stub: CashuStub, over: Record<string, unknown> = {}) {
@@ -1570,6 +1618,210 @@ describe("refund-clause reclaim", () => {
     await settleRecordedPayments("held-reclaim-retried");
     expect(store.loadJob("held-reclaim-retried")?.unconfirmedPaymentSubmissions).toBeUndefined();
     expect(store.loadJob("held-reclaim-retried")?.inFlightPaymentRequestSeqs).toBeUndefined();
+  });
+
+  describe("a reclaim swap's result is durable before anything acts on it", () => {
+    const SECOND_ID = "22222222-2222-4222-8222-222222222222";
+
+    // A save that throws must not outlive the test that asked for it.
+    afterEach(() => { vi.mocked(saveAgentWallet).mockReset(); });
+
+    function failingLock(name: string) {
+      const lockSync = lockfile.lockSync.bind(lockfile);
+      return vi.spyOn(lockfile, "lockSync").mockImplementation((file, options) => {
+        if (String(file).endsWith(name)) throw Object.assign(new Error(`${name} is locked`), { code: "ELOCKED" });
+        return lockSync(file, options);
+      });
+    }
+
+    function failSavesWhile(failing: { value: boolean }) {
+      const saved = vi.mocked(saveAgentWallet).getMockImplementation();
+      vi.mocked(saveAgentWallet).mockImplementation((next) => {
+        if (failing.value) throw new Error("disk full");
+        saved?.(next);
+      });
+    }
+
+    it("recovers the new proofs after a failed wallet save without swapping again", async () => {
+      persistentWallet(baseWallet([claused()]));
+      const failing = { value: true };
+      failSavesWhile(failing);
+      const swapped = cashuStub();
+
+      const first = await sweepPendingSubmissions(sweepOpts(swapped));
+
+      expect(first.outcomes[0]).toMatchObject({ kind: "reclaim_skipped", reason: RECLAIM_UNSAVED_REASON, terminal: false });
+      expect(first.writeFailures).toEqual([{ requestId: REQUEST_ID, stage: "wallet_save", message: "disk full" }]);
+      expect(loadReclaimIntent(REQUEST_ID)).toMatchObject({ requestId: REQUEST_ID, keysetId: "k1", spentSats: 0 });
+      expect(loadAgentWallet()?.proofs).toEqual([]);
+
+      // The mint now reads the entry's proofs as spent: that is our own swap.
+      failing.value = false;
+      const later = cashuStub({ spentSecrets: ["out-1"], restore: "signed", committed: DEFAULT_BACK });
+      const second = await sweepPendingSubmissions(sweepOpts(later));
+
+      expect(second.outcomes[0]).toMatchObject({ kind: "reclaimed", reclaimed_sats: 5 });
+      expect(swapped.completeSwap).toHaveBeenCalledTimes(1);
+      expect(later.completeSwap).not.toHaveBeenCalled();
+      expect(later.prepare).not.toHaveBeenCalled();
+      expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["back-1"]);
+      expect(loadAgentWallet()?.pending_submissions).toEqual([]);
+      expect(loadAgentWallet()?.recent_spends).toEqual([]);
+      expect(loadReclaimIntent(REQUEST_ID)).toBeUndefined();
+    });
+
+    it("recovers every pending entry's proofs when the save throws for each", async () => {
+      const second = claused({ request_id: SECOND_ID, output_proofs: [proof("out-2", 5)] });
+      persistentWallet(baseWallet([claused(), second]));
+      const failing = { value: true };
+      failSavesWhile(failing);
+      const outputsPerSwap = [
+        [{ id: "k1", amount: 5, secret: "back-1", C: "02CAFE" }],
+        [{ id: "k1", amount: 5, secret: "back-2", C: "02CAFE" }],
+      ];
+      const swapped = cashuStub({ outputsPerSwap });
+
+      const first = await sweepPendingSubmissions(sweepOpts(swapped));
+
+      // The first entry's failed save did not stop the second from being swapped.
+      expect(swapped.completeSwap).toHaveBeenCalledTimes(2);
+      expect(first.writeFailures?.map((failure) => failure.requestId)).toEqual([REQUEST_ID, SECOND_ID]);
+
+      failing.value = false;
+      const later = cashuStub({
+        spentSecrets: ["out-1", "out-2"],
+        restore: "signed",
+        committed: outputsPerSwap.flat(),
+      });
+      const result = await sweepPendingSubmissions(sweepOpts(later));
+
+      expect(result.outcomes.map((outcome) => outcome.kind)).toEqual(["reclaimed", "reclaimed"]);
+      expect(later.completeSwap).not.toHaveBeenCalled();
+      expect(loadAgentWallet()?.proofs.map((p) => p.secret).sort()).toEqual(["back-1", "back-2"]);
+      expect(loadAgentWallet()?.pending_submissions).toEqual([]);
+      expect(reclaimIntentIds().size).toBe(0);
+    });
+
+    it("saves each entry's proofs before the next entry's mint round trip", async () => {
+      persistentWallet(baseWallet([claused(), claused({ request_id: SECOND_ID, output_proofs: [proof("out-2", 5)] })]));
+      const stub = cashuStub({ outputsPerSwap: [[{ id: "k1", amount: 5, secret: "back-1", C: "02CAFE" }], [{ id: "k1", amount: 5, secret: "back-2", C: "02CAFE" }]] });
+      const savedBeforeSecondSwap: string[][] = [];
+      stub.completeSwap.mockImplementationOnce(stub.completeSwap.getMockImplementation()!).mockImplementationOnce((preview: { __outs: unknown[] }) => {
+        savedBeforeSecondSwap.push(loadAgentWallet()?.proofs.map((p) => p.secret) ?? []);
+        return Promise.resolve({ send: preview.__outs, keep: [] });
+      });
+
+      await sweepPendingSubmissions(sweepOpts(stub));
+
+      expect(savedBeforeSecondSwap).toEqual([["back-1"]]);
+    });
+
+    it("releases the job's held ask on the next read when only the verdict journal write failed", async () => {
+      const store = await holdAsk("held-journal-failed");
+      persistentWallet(baseWallet([claused()]));
+      const busy = failingLock("submission-verdicts.json");
+
+      const result = await sweepPendingSubmissions(sweepOpts(cashuStub()));
+
+      // Money first: the proofs are in the wallet even though the journal failed.
+      expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["back-1"]);
+      expect(result.writeFailures).toMatchObject([{ requestId: REQUEST_ID, stage: "verdict_journal" }]);
+      expect(store.loadJob("held-journal-failed")?.unconfirmedPaymentSubmissions?.[4]).toBeDefined();
+      expect(loadReclaimIntent(REQUEST_ID)).toBeDefined();
+
+      busy.mockRestore();
+      await settleRecordedPayments("held-journal-failed");
+
+      expect(store.loadJob("held-journal-failed")?.unconfirmedPaymentSubmissions).toBeUndefined();
+      expect(store.loadJob("held-journal-failed")?.inFlightPaymentRequestSeqs).toBeUndefined();
+      expect(store.loadJob("held-journal-failed")?.totalPaidMsats).toBeUndefined();
+      expect(loadReclaimIntent(REQUEST_ID)).toBeUndefined();
+    });
+
+    it("never books a payment the provider did not take when both writes fail", async () => {
+      const store = await holdAsk("held-both-failed");
+      persistentWallet(baseWallet([claused()]));
+      const failing = { value: true };
+      failSavesWhile(failing);
+      const busy = failingLock("submission-verdicts.json");
+      await sweepPendingSubmissions(sweepOpts(cashuStub()));
+      busy.mockRestore();
+
+      // The swap is committed, the entry is still in the wallet, and the mint
+      // reads its proofs as spent. The mint cannot hand the outputs back yet.
+      const unrestorable = cashuStub({ spentSecrets: ["out-1"], restore: "nothing" });
+      const second = await sweepPendingSubmissions(sweepOpts(unrestorable));
+
+      expect(second.outcomes[0]).toMatchObject({ kind: "reclaim_skipped" });
+      expect(loadAgentWallet()?.recent_spends).toEqual([]);
+      expect(loadAgentWallet()?.pending_submissions).toHaveLength(1);
+      expect(unrestorable.completeSwap).not.toHaveBeenCalled();
+      await settleRecordedPayments("held-both-failed");
+      expect(store.loadJob("held-both-failed")?.totalPaidMsats).toBeUndefined();
+      expect(store.loadJob("held-both-failed")?.paidPaymentRequestSeqs).toBeUndefined();
+      expect(store.loadJob("held-both-failed")?.unconfirmedPaymentSubmissions?.[4]).toBeDefined();
+
+      // Once the mint can restore, the reclaim lands and the ask is released.
+      failing.value = false;
+      const restorable = cashuStub({ spentSecrets: ["out-1"], restore: "signed", committed: DEFAULT_BACK });
+      await sweepPendingSubmissions(sweepOpts(restorable));
+      expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["back-1"]);
+      expect(store.loadJob("held-both-failed")?.unconfirmedPaymentSubmissions).toBeUndefined();
+      expect(store.loadJob("held-both-failed")?.totalPaidMsats).toBeUndefined();
+    });
+
+    it("starts over, swapping once, when an ambiguous failure never reached the mint", async () => {
+      persistentWallet(baseWallet([claused()]));
+      const refused = cashuStub({ sendError: new Error("socket hang up") });
+
+      const first = await sweepPendingSubmissions(sweepOpts(refused));
+
+      expect(first.outcomes[0]).toMatchObject({ kind: "reclaim_skipped", reason: "socket hang up" });
+      expect(loadReclaimIntent(REQUEST_ID)).toBeDefined();
+
+      // Nothing was restorable and every input is still UNSPENT.
+      const fresh = cashuStub({ restore: "nothing" });
+      const second = await sweepPendingSubmissions(sweepOpts(fresh));
+
+      expect(second.outcomes[0]).toMatchObject({ kind: "reclaimed" });
+      expect(fresh.completeSwap).toHaveBeenCalledTimes(1);
+      expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["back-1"]);
+      expect(reclaimIntentIds().size).toBe(0);
+    });
+
+    it("drops the intent when the mint definitely refuses the swap", async () => {
+      persistentWallet(baseWallet([claused()]));
+      const stub = cashuStub({ sendError: new MintOperationError(11001, "token already spent") });
+
+      const result = await sweepPendingSubmissions(sweepOpts(stub));
+
+      expect(result.outcomes[0]).toMatchObject({ kind: "reclaim_skipped" });
+      expect(reclaimIntentIds().size).toBe(0);
+    });
+
+    it("does not swap when the intent cannot be written first", async () => {
+      persistentWallet(baseWallet([claused()]));
+      const busy = failingLock("reclaim-intents.json");
+      const stub = cashuStub();
+
+      const result = await sweepPendingSubmissions(sweepOpts(stub));
+      busy.mockRestore();
+
+      expect(stub.completeSwap).not.toHaveBeenCalled();
+      expect(result.outcomes[0]).toMatchObject({ kind: "reclaim_skipped", reason: expect.stringContaining("nothing was swapped") });
+    });
+
+    it("names an unsaved reclaim in the submissions view with the command that recovers it", async () => {
+      persistentWallet(baseWallet([claused()]));
+      const failing = { value: true };
+      failSavesWhile(failing);
+      await sweepPendingSubmissions(sweepOpts(cashuStub()));
+
+      const [entry] = describePendingSubmissions(loadAgentWallet()!, NOW_MS).entries;
+
+      expect(entry).toMatchObject({ request_id: REQUEST_ID, state: "reclaim_failed", reclaim_error: RECLAIM_UNSAVED_REASON });
+      expect(entry.display).toContain("dvm wallet show");
+    });
   });
 
   function persistedEntry(): PendingSubmission | undefined {

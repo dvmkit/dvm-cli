@@ -28,9 +28,11 @@ import {
   shellQuoteArg,
 } from "@dvmkit/sdk/internal";
 import { type SubmissionEvidenceRecord } from "../submission-evidence";
+import { reclaimIntentIds } from "./reclaim-intents";
 import {
   isResumable,
   publicRequestIdOf,
+  RECLAIM_UNSAVED_REASON,
   reclaimAtMs,
   RESUME_MAX_AGE_MS,
   RESUME_MAX_ATTEMPTS,
@@ -115,9 +117,14 @@ export interface PendingSubmissionsSummary {
 
 export function describePendingSubmissions(
   wallet: AgentWallet,
-  nowMs: number = Date.now()
+  nowMs: number = Date.now(),
+  /**
+   * Entries whose reclaim swap went through at the mint without its result
+   * reaching the wallet. Read from the reclaim-intent file by default.
+   */
+  reclaimUnsaved: ReadonlySet<string> = reclaimIntentIds()
 ): PendingSubmissionsSummary {
-  const entries = wallet.pending_submissions.map((entry) => toView(entry, nowMs));
+  const entries = wallet.pending_submissions.map((entry) => toView(entry, nowMs, reclaimUnsaved.has(entry.request_id)));
   return {
     entries,
     at_risk_sats: entries.filter((e) => e.at_risk).reduce((sum, e) => sum + e.amount_sats, 0),
@@ -435,12 +442,14 @@ export function describeSubmissionEvidence(
   });
 }
 
-function toView(entry: PendingSubmission, nowMs: number): PendingSubmissionView {
+function toView(entry: PendingSubmission, nowMs: number, reclaimUnsaved: boolean): PendingSubmissionView {
   const createdMs = Date.parse(entry.created_at);
   const ageMs = Number.isNaN(createdMs) ? Number.POSITIVE_INFINITY : nowMs - createdMs;
   const attempts = entry.attempts ?? 0;
   const reclaimAt = reclaimAtMs(entry);
-  const state = deriveState(entry, ageMs, attempts, reclaimAt);
+  // The mint already holds the swapped proofs for this entry; the next sweep
+  // restores them, and until then it needs a person to know to run one.
+  const state = reclaimUnsaved ? "reclaim_failed" : deriveState(entry, ageMs, attempts, reclaimAt);
 
   return {
     request_id: entry.request_id,
@@ -452,13 +461,19 @@ function toView(entry: PendingSubmission, nowMs: number): PendingSubmissionView 
     state,
     at_risk: state !== "awaiting_swap",
     reclaim_at: reclaimAt === null ? null : new Date(reclaimAt).toISOString(),
-    reclaim_error:
-      state === "reclaim_failed" || state === "unreclaimable"
+    reclaim_error: reclaimUnsaved
+      ? RECLAIM_UNSAVED_REASON
+      : state === "reclaim_failed" || state === "unreclaimable"
         ? (entry.reclaim_error ?? null)
         : null,
     ...(entry.accepted_unresolved ? { accepted_unresolved: entry.accepted_unresolved } : {}),
     ...(publicRequestIdOf(entry) ? { public_request_id: publicRequestIdOf(entry) } : {}),
-    display: describe(entry, state, reclaimAt, nowMs),
+    display: describe(
+      reclaimUnsaved ? { ...entry, reclaim_error: RECLAIM_UNSAVED_REASON } : entry,
+      state,
+      reclaimAt,
+      nowMs
+    ),
   };
 }
 
