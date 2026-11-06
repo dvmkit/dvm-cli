@@ -236,6 +236,33 @@ describe("metered caller guidance", () => {
 });
 
 describe("credit-only threshold", () => {
+  it.each(["off", "expired"])("names the recovery for a %s credit without changing posture", async (reason) => {
+    seedCredit();
+    const config = JSON.stringify({ credit: { posture: reason === "off" ? "off" : "suggest" } });
+    writeFileSync(join(root, "config.json"), config);
+    if (reason === "expired") {
+      const path = join(root, "credits.json");
+      const store = JSON.parse(readFileSync(path, "utf8"));
+      store.credits[0].expiryMs = Date.now() - 1;
+      writeFileSync(path, JSON.stringify(store));
+    }
+    const failure = request({ endpoint, input: "work", budget: "$1.50", autoPayBelow: "$0.90",
+      creditOnly: "approved-credit", requestId: "request-blocked" });
+    await expect(failure).rejects.toMatchObject({ code: "credit_only_unavailable",
+      data: { reason: reason === "off" ? "posture_off" : "expired" },
+      hint: reason === "off"
+        ? expect.stringContaining("dvm credit posture suggest --dvm")
+        : expect.stringContaining("dvm credit balance <dvm> --credit-id <id>"),
+    });
+    if (reason === "off") {
+      await expect(failure).rejects.toMatchObject({ hint: expect.stringContaining("dvm credit drain") });
+      await expect(failure).rejects.toMatchObject({ hint: expect.not.stringContaining("dvm credit balance") });
+    }
+    expect(readFileSync(join(root, "config.json"), "utf8")).toBe(config);
+    expect(seams.submit).not.toHaveBeenCalled();
+    expect(seams.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("accepts a raised bound, persists the restriction and pays only the named credit", async () => {
     seedCredit();
     const verifier = createSignedRequestVerifier({ _zod: {}, parse: (data: unknown) => data,

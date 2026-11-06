@@ -441,6 +441,7 @@ export function creditList(opts: CreditListOptions): void {
   const identityOf = (endpoint: string) => offlineDvmIdentity(creditConfig, endpoint, headroomOf);
   const postureOf = (endpoint: string) =>
     effectiveCreditPosture(creditConfig, endpoint, identityOf(endpoint));
+  const postureOff = (endpoint: string) => postureOf(endpoint).posture === "off";
   const fundingRailOf = (endpoint: string) =>
     effectiveFundingRail(creditConfig, endpoint, identityOf(endpoint));
   const globalPosture = isCreditPosture(creditConfig?.posture)
@@ -448,12 +449,12 @@ export function creditList(opts: CreditListOptions): void {
     : { posture: DEFAULT_CREDIT_POSTURE, source: "default" as const };
   const globalRail = effectiveFundingRail(creditConfig);
   const siblingCredits = credits.flatMap((credit) => credit.siblingCredits ?? []);
-  const totals = localCreditCurrencyTotals(credits, implicitCredits);
+  const totals = localCreditCurrencyTotals(credits, implicitCredits, postureOff);
 
   if (opts.human) {
     info(humanPostureLine(globalPosture));
     for (const [endpoint, per] of postureOverrides(creditConfig)) {
-      info(`  At ${dvmLabelFromEndpoint(endpoint)}: ${per} (overrides the global setting).`);
+      info(`  At ${dvmLabelFromEndpoint(endpoint)}: ${per} (overrides the global setting).${per === "off" ? " Spending held credit is also switched off." : ""}`);
     }
     info(humanFundingRailLine(globalRail));
     for (const [endpoint, rail] of fundingRailOverrides(creditConfig)) {
@@ -472,13 +473,13 @@ export function creditList(opts: CreditListOptions): void {
       return;
     }
     for (const c of credits) {
-      info(`  ${humanCreditRow(c)}`);
+      info(`  ${humanCreditRow(c, postureOff(c.endpoint))}`);
       for (const sibling of c.siblingCredits ?? []) {
         info(`    ${humanSiblingCreditRow(c, sibling)}`);
       }
       info(`    ${headroomDisplay(headroomOf.of(headroomInputsFor(c, identityOf(c.endpoint))))}`);
     }
-    for (const row of humanImplicitCreditRows(implicitCredits)) info(`  ${row}`);
+    for (const row of humanImplicitCreditRows(implicitCredits, postureOff)) info(`  ${row}`);
     for (const snapshot of snapshots) {
       const machine = cachedDvmJson(snapshot, credits, headroomOf, identityOf(snapshot.endpoint));
       info(`  ${String(machine.display)}`);
@@ -513,12 +514,12 @@ export function creditList(opts: CreditListOptions): void {
       hint: `Pin it with 'dvm credit rail <${CREDIT_FUND_RAILS.join("|")}>' or return to the amount rule with 'dvm credit rail --clear'; add --dvm <dvm> to scope either operation.`,
     },
     credits: credits.map((c) => ({
-      ...storedCreditJson(c, headroomOf.of(headroomInputsFor(c, identityOf(c.endpoint)))),
+      ...storedCreditJson(c, headroomOf.of(headroomInputsFor(c, identityOf(c.endpoint))), postureOff(c.endpoint)),
       ...postureFields(postureOf(c.endpoint)),
       ...fundingRailFields(fundingRailOf(c.endpoint)),
     })),
     count: credits.length,
-    implicit_credits: implicitCredits.map(implicitCreditJson),
+    implicit_credits: implicitCredits.map((c) => implicitCreditJson(c, postureOff(c.endpoint))),
     implicit_count: implicitCredits.length,
     credit_count: credits.length + siblingCredits.length + implicitCredits.length,
     sibling_count: siblingCredits.length,
@@ -590,7 +591,7 @@ function postureSentence(posture: CreditPosture): string {
     case "auto":
       return "credit is bought within the trust-tier caps without asking, and every purchase reports its amount, route and reason.";
     case "off":
-      return "no multi-job credit is opened, refilled, or drawn on; every job pays per-call.";
+      return "no multi-job credit is opened or refilled, and spending held credit is switched off; every job pays per-call.";
     case "suggest":
       return "nothing is ever bought automatically; where a credit would have helped, the job output says so and names how to fund it.";
   }
@@ -598,7 +599,8 @@ function postureSentence(posture: CreditPosture): string {
 
 function humanPostureLine(effective: { posture: CreditPosture; source: string }): string {
   const provenance = effective.source === "global" ? "set in config" : "the default";
-  return `Automatic credit purchases: ${effective.posture} (${provenance}) — ${postureSentence(effective.posture)}`;
+  const subject = effective.posture === "off" ? "Credit purchases and spending" : "Automatic credit purchases";
+  return `${subject}: ${effective.posture} (${provenance}) — ${postureSentence(effective.posture)}`;
 }
 
 function postureAdoptionSentence(posture: CreditPosture): string {
@@ -672,8 +674,9 @@ function fundingRailFields(effective: EffectiveFundingRail): {
   };
 }
 
-function storedCreditJson(c: StoredCredit, headroom: CreditHeadroom): Record<string, unknown> {
+function storedCreditJson(c: StoredCredit, headroom: CreditHeadroom, postureOff: boolean): Record<string, unknown> {
   const channelId = storedCreditChannelId(c);
+  const eligible = c.selectionCleared !== true && c.status === "active" && !c.reconciliationPending;
   return {
     endpoint: c.endpoint,
     dvm: dvmLabelFromEndpoint(c.endpoint),
@@ -687,7 +690,8 @@ function storedCreditJson(c: StoredCredit, headroom: CreditHeadroom): Record<str
     ...(channelId ? { channel_id: channelId } : {}),
     ...(c.reconciliationPending ? { reconciliation_pending: true } : {}),
     tracked: c.selectionCleared !== true,
-    drawable: c.selectionCleared !== true && c.status === "active" && !c.reconciliationPending,
+    drawable: eligible && !postureOff,
+    ...(eligible && postureOff ? { draw_blocked_reason: "posture_off" } : {}),
     ...(c.siblingCredits
       ? { sibling_credits: c.siblingCredits.map((sibling) => siblingCreditJson(c, sibling)) }
       : {}),
@@ -707,7 +711,7 @@ function storedCreditJson(c: StoredCredit, headroom: CreditHeadroom): Record<str
         }
       : {}),
     headroom: headroomJson(headroom),
-    display: humanCreditRow(c),
+    display: humanCreditRow(c, postureOff),
   };
 }
 
@@ -752,14 +756,16 @@ function siblingCreditJson(
 
 function localCreditCurrencyTotals(
   credits: StoredCredit[],
-  implicitCredits: StoredImplicitCredit[] = []
+  implicitCredits: StoredImplicitCredit[],
+  postureOff: (endpoint: string) => boolean
 ): CreditCurrencyTotals[] {
   const totals = new Map<string, CreditCurrencyTotals>();
   for (const credit of credits) {
     const tracked = currencyTotal(totals, credit.currency);
     tracked.trackedCount += 1;
     if (credit.status === "active" && !credit.reconciliationPending) {
-      tracked.drawableMicro += Math.max(credit.remainingMicro, 0);
+      if (postureOff(credit.endpoint)) tracked.postureBlockedMicro += Math.max(credit.remainingMicro, 0);
+      else tracked.drawableMicro += Math.max(credit.remainingMicro, 0);
     }
     for (const sibling of credit.siblingCredits ?? []) {
       const siblingTotal = currencyTotal(totals, sibling.currency);
@@ -772,7 +778,10 @@ function localCreditCurrencyTotals(
   for (const credit of implicitCredits) {
     const total = currencyTotal(totals, credit.currency);
     total.trackedCount += 1;
-    if (credit.status === "active") total.drawableMicro += Math.max(credit.remainingMicro, 0);
+    if (credit.status === "active") {
+      if (postureOff(credit.endpoint)) total.postureBlockedMicro += Math.max(credit.remainingMicro, 0);
+      else total.drawableMicro += Math.max(credit.remainingMicro, 0);
+    }
   }
   return sortedCurrencyTotals(totals);
 }
@@ -1068,7 +1077,7 @@ function drainReceiptCount(c: StoredCredit): number {
   return (c.drainEvidence ?? []).reduce((sum, e) => sum + e.receipts.length, 0);
 }
 
-function humanCreditRow(c: StoredCredit): string {
+function humanCreditRow(c: StoredCredit, postureOff: boolean): string {
   const label = dvmLabelFromEndpoint(c.endpoint).padEnd(12);
   const amount = formatFiat(
     Math.max(c.status === "unbacked" ? c.balanceMicro : c.remainingMicro, 0) / 1_000_000,
@@ -1081,6 +1090,9 @@ function humanCreditRow(c: StoredCredit): string {
   const stranded = others.filter((d) => d.creditId !== undefined).length;
   const unattributed = others.length - stranded;
   const flags = [
+    postureOff && c.status === "active" && !c.reconciliationPending
+      ? "held but spending switched off by credit posture; balance remains reclaimable"
+      : undefined,
     c.status !== "active" ? c.status : undefined,
     c.reconciliationPending ? "backing reconciliation pending" : undefined,
     c.provisional ? "syncing" : undefined,
@@ -1102,7 +1114,7 @@ function humanCreditRow(c: StoredCredit): string {
 }
 
 /** Compact released-balance summary: one line per DVM/currency/state, never one per failed job. */
-function humanImplicitCreditRows(credits: StoredImplicitCredit[]): string[] {
+function humanImplicitCreditRows(credits: StoredImplicitCredit[], postureOff: (endpoint: string) => boolean): string[] {
   const groups = new Map<string, StoredImplicitCredit[]>();
   for (const credit of credits) {
     const key = `${credit.endpoint}\u0000${credit.currency}\u0000${credit.status}`;
@@ -1120,6 +1132,9 @@ function humanImplicitCreditRows(credits: StoredImplicitCredit[]): string[] {
     const count = `${String(group.length)} released per-call balance${group.length === 1 ? "" : "s"}`;
     if (first.status === "lost") {
       return `${label}  ${amount} across ${count} · lost; no drain path is available`;
+    }
+    if (postureOff(first.endpoint)) {
+      return `${label}  ${amount} across ${count} · held but spending switched off by credit posture; no drain path is available`;
     }
     const expiry = Math.min(...group.map((credit) => credit.expiryMs));
     return `${label}  ${amount} across ${count} · next request uses the earliest expiry first · expires by ${new Date(expiry).toISOString().slice(0, 10)}`;

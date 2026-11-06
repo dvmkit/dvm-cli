@@ -132,8 +132,9 @@ export function advisoryBtcRate(): Promise<number | undefined> {
     .catch(() => undefined);
 }
 
-export function implicitCreditJson(credit: StoredImplicitCredit): Record<string, unknown> {
+export function implicitCreditJson(credit: StoredImplicitCredit, postureOff: boolean): Record<string, unknown> {
   const active = credit.status === "active";
+  const blocked = active && postureOff;
   const amount = formatFiat(Math.max(credit.remainingMicro, 0) / 1_000_000, credit.currency);
   const label = dvmLabelFromEndpoint(credit.endpoint);
   return {
@@ -147,7 +148,8 @@ export function implicitCreditJson(credit: StoredImplicitCredit): Record<string,
     expiry_ms: credit.expiryMs,
     status: credit.status,
     tracked: true,
-    drawable: active,
+    drawable: active && !postureOff,
+    ...(blocked ? { draw_blocked_reason: "posture_off" } : {}),
     drainable: false,
     released_by_job_id: credit.releasedByJobId,
     released_at_ms: credit.releasedAt,
@@ -166,9 +168,11 @@ export function implicitCreditJson(credit: StoredImplicitCredit): Record<string,
           },
         }
       : {}),
-    display: active
-      ? `${amount} released by an unsuccessful per-call job at ${label}; the next eligible request spends it automatically before prepaid credit.`
-      : `${amount} released per-call balance at ${label} is lost; implicit credits have no drain path after expiry or server retirement.`,
+    display: blocked
+      ? `${amount} released per-call balance is held at ${label}, but spending it is switched off by credit posture; no drain path is available.`
+      : active
+        ? `${amount} released by an unsuccessful per-call job at ${label}; the next eligible request spends it automatically before prepaid credit.`
+        : `${amount} released per-call balance at ${label} is lost; implicit credits have no drain path after expiry or server retirement.`,
     hint: active
       ? `Use it promptly. ${new Date(credit.expiryMs).toISOString()} is the latest possible expiry inferred from the receipt; the server may retire it earlier. No funding menu or new payment is needed.`
       : "No reclaim action is available. A provider must offer prepaid credit for unused value to have a drain path.",
@@ -180,6 +184,7 @@ export interface CreditCurrencyTotals {
   trackedCount: number;
   siblingCount: number;
   drawableMicro: number;
+  postureBlockedMicro: number;
   siblingSpendableMicro: number;
 }
 
@@ -194,6 +199,7 @@ export function currencyTotal(
     trackedCount: 0,
     siblingCount: 0,
     drawableMicro: 0,
+    postureBlockedMicro: 0,
     siblingSpendableMicro: 0,
   };
   totals.set(currency, created);
@@ -213,8 +219,9 @@ export function creditCurrencyTotalsJson(
     tracked_count: total.trackedCount,
     sibling_count: total.siblingCount,
     drawable_micro: total.drawableMicro,
+    ...(total.postureBlockedMicro > 0 ? { posture_blocked_micro: total.postureBlockedMicro } : {}),
     sibling_spendable_micro: total.siblingSpendableMicro,
-    spendable_micro: total.drawableMicro + total.siblingSpendableMicro,
+    spendable_micro: total.drawableMicro + total.postureBlockedMicro + total.siblingSpendableMicro,
     display: creditCurrencyTotalDisplay(total, source),
   };
 }
@@ -233,10 +240,14 @@ export function creditCurrencyTotalDisplay(
   const drawable = formatFiat(total.drawableMicro / 1_000_000, total.currency);
   const sibling = formatFiat(total.siblingSpendableMicro / 1_000_000, total.currency);
   const spendable = formatFiat(
-    (total.drawableMicro + total.siblingSpendableMicro) / 1_000_000,
+    (total.drawableMicro + total.postureBlockedMicro + total.siblingSpendableMicro) / 1_000_000,
     total.currency
   );
   const certainty = source === "local" ? "believed" : "server-confirmed";
+  if (total.postureBlockedMicro > 0) {
+    const blocked = formatFiat(total.postureBlockedMicro / 1_000_000, total.currency);
+    return `${spendable} ${certainty} spendable: ${drawable} drawable from tracked credits, ${blocked} held but spending switched off by credit posture, and ${sibling} held on sibling credits that draws do not use.`;
+  }
   return total.siblingSpendableMicro > 0
     ? `${spendable} ${certainty} spendable: ${drawable} drawable from tracked credits, and ${sibling} held on sibling credits that draws do not use.`
     : `${drawable} ${certainty} spendable, all drawable from tracked credits; no sibling spendable balance is recorded in ${total.currency.toUpperCase()}.`;
