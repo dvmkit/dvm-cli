@@ -166,7 +166,7 @@ import { progressNotice } from "../lib/progress-notice";
 import { quoteWithinDeclaredLimit } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
-import { recordRequestRefusal } from "../lib/request-refusal-store";
+import { clearRequestRefusal, recordRequestRefusal } from "../lib/request-refusal-store";
 import { createArtifactSaveSession } from "../lib/save-artifact";
 import { applyJsonSchemaDefaults, formatAppliedDefaults } from "../lib/schema-defaults";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "../lib/stream-loop";
@@ -2636,6 +2636,7 @@ function persistRequestIntent(args: {
       { request_id: requestId, status: "unknown" }
     );
   }
+  clearRequestRefusal(requestId);
 }
 
 /**

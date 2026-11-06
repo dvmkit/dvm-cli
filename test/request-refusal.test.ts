@@ -105,6 +105,7 @@ describe("a request refused before it was sent", () => {
     await request(submitArgs);
     expect(seams.submit).toHaveBeenCalledTimes(1);
     expect(loadRequestIntent(rid)).toMatchObject({ requestId: rid, creditOnly: "approved-credit" });
+    expect(existsSync(join(REQUEST_REFUSALS_DIR, `${rid}.json`))).toBe(false);
 
     await requestResult(rid);
     expect(seams.requestResult).toHaveBeenCalledTimes(1);
@@ -130,15 +131,28 @@ describe("a request refused before it was sent", () => {
     expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ jobId: "job-1" }));
   });
 
-  it("does not let a stale refusal hide a real intent", async () => {
+  it("does not report a submitted ID as unsent after its intent is lost", async () => {
     seedCredit("off");
     await expect(request(submitArgs)).rejects.toMatchObject({ data: { submitted: false } });
     seedCredit("suggest");
     await request(submitArgs);
-    expect(loadRequestRefusal(rid)).not.toBeNull();
-    seams.requestResult.mockResolvedValue({ jobId: "job-1", status: "completed" });
+
+    rmSync(join(REQUEST_INTENTS_DIR, rid), { recursive: true, force: true });
+    for (const lookup of [requestResult, requestResume]) {
+      await expect(lookup(rid)).rejects.toMatchObject({
+        code: "request_not_found", data: { request_id: rid, status: "unknown" },
+      });
+    }
+  });
+
+  it("lets a real intent win over a refusal record that was left behind", async () => {
+    seedCredit("suggest");
+    await request(submitArgs);
+    mkdirSync(REQUEST_REFUSALS_DIR, { recursive: true });
+    writeFileSync(join(REQUEST_REFUSALS_DIR, `${rid}.json`), JSON.stringify({ v: 1, requestId: rid, code: "credit_only_unavailable", refusedAt: 1 }));
     await requestResult(rid);
     expect(seams.requestResult).toHaveBeenCalledTimes(1);
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ jobId: "job-1" }));
   });
 
   it("leaves an ID with neither intent nor refusal as unknown", async () => {

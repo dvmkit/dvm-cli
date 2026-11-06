@@ -11,6 +11,7 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "fs";
 import { join } from "path";
@@ -85,6 +86,21 @@ export function recordRequestRefusal(
     // lookup loses its evidence and falls back to the unknown answer.
   }
   return true;
+}
+
+/**
+ * Drop the refusal for an ID once a real intent exists. Without this, losing
+ * the intent later (partial restore, manual cleanup) would let the old refusal
+ * tell the caller that a submitted request was never sent.
+ */
+export function clearRequestRefusal(requestId: string): void {
+  if (!isPublicRequestId(requestId)) return;
+  try {
+    rmSync(refusalPath(requestId), { force: true });
+  } catch {
+    // Best effort: lookups read the intent first, so a leftover record is inert
+    // while the intent exists.
+  }
 }
 
 /** Load the refusal recorded for this ID; null when none exists or it is unreadable. */
