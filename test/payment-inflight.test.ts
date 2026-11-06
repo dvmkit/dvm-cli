@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const sdk = vi.hoisted(() => ({
   addPayment: vi.fn(),
   commitAgentSpend: vi.fn(async () => undefined),
+  commitHeldSubmission: vi.fn(async () => undefined),
   buildTempoCredential: vi.fn(),
   enforceGlobalBudget: vi.fn(),
   loadAgentWallet: vi.fn(),
@@ -50,6 +51,7 @@ vi.mock("../src/lib/budget-ledger", async (importOriginal) => ({
 vi.mock("../src/lib/wallet-agent/spend", () => ({
   prepareAgentSpend: sdk.prepareAgentSpend,
   commitAgentSpend: sdk.commitAgentSpend,
+  commitHeldSubmission: sdk.commitHeldSubmission,
   abandonPendingSubmission: vi.fn(async () => undefined),
 }));
 vi.mock("../src/lib/wallet-agent/recovery-submissions", () => ({ sweepPendingSubmissions: async () => undefined }));
@@ -75,6 +77,14 @@ const x402Offer = {
   payment_required: "challenge",
 } as unknown as NonNullable<PaymentRequestContent["x402"]>;
 
+// The signed x402 payment an earlier, unconfirmed send dispatched for seq 5.
+const sentX402 = {
+  rail: "x402", content: { x402_payment: "x402-original", amount_msats: 12_000 },
+  requestAmountMsats: 10_000, amountMsats: 12_000, btcRate: 100_000, amountUsdcMicro: "10000",
+} as const;
+const redelivery = (content: Record<string, unknown> = sentX402.content) =>
+  [expect.any(String), { type: "payment", content }, provider, expect.anything()];
+
 afterEach(() => {
   try {
     expect(fetch).not.toHaveBeenCalled();
@@ -95,7 +105,7 @@ describe("mid-job payment rail selection", () => {
       jobToken: "job-token",
     });
     sdk.enforceGlobalBudget.mockResolvedValue(100_000);
-    sdk.loadAgentWallet.mockReturnValue({ proofs: [{}] });
+    sdk.loadAgentWallet.mockReturnValue({ proofs: [{}], pending_submissions: [], recent_spends: [] });
     sdk.loadConfig.mockReturnValue({ tempo: { method: "tempo", apiKey: "0xkey" } });
     sdk.loadX402Wallet.mockReturnValue({ privateKey: "0xkey" });
     sdk.tempoCredentialAmountMicro.mockReturnValue(10_000n);
@@ -108,6 +118,9 @@ describe("mid-job payment rail selection", () => {
   const walletPrep = (ask: PaymentRequestContent) => {
     sdk.prepareAgentSpend.mockResolvedValue({ cashuToken: "cashu-proof", requestId: "spend-1",
       mint: "https://mint.example", totalSats: 10, intendedLockPubkey: ask.lock_pubkey });
+    sdk.loadAgentWallet.mockReturnValue({ proofs: [{}], recent_spends: [], pending_submissions: [{
+      request_id: "spend-1", endpoint: provider.endpoint, mint: "https://mint.example", amount_sats: 10,
+      intended_lock_pubkey: ask.lock_pubkey, cashu_token: "cashu-proof", output_proofs: [], created_at: "" }] });
     sdk.buildTempoCredential.mockReturnValue({ credential: "tempo-proof" });
   };
 
@@ -151,7 +164,8 @@ describe("mid-job payment rail selection", () => {
     vi.useFakeTimers();
     try {
       const { store, jobId, transport, history } = await setup("answered-prompt-wait");
-      store.updateJob(jobId, { inFlightPaymentRequestSeqs: [5], inFlightPaymentRequestStartedAtMs: { 5: Date.now() - 60_000 } });
+      store.updateJob(jobId, { inFlightPaymentRequestSeqs: [5], inFlightPaymentRequestStartedAtMs: { 5: Date.now() - 60_000 },
+        unconfirmedPaymentSubmissions: { 5: sentX402 } });
       // SDK keeps status awaiting-input while pendingPayment is set after a prompt is answered.
       const messages: Message[] = [...history(false),
         { seq: 7, from: "provider", timestamp: 0, type: "prompt", content: { id: "p", text: "Continue?" } },
@@ -163,14 +177,15 @@ describe("mid-job payment rail selection", () => {
       await vi.advanceTimersByTimeAsync(600_000);
       const result = await pending;
       expect(result.autoPayments).toHaveLength(1);
+      expect(transport.sendMessage).toHaveBeenCalledExactlyOnceWith(...redelivery());
     } finally { vi.useRealTimers(); }
   });
 
-  it.each([false, true])("wait pays after the settle window with an incremental stream (explicit after=%s)", async (explicit) => {
+  it.each([false, true])("wait re-delivers after the settle window with an incremental stream (explicit after=%s)", async (explicit) => {
     vi.useFakeTimers();
     try {
       const { store, jobId, transport, history } = await setup(`window-expiry-${explicit}`);
-      store.markPaymentRequestInFlight(jobId, 5);
+      store.markPaymentRequestInFlight(jobId, 5, sentX402);
       const messages = history(false);
       transport.getMessages.mockImplementation(async (_job, after) => messages.filter((message) => message.seq > after));
       const stream = vi.fn(async (_job, after) => ({ messages: messages.filter((message) => message.seq > after), reason: "yield" as const }));
@@ -178,9 +193,11 @@ describe("mid-job payment rail selection", () => {
         afterSeq: 4, afterSeqExplicit: explicit }, 180_000);
       await vi.advanceTimersByTimeAsync(180_000);
       const result = await pending;
-      expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+      expect(transport.sendMessage).toHaveBeenCalledExactlyOnceWith(...redelivery());
+      expect(sdk.tryX402Payment).not.toHaveBeenCalled();
       expect(result.autoPayments).toHaveLength(1);
       expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
+      expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
     } finally { vi.useRealTimers(); }
   });
 
@@ -271,12 +288,12 @@ describe("mid-job payment rail selection", () => {
     transport.sendMessage.mockImplementationOnce(async () => { loseLock(); return { seq: 6 }; });
     const outcome = await handlePaymentRequest(jobId, ask, policy, transport, provider, { rail, requestSeq: 5 })
       .catch((error: unknown) => error);
-    expect(sdk.addPayment).toHaveBeenCalledExactlyOnceWith(jobId, rail === "cashu" ? 10_000 : 12_000,
-      { requestSeq: 5, approval: "auto" });
+    expect(store.loadJob(jobId)).toMatchObject({ totalPaidMsats: rail === "cashu" ? 10_000 : 12_000, paymentsHonoured: 1,
+      paymentApprovals: [{ requestSeq: 5, approval: "auto" }] });
     expect(sdk.recordSpend).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       jobId, msats: rail === "cashu" ? 10_000 : 12_000,
     }));
-    expect(sdk.commitAgentSpend).toHaveBeenCalledTimes(rail === "cashu" ? 1 : 0);
+    expect(sdk.commitHeldSubmission).toHaveBeenCalledTimes(rail === "cashu" ? 1 : 0);
     expect(outcome).toMatchObject({ status: "paid" });
     expect(transport.sendMessage).toHaveBeenCalledTimes(1);
     expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
@@ -418,21 +435,77 @@ describe("mid-job payment rail selection", () => {
   });
 
   // A refused or never-dispatched payment must not prevent paying the same ask later.
+  // A refusal releases the signed payment; one that never left is sent again unchanged.
   it.each([
-    ["payment_invalid", () => new DvmError("payment_invalid", "Invalid payment", undefined, { http_status: 402 })],
-    ["payment_insufficient", () => new DvmError("payment_insufficient", "Insufficient payment", undefined, { http_status: 402 })],
-    ["structured refusal", () => new DvmError("invalid_request", "Invalid request", undefined, { http_status: 400 })],
-    ["connection refused", () => new TypeError("fetch failed", { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) })],
-    ["DNS failure", () => new TypeError("fetch failed", { cause: Object.assign(new Error("lookup failed"), { code: "ENOTFOUND" }) })],
-  ])("releases the in-flight request after %s", async (label, makeError) => {
+    ["payment_invalid", () => new DvmError("payment_invalid", "Invalid payment", undefined, { http_status: 402 }), 2],
+    ["structured refusal", () => new DvmError("invalid_request", "Invalid request", undefined, { http_status: 400 }), 2],
+    ["connection refused", () => new TypeError("fetch failed", { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) }), 1],
+    ["DNS failure", () => new TypeError("fetch failed", { cause: Object.assign(new Error("lookup failed"), { code: "ENOTFOUND" }) }), 1],
+  ])("releases the in-flight request after %s", async (label, makeError, signatures) => {
     const { store, jobId, ask, transport } = await setup(label);
     transport.sendMessage.mockRejectedValueOnce(makeError());
     await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5 })).rejects.toBeTruthy();
     expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
+    sdk.tryX402Payment.mockResolvedValue({ paymentHeader: "x402-second", amountMsats: 12_000, amountUsdcMicro: "10000", btcRate: 100_000 });
     await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5 }))
       .resolves.toMatchObject({ status: "paid" });
     expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+    expect(sdk.tryX402Payment).toHaveBeenCalledTimes(signatures);
+    expect(transport.sendMessage.mock.calls[1][1]).toMatchObject({ content: { x402_payment: signatures === 1 ? "x402-proof" : "x402-second" } });
     expect(store.loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([5]);
+    expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
+  });
+
+  // After a lost first send, `payment_invalid` may mean the provider already
+  // took the credential: a used Tempo credential, or an x402 authorization it
+  // settled before writing its replay marker. Both rails hold.
+  it.each(["x402", "tempo"] as const)("holds a re-delivered %s credential answered payment_invalid", async (rail) => {
+    const { store, jobId, transport } = await setup(`redelivered-invalid-${rail}`);
+    const ask = railAsk(); walletPrep(ask);
+    transport.sendMessage.mockRejectedValueOnce(new DvmError("timeout", "Reply lost"));
+    const pay = () => handlePaymentRequest(jobId, ask, policy, transport, provider, { rail, requestSeq: 5 });
+    await expect(pay()).rejects.toMatchObject({ code: "timeout" });
+    store.updateJob(jobId, { inFlightPaymentRequestStartedAtMs: { 5: Date.now() - 60_000 } });
+    transport.sendMessage.mockRejectedValueOnce(new DvmError("payment_invalid", "Credential refused", undefined, { http_status: 402 }));
+    const refusal = await pay().catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ code: "payment_invalid", hint: expect.stringContaining("dvm decline") });
+    expect((refusal as DvmError).hint).toContain("dvm cancel");
+    expect((refusal as DvmError).hint).not.toContain("new authorization");
+    expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({ rail, blocked: { reason: "not_resendable" } });
+    await expect(pay()).rejects.toMatchObject({ code: "payment_unconfirmed" });
+    expect(sdk.tryX402Payment).toHaveBeenCalledTimes(rail === "x402" ? 1 : 0);
+    expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(rail === "tempo" ? 1 : 0);
+    expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("holds an expired x402 authorization answered payment_invalid and names its expiry", async () => {
+    const { store, jobId, ask, transport } = await setup("expired-x402");
+    const expiredAt = Math.floor(Date.now() / 1000) - 60;
+    const header = Buffer.from(JSON.stringify({ x402Version: 1, scheme: "exact", network: "base",
+      payload: { signature: "0x00", authorization: { from: "0x01", to: "0x02", value: "10000", validAfter: "0",
+        validBefore: String(expiredAt), nonce: "0x" + "00".repeat(32) } } })).toString("base64");
+    store.updateJob(jobId, { inFlightPaymentRequestSeqs: [5], inFlightPaymentRequestStartedAtMs: { 5: Date.now() - 60_000 },
+      unconfirmedPaymentSubmissions: { 5: { ...sentX402, content: { x402_payment: header, amount_msats: 12_000 } } } });
+    transport.sendMessage.mockRejectedValueOnce(new DvmError("payment_invalid", "Authorization expired", undefined, { http_status: 402 }));
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5 }))
+      .rejects.toMatchObject({ hint: expect.stringContaining(`expired at ${new Date(expiredAt * 1000).toISOString()}`) });
+    expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({ blocked: { reason: "not_resendable" } });
+    expect(sdk.tryX402Payment).not.toHaveBeenCalled();
+  });
+
+  // A provider may keep a short payment; only an explicit approval signs another.
+  it("holds a short x402 payment until an explicit pay signs a new authorization", async () => {
+    const { store, jobId, ask, transport } = await setup("short-x402");
+    transport.sendMessage.mockRejectedValueOnce(new DvmError("payment_insufficient", "Short", undefined, { http_status: 402 }));
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5 }))
+      .rejects.toMatchObject({ code: "payment_insufficient", hint: expect.stringContaining("may have kept it") });
+    expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({ blocked: { reason: "credit_held" } });
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5 })).resolves.toBe("needs-approval");
+    expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+    sdk.tryX402Payment.mockResolvedValue({ paymentHeader: "x402-second", amountMsats: 12_000, amountUsdcMicro: "10000", btcRate: 100_000 });
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5, approval: "explicit" }))
+      .resolves.toMatchObject({ status: "paid" });
+    expect(transport.sendMessage.mock.calls[1][1]).toMatchObject({ content: { x402_payment: "x402-second" } });
   });
 
   it("records replay_rejected as paid without sending another payment", async () => {
@@ -477,21 +550,17 @@ describe("mid-job payment rail selection", () => {
     if (paid) await expect(retry).rejects.toMatchObject({ code: "payment_already_sent" });
     else await expect(retry).resolves.toMatchObject({ status: "paid" });
     expect(transport.sendMessage).toHaveBeenCalledTimes(paid ? 1 : 2);
+    if (!paid) expect(transport.sendMessage.mock.calls[1][1]).toEqual(transport.sendMessage.mock.calls[0][1]);
+    expect(sdk.tryX402Payment).toHaveBeenCalledTimes(1);
     expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
     expect(store.loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([5]);
   });
 
-  it.each(["cashu", "tempo", "x402"] as const)("defers a replacement %s payment until the provider can record the lost send", async (rail) => {
+  it.each(["cashu", "tempo", "x402"] as const)("defers, then re-delivers the lost %s payment without signing a replacement", async (rail) => {
     vi.useFakeTimers();
     try {
       const { store, jobId, transport, history } = await setup(`settling's ${rail}`);
-      const ask = request({
-        lock_pubkey: "02" + "01".repeat(32), mints: ["https://mint.example"],
-        x402: x402Offer, tempo: { challenges: [{ method: "tempo" }] } as PaymentRequestContent["tempo"],
-      });
-      sdk.prepareAgentSpend.mockResolvedValue({ cashuToken: "cashu-proof", requestId: "spend-1",
-        mint: "https://mint.example", totalSats: 10, intendedLockPubkey: ask.lock_pubkey });
-      sdk.buildTempoCredential.mockReturnValue({ credential: "tempo-proof" });
+      const ask = railAsk(); walletPrep(ask);
       transport.sendMessage.mockRejectedValueOnce(new DvmError("timeout", "Reply lost"));
       const pay = () => handlePaymentRequest(jobId, ask, policy, transport, provider, { rail, requestSeq: 5 });
       const startedAt = Date.now();
@@ -513,7 +582,15 @@ describe("mid-job payment rail selection", () => {
       await vi.advanceTimersByTimeAsync(1);
       await expect(pay()).resolves.toMatchObject({ status: "paid" });
       expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+      expect(transport.sendMessage.mock.calls[1][1]).toEqual(transport.sendMessage.mock.calls[0][1]);
+      expect(sdk.prepareAgentSpend).toHaveBeenCalledTimes(rail === "cashu" ? 1 : 0);
+      expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(rail === "tempo" ? 1 : 0);
+      expect(sdk.tryX402Payment).toHaveBeenCalledTimes(rail === "x402" ? 1 : 0);
+      expect(store.loadJob(jobId)).toMatchObject({ paymentsHonoured: 1, paidPaymentRequestSeqs: [5] });
+      expect(sdk.recordSpend).toHaveBeenCalledTimes(1);
+      expect(sdk.commitHeldSubmission).toHaveBeenCalledTimes(rail === "cashu" ? 1 : 0);
       expect(store.loadJob(jobId)?.inFlightPaymentRequestStartedAtMs).toBeUndefined();
+      expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
     } finally { vi.useRealTimers(); }
   });
 
@@ -536,17 +613,18 @@ describe("mid-job payment rail selection", () => {
 
   it.each([false, true])("keeps the latest charge payable alongside a later prompt (answered=%s)", async (answered) => {
     const { store, jobId, ask, transport, history } = await setup(`prompt-${answered}`);
-    store.updateJob(jobId, { inFlightPaymentRequestSeqs: [5], inFlightPaymentRequestStartedAtMs: { 5: Date.now() - 60_000 } });
+    store.updateJob(jobId, { inFlightPaymentRequestSeqs: [5], inFlightPaymentRequestStartedAtMs: { 5: Date.now() - 60_000 },
+      unconfirmedPaymentSubmissions: { 5: sentX402 } });
     const messages: Message[] = [...history(false), { seq: 7, from: "provider", timestamp: 0, type: "prompt", content: { id: "p", text: "Continue?" } }];
     if (answered) messages.push({ seq: 8, from: "requester", timestamp: 0, type: "response", content: { prompt_id: "p", text: "yes" } });
     transport.getMessages.mockResolvedValue(messages);
     await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5 })).resolves.toMatchObject({ status: "paid" });
-    expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+    expect(transport.sendMessage).toHaveBeenCalledExactlyOnceWith(...redelivery());
   });
 
   it.each(["history", "status"])("normalizes a transport %s timeout into payment recovery guidance", async (boundary) => {
     const { store, jobId, ask, transport } = await setup("reader's job");
-    store.updateJob(jobId, { inFlightPaymentRequestSeqs: [5] });
+    store.updateJob(jobId, { inFlightPaymentRequestSeqs: [5], unconfirmedPaymentSubmissions: { 5: sentX402 } });
     const timeout = new DvmError("timeout", "Message poll timed out.", "Unquoted transport hint");
     if (boundary === "history") transport.getMessages.mockRejectedValue(timeout);
     else transport.status.mockRejectedValue(timeout);
@@ -579,20 +657,30 @@ describe("mid-job payment rail selection", () => {
     });
   });
 
-  it("retries an older in-flight record without a timestamp only while the same charge is pending", async () => {
+  // Records written before submissions were kept name no payment to re-deliver.
+  it("never signs over an older in-flight record it cannot re-deliver", async () => {
     const { store, jobId, ask, transport } = await setup("legacy");
     store.updateJob(jobId, { inFlightPaymentRequestSeqs: [5] });
-    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5 }))
-      .resolves.toMatchObject({ status: "paid" });
+    const failure = await handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", requestSeq: 5 })
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "payment_unconfirmed",
+      message: expect.stringContaining("No new payment was signed"), data: { next_action: { type: "poll", job_id: jobId,
+        hint: expect.stringContaining("dvm cancel payment-legacy") } } });
+    const hint = (failure as { data: { next_action: { hint: string } } }).data.next_action.hint;
+    expect(hint).toContain("dvm decline payment-legacy");
+    expect(hint).not.toContain("replacement");
+    expect(hint).not.toContain("dvm pay");
     expect(transport.status).toHaveBeenCalledWith(jobId, provider, { jobToken: "job-token", timeoutMs: 60_000 });
-    expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+    expect(sdk.tryX402Payment).not.toHaveBeenCalled();
+    expect(transport.sendMessage).not.toHaveBeenCalled();
+    expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toEqual([5]);
   });
 
   it.each(["history", "status"])("bounds a hanging pre-send %s read and never pays", async (boundary) => {
     vi.useFakeTimers();
     try {
       const { store, jobId, ask, transport } = await setup("hung-history");
-      store.markPaymentRequestInFlight(jobId, 5);
+      store.markPaymentRequestInFlight(jobId, 5, sentX402);
       if (boundary === "status") {
         store.updateJob(jobId, { inFlightPaymentRequestStartedAtMs: { 5: Date.now() - 45_000 } });
         transport.status.mockImplementation(() => new Promise(() => undefined));
@@ -609,11 +697,11 @@ describe("mid-job payment rail selection", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("wait rechecks the provider and pays once when the injected clock reaches the settle deadline", async () => {
+  it("wait rechecks the provider and re-delivers once when the injected clock reaches the settle deadline", async () => {
     vi.useFakeTimers();
     try {
       const { store, jobId, transport, history } = await setup("wait-settle");
-      store.markPaymentRequestInFlight(jobId, 5);
+      store.markPaymentRequestInFlight(jobId, 5, sentX402);
       const startedAt = Date.now();
       let elapsed = 0;
       const clock = () => startedAt + elapsed;
@@ -634,7 +722,7 @@ describe("mid-job payment rail selection", () => {
       expect(result.messages.filter((message) => message.seq === 6)).toEqual([progress]);
       expect(result.messages.map((message) => message.seq)).toEqual([5, 6, 7]);
       expect(onMessage.mock.calls.filter(([message]) => message.seq === 6)).toEqual([[progress]]);
-      expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+      expect(transport.sendMessage).toHaveBeenCalledExactlyOnceWith(...redelivery());
       expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
     } finally { vi.useRealTimers(); }
   });

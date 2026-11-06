@@ -193,6 +193,7 @@
     "payment_request_not_pending",
     "payment_required",
     "payment_settling",
+    "payment_unconfirmed",
     "platform_dvm_id_unavailable",
     "platform_unreachable",
     "provider_body_unreadable",

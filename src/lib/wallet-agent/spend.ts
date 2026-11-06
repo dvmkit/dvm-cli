@@ -83,6 +83,8 @@ export interface PreparedAgentSpend {
   submissionBindingFingerprint?: string;
   /** Earlier failed candidates, in trial order; success messages exclude dependency prose. */
   attempts?: SpendMintAttempt[];
+  /** The token is existing reserve proofs shipped as-is, not outputs minted for this call. */
+  fromReserve?: true;
 }
 
 /**
@@ -408,6 +410,7 @@ export async function prepareAgentSpend(args: {
       totalSats: inner.submission.amount_sats,
       endpoint: args.endpoint,
       intendedLockPubkey: args.cashuP2pk.lock_pubkey,
+      fromReserve: true,
       ...(inner.submission.context?.binding_fingerprint
         ? { submissionBindingFingerprint: inner.submission.context.binding_fingerprint }
         : {}),
@@ -843,6 +846,29 @@ export async function commitAgentSpend(args: {
       recent_spends: [...wallet.recent_spends, args.recentSpend].slice(-RECENT_SPENDS_CAP),
     };
     saveAgentWallet(next);
+  });
+}
+
+/** Commit a submission the DVM took, from its own journal entry; a no-op once the wallet holds none. */
+export async function commitHeldSubmission(requestId: string, now: () => number = Date.now): Promise<void> {
+  await withWalletLock(() => {
+    const wallet = loadAgentWallet();
+    const submission = wallet?.pending_submissions.find((s) => s.request_id === requestId);
+    if (!wallet || !submission) return;
+    // Reserve-direct tokens ship proofs that still sit in `proofs`, marked in flight.
+    const shippedKeys = new Set(submission.output_proofs.map((p) => `${p.secret}:${p.C}`));
+    saveAgentWallet({
+      ...wallet,
+      proofs: wallet.proofs.filter((p) => !shippedKeys.has(`${p.secret}:${p.C}`)),
+      pending_submissions: wallet.pending_submissions.filter((s) => s.request_id !== requestId),
+      recent_spends: [...wallet.recent_spends, {
+        request_id: requestId,
+        dvm_endpoint: submission.endpoint,
+        mint: submission.mint,
+        amount_sats: submission.amount_sats,
+        signed_at_ms: now(),
+      }].slice(-RECENT_SPENDS_CAP),
+    });
   });
 }
 

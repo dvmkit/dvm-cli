@@ -1,31 +1,76 @@
 import { DvmError, isAbortError, shellQuoteArg, type Message, type MessagePollOptions, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
-import { clearPaymentRequestInFlight, loadJob, markPaymentRequestPaid } from "./job-store";
+import { clearPaymentRequestInFlight, loadJob, markPaymentRequestAnswered, type UnconfirmedPaymentSubmission } from "./job-store";
+import { settleTakenPayment } from "./taken-payment";
+import { applySubmissionVerdicts } from "./wallet-agent/submission-verdicts";
 import { loadMessages } from "./messages";
 
 export const JOB_READ_TIMEOUT_MS = 60_000;
 // A lost send may still be processing before history records it. Give every
-// rail 45 seconds before authorizing a replacement debit, including x402.
+// rail 45 seconds before the same payment is sent again, including x402.
 export const PAYMENT_SETTLE_WINDOW_MS = 45_000;
 
 export function answeredYieldSeqs(messages: Message[]): Set<number> {
   const answered = new Set<number>();
   const prompts = new Map<string, number>();
-  let paymentRequest: number | undefined;
   for (const message of [...messages].sort((a, b) => a.seq - b.seq)) {
     if (message.from === "provider") {
-      if (message.type === "payment-request") paymentRequest = message.seq;
       if (message.type === "prompt") prompts.set(message.content.id, message.seq);
     } else if (message.type === "response") {
       const seq = prompts.get(message.content.prompt_id);
       if (seq !== undefined) answered.add(seq);
-    } else if (message.type === "payment") {
-      // Balance authorizations identify the ask explicitly. Older rail messages
-      // answer the preceding charge; provider payments are refunds, not answers.
-      const seq = message.content.credit?.request_seq ?? paymentRequest;
-      if (seq !== undefined) answered.add(seq);
     }
   }
+  for (const seq of paymentAnswers(messages).keys()) answered.add(seq);
   return answered;
+}
+
+/**
+ * Requester payments by the ask they answer. Balance authorizations identify
+ * the ask explicitly; older rail messages answer the preceding charge. Provider
+ * payments are refunds, not answers.
+ */
+function paymentAnswers(messages: Message[]): Map<number, Message[]> {
+  const answers = new Map<number, Message[]>();
+  let paymentRequest: number | undefined;
+  for (const message of [...messages].sort((a, b) => a.seq - b.seq)) {
+    if (message.from === "provider" && message.type === "payment-request") paymentRequest = message.seq;
+    else if (message.from !== "provider" && message.type === "payment") {
+      const seq = message.content.credit?.request_seq ?? paymentRequest;
+      if (seq !== undefined) answers.set(seq, [...answers.get(seq) ?? [], message]);
+    }
+  }
+  return answers;
+}
+
+/**
+ * A provider keeps a payment message's content as sent, so a recorded payment
+ * carrying this submission's request id or exact credential is this payment.
+ */
+function carriesSubmission(content: Record<string, unknown>, submission: UnconfirmedPaymentSubmission): boolean {
+  if (submission.rail === "cashu_p2pk") return content.cashu_request_id === submission.cashuRequestId;
+  const key = submission.rail === "x402" ? "x402_payment" : "tempo_credential";
+  return content[key] !== undefined && canonicalJson(content[key]) === canonicalJson(submission.content[key]);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object")
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+/**
+ * Settle an ask that history shows a payment answered. The held submission is
+ * booked only when one of those payments carries it; otherwise the ask is
+ * marked answered and the submission, with its wallet entry, waits for the
+ * sweep's spent or reclaimed verdict.
+ */
+export async function settleAnsweredAsk(jobId: string, requestSeq: number, history: Message[]): Promise<void> {
+  const submission = loadJob(jobId)?.unconfirmedPaymentSubmissions?.[requestSeq];
+  const payments = paymentAnswers(history).get(requestSeq) ?? [];
+  if (submission && payments.some((payment) => carriesSubmission(payment.content as unknown as Record<string, unknown>, submission)))
+    await settleTakenPayment(jobId, requestSeq);
+  else markPaymentRequestAnswered(jobId, requestSeq);
 }
 
 function latestProviderPaymentRequest(messages: Message[]): Message | undefined {
@@ -46,8 +91,13 @@ export function loadAnsweredYieldSeqs(jobId: string): Set<number> {
   const job = loadJob(jobId);
   for (const seq of job?.paidPaymentRequestSeqs ?? []) answered.add(seq);
   for (const payment of job?.bookedCreditPayments ?? []) answered.add(payment.authorization.request_seq);
-  if (job?.callerDeclined) for (const seq of declinedYieldSeqs(loadMessages(jobId))) answered.add(seq);
+  for (const seq of declinedAskSeqs(jobId)) answered.add(seq);
   return answered;
+}
+
+/** Asks and prompts the caller's confirmed decline answered; none of them was paid. */
+export function declinedAskSeqs(jobId: string): Set<number> {
+  return new Set(loadJob(jobId)?.callerDeclined ? declinedYieldSeqs(loadMessages(jobId)) : []);
 }
 
 /**
@@ -79,11 +129,12 @@ export async function reconcileInFlightPaymentRequest(
   return reconcilePaymentRequestHistory(jobId, requestSeq, history, status, () => decisionTime);
 }
 
-export function reconcilePaymentRequestHistory(
+export async function reconcilePaymentRequestHistory(
   jobId: string, requestSeq: number, history: Message[], status: string | undefined, now: () => number = Date.now
-): boolean {
-  if (answeredYieldSeqs(history).has(requestSeq)) {
-    markPaymentRequestPaid(jobId, requestSeq);
+): Promise<boolean> {
+  // The provider recorded a payment for this ask; book it only if it is this one.
+  if (paymentAnswers(history).has(requestSeq)) {
+    await settleAnsweredAsk(jobId, requestSeq, history);
     return true;
   }
   // A newer ask abandons this one; it must neither be retried nor pin the cursor.
@@ -101,6 +152,23 @@ export function reconcilePaymentRequestHistory(
       `Check the job with \`dvm messages ${shellQuoteArg(jobId)} --wait\` before paying again.`);
   // Keep the record until the locked sender restamps it or confirms acceptance.
   return false;
+}
+
+/**
+ * Settle every held ask the local message log shows a payment answered,
+ * including one the job has moved past, and apply any sweep verdict for a
+ * held token. Only payment messages count here, never a decline.
+ */
+export async function settleRecordedPayments(jobId: string): Promise<void> {
+  await applySubmissionVerdicts().catch(() => undefined);
+  const job = loadJob(jobId);
+  const held = new Set([...(job?.inFlightPaymentRequestSeqs ?? []),
+    ...Object.keys(job?.unconfirmedPaymentSubmissions ?? {}).map(Number)]);
+  for (const seq of job?.paidPaymentRequestSeqs ?? []) held.delete(seq);
+  if (held.size === 0) return;
+  const history = loadMessages(jobId);
+  const answers = paymentAnswers(history);
+  for (const seq of held) if (answers.has(seq)) await settleAnsweredAsk(jobId, seq, history);
 }
 
 function settleUntilMs(jobId: string, requestSeq: number, now: number): number {

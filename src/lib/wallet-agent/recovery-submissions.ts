@@ -39,6 +39,7 @@ import {
   recordUpfrontRailPayment,
 } from "../job-store";
 import { parseUpfrontPayment, type PricedSubmissionContext } from "../upfront-payment";
+import { applySubmissionVerdicts, recordSubmissionVerdicts, type SubmissionVerdict } from "./submission-verdicts";
 import { sameEndpoint } from "../job-access";
 import { requestRecoveryPath } from "../request-recovery-path";
 import { isFundingReceipt } from "@dvmkit/sdk/internal";
@@ -267,6 +268,9 @@ export async function sweepPendingSubmissions(
   }
 
   if (outcomes.some(mutatesWallet)) {
+    // The wallet keeps no record of a reclaim, so carry the verdicts in a
+    // journal written first. Money comes first: a failed write still saves.
+    try { recordSubmissionVerdicts(outcomes.flatMap(verdictFor)); } catch { /* the ask stays held */ }
     await withWalletLock(() => {
       const fresh = loadAgentWallet() ?? wallet;
       const next = outcomes.reduce<AgentWallet>(
@@ -275,9 +279,27 @@ export async function sweepPendingSubmissions(
       );
       saveAgentWallet(next);
     });
+    // Re-run by every later read of a held ask if this one fails.
+    await applySubmissionVerdicts().catch(() => undefined);
   }
 
   return { outcomes };
+}
+
+/**
+ * The verdict a held job ask needs from this outcome. A full reclaim proves
+ * the provider can no longer redeem the token, so its ask may be paid afresh.
+ * All-spent outputs mean the provider redeemed it, unless they were reserve
+ * proofs, which could have paid another call. A partial redeem is neither a
+ * payment of the ask nor a refund, so it blocks the ask for an explicit choice.
+ */
+function verdictFor(outcome: SubmissionSweepOutcome): SubmissionVerdict[] {
+  const reserve = outcome.entry.output_proofs.some((proof) => proof.reserved_for !== undefined) ? { reserve: true as const } : {};
+  if (outcome.kind === "already_accepted") return [{ requestId: outcome.entry.request_id, verdict: "spent", ...reserve }];
+  if (outcome.kind !== "reclaimed") return [];
+  return [outcome.spent_sats > 0
+    ? { requestId: outcome.entry.request_id, verdict: "partly_spent", spentSats: outcome.spent_sats, amountSats: outcome.entry.amount_sats }
+    : { requestId: outcome.entry.request_id, verdict: "reclaimed" }];
 }
 
 /**

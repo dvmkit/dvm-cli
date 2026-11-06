@@ -59,6 +59,9 @@ import {
   type StoredCredit,
 } from "@dvmkit/sdk/internal";
 import { saveJob } from "../../job-store";
+import lockfile from "proper-lockfile";
+import { applySubmissionVerdicts, recordSubmissionVerdicts } from "../submission-verdicts";
+import { settleRecordedPayments } from "../../yield-state";
 import { readFileSync, rmSync } from "node:fs";
 import {
   recordSubmissionEvidence,
@@ -1469,6 +1472,104 @@ describe("refund-clause reclaim", () => {
     expect(persisted?.pending_submissions).toHaveLength(0);
     expect(persisted?.proofs).toHaveLength(0);
     expect(persisted?.recent_spends).toHaveLength(1);
+  });
+
+  // A mid-job ask holding this token learns the sweep's verdict once the
+  // wallet save that dropped the entry has landed.
+  function persistentWallet(wallet: AgentWallet): void {
+    let current = wallet;
+    vi.mocked(loadAgentWallet).mockImplementation(() => current);
+    vi.mocked(saveAgentWallet).mockImplementation((next) => { current = next; });
+  }
+
+  async function holdAsk(jobId: string) {
+    const store = await vi.importActual<typeof import("../../job-store")>("../../job-store");
+    store.saveJob({ id: jobId, endpoint: ENDPOINT, status: "awaiting-input", submittedAt: 0,
+      inFlightPaymentRequestSeqs: [4], unconfirmedPaymentSubmissions: { 4: {
+        rail: "cashu_p2pk", cashuRequestId: REQUEST_ID, requestAmountMsats: 5000, amountMsats: 5000, btcRate: 100_000 } } });
+    return store;
+  }
+
+  it("releases the job ask held for a token the wallet reclaimed in full", async () => {
+    const store = await holdAsk("held-reclaimed");
+    persistentWallet(baseWallet([claused()]));
+    await sweepPendingSubmissions(sweepOpts(cashuStub()));
+    const job = store.loadJob("held-reclaimed");
+    expect(job?.unconfirmedPaymentSubmissions).toBeUndefined();
+    expect(job?.inFlightPaymentRequestSeqs).toBeUndefined();
+    expect(job?.paidPaymentRequestSeqs).toBeUndefined();
+    expect(job?.totalPaidMsats).toBeUndefined();
+  });
+
+  it("books the job ask once when the DVM redeemed its token late", async () => {
+    const store = await holdAsk("held-redeemed-late");
+    persistentWallet(baseWallet([claused()]));
+    await sweepPendingSubmissions(sweepOpts(cashuStub({ spentSecrets: ["out-1"] })));
+    await sweepPendingSubmissions(sweepOpts(cashuStub({ spentSecrets: ["out-1"] })));
+    await applySubmissionVerdicts();
+    expect(store.loadJob("held-redeemed-late")).toMatchObject({ paidPaymentRequestSeqs: [4], totalPaidMsats: 5000, paymentsHonoured: 1 });
+    expect(store.loadJob("held-redeemed-late")?.unconfirmedPaymentSubmissions).toBeUndefined();
+  });
+
+  it("blocks the job ask for an explicit choice after a partial redeem, booking nothing", async () => {
+    const store = await holdAsk("held-partial");
+    persistentWallet(baseWallet([
+      claused({ amount_sats: 9, output_proofs: [proof("out-1", 5), proof("out-2", 4)] }),
+    ]));
+    await sweepPendingSubmissions(sweepOpts(cashuStub({ spentSecrets: ["out-1"],
+      outputs: [{ id: "k1", amount: 4, secret: "back-1", C: "02CAFE" }] })));
+    expect(store.loadJob("held-partial")?.unconfirmedPaymentSubmissions?.[4]).toMatchObject({ cashuRequestId: REQUEST_ID,
+      blocked: { reason: "proofs_spent", detail: expect.stringContaining("redeemed 5 of the 9 sats") } });
+    expect(store.loadJob("held-partial")?.totalPaidMsats).toBeUndefined();
+  });
+
+  it("blocks rather than books an ask whose reserve proofs the sweep found spent", async () => {
+    const store = await holdAsk("held-reserve-spent");
+    persistentWallet(baseWallet([claused({ output_proofs: [{ ...proof("out-1", 5), reserved_for: "builder:dvm.test" }] })]));
+    await sweepPendingSubmissions(sweepOpts(cashuStub({ spentSecrets: ["out-1"] })));
+    expect(store.loadJob("held-reserve-spent")?.unconfirmedPaymentSubmissions?.[4]).toMatchObject({ blocked: { reason: "proofs_spent" } });
+    expect(store.loadJob("held-reserve-spent")?.totalPaidMsats).toBeUndefined();
+  });
+
+  it("does not book a short payment the provider kept as credit when it redeems the token", async () => {
+    const store = await holdAsk("held-as-credit");
+    const held = store.loadJob("held-as-credit")!.unconfirmedPaymentSubmissions![4];
+    store.updateJob("held-as-credit", { inFlightPaymentRequestSeqs: undefined,
+      unconfirmedPaymentSubmissions: { 4: { ...held, blocked: { reason: "credit_held", creditId: "credit-1" } } } });
+    persistentWallet(baseWallet([claused()]));
+    await sweepPendingSubmissions(sweepOpts(cashuStub({ spentSecrets: ["out-1"] })));
+    expect(store.loadJob("held-as-credit")?.totalPaidMsats).toBeUndefined();
+    expect(store.loadJob("held-as-credit")?.unconfirmedPaymentSubmissions?.[4]).toMatchObject({ blocked: { reason: "credit_held" } });
+  });
+
+  it("keeps a journalled reclaim over a later spent verdict for the same token", async () => {
+    const store = await holdAsk("held-reclaim-then-spent");
+    recordSubmissionVerdicts([{ requestId: REQUEST_ID, verdict: "reclaimed" }]);
+    // The wallet save after that reclaim never landed, so the entry is still
+    // held, and the mint now reports the reclaim's own swap as spent proofs.
+    persistentWallet(baseWallet([claused()]));
+    await sweepPendingSubmissions(sweepOpts(cashuStub({ spentSecrets: ["out-1"] })));
+    const job = store.loadJob("held-reclaim-then-spent");
+    expect(job?.totalPaidMsats).toBeUndefined();
+    expect(job?.paidPaymentRequestSeqs).toBeUndefined();
+    expect(job?.unconfirmedPaymentSubmissions).toBeUndefined();
+  });
+
+  // The jobs file can be locked by another command when the sweep finishes.
+  it("applies a reclaim on a later read when the job update failed after the wallet save", async () => {
+    const store = await holdAsk("held-reclaim-retried");
+    persistentWallet(baseWallet([claused()]));
+    const lockSync = lockfile.lockSync.bind(lockfile);
+    const busy = vi.spyOn(lockfile, "lockSync").mockImplementation((file, options) => {
+      if (String(file).endsWith("jobs.json")) throw Object.assign(new Error("Lock file is already being held"), { code: "ELOCKED" });
+      return lockSync(file, options);
+    });
+    await sweepPendingSubmissions(sweepOpts(cashuStub()));
+    expect(store.loadJob("held-reclaim-retried")?.unconfirmedPaymentSubmissions?.[4]).toBeDefined();
+    busy.mockRestore();
+    await settleRecordedPayments("held-reclaim-retried");
+    expect(store.loadJob("held-reclaim-retried")?.unconfirmedPaymentSubmissions).toBeUndefined();
+    expect(store.loadJob("held-reclaim-retried")?.inFlightPaymentRequestSeqs).toBeUndefined();
   });
 
   function persistedEntry(): PendingSubmission | undefined {

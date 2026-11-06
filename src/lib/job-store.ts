@@ -27,6 +27,52 @@ export interface CreditPaymentIntent {
   selectedUnbound?: true;
 }
 
+interface SubmissionBooking {
+  /** The ask's `amount_msats`, which this submission answers. */
+  requestAmountMsats: number;
+  /** Amount booked once the provider takes the payment. */
+  amountMsats: number;
+  btcRate: number;
+  /** Approval of the send that signed this payment; a re-delivery keeps it. */
+  approval?: PaymentApproval;
+  /** Provider-supplied ask reason, recorded with the spend. */
+  reason?: string;
+  /**
+   * Set when this token cannot be re-delivered: no command sends it again.
+   * Whether a fresh token may be signed for the ask is the job's
+   * `askPaymentBlocks`, which outlives this record. A `not_resendable` token
+   * leaves decline or cancel while it is held.
+   */
+  blocked?: HeldPaymentBlock;
+}
+
+/** An ask for which no fresh payment may be signed automatically; an explicit `dvm pay` still may. */
+export type AskPaymentBlock = Extract<HeldPaymentBlock, { reason: "credit_held" | "proofs_spent" }>;
+
+export type HeldPaymentBlock =
+  /** The provider answered that the payment fell short; a Cashu token is kept, on credit where it has a ledger. */
+  | { reason: "credit_held"; creditId?: string }
+  /** Reserve proofs this token used are spent at the mint, and the provider recorded no payment. */
+  | { reason: "proofs_spent"; detail?: string }
+  /** The provider's answer does not change on a re-send, but it may still redeem this payment. */
+  | { reason: "not_resendable"; detail: string };
+
+export type UnconfirmedPaymentSubmission =
+  | (SubmissionBooking & {
+      rail: "cashu_p2pk";
+      /** Wallet pending-submission id, sent as `cashu_request_id`. The token stays in the wallet journal. */
+      cashuRequestId: string;
+      /** The token is reserve proofs shipped as-is, which could also have been spent elsewhere. */
+      reserve?: true;
+    })
+  | (SubmissionBooking & {
+      rail: "x402" | "tempo";
+      /** Exact signed `payment` message content, re-sent unchanged. */
+      content: Record<string, unknown>;
+      /** Exact signed x402 value in USDC microunits. */
+      amountUsdcMicro?: string;
+    });
+
 export interface JobRecord {
   /** A successful local cancel send; legacy terminal statuses do not establish caller intent. */
   callerCancelled?: true;
@@ -112,6 +158,21 @@ export interface JobRecord {
   claimedPaymentAmountsMsats?: Record<number, number>;
   /** Rail sends started without a confirmed acknowledgement; reconcile before spending again. */
   inFlightPaymentRequestSeqs?: number[];
+  /**
+   * The exact payment dispatched for each mid-job ask, keyed by request seq. It
+   * is held until the provider takes it (booked once, then dropped), refuses it
+   * with a listed definite refusal, a newer ask supersedes it, or the wallet
+   * confirms it reclaimed the Cashu token. While held, no other payment is
+   * signed for that ask; a retry re-delivers this one.
+   */
+  unconfirmedPaymentSubmissions?: Record<string, UnconfirmedPaymentSubmission>;
+  /**
+   * Asks, keyed by request seq, that automatic commands must not pay with a
+   * fresh token. Cleared only when a replacement is recorded as taken, or by
+   * `dvm decline` or `dvm cancel`: never by a refusal, a dropped submission or
+   * a sweep verdict.
+   */
+  askPaymentBlocks?: Record<string, AskPaymentBlock>;
   /** Latest dispatch or uncertain-outcome times (Unix milliseconds), keyed by request seq. Missing on older records, which skip the settle delay. */
   inFlightPaymentRequestStartedAtMs?: Record<string, number>;
   /** Sequence numbers of settled payment requests, retained across restarts. */
@@ -312,41 +373,66 @@ export function loadAllJobs(): JobRecord[] {
 export function addPayment(jobId: string, amountMsats: number, approval?: { requestSeq: number; approval: PaymentApproval }): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
-    if (!job) return;
-    job.totalPaidMsats = (job.totalPaidMsats ?? 0) + amountMsats;
-    job.paymentsHonoured = (job.paymentsHonoured ?? 0) + 1;
-    if (approval) (job.paymentApprovals ??= []).push(approval);
-    // A rail may bind a previously free job to an implicit credit whose IDs
-    // this message response does not expose. Future balance payments must not guess.
-    if (job.creditBinding && "unbound" in job.creditBinding) delete job.creditBinding;
+    if (job) bookPayment(job, amountMsats, approval);
   });
 }
 
-export function markPaymentRequestInFlight(jobId: string, requestSeq: number): void {
+function bookPayment(job: JobRecord, amountMsats: number, approval?: { requestSeq: number; approval: PaymentApproval }): void {
+  job.totalPaidMsats = (job.totalPaidMsats ?? 0) + amountMsats;
+  job.paymentsHonoured = (job.paymentsHonoured ?? 0) + 1;
+  if (approval) (job.paymentApprovals ??= []).push(approval);
+  // A rail may bind a previously free job to an implicit credit whose IDs
+  // this message response does not expose. Future balance payments must not guess.
+  if (job.creditBinding && "unbound" in job.creditBinding) delete job.creditBinding;
+}
+
+/** A `submission` is persisted in the same write, so no dispatch exists without its re-delivery record. */
+export function markPaymentRequestInFlight(jobId: string, requestSeq: number, submission?: UnconfirmedPaymentSubmission): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (job) {
       if (!job.inFlightPaymentRequestSeqs?.includes(requestSeq))
         (job.inFlightPaymentRequestSeqs ??= []).push(requestSeq);
       (job.inFlightPaymentRequestStartedAtMs ??= {})[requestSeq] = Date.now();
+      if (submission) (job.unconfirmedPaymentSubmissions ??= {})[requestSeq] = submission;
     }
   });
 }
 
-export function clearPaymentRequestInFlight(jobId: string, requestSeq: number): void {
+/**
+ * `keepSubmission` is for a send that never reached the provider: the ask is
+ * no longer in flight, but its signed payment must still be the one delivered.
+ */
+export function clearPaymentRequestInFlight(jobId: string, requestSeq: number, opts?: { keepSubmission?: boolean }): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
-    if (!job?.inFlightPaymentRequestSeqs) return;
+    if (!job) return;
+    if (!opts?.keepSubmission) clearUnconfirmedSubmission(job, requestSeq);
+    if (!job.inFlightPaymentRequestSeqs) return;
     job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs.filter((seq) => seq !== requestSeq);
     if (!job.inFlightPaymentRequestSeqs.length) delete job.inFlightPaymentRequestSeqs;
     clearPaymentRequestStartTime(job, requestSeq);
   });
 }
 
-export function markPaymentRequestPaid(jobId: string, requestSeq: number): void {
-  mutateJobs((jobs) => {
+function clearUnconfirmedSubmission(job: JobRecord, requestSeq: number): void {
+  if (!job.unconfirmedPaymentSubmissions) return;
+  delete job.unconfirmedPaymentSubmissions[requestSeq];
+  if (!Object.keys(job.unconfirmedPaymentSubmissions).length) delete job.unconfirmedPaymentSubmissions;
+}
+
+/**
+ * Record that the provider took the payment held for this ask. Call it only
+ * with evidence that the held submission itself was taken. It is booked into
+ * the job's totals in the same write that drops it, and only the caller that
+ * receives it back books the ledger and wallet, so a payment is booked at most
+ * once: a crash before that caller finishes loses the ledger entry rather than
+ * double-booking. Returns that submission, or undefined when none was held.
+ */
+export function markPaymentRequestPaid(jobId: string, requestSeq: number): UnconfirmedPaymentSubmission | undefined {
+  return mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
-    if (!job) return;
+    if (!job) return undefined;
     if (!job.paidPaymentRequestSeqs?.includes(requestSeq))
       (job.paidPaymentRequestSeqs ??= []).push(requestSeq);
     if (job.inFlightPaymentRequestSeqs) {
@@ -354,7 +440,80 @@ export function markPaymentRequestPaid(jobId: string, requestSeq: number): void 
       if (!job.inFlightPaymentRequestSeqs.length) delete job.inFlightPaymentRequestSeqs;
     }
     clearPaymentRequestStartTime(job, requestSeq);
+    const booked = job.unconfirmedPaymentSubmissions?.[requestSeq];
+    clearUnconfirmedSubmission(job, requestSeq);
+    if (booked) bookPayment(job, booked.amountMsats, booked.approval ? { requestSeq, approval: booked.approval } : undefined);
+    // A token that can still be re-delivered, recorded taken on a blocked ask,
+    // is the replacement an explicit pay approved; the blocked token is not.
+    if (booked && !booked.blocked && job.askPaymentBlocks?.[requestSeq]) {
+      delete job.askPaymentBlocks[requestSeq];
+      if (!Object.keys(job.askPaymentBlocks).length) delete job.askPaymentBlocks;
+    }
+    return booked;
   });
+}
+
+/**
+ * Record that the ask was answered without evidence it was by the held
+ * submission (another payment, or history that no longer carries the content).
+ * The submission stays: a later sweep verdict books or releases it.
+ */
+export function markPaymentRequestAnswered(jobId: string, requestSeq: number): void {
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (!job) return;
+    if (!job.paidPaymentRequestSeqs?.includes(requestSeq))
+      (job.paidPaymentRequestSeqs ??= []).push(requestSeq);
+    job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs?.filter((seq) => seq !== requestSeq);
+    if (!job.inFlightPaymentRequestSeqs?.length) delete job.inFlightPaymentRequestSeqs;
+    clearPaymentRequestStartTime(job, requestSeq);
+  });
+}
+
+/** Stop re-sending a held payment; it is no longer in flight, but still held. */
+export function blockHeldPayment(jobId: string, requestSeq: number, blocked: HeldPaymentBlock): void {
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    const submission = job?.unconfirmedPaymentSubmissions?.[requestSeq];
+    if (!job || !submission) return;
+    submission.blocked = blocked;
+    if (blocked.reason !== "not_resendable") (job.askPaymentBlocks ??= {})[requestSeq] = blocked;
+    job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs?.filter((seq) => seq !== requestSeq);
+    if (!job.inFlightPaymentRequestSeqs?.length) delete job.inFlightPaymentRequestSeqs;
+    clearPaymentRequestStartTime(job, requestSeq);
+  });
+}
+
+/** `dvm decline` and `dvm cancel` end the job, which lifts its ask blocks. */
+export function clearAskPaymentBlocks(jobId: string): void {
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (job) delete job.askPaymentBlocks;
+  });
+}
+
+/** Release every held Cashu submission whose token the wallet reclaimed, so its ask may be paid afresh. */
+export function releaseReclaimedSubmissions(cashuRequestIds: ReadonlySet<string>): void {
+  if (cashuRequestIds.size === 0) return;
+  mutateJobs((jobs) => {
+    for (const job of jobs) {
+      for (const [seq, submission] of Object.entries(job.unconfirmedPaymentSubmissions ?? {})) {
+        if (submission.rail !== "cashu_p2pk" || !cashuRequestIds.has(submission.cashuRequestId)) continue;
+        clearUnconfirmedSubmission(job, Number(seq));
+        job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs?.filter((held) => held !== Number(seq));
+        if (!job.inFlightPaymentRequestSeqs?.length) delete job.inFlightPaymentRequestSeqs;
+        clearPaymentRequestStartTime(job, Number(seq));
+      }
+    }
+  });
+}
+
+/** Jobs and asks whose held Cashu payment is one of these wallet submissions. */
+export function heldCashuSubmissionAsks(cashuRequestIds: ReadonlySet<string>): { jobId: string; requestSeq: number; cashuRequestId: string; blocked?: HeldPaymentBlock }[] {
+  return loadAllJobs().flatMap((job) => Object.entries(job.unconfirmedPaymentSubmissions ?? {})
+    .flatMap(([seq, submission]) => submission.rail === "cashu_p2pk" && cashuRequestIds.has(submission.cashuRequestId)
+      ? [{ jobId: job.id, requestSeq: Number(seq), cashuRequestId: submission.cashuRequestId,
+          ...(submission.blocked ? { blocked: submission.blocked } : {}) }] : []));
 }
 
 function clearPaymentRequestStartTime(job: JobRecord, requestSeq: number): void {

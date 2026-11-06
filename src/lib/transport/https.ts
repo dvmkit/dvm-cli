@@ -811,7 +811,10 @@ export class HttpsTransport implements Transport {
       // 409 while the job is still live and still waiting to be paid. Mapping
       // that to `job_terminal` told the agent to walk away from a running job —
       // surface the DVM's own code and copy instead.
+      // `request_id_reused` is the same accumulator refusing these proofs while
+      // the job is still open; it is no sign the job ended.
       if (body && (body.error === "replay_rejected" ||
+          (message.type === "payment" && body.error === "request_id_reused") ||
           (message.type === "payment" && message.content.credit && typeof body.error === "string"))) {
         const error = withDrawFunding(withCreditErrorContext(buildPaymentError(body), body), body);
         error.data = { ...error.data, http_status: res.status };
@@ -1436,8 +1439,14 @@ function isReceipt402(code: unknown): boolean {
  * selecting trusted copy from an untrusted code.
  */
 function buildPaymentError(errorBody: Record<string, unknown>): DvmError {
-  const code = typeof errorBody.error === "string" ? errorBody.error : "payment_insufficient";
-  return buildStructuredError(code, errorBody);
+  if (typeof errorBody.error === "string") return buildStructuredError(errorBody.error, errorBody);
+  const nested = errorBody.error && typeof errorBody.error === "object" && !Array.isArray(errorBody.error)
+    ? errorBody.error as Record<string, unknown> : undefined;
+  if (typeof nested?.code === "string") return buildStructuredError(nested.code, nested);
+  // The provider named no code; callers must not treat this one as its answer.
+  const error = buildStructuredError("payment_insufficient", errorBody);
+  error.data = { ...error.data, code_source: "inferred" };
+  return error;
 }
 
 /**

@@ -5,7 +5,8 @@ import { formatMessageHuman } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { createArtifactSaveSession } from "../lib/save-artifact";
-import { type PaymentPolicyContext, computeNextAction, isTerminalJobStatus, type NextAction, pollNextAction } from "../lib/next-action";
+import { type PaymentPolicyContext, computeNextAction, isTerminalJobStatus, type NextAction, paymentInFlightHint, pollNextAction } from "../lib/next-action";
+import { pendingPaymentRequest, settleRecordedPayments } from "../lib/yield-state";
 import { buildCompletionHintFields, completionSnapshot, type JobCompletion, nextStepHint } from "../lib/completion-hints";
 import {
   type JobStatus,
@@ -142,7 +143,10 @@ async function statusWithAccess(
   if (opts.messages) {
     const after = access.endpointOverridden ? 0 : (stored?.messageCursor ?? 0);
     msgs = await transport.getMessages(jobId, after, ref, { timeoutMs: timeout, jobToken });
-    if (!access.endpointOverridden) appendMessages(jobId, msgs);
+    if (!access.endpointOverridden) {
+      appendMessages(jobId, msgs);
+      await settleRecordedPayments(jobId);
+    }
     newCursor = maxSeq(msgs, after);
   }
 
@@ -150,6 +154,7 @@ async function statusWithAccess(
     timeoutMs: timeout,
     jobToken,
     context: access.endpointOverridden ? undefined : stored ?? undefined,
+    held: access.endpointOverridden ? undefined : loadJob(jobId),
   });
 
   // Update job store if we learned something new. A terminal read snapshots the
@@ -357,14 +362,25 @@ async function resolveNextAction(
   fetched: Message[],
   transport: Transport,
   ref: ProviderRef,
-  opts: { timeoutMs: number; jobToken?: string; context?: PaymentPolicyContext }
+  opts: { timeoutMs: number; jobToken?: string; context?: PaymentPolicyContext; held?: JobRecord | null }
 ): Promise<NextAction> {
   if (isTerminalJobStatus(status)) return null;
   if (status === "awaiting-input") {
     const fromBatch = computeNextAction(jobId, fetched, undefined, opts.context);
-    if (fromBatch) return fromBatch;
+    if (fromBatch) return withHeldPaymentHint(jobId, fromBatch, fetched, opts.held);
     const history = await transport.getMessages(jobId, 0, ref, opts);
-    return computeNextAction(jobId, history, undefined, opts.context) ?? pollNextAction(jobId);
+    return withHeldPaymentHint(jobId, computeNextAction(jobId, history, undefined, opts.context), history, opts.held) ??
+      pollNextAction(jobId);
   }
   return pollNextAction(jobId);
+}
+
+/** A pay action for an ask whose earlier payment is unconfirmed must say so, not just ask for payment. */
+function withHeldPaymentHint(jobId: string, action: NextAction, messages: Message[], held: JobRecord | null | undefined): NextAction {
+  if (action?.type !== "pay" || !held) return action;
+  const ask = pendingPaymentRequest(messages);
+  if (!ask || !(held.inFlightPaymentRequestSeqs?.includes(ask.seq) || held.unconfirmedPaymentSubmissions?.[ask.seq] ||
+    held.askPaymentBlocks?.[ask.seq]))
+    return action;
+  return { ...action, hint: paymentInFlightHint(jobId, held, ask.seq) };
 }

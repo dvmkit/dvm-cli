@@ -23,7 +23,7 @@ vi.mock("../src/lib/x402/wallet", async (original) => ({
 }));
 vi.mock("../src/lib/x402/client", async (original) => ({
   ...(await original<typeof import("../src/lib/x402/client")>()),
-  tryX402Payment: async () => ({ paymentHeader: "payment-proof", amountMsats: 1000, amountUsdcMicro: 1000n, btcRate: 100000, x402Version: 2 }),
+  tryX402Payment: async () => ({ paymentHeader: "payment-proof", amountMsats: 1000, amountUsdcMicro: "1000", btcRate: 100000, x402Version: 2 }),
 }));
 
 const endpoint = "https://provider.example";

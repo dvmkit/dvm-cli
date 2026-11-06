@@ -3,7 +3,8 @@ import { answeredYieldSeqs } from "./yield-state";
 import { formatPaymentAmount } from "./currency";
 import { formatFiat } from "@dvmkit/sdk";
 import type { JobPolicy, Message, PaymentRequestContent } from "@dvmkit/sdk/internal";
-import { asProviderText, type ProviderText } from "@dvmkit/sdk/internal";
+import type { JobRecord } from "./job-store";
+import { asProviderText, loadAgentWallet, shellQuoteArg, type ProviderText } from "@dvmkit/sdk/internal";
 
 export type NextAction =
   | null
@@ -116,8 +117,60 @@ export function pollNextAction(jobId: string, hint?: string): NextActionPoll {
   };
 }
 
-export function paymentInFlightHint(jobId: string): string {
-  return `A payment may already have been sent for this request. Resolve it with \`dvm pay ${guidanceJobArg(jobId)}\`; it checks provider history before paying again.`;
+type HeldJob = Pick<JobRecord, "unconfirmedPaymentSubmissions" | "askPaymentBlocks" | "endpoint" | "dvmId">;
+
+/**
+ * Whether `dvm pay` would re-send the payment held for this ask: one is held,
+ * nothing blocks it, and for Cashu the wallet still holds its token.
+ */
+export function heldPaymentResendable(job: HeldJob | null | undefined, requestSeq: number): boolean {
+  const submission = job?.unconfirmedPaymentSubmissions?.[requestSeq];
+  if (!submission || submission.blocked) return false;
+  if (submission.rail !== "cashu_p2pk") return true;
+  return loadAgentWallet()?.pending_submissions.some((entry) => entry.request_id === submission.cashuRequestId) === true;
+}
+
+/**
+ * For an ask whose earlier payment is unconfirmed. It promises a `dvm pay`
+ * re-send only when one is possible, and otherwise names what is true of the
+ * held payment and the ways out.
+ */
+export function paymentInFlightHint(jobId: string, job?: HeldJob | null, requestSeq?: number): string {
+  const arg = guidanceJobArg(jobId);
+  const resend = `A payment may already have been sent for this request. Resolve it with \`dvm pay ${arg}\`; it checks provider history and re-sends that same payment rather than signing a new one.`;
+  if (!job || requestSeq === undefined) return resend;
+  const submission = job.unconfirmedPaymentSubmissions?.[requestSeq];
+  const stop = `To stop instead, \`dvm decline ${arg}\` ends the job and keeps the finished work, or \`dvm cancel ${arg}\` halts the work now and charges the work in progress.`;
+  // A token that can be re-delivered, a blocked ask's replacement included, is re-sent by `dvm pay`.
+  if (submission && !submission.blocked)
+    return heldPaymentResendable(job, requestSeq) ? resend
+      : `The wallet no longer holds the earlier Cashu payment for this request, so it cannot be re-sent. ${unresendablePaymentHint(jobId)}`;
+  if (submission?.blocked?.reason === "not_resendable")
+    return `${submission.blocked.detail} ${unresendablePaymentHint(jobId)}`;
+  const askBlock = job.askPaymentBlocks?.[requestSeq];
+  if (askBlock?.reason === "credit_held") {
+    const credit = askBlock.creditId;
+    const drain = `dvm credit drain ${shellQuoteArg(job.dvmId ?? job.endpoint)}${credit ? ` --credit-id ${shellQuoteArg(credit)}` : ""}`;
+    const kept = submission?.rail === "cashu_p2pk"
+      ? `The provider kept the earlier Cashu payment for this charge${credit ? ` as credit ${credit}` : ""} because it fell short`
+      : submission
+        ? `The provider answered that the earlier payment fell short of this charge and may have kept it${credit ? ` as credit ${credit}` : ""}`
+        : `The provider answered that an earlier payment for this charge fell short and may hold it${credit ? ` as credit ${credit}` : ""}`;
+    return `${kept}, so that payment does not pay the charge and is not sent again. ` +
+      `Reclaim any balance it holds with \`${drain}\`. Paying the charge takes a new payment that only an explicit \`dvm pay ${arg}\` signs. ${stop}`;
+  }
+  if (askBlock?.reason === "proofs_spent")
+    return `${askBlock.detail ?? "The proofs the earlier Cashu payment used are already spent at the mint; the provider may already have redeemed them for this charge, so paying again may pay twice."} Nothing is sent again or signed automatically. ` +
+      `Paying the charge takes a new payment that only an explicit \`dvm pay ${arg}\` signs. ${stop}`;
+  return `A payment was already sent for this request and is unconfirmed, and this CLI holds no copy to re-send. ${unresendablePaymentHint(jobId)}`;
+}
+
+/** Where an unconfirmed payment cannot be re-sent, and no other payment may be signed for its ask. */
+export function unresendablePaymentHint(jobId: string): string {
+  const job = guidanceJobArg(jobId);
+  return "No new payment will be signed for this charge while the earlier one is unconfirmed. " +
+    `If the provider records it, \`dvm messages ${job} --wait\` shows the job continue. ` +
+    `To stop instead, \`dvm decline ${job}\` ends the job and keeps the finished work, or \`dvm cancel ${job}\` halts the work now and charges the work in progress.`;
 }
 
 /** Message types that signal the end of a provider's turn. */

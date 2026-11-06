@@ -554,13 +554,31 @@ it.each(["timeout", "AbortError"])("does not reconnect after %s inside a payment
 it("keeps an uncertain send actionable without auto-paying in non-streamed JSON", async () => {
   const jobId = "uncertain's job";
   saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0,
+    policy, inFlightPaymentRequestSeqs: [5], unconfirmedPaymentSubmissions: { 5: {
+      rail: "x402", content: { x402_payment: "signed" }, requestAmountMsats: 1000, amountMsats: 1000, btcRate: 100_000 } } });
+  transport([]);
+  vi.mocked(seams.transport.getMessages).mockResolvedValue([msg(5, "payment-request", { amount_msats: 1000, reason: "One block" })]);
+  await messages(jobId, { stream: false });
+  expect(output().next_action).toMatchObject({ type: "pay", hint: expect.stringContaining("re-sends that same payment") });
+  expect(output().next_action.hint).toContain("dvm pay '<job_id>'");
+  expect(seams.pay).not.toHaveBeenCalled();
+  expect(seams.transport.sendMessage).not.toHaveBeenCalled();
+});
+
+// An older CLI's in-flight record kept no copy, so `dvm pay` would refuse; the
+// hint must not send the agent there and back.
+it("names decline and cancel for an unconfirmed send this CLI cannot re-send", async () => {
+  const jobId = "legacy's job";
+  saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0,
     policy, inFlightPaymentRequestSeqs: [5] });
   transport([]);
   vi.mocked(seams.transport.getMessages).mockResolvedValue([msg(5, "payment-request", { amount_msats: 1000, reason: "One block" })]);
   await messages(jobId, { stream: false });
-  expect(output().next_action).toMatchObject({ type: "pay", hint: expect.stringContaining("payment may already have been sent") });
-  expect(output().next_action.hint).toContain("dvm pay '<job_id>'");
-  expect(seams.pay).not.toHaveBeenCalled();
+  const hint = output().next_action.hint;
+  expect(hint).toContain("No new payment will be signed");
+  expect(hint).toContain("dvm decline '<job_id>'");
+  expect(hint).toContain("dvm cancel '<job_id>'");
+  expect(hint).not.toContain("dvm pay");
   expect(seams.transport.sendMessage).not.toHaveBeenCalled();
 });
 

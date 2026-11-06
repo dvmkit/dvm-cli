@@ -16,17 +16,18 @@ import { handlePaymentRequest } from "../src/lib/payment-responder";
 import { status } from "../src/commands/status";
 import { HttpsTransport } from "../src/lib/transport/https";
 import { loadLedger } from "../src/lib/budget-ledger";
-import { commitAgentSpend, prepareAgentSpend } from "../src/lib/wallet-agent/spend";
+import { commitHeldSubmission, prepareAgentSpend } from "../src/lib/wallet-agent/spend";
 
 const market = vi.hoisted(() => ({ rate: 100_000 }));
 vi.mock("../src/lib/btc-rate", () => ({ resolveBtcUsdRate: async () => ({ rate: market.rate, stale: false }) }));
 vi.mock("@dvmkit/sdk/internal", async (original) => ({
-  ...await original<typeof import("@dvmkit/sdk/internal")>(), loadAgentWallet: () => ({ proofs: [] }),
+  ...await original<typeof import("@dvmkit/sdk/internal")>(), loadAgentWallet: () => ({ proofs: [], pending_submissions: [], recent_spends: [] }),
 }));
 vi.mock("../src/lib/wallet-agent/spend", () => ({
   prepareAgentSpend: vi.fn(async () => ({ cashuToken: "mint-fixture", requestId: "fund-1",
     mint: "https://mint.invalid", totalSats: 50, intendedLockPubkey: "02" + "01".repeat(32) })),
   commitAgentSpend: vi.fn(async () => undefined),
+  commitHeldSubmission: vi.fn(async () => undefined),
   abandonPendingSubmission: vi.fn(async () => undefined),
 }));
 vi.mock("../src/lib/wallet-agent/recovery-submissions", () => ({ sweepPendingSubmissions: async () => undefined }));
@@ -86,7 +87,7 @@ describe("payment acknowledgement funding evidence", () => {
     seed();
     wire();
     const failure = new Error("Wallet commit unavailable");
-    vi.mocked(commitAgentSpend).mockRejectedValueOnce(failure);
+    vi.mocked(commitHeldSubmission).mockRejectedValueOnce(failure);
     await expect(pay()).rejects.toBe(failure);
     expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4]);
     await expect(pay()).rejects.toMatchObject({ code: "payment_already_sent" });
@@ -122,7 +123,7 @@ describe("payment acknowledgement funding evidence", () => {
     expect(warnings()).toEqual([]);
     expect(loadLedger()).toEqual(ledger);
     expect(prepareAgentSpend).toHaveBeenCalledTimes(1);
-    expect(commitAgentSpend).toHaveBeenCalledTimes(1);
+    expect(commitHeldSubmission).toHaveBeenCalledTimes(1);
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -134,7 +135,7 @@ describe("payment acknowledgement funding evidence", () => {
     await expect(pay()).rejects.toMatchObject({ code });
     expect(loadJob(jobId)?.drawFundingReceipts).toHaveLength(1);
     expect(loadJob(jobId)?.paymentsHonoured).toBeUndefined();
-    expect(commitAgentSpend).not.toHaveBeenCalled();
+    expect(commitHeldSubmission).not.toHaveBeenCalled();
     fetch.mockClear();
     await settle(response());
     expect(warnings()).toEqual([]);
@@ -149,20 +150,38 @@ describe("payment acknowledgement funding evidence", () => {
     expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4]);
     expect(loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
     expect(loadJob(jobId)?.paymentsHonoured).toBe(1);
-    expect(commitAgentSpend).toHaveBeenCalledTimes(1);
+    expect(commitHeldSubmission).toHaveBeenCalledTimes(1);
     fetch.mockClear();
     await settle(response());
     expect(warnings()).toEqual([]);
     expect(loadCredit(endpoint, signing.pubkey, identity)?.remainingMicro).toBe(400_000);
   });
 
-  it.each(["payment_invalid", "payment_insufficient"])("clears a structured Cashu %s refusal for retry", async (code) => {
+  it("clears a structured Cashu payment_invalid refusal for retry", async () => {
     seed();
-    wire(undefined, 402, code);
-    await expect(pay()).rejects.toMatchObject({ code });
+    wire(undefined, 402, "payment_invalid");
+    await expect(pay()).rejects.toMatchObject({ code: "payment_invalid" });
     expect(loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
+    expect(loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
     wire();
     await expect(pay()).resolves.toMatchObject({ status: "paid" });
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4]);
+  });
+
+  // The provider accumulates a short Cashu token before it finds the shortfall,
+  // so it keeps it; only an explicit approval may sign another payment.
+  it("holds a short Cashu payment the provider kept until an explicit pay", async () => {
+    seed();
+    const fetch = wire(undefined, 402, "payment_insufficient");
+    await expect(pay()).rejects.toMatchObject({ code: "payment_insufficient" });
+    expect(loadJob(jobId)?.unconfirmedPaymentSubmissions?.[4]).toMatchObject({ blocked: { reason: "credit_held" } });
+    fetch.mockClear();
+    await expect(pay()).resolves.toBe("needs-approval");
+    expect(fetch.mock.calls.some(([url]) => String(url).endsWith("/messages"))).toBe(false);
+    wire();
+    await expect(handlePaymentRequest(jobId, ask, policy, new HttpsTransport(), { endpoint },
+      { rail: "cashu", requestSeq: 4, approval: "explicit" })).resolves.toMatchObject({ status: "paid" });
+    expect(prepareAgentSpend).toHaveBeenCalledTimes(2);
     expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4]);
   });
 
@@ -173,7 +192,7 @@ describe("payment acknowledgement funding evidence", () => {
     fetch.mockImplementationOnce(async () => new Response("Invalid reply", { status: 402 }));
     await expect(pay()).rejects.toMatchObject({ code: "payment_insufficient" });
     expect(loadJob(jobId)?.inFlightPaymentRequestSeqs).toEqual([4]);
-    expect(commitAgentSpend).not.toHaveBeenCalled();
+    expect(commitHeldSubmission).not.toHaveBeenCalled();
   });
 
   it("recovers a lost acknowledgement from the provider's job read", async () => {
@@ -279,7 +298,7 @@ describe("signed draw funding reconciliation", () => {
     expect(transport.describe).not.toHaveBeenCalled();
     expect(transport.sendMessage).not.toHaveBeenCalled();
     expect(prepareAgentSpend).not.toHaveBeenCalled();
-    expect(commitAgentSpend).not.toHaveBeenCalled();
+    expect(commitHeldSubmission).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 

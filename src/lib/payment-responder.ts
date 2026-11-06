@@ -1,5 +1,6 @@
 import { withJobPaymentLock } from "./payment-lock";
-import { loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest } from "./yield-state";
+import { loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest, settleRecordedPayments } from "./yield-state";
+import { finishBookedSubmission, midJobSpendLabel } from "./taken-payment";
 import { sameEndpoint } from "./job-access";
 import { bookedCreditPayment, sendCreditPayment, tryCreditPayment } from "./credit-payment";
 import { buildTempoCredential } from "./payment-rails/tempo-credential";
@@ -18,18 +19,26 @@ import {
   type OutboundMessage,
   type SendMessageOptions,
   tempoCredentialAmountMicro,
+  toCashuProofs,
+  decodePayment,
+  exactEvmAuthorization,
   type Transport,
   usdcToMsats,
 } from "@dvmkit/sdk/internal";
+import { getEncodedToken } from "@cashu/cashu-ts";
 import {
   addPayment,
   clearPaymentRequestInFlight,
   loadJob,
   hasUnknownUpfrontCredit,
   hasUnknownUpfrontRail,
+  type HeldPaymentBlock,
+  type JobRecord,
   markPaymentRequestPaid,
   markPaymentRequestInFlight,
+  blockHeldPayment,
   type PaymentApproval,
+  type UnconfirmedPaymentSubmission,
 } from "./job-store";
 import {
   info,
@@ -53,7 +62,7 @@ import { applyMintPin } from "./mint-pin";
 import { assertTempoChallengeNetwork, resolveTempoNetworkSelection } from "./tempo-network";
 import { captureDrawFundingReceipts } from "./draw-funding";
 import { loadRequestIntent } from "./request-intent-store";
-import { pollNextAction } from "./next-action";
+import { heldPaymentResendable, paymentInFlightHint, pollNextAction, unresendablePaymentHint } from "./next-action";
 import { guidanceJobArg, providerFields } from "./provider-output";
 
 export interface PaidPaymentResult {
@@ -80,7 +89,12 @@ export async function handlePaymentRequest(
   // every `payment` `sendMessage`.
   opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean }
 ): Promise<PaymentResult> {
+  const seq = opts?.requestSeq;
+  // An explicit `dvm pay` on an ask blocked from automatic payment is a
+  // replacement attempt: its errors are about the new payment.
+  let replacing = false;
   return withJobPaymentLock(jobId, (assertOwned) => {
+    replacing = opts?.approval === "explicit" && seq !== undefined && loadJob(jobId)?.askPaymentBlocks?.[seq] !== undefined;
     // Guard every rail, balance recovery, and retry at the dispatch boundary.
     const guardedTransport = new Proxy(transport, {
       get(target, key) {
@@ -105,6 +119,23 @@ export async function handlePaymentRequest(
       } catch {
         // Unreadable recovery metadata must not replace the payment refusal.
       }
+    }
+    // A payment held for this ask that a re-send cannot settle: the provider's
+    // hint and the replacement text below would both be untrue here. An
+    // explicit replacement's own refusal, such as the budget, keeps its hint.
+    const heldUnsendable = !replacing && seq !== undefined && holdsPayment(job, seq) && !heldPaymentResendable(job, seq);
+    if (error.code !== "payment_unconfirmed" && heldUnsendable) {
+      error.hint = paymentInFlightHint(jobId, job, seq);
+      if (error.proseSources?.hint) error.proseSources = { ...error.proseSources, hint: undefined };
+    }
+    // Its own hint already names the ways forward; no replacement is involved.
+    if (error.code === "payment_unconfirmed" || heldUnsendable) {
+      error.data = providerFields({
+        ...error.data,
+        job_id: jobId,
+        next_action: providerFields({ ...pollNextAction(jobId, error.hint) }, ["job_id"]),
+      }, ["job_id"]);
+      throw error;
     }
     const command = requestId
       ? `dvm request-result ${shellQuoteArg(requestId)}`
@@ -139,8 +170,7 @@ async function handleLockedPaymentRequest(
   if (job && hasUnknownUpfrontCredit(job))
     throw new DvmError("upfront_credit_unknown", "The original upfront credit debit is unknown or conflicting.",
       "Recover the accepted upfront amount with 'dvm request-result' before authorizing more payments.");
-  const spent = job?.totalPaidMsats ?? 0;
-  const paymentsHonoured = job?.paymentsHonoured ?? 0;
+
   // Caller-pinned spend mint, persisted at request time or by
   // `dvm pay --mint`. Honoured on every spend leg below — no fallback.
   const pinnedMint = job?.pinnedMint;
@@ -181,13 +211,33 @@ async function handleLockedPaymentRequest(
     throw new DvmError("credit_payment_retry_required", "The saved balance payment was not recovered; no replacement payment was sent.",
       `Run \`dvm status ${shellQuoteArg(jobId)}\` to refresh the job, then run \`dvm pay ${shellQuoteArg(jobId)}\` only if payment is still requested.`);
 
+  // A payment held for this ask was signed for the stored endpoint; another
+  // endpoint must not be paid around it.
+  if (!matchingEndpoint && job && opts?.requestSeq !== undefined && holdsPayment(job, opts.requestSeq))
+    throw unconfirmedPaymentError(jobId, "An earlier payment for this request was sent to this job's stored endpoint and is unconfirmed.",
+      `Re-send it with \`dvm pay ${guidanceJobArg(jobId)}\` without --endpoint; it re-delivers that same payment.`);
+
+  let unconfirmed: UnconfirmedPaymentSubmission | undefined;
   if (matchingEndpoint && opts?.requestSeq !== undefined) {
     if (job.inFlightPaymentRequestSeqs?.includes(opts.requestSeq))
       await reconcileInFlightPaymentRequest(jobId, opts.requestSeq, transport, provider, { jobToken });
+    await settleRecordedPayments(jobId);
     if (loadAnsweredYieldSeqs(jobId).has(opts.requestSeq))
       throw new DvmError("payment_already_sent", "Payment already sent for this request.",
         `Keep watching with \`dvm messages ${shellQuoteArg(jobId)} --wait\` before paying again.`);
+    // Reconciliation may have resolved or released the earlier send.
+    const current = loadJob(jobId);
+    unconfirmed = current?.unconfirmedPaymentSubmissions?.[opts.requestSeq];
+    // An in-flight send recorded by an older CLI kept no copy to re-deliver,
+    // and the provider may still accept it.
+    if (!unconfirmed && current?.inFlightPaymentRequestSeqs?.includes(opts.requestSeq))
+      throw unconfirmedPaymentError(jobId, "An earlier payment for this request is unconfirmed and this CLI holds no copy to re-send.");
   }
+
+  // Settling above can book an earlier payment, so the caps read the job now.
+  const latest = loadJob(jobId);
+  const spent = latest?.totalPaidMsats ?? 0;
+  const paymentsHonoured = latest?.paymentsHonoured ?? 0;
 
   if (policy.maxIncrementMsats > 0 && request.amount_msats > policy.maxIncrementMsats) {
     return "over-budget";
@@ -212,6 +262,25 @@ async function handleLockedPaymentRequest(
     );
 
   if (request.amount_msats > policy.autoPayBelowMsats) return "needs-approval";
+
+  // Before any balance or rail can sign a second payment for the same ask.
+  if (unconfirmed && opts?.requestSeq !== undefined) {
+    // A token that can still be re-delivered is sent again, never replaced.
+    if (!unconfirmed.blocked)
+      return redeliverUnconfirmedPayment({
+        jobId, request, requestSeq: opts.requestSeq, submission: unconfirmed,
+        transport, provider, jobToken, rail: opts.rail,
+      });
+    if (unconfirmed.blocked.reason === "not_resendable")
+      throw unconfirmedPaymentError(jobId, "Sending the earlier payment for this request again cannot settle it.",
+        paymentInFlightHint(jobId, loadJob(jobId), opts.requestSeq));
+  }
+  // A short payment kept as credit, or spent reserve proofs, settle nothing,
+  // and the ask stays blocked whatever becomes of a replacement's own record:
+  // only an explicit `dvm pay` may sign a fresh payment for it. The earlier
+  // token stays in the wallet journal for the sweep's verdict.
+  if (opts?.requestSeq !== undefined && loadJob(jobId)?.askPaymentBlocks?.[opts.requestSeq] && opts.approval !== "explicit")
+    return "needs-approval";
 
   if (matchingEndpoint && !balanceRefused && opts?.rail === undefined) {
     const creditPaid = await tryCreditPayment({ jobId, request, policy,
@@ -309,33 +378,20 @@ async function handleLockedPaymentRequest(
         // which may be slightly higher than the msat quote at the caller's
         // contemporaneous BTC/USD rate.
         await enforceGlobalBudget({ plannedMsats: proof.amountMsats, btcRate: proof.btcRate });
-        await sendRailPayment(transport,
-          jobId,
-          {
-            type: "payment",
-            content: {
-              x402_payment: proof.paymentHeader,
-              amount_msats: proof.amountMsats,
-            },
+        return deliverSignedRailPayment({
+          jobId, request, transport, provider, jobToken, approval,
+          requestSeq: matchingEndpoint ? opts?.requestSeq : undefined,
+          submission: {
+            rail: "x402",
+            content: { x402_payment: proof.paymentHeader, amount_msats: proof.amountMsats },
+            requestAmountMsats: request.amount_msats,
+            amountMsats: proof.amountMsats,
+            btcRate: proof.btcRate,
+            amountUsdcMicro: proof.amountUsdcMicro,
+            approval: approval?.approval,
+            reason: request.reason,
           },
-          provider,
-          { jobToken },
-          matchingEndpoint ? opts?.requestSeq : undefined
-        );
-        addPayment(jobId, proof.amountMsats, approval);
-        recordSpend({
-          msats: proof.amountMsats,
-          btcRate: proof.btcRate,
-          jobId,
-          providerEndpoint: provider.endpoint,
-          ...midJobSpendLabel(request.reason),
         });
-        return {
-          status: "paid",
-          rail: "x402",
-          amountMsats: proof.amountMsats,
-          amountUsdcMicro: proof.amountUsdcMicro,
-        };
       }
     }
   }
@@ -354,32 +410,116 @@ async function handleLockedPaymentRequest(
       // branch above does.
       const paidMsats = usdcToMsats(Number(tempoCredentialAmountMicro(cred)) / 1e6, tempoRate);
       await enforceGlobalBudget({ plannedMsats: paidMsats, btcRate: tempoRate });
-      await sendRailPayment(transport,
-        jobId,
-        {
-          type: "payment",
-          content: {
-            tempo_credential: cred,
-            amount_msats: paidMsats,
-          },
+      return deliverSignedRailPayment({
+        jobId, request, transport, provider, jobToken, approval,
+        requestSeq: matchingEndpoint ? opts?.requestSeq : undefined,
+        submission: {
+          rail: "tempo",
+          content: { tempo_credential: cred, amount_msats: paidMsats },
+          requestAmountMsats: request.amount_msats,
+          amountMsats: paidMsats,
+          btcRate: tempoRate,
+          approval: approval?.approval,
+          reason: request.reason,
         },
-        provider,
-        { jobToken },
-        matchingEndpoint ? opts?.requestSeq : undefined
-      );
-      addPayment(jobId, paidMsats, approval);
-      recordSpend({
-        msats: paidMsats,
-        btcRate: tempoRate,
-        jobId,
-        providerEndpoint: provider.endpoint,
-        ...midJobSpendLabel(request.reason),
       });
-      return { status: "paid", rail: "tempo", amountMsats: paidMsats };
     }
   }
 
   return "needs-approval";
+}
+
+function unconfirmedPaymentError(jobId: string, message: string, hint = unresendablePaymentHint(jobId)): DvmError {
+  return new DvmError("payment_unconfirmed", `${message} No new payment was signed.`, hint);
+}
+
+function holdsPayment(job: JobRecord, requestSeq: number): boolean {
+  return job.inFlightPaymentRequestSeqs?.includes(requestSeq) === true ||
+    job.unconfirmedPaymentSubmissions?.[requestSeq] !== undefined;
+}
+
+/**
+ * Send the payment already signed for this ask again, never a new one. The
+ * provider settles a Cashu token once per `cashu_request_id`; a copy it already
+ * took answers as a replay or as spent proofs, and either is booked as paid.
+ */
+async function redeliverUnconfirmedPayment(args: {
+  jobId: string;
+  request: PaymentRequestContent;
+  requestSeq: number;
+  submission: UnconfirmedPaymentSubmission;
+  transport: Transport;
+  provider: ProviderRef;
+  jobToken?: string;
+  rail?: RailFlag;
+}): Promise<PaidPaymentResult> {
+  const { jobId, request, submission, provider } = args;
+  const sentRail: RailFlag = submission.rail === "cashu_p2pk" ? "cashu" : submission.rail;
+  if (submission.requestAmountMsats !== request.amount_msats)
+    throw unconfirmedPaymentError(jobId, "The unconfirmed payment held for this request answered a different amount.");
+  if (args.rail !== undefined && args.rail !== sentRail)
+    throw unconfirmedPaymentError(jobId, `An unconfirmed ${sentRail} payment was already sent for this request.`,
+      `Re-send it with \`dvm pay ${guidanceJobArg(jobId)}\` without --rail; it re-delivers that same payment.`);
+  if (submission.rail !== "cashu_p2pk")
+    return deliverSignedRailPayment({ ...args, submission, redelivery: true });
+
+  const wallet = loadAgentWallet();
+  if (!wallet)
+    throw unconfirmedPaymentError(jobId, "The agent wallet holding the unconfirmed Cashu payment for this request is unavailable.",
+      `Restore the agent wallet, then run \`dvm pay ${guidanceJobArg(jobId)}\` to re-send that same payment. ${unresendablePaymentHint(jobId)}`);
+  const held = wallet.pending_submissions.find((entry) => entry.request_id === submission.cashuRequestId);
+  // Only a sweep verdict (applied before this point) settles a token the
+  // wallet dropped; a forgotten or aged-out entry may still be redeemable,
+  // and a recent spend can be a partial redeem rather than this payment.
+  if (!held)
+    throw unconfirmedPaymentError(jobId, "The wallet no longer holds the unconfirmed Cashu payment for this request and recorded no verdict on it.");
+  const cashuToken = held.cashu_token ?? (held.output_proofs.length
+    ? getEncodedToken({ mint: held.mint, proofs: toCashuProofs(held.output_proofs) }) : undefined);
+  if (!cashuToken || !sameEndpoint(held.endpoint, provider.endpoint))
+    throw unconfirmedPaymentError(jobId, "The unconfirmed Cashu payment for this request cannot be re-delivered.");
+  await deliverAgentWalletPayment({
+    ...args,
+    submission: held.output_proofs.some((proof) => proof.reserved_for !== undefined) ? { ...submission, reserve: true } : submission,
+    redelivery: true,
+    prepared: {
+      cashuToken,
+      requestId: held.request_id,
+      mint: held.mint,
+      totalSats: held.amount_sats,
+      endpoint: held.endpoint,
+      intendedLockPubkey: held.intended_lock_pubkey,
+    },
+  });
+  return { status: "paid", rail: "cashu_p2pk", amountMsats: request.amount_msats };
+}
+
+/** Send a signed x402 or Tempo payment and book it once the provider takes it. */
+async function deliverSignedRailPayment(args: {
+  jobId: string;
+  request: PaymentRequestContent;
+  submission: Extract<UnconfirmedPaymentSubmission, { rail: "x402" | "tempo" }>;
+  transport: Transport;
+  provider: ProviderRef;
+  jobToken?: string;
+  requestSeq?: number;
+  approval?: { requestSeq: number; approval: PaymentApproval };
+  redelivery?: boolean;
+}): Promise<PaidPaymentResult> {
+  const { jobId, submission, provider } = args;
+  const sent = await sendRailPayment(args.transport, jobId,
+    { type: "payment", content: submission.content } as OutboundMessage,
+    provider, { jobToken: args.jobToken }, args.requestSeq, submission, args.redelivery);
+  if (!sent.tracked) {
+    addPayment(jobId, submission.amountMsats, args.approval);
+    recordSpend({ msats: submission.amountMsats, btcRate: submission.btcRate, jobId,
+      providerEndpoint: provider.endpoint, ...midJobSpendLabel(args.request.reason) });
+  } else if (sent.booked) await finishBookedSubmission(jobId, sent.booked, provider.endpoint);
+  return {
+    status: "paid",
+    rail: submission.rail,
+    amountMsats: submission.amountMsats,
+    ...(submission.amountUsdcMicro !== undefined ? { amountUsdcMicro: submission.amountUsdcMicro } : {}),
+  };
 }
 
 /**
@@ -397,17 +537,6 @@ async function handleLockedPaymentRequest(
  * recovery — the upfront-only `sweepPendingSubmissions` can't auto-replay
  * a mid-job send, but the capital stays reachable.
  */
-/**
- * Spend-label fields recorded in the budget ledger for a mid-job payment,
- * rendered by `dvm wallet history`. The provider's `payment-request.reason`
- * is provider-supplied free text, so it's tagged `labelSource: "provider"` and
- * the history command provenance-wraps it on relay. Omitted when blank.
- */
-function midJobSpendLabel(reason: string): { label?: string; labelSource?: "provider" } {
-  const text = reason.trim();
-  return text ? { label: text, labelSource: "provider" } : {};
-}
-
 async function tryAgentWalletMidJobPayment(args: {
   jobId: string;
   request: PaymentRequestContent;
@@ -513,8 +642,39 @@ async function tryAgentWalletMidJobPayment(args: {
     );
   }
 
+  await deliverAgentWalletPayment({ jobId, request, prepared, transport, provider, approval, jobToken,
+    requestSeq: args.requestSeq,
+    submission: {
+      rail: "cashu_p2pk",
+      cashuRequestId: prepared.requestId,
+      ...(prepared.fromReserve ? { reserve: true as const } : {}),
+      requestAmountMsats: request.amount_msats,
+      amountMsats: request.amount_msats,
+      btcRate,
+      approval: approval?.approval,
+      reason: request.reason,
+    },
+  });
+  return true;
+}
+
+/** Ship a prepared or held Cashu token and book it once the provider takes it. */
+async function deliverAgentWalletPayment(args: {
+  jobId: string;
+  request: PaymentRequestContent;
+  prepared: PreparedAgentSpend;
+  submission: Extract<UnconfirmedPaymentSubmission, { rail: "cashu_p2pk" }>;
+  transport: Transport;
+  provider: ProviderRef;
+  approval?: { requestSeq: number; approval: PaymentApproval };
+  jobToken?: string;
+  requestSeq?: number;
+  redelivery?: boolean;
+}): Promise<void> {
+  const { jobId, request, prepared, submission, transport, provider, approval, jobToken } = args;
+  let sent: SentPayment;
   try {
-    await sendMidJobPaymentWithRetry({
+    sent = await sendMidJobPaymentWithRetry({
       jobId,
       amountMsats: request.amount_msats,
       prepared,
@@ -522,19 +682,34 @@ async function tryAgentWalletMidJobPayment(args: {
       provider,
       jobToken,
       requestSeq: args.requestSeq,
+      submission,
+      redelivery: args.redelivery,
     });
   } catch (err) {
-    // Per the crash-safety contract: only abandon on `payment_invalid`
-    // (DVM rejected the spend permanently). Everything else — including
-    // `payment_lock_pubkey_stale`, exhausted `proof_pending` /
-    // `mint_unreachable` retries, 5xx, and network errors — leaves the
-    // `pending_submission` on disk so the locked capital remains recoverable.
-    if (err instanceof DvmError && err.code === "payment_invalid") {
+    // Only a definite `payment_invalid` refusal abandons the wallet entry.
+    // Every other failure, including exhausted `proof_pending` /
+    // `mint_unreachable` retries, `payment_lock_pubkey_stale`, 5xx and network
+    // errors, leaves the `pending_submission` on disk so the locked capital
+    // stays recoverable and the same token can be re-delivered.
+    if (err instanceof DvmError && err.code === "payment_invalid" && sendOutcome(err, submission, args.redelivery).kind === "refused") {
       await abandonPendingSubmission({ requestId: prepared.requestId, preserveRecovery: true });
+    }
+    // The provider no longer takes this token's lock key, but holding that key
+    // it could still redeem it; a re-send gets the same answer.
+    if (args.requestSeq !== undefined && err instanceof DvmError &&
+        (err.code === "payment_lock_pubkey_stale" || err.code === "wrong_lock_pubkey")) {
+      const reclaimAt = loadAgentWallet()?.pending_submissions.find((entry) => entry.request_id === prepared.requestId)?.t_expire;
+      blockHeldPayment(jobId, args.requestSeq, { reason: "not_resendable", detail:
+        "The provider no longer accepts the lock key this Cashu token was made for, though it may still redeem it." +
+        (reclaimAt ? ` The wallet can take the token back after ${new Date(reclaimAt).toISOString()} if it does not.` : "") });
     }
     throw err;
   }
 
+  if (sent.tracked) {
+    if (sent.booked) await finishBookedSubmission(jobId, sent.booked, provider.endpoint);
+    return;
+  }
   await commitAgentSpend({
     requestId: prepared.requestId,
     recentSpend: {
@@ -545,16 +720,14 @@ async function tryAgentWalletMidJobPayment(args: {
       signed_at_ms: Date.now(),
     },
   });
-
   addPayment(jobId, request.amount_msats, approval);
   recordSpend({
     msats: request.amount_msats,
-    btcRate,
+    btcRate: submission.btcRate,
     jobId,
     providerEndpoint: provider.endpoint,
     ...midJobSpendLabel(request.reason),
   });
-  return true;
 }
 
 /**
@@ -572,9 +745,11 @@ async function sendMidJobPaymentWithRetry(args: {
   sleep?: (ms: number) => Promise<void>;
   jobToken?: string;
   requestSeq?: number;
-}): Promise<void> {
+  submission: UnconfirmedPaymentSubmission;
+  redelivery?: boolean;
+}): Promise<SentPayment> {
   const { jobId, amountMsats, prepared, transport, provider, jobToken } = args;
-  await withAgentWalletPaymentRetry({
+  return withAgentWalletPaymentRetry({
     attempt: () =>
       sendRailPayment(transport,
         jobId,
@@ -589,7 +764,9 @@ async function sendMidJobPaymentWithRetry(args: {
         },
         provider,
         { jobToken },
-        args.requestSeq
+        args.requestSeq,
+        args.submission,
+        args.redelivery
       ),
     intendedLockPubkey: prepared.intendedLockPubkey,
     refetchInfo: () => transport.describe(provider),
@@ -597,14 +774,23 @@ async function sendMidJobPaymentWithRetry(args: {
   });
 }
 
+/**
+ * `tracked` sends were journalled under their ask's seq; `booked` is the
+ * submission this send booked, absent when a concurrent reader booked it first.
+ * An untracked send (another endpoint) leaves booking to its caller.
+ */
+type SentPayment = { tracked: true; booked?: UnconfirmedPaymentSubmission } | { tracked: false };
+
 async function sendRailPayment(
   transport: Transport,
   jobId: string,
   message: OutboundMessage,
   provider: ProviderRef,
   options?: SendMessageOptions,
-  requestSeq?: number
-): Promise<void> {
+  requestSeq?: number,
+  submission?: UnconfirmedPaymentSubmission,
+  redelivery?: boolean
+): Promise<SentPayment> {
   // The acknowledgement's seq is a post-dispatch cursor, not the inbound
   // payment sequence signed by the provider.
   const capture = (evidence: { drawFundingReceipt?: unknown; drawFundingReceiptParseError?: unknown }) => {
@@ -616,37 +802,118 @@ async function sendRailPayment(
   };
   // Persist before dispatch: a lost reply cannot distinguish a rejected send
   // from a payment the provider already accepted.
-  if (requestSeq !== undefined) markPaymentRequestInFlight(jobId, requestSeq);
+  if (requestSeq !== undefined) markPaymentRequestInFlight(jobId, requestSeq, submission);
+  let result: Awaited<ReturnType<Transport["sendMessage"]>>;
   try {
-    const result = await transport.sendMessage(jobId, message, provider, options);
-    // Retain the accepted ask before wallet bookkeeping or receipt parsing can
-    // fail, so a later stream never constructs a fresh payment for the same seq.
-    if (requestSeq !== undefined) markPaymentRequestPaid(jobId, requestSeq);
-    if (result) capture(result);
+    result = await transport.sendMessage(jobId, message, provider, options);
   } catch (error) {
     // A failure after deposit acceptance can still carry signed funding evidence.
-    if (requestSeq !== undefined) {
-      if (error instanceof DvmError && error.code === "replay_rejected") markPaymentRequestPaid(jobId, requestSeq);
-      else if (definitelyNotAccepted(error)) clearPaymentRequestInFlight(jobId, requestSeq);
-      else markPaymentRequestInFlight(jobId, requestSeq);
-    }
     if (error instanceof DvmError && error.data) capture(error.data);
-    if (error instanceof DvmError && error.code === "replay_rejected") return;
+    const outcome = sendOutcome(error, submission, redelivery);
+    if (requestSeq === undefined) {
+      if (outcome.kind === "taken" && error instanceof DvmError && error.code === "replay_rejected") return { tracked: false };
+      throw error;
+    }
+    if (outcome.kind === "taken") return { tracked: true, booked: markPaymentRequestPaid(jobId, requestSeq) };
+    if (outcome.kind === "blocked") blockHeldPayment(jobId, requestSeq, outcome.blocked);
+    else if (outcome.kind === "refused") clearPaymentRequestInFlight(jobId, requestSeq);
+    else if (outcome.kind === "not_sent") clearPaymentRequestInFlight(jobId, requestSeq, { keepSubmission: true });
+    else markPaymentRequestInFlight(jobId, requestSeq);
     throw error;
   }
+  // Book the accepted ask before receipt parsing can fail, so a later stream
+  // never constructs a fresh payment for the same seq.
+  const sent: SentPayment = requestSeq === undefined ? { tracked: false }
+    : { tracked: true, booked: markPaymentRequestPaid(jobId, requestSeq) };
+  if (result) capture(result);
+  return sent;
 }
 
-function definitelyNotAccepted(error: unknown): boolean {
-  if (error instanceof DvmError) {
-    const status = error.data?.http_status;
-    return typeof status === "number" && status >= 400 && status < 500;
+/**
+ * Provider refusals that examine these exact proofs or this credential and
+ * keep nothing, checked against the codes the SDK's receive path answers with.
+ * Only these release an ask for a new payment, and only when the provider's
+ * own `error` field named the code. Transient mint answers (`proof_pending`,
+ * `mint_unreachable`), throttling (408, 425, 429), a prose `Job not found` and
+ * every unlisted or unstructured answer hold the payment instead.
+ */
+const DEFINITE_REFUSALS: ReadonlySet<string> = new Set([
+  "payment_invalid",
+  "lock_not_exclusive",
+  "not_p2pk_locked",
+  "cashu_not_p2pk_locked",
+  "invalid_token",
+  "invalid_message",
+  "invalid_input",
+  "invalid_request",
+]);
+
+type SendOutcome =
+  | { kind: "taken" | "refused" | "not_sent" | "unknown" }
+  | { kind: "blocked"; blocked: HeldPaymentBlock };
+
+function sendOutcome(error: unknown, submission: UnconfirmedPaymentSubmission | undefined, redelivery: boolean | undefined): SendOutcome {
+  if (!(error instanceof DvmError)) return { kind: requestNeverSent(error) ? "not_sent" : "unknown" };
+  if (error.code === "replay_rejected") return { kind: "taken" };
+  const status = error.data?.http_status;
+  if (typeof status !== "number" || status < 400 || status >= 500) return { kind: "unknown" };
+  // A code the transport filled in for a body that named none proves nothing.
+  if (error.data?.code_source === "inferred") return { kind: "unknown" };
+  const cashu = submission?.rail === "cashu_p2pk" ? submission : undefined;
+  if (cashu && error.code === "proof_not_unspent") {
+    // The receive path checks proof state before replay detection, so a token
+    // it already redeemed answers as spent proofs. Outputs swapped for this
+    // payment went only to this provider, so spent means it redeemed them;
+    // reserve proofs could have paid another call.
+    if (!cashu.reserve) return { kind: "taken" };
+    return { kind: "blocked", blocked: { reason: "proofs_spent",
+      detail: "The reserve proofs the earlier Cashu payment used are already spent at the mint and the provider recorded no payment for this charge, but it may already have redeemed this token for this charge, so paying again may pay twice." } };
   }
-  if (!(error instanceof Error)) return false;
-  // These failures occur before an HTTP request can reach the provider. A
-  // generic fetch failure or ECONNRESET can also mean a lost acknowledgement.
+  // A short Cashu payment is accepted into the provider's accumulator before
+  // the shortfall is found: the token is kept, held on credit where the
+  // provider has a ledger, so it is neither refused nor a payment of the ask.
+  // The SDK sends this code on no other rail mid-job, so another provider's
+  // short x402 or Tempo answer is held the same way rather than trusted.
+  if (error.code === "payment_insufficient")
+    return { kind: "blocked", blocked: { reason: "credit_held",
+      ...(typeof error.data?.credit_id === "string" ? { creditId: error.data.credit_id } : {}) } };
+  // The same request id already carries another payment there; a re-send gets the same answer.
+  if (error.code === "request_id_reused")
+    return { kind: "blocked", blocked: { reason: "not_resendable",
+      detail: "The provider did not take this payment, because its request id already carries a different payment there." } };
+  if (!DEFINITE_REFUSALS.has(error.code)) return { kind: "unknown" };
+  // After a lost first send, `payment_invalid` may mean the provider already
+  // took this credential: it answers that way for a Tempo credential it used,
+  // and for an x402 authorization it settled before writing its replay marker.
+  // An authorization that never settled stays unpaid, so holding loses nothing.
+  if (redelivery && submission && submission.rail !== "cashu_p2pk" && error.code === "payment_invalid")
+    return { kind: "blocked", blocked: { reason: "not_resendable", detail: submission.rail === "tempo"
+      ? "The provider refused the earlier Tempo credential, which it also does for one it already used."
+      : `${x402RefusalNote(submission.content.x402_payment)} It also answers that way for an authorization it already settled.` } };
+  return { kind: "refused" };
+}
+
+/** Name an x402 authorization's expiry, beside the refusal of its re-delivery. */
+function x402RefusalNote(header: unknown): string {
+  try {
+    const validBefore = Number(exactEvmAuthorization(decodePayment(String(header))).validBefore) * 1000;
+    if (Number.isFinite(validBefore))
+      return validBefore <= Date.now()
+        ? `The provider refused the earlier x402 authorization, which expired at ${new Date(validBefore).toISOString()}.`
+        : "The provider refused the earlier x402 authorization before it expired.";
+  } catch {
+    // An undecodable header still leaves the provider's refusal as the outcome.
+  }
+  return "The provider refused the earlier x402 authorization.";
+}
+
+/** These failures occur before an HTTP request can reach the provider. */
+function requestNeverSent(error: unknown): boolean {
+  if (!(error instanceof Error) || error instanceof DvmError) return false;
+  // A generic fetch failure or ECONNRESET can also mean a lost acknowledgement.
   if ("code" in error && ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"].includes(String(error.code))) return true;
-  if (error instanceof AggregateError) return error.errors.length > 0 && error.errors.every(definitelyNotAccepted);
-  return definitelyNotAccepted(error.cause);
+  if (error instanceof AggregateError) return error.errors.length > 0 && error.errors.every(requestNeverSent);
+  return requestNeverSent(error.cause);
 }
 
 /**
