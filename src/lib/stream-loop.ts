@@ -16,17 +16,15 @@ import {
   type StreamResult,
   type Transport,
 } from "@dvmkit/sdk/internal";
-import {
-  loadJob,
-  markPaymentRequestPaid,
-} from "./job-store";
+import { loadJob, markPaymentRequestAnswered } from "./job-store";
 
 import {
   createMessageAppendSession,
+  loadMessages,
   maxSeq,
   type MessageAppendSession,
 } from "./messages";
-import { answeredYieldSeqs, loadAnsweredYieldSeqs, pendingPaymentRequest, reconcileInFlightPaymentRequest } from "./yield-state";
+import { answeredYieldSeqs, declinedAskSeqs, loadAnsweredYieldSeqs, pendingPaymentRequest, reconcileInFlightPaymentRequest, settleAnsweredAsk, settleRecordedPayments } from "./yield-state";
 import { paidConfirmationDisplay } from "./payment-copy";
 import { handlePaymentRequest, type PaymentResult, type PaidPaymentResult } from "./payment-responder";
 import { claimInboundPayments, type RefundClaim, withRefundNextAction } from "./refund-claim";
@@ -117,7 +115,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   const jobToken = opts.jobToken ?? loadJob(jobId)?.jobToken;
   // A decline the provider confirmed ended the job, even when its message is not in this batch.
   const declined = () => persistLocalState && loadJob(jobId)?.callerDeclined === true;
-  function recordAutoPayment(result: PaidPaymentResult, request: PaymentRequestContent, seq: number): void {
+  async function recordAutoPayment(result: PaidPaymentResult, request: PaymentRequestContent, seq: number): Promise<void> {
     autoPayments.push({
       amount_msats: result.amountMsats,
       rail: result.rail,
@@ -125,7 +123,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       ...(result.amountUsdcMicro !== undefined && { amount_usdc_microunits: result.amountUsdcMicro }),
       display: paidConfirmationDisplay(result, request.fiat_amount),
     });
-    if (persistLocalState) markPaymentRequestPaid(jobId, seq);
+    // The payer already booked what it sent; this only records the ask answered.
+    if (persistLocalState) markPaymentRequestAnswered(jobId, seq);
     answeredSeqs.add(seq);
     justAutoPaid = true;
   }
@@ -139,10 +138,10 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       });
     } catch (error) {
       if (error instanceof DvmError && error.code === "payment_settling")
-        return { messages: [], autoPayments, refunds, cursor, nextAction: pollNextAction(jobId, paymentInFlightHint(jobId)) };
+        return { messages: [], autoPayments, refunds, cursor, nextAction: pollNextAction(jobId, paymentInFlightHint(jobId, loadJob(jobId), pending.authorization.request_seq)) };
       throw error;
     }
-    if (typeof result === "object") recordAutoPayment(result, pending.request, pending.authorization.request_seq);
+    if (typeof result === "object") await recordAutoPayment(result, pending.request, pending.authorization.request_seq);
     else pendingAction = computeNextAction(jobId, [{
       seq: pending.authorization.request_seq, from: "provider", timestamp: 0,
       type: "payment-request", content: pending.request,
@@ -214,6 +213,9 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       if (persistLocalState) {
         messageAppendSession ??= createMessageAppendSession(jobId);
         messageAppendSession.append(batchMessages);
+        // Book a payment whose answer was lost but the provider recorded,
+        // even when the job has moved past its ask.
+        await settleRecordedPayments(jobId);
       }
 
       // Auto-claim any inbound Cashu payment (refund/change) into the local wallet.
@@ -230,7 +232,9 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
         (message.type !== "payment-request" || message.seq === pendingPayment?.seq)))
         ?? findLastYield(batchMessages);
       if (lastYield?.type === "payment-request" && answeredSeqs.has(lastYield.seq)) {
-        if (persistLocalState) markPaymentRequestPaid(jobId, lastYield.seq);
+        // A declined ask was not paid; any other answer books only what history proves.
+        if (persistLocalState && !declinedAskSeqs(jobId).has(lastYield.seq))
+          await settleAnsweredAsk(jobId, lastYield.seq, loadMessages(jobId));
         break;
       }
       if (lastYield?.type === "payment-request" && persistLocalState &&
@@ -265,8 +269,10 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
               jobToken, requestSeq: lastYield.seq,
             });
           } catch (error) {
-            if (error instanceof DvmError && error.code === "payment_settling") {
+            if (error instanceof DvmError && ["payment_settling", "payment_unconfirmed"].includes(error.code)) {
               paymentUnresolved = true;
+              // The ask stays open; a reconnect must read it again.
+              if (error.code === "payment_unconfirmed") cursor = Math.min(cursor, lastYield.seq - 1);
               break;
             }
             if (error instanceof DvmError && error.code === "payment_already_sent") {
@@ -276,7 +282,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
             throw error;
           }
           if (typeof result === "object") {
-            recordAutoPayment(result, req, lastYield.seq);
+            await recordAutoPayment(result, req, lastYield.seq);
             continue;
           }
           if (result === "payment-cap-exceeded") {
@@ -328,6 +334,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       if (persistLocalState) {
         messageAppendSession ??= createMessageAppendSession(jobId);
         messageAppendSession.append(recheck);
+        await settleRecordedPayments(jobId);
         refunds.push(...(await claimInboundPayments(jobId, recheck)));
       }
     }
@@ -341,9 +348,11 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   let nextAction = withRefundNextAction(jobId, yieldAction ?? (terminal ? null : pollNextAction(jobId)), refunds);
 
   const lastYield = findLastYield(allMessages);
-  if (nextAction?.type === "pay" && lastYield?.type === "payment-request" && persistLocalState &&
-      loadJob(jobId)?.inFlightPaymentRequestSeqs?.includes(lastYield.seq))
-    nextAction = { ...nextAction, hint: paymentInFlightHint(jobId) };
+  const heldJob = persistLocalState ? loadJob(jobId) : null;
+  if (nextAction?.type === "pay" && lastYield?.type === "payment-request" && heldJob &&
+      (heldJob.inFlightPaymentRequestSeqs?.includes(lastYield.seq) || heldJob.unconfirmedPaymentSubmissions?.[lastYield.seq] ||
+        heldJob.askPaymentBlocks?.[lastYield.seq]))
+    nextAction = { ...nextAction, hint: paymentInFlightHint(jobId, heldJob, lastYield.seq) };
 
   // A paid request can remain the last yield while the provider catches up.
   if (nextAction?.type === "pay" || (nextAction?.type === "poll" && !terminal)) {
@@ -356,7 +365,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     }
   }
 
-  if (paymentUnresolved) nextAction = pollNextAction(jobId, paymentInFlightHint(jobId));
+  if (paymentUnresolved) nextAction = pollNextAction(jobId, paymentInFlightHint(jobId, heldJob,
+    lastYield?.type === "payment-request" ? lastYield.seq : undefined));
   return { messages: allMessages, autoPayments, refunds, nextAction, cursor };
 }
 

@@ -109,6 +109,51 @@ describe("HTTPS payment send deadlines", () => {
   });
 });
 
+describe("HTTPS payment refusals", () => {
+  const send = (endpoint: string) => new HttpsTransport().sendMessage("job-1", {
+    type: "payment", content: { cashu_token: "token", cashu_request_id: "request-1", amount_msats: 10_000 },
+  }, { endpoint });
+  const answer = (status: number, body: string) => listen(createServer((_request, response) => {
+    response.writeHead(status, { "Content-Type": "application/json" });
+    response.end(body);
+  }));
+
+  // The SDK accumulator's body for proofs refused under a request id that already carries another payment.
+  it("keeps request_id_reused a payment refusal on a live job, with its status", async () => {
+    const endpoint = await answer(409, JSON.stringify({ error: "request_id_reused",
+      message: "This request id already carries a different payment at this DVM; these proofs were not accepted.",
+      display: "This payment was not accepted and nothing was charged.", retryable: false }));
+    await expect(send(endpoint)).rejects.toMatchObject({ code: "request_id_reused", data: { http_status: 409 } });
+  });
+
+  it("still reports a conflict without a payment code as the job having ended", async () => {
+    const endpoint = await answer(409, JSON.stringify({ error: "job_not_active" }));
+    await expect(send(endpoint)).rejects.toMatchObject({ code: "job_terminal" });
+  });
+
+  // Only a code the provider's own `error` field names may release a payment.
+  it.each([
+    ["an empty body", "{}"],
+    ["a message without a code", JSON.stringify({ message: "Payment required" })],
+  ])("marks the code of a 402 with %s as inferred", async (_label, body) => {
+    const endpoint = await answer(402, body);
+    await expect(send(endpoint)).rejects.toMatchObject({ code: "payment_insufficient",
+      data: { http_status: 402, code_source: "inferred" } });
+  });
+
+  it("keeps a nested structured 402 code as the provider's own", async () => {
+    const endpoint = await answer(402, JSON.stringify({ error: { code: "payment_invalid", message: "Refused" } }));
+    const refusal = await send(endpoint).catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ code: "payment_invalid", data: { http_status: 402 } });
+    expect((refusal as DvmError).data?.code_source).toBeUndefined();
+  });
+
+  it("carries the status of a prose 404 so a payment is not released on it", async () => {
+    const endpoint = await answer(404, JSON.stringify({ error: "Job not found" }));
+    await expect(send(endpoint)).rejects.toMatchObject({ data: { http_status: 404 } });
+  });
+});
+
 describe("HTTPS message poll disconnections", () => {
   it.each([
     { status: 200, body: '{"messages":[' },

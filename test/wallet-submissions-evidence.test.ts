@@ -18,6 +18,7 @@ import {
 } from "@dvmkit/sdk/internal";
 
 import { walletSubmissions } from "../src/commands/wallet-submissions";
+import { loadJob, saveJob } from "../src/lib/job-store";
 import {
   journalMarkerFor,
   loadSubmissionEvidence,
@@ -129,7 +130,31 @@ describe("dvm wallet submissions evidence", () => {
     await walletSubmissions({ forget: REQUEST_ID, yes: true });
 
     expect(output.json.mock.calls.at(-1)?.[0]).toMatchObject({ status: "forgotten" });
+    expect(output.json.mock.calls.at(-1)?.[0]).not.toHaveProperty("warning");
     expect(loadSubmissionEvidence(REQUEST_ID)).toMatchObject({ kind: "body_unreadable" });
+  });
+
+  it("warns that forgetting a token held for an open charge lets that charge become payable again", async () => {
+    const record = recordSubmissionEvidence({
+      observation: { kind: "body_unreadable", headerJobId: "job-a" },
+      endpoint: ENDPOINT,
+      cashuRequestId: REQUEST_ID,
+      rail: "cashu",
+    });
+    saveAgentWallet(walletWith({ accepted_unresolved: journalMarkerFor(record) }));
+    saveJob({ id: "held-job", endpoint: ENDPOINT, status: "awaiting-input", submittedAt: 0,
+      unconfirmedPaymentSubmissions: { 3: { rail: "cashu_p2pk", cashuRequestId: REQUEST_ID,
+        requestAmountMsats: 5000, amountMsats: 5000, btcRate: 100_000 } } });
+
+    await walletSubmissions({ forget: REQUEST_ID, yes: true });
+
+    expect(output.json.mock.calls.at(-1)?.[0]).toMatchObject({
+      status: "forgotten",
+      warning: expect.stringContaining("can become payable again"),
+      held_for: [{ job_id: "held-job", request_seq: 3 }],
+    });
+    // The job still holds the ask: no new payment is signed for it.
+    expect(loadJob("held-job")?.unconfirmedPaymentSubmissions?.[3]).toMatchObject({ cashuRequestId: REQUEST_ID });
   });
 });
 

@@ -19,6 +19,7 @@
  * coming back; forgetting them is the only way left to actually lose them.
  */
 
+import { heldCashuSubmissionAsks } from "../lib/job-store";
 import {
   DvmError,
   loadAgentWallet,
@@ -192,12 +193,19 @@ async function forgetSubmission(requestId: string, opts: WalletSubmissionsOption
   await abandonPendingSubmission({ requestId });
 
   const abandoned = view.at_risk ? view.amount_sats : 0;
+  const heldFor = heldCashuSubmissionAsks(new Set([requestId]));
+  // The job keeps holding the ask, so this CLI still signs nothing for it; but
+  // the journal can no longer prove the token was reclaimed or taken.
+  const warning = heldFor.length === 0 ? undefined
+    : `This token is the unconfirmed payment for an open charge on ${heldFor.map((ask) => `job ${ask.jobId}`).join(", ")}. ` +
+      "That charge stays held, but if the provider asks for it again it can become payable again, and the provider can still redeem the forgotten token.";
   if (opts.human) {
     info(
       view.at_risk
         ? `Forgot request ${requestId} — abandoned ${abandoned} sats paid to ${view.endpoint}.`
         : `Forgot request ${requestId} — no sats were spent (nothing to abandon).`
     );
+    if (warning) info(`Warning: ${warning}`);
     return;
   }
   json({
@@ -215,6 +223,7 @@ async function forgetSubmission(requestId: string, opts: WalletSubmissionsOption
           ? `Forgot the unconfirmed payment for request ${requestId}. ${abandoned} sats paid to ${view.endpoint} are abandoned — nothing was given up by forgetting it, since ${view.reclaim_error ?? "the mint's fee exceeds the value"}.`
           : `Forgot the unconfirmed payment for request ${requestId}. ${abandoned} sats paid to ${view.endpoint} are abandoned — the proofs were locked to the provider with no refund.`,
     hint: "The entry is gone from the journal. This cannot be undone.",
+    ...(warning ? { warning, held_for: heldFor.map((ask) => ({ job_id: ask.jobId, request_seq: ask.requestSeq })) } : {}),
   });
 }
 

@@ -36,7 +36,8 @@ import {
   createArtifactSaveSession,
 } from "../lib/save-artifact";
 import { parseDurationMs } from "../lib/duration";
-import { loadAnsweredYieldSeqs } from "../lib/yield-state";
+import { loadAnsweredYieldSeqs, settleRecordedPayments } from "../lib/yield-state";
+import { loadJob } from "../lib/job-store";
 import { waitForJob } from "../lib/wait-for-job";
 import { streamLoop } from "../lib/stream-loop";
 import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
@@ -75,9 +76,11 @@ async function messagesWithAccess(
     const answered = access.endpointOverridden ? new Set<number>() : loadAnsweredYieldSeqs(jobId);
     const action = computeNextAction(jobId, batch.filter((message) => !answered.has(message.seq)), undefined, access.endpointOverridden ? undefined : stored ?? undefined);
     const request = batch.findLast((message) => message.type === "payment-request");
-    if (action?.type === "pay" && request && !access.endpointOverridden &&
-        stored?.inFlightPaymentRequestSeqs?.includes(request.seq))
-      return { ...action, hint: paymentInFlightHint(jobId) };
+    const current = access.endpointOverridden ? null : loadJob(jobId);
+    if (action?.type === "pay" && request && current &&
+        (current.inFlightPaymentRequestSeqs?.includes(request.seq) || current.unconfirmedPaymentSubmissions?.[request.seq] ||
+          current.askPaymentBlocks?.[request.seq]))
+      return { ...action, hint: paymentInFlightHint(jobId, current, request.seq) };
     return action;
   }
 
@@ -140,7 +143,10 @@ async function messagesWithAccess(
       }
       throw err;
     }
-    if (!access.endpointOverridden) appendMessages(jobId, msgs);
+    if (!access.endpointOverridden) {
+      appendMessages(jobId, msgs);
+      await settleRecordedPayments(jobId);
+    }
     const newCursor = maxSeq(msgs, after);
     const providerStatus = await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken });
     if (!access.endpointOverridden) {

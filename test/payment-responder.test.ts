@@ -160,6 +160,10 @@ describe("mid-job payment rail selection", () => {
   });
 
   it.each(["auto", "explicit"] as const)("records %s approval on a successful forced x402 payment", async (approval) => {
+    const store = await vi.importActual<typeof import("../src/lib/job-store")>("../src/lib/job-store");
+    const jobId = `job-${approval}`;
+    store.saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, jobToken: "job-token" });
+    sdk.loadJob.mockImplementation(store.loadJob);
     sdk.tryX402Payment.mockResolvedValue({
       paymentHeader: "x402-proof",
       amountMsats: 12_000,
@@ -169,7 +173,7 @@ describe("mid-job payment rail selection", () => {
     const transport = fakeTransport();
 
     const result = await handlePaymentRequest(
-      "job-1",
+      jobId,
       request({
         x402: x402Offer,
       }),
@@ -180,11 +184,13 @@ describe("mid-job payment rail selection", () => {
     );
 
     expect(result).toMatchObject({ status: "paid", rail: "x402" });
-    expect(sdk.addPayment).toHaveBeenCalledWith("job-1", 12_000, { requestSeq: 3, approval });
+    expect(store.loadJob(jobId)).toMatchObject({ totalPaidMsats: 12_000, paymentsHonoured: 1,
+      paymentApprovals: [{ requestSeq: 3, approval }] });
+    expect(sdk.recordSpend).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ jobId: jobId, msats: 12_000 }));
     expect(sdk.loadAgentWallet).not.toHaveBeenCalled();
     expect(sdk.buildTempoCredential).not.toHaveBeenCalled();
     expect(transport.sendMessage).toHaveBeenCalledWith(
-      "job-1",
+      jobId,
       expect.objectContaining({
         content: expect.objectContaining({ x402_payment: "x402-proof" }),
       }),

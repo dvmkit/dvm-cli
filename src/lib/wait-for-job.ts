@@ -2,7 +2,7 @@ import { withJobPaymentLock } from "./payment-lock";
 import { DvmError, isAbortError, type Message } from "@dvmkit/sdk/internal";
 import { loadJob } from "./job-store";
 import { createMessageAppendSession, maxSeq } from "./messages";
-import { loadAnsweredYieldSeqs, answeredYieldSeqs, reconcilePaymentRequestHistory, JOB_READ_TIMEOUT_MS } from "./yield-state";
+import { loadAnsweredYieldSeqs, answeredYieldSeqs, reconcilePaymentRequestHistory, settleRecordedPayments, JOB_READ_TIMEOUT_MS } from "./yield-state";
 import { claimInboundPayments, withRefundNextAction } from "./refund-claim";
 import { isTerminalJobStatus, pollNextAction } from "./next-action";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "./stream-loop";
@@ -57,6 +57,8 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
       for (const message of tail) onMessage(message);
       if (opts.persistLocalState !== false) {
         messageAppendSession?.append(tail);
+        // A job can finish on a payment whose answer was lost; book it now.
+        await settleRecordedPayments(opts.jobId);
         result.refunds.push(...await claimInboundPayments(opts.jobId, tail));
       }
       result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
@@ -75,7 +77,7 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
           const messages = await opts.transport.getMessages(opts.jobId, 0, opts.provider, readOptions());
           assertOwned();
           for (const seq of loadJob(opts.jobId)?.inFlightPaymentRequestSeqs ?? []) {
-            try { reconcilePaymentRequestHistory(opts.jobId, seq, messages, snapshot.status, now); }
+            try { await reconcilePaymentRequestHistory(opts.jobId, seq, messages, snapshot.status, now); }
             catch (error) {
               if (!(error instanceof DvmError) || !["payment_settling", "payment_request_not_pending"].includes(error.code)) throw error;
               if (!loadJob(opts.jobId)?.inFlightPaymentRequestSeqs?.includes(seq)) continue;
@@ -96,6 +98,7 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
       }
       if (!history) break;
       messageAppendSession?.append(history);
+      if (opts.persistLocalState !== false) await settleRecordedPayments(opts.jobId);
       const answered = opts.persistLocalState === false ? new Set<number>() : loadAnsweredYieldSeqs(opts.jobId);
       for (const seq of answeredYieldSeqs(history)) answered.add(seq);
       const pending = history.findLast((msg: Message) => msg.from === "provider" &&

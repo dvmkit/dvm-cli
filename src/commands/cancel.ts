@@ -5,6 +5,7 @@ import {
 } from "../lib/output";
 import {
   type JobRecord,
+  clearAskPaymentBlocks,
   markJobTerminal,
 } from "../lib/job-store";
 
@@ -51,8 +52,10 @@ async function cancelWithAccess(
     opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true });
 
   // A piece-charging DVM charges the work in progress on a cancel; its receipt says how much.
+  // An accepted cancel can leave the ask open, so only a confirmed ending lifts its block.
   const { settlement, status } = await readEnding({ jobId, transport, ref, jobToken,
-    persistLocalState: !access.endpointOverridden, human: opts.human });
+    persistLocalState: !access.endpointOverridden, human: opts.human,
+    onTerminal: () => { if (!access.endpointOverridden) clearAskPaymentBlocks(jobId); } });
   transport.close();
 
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;

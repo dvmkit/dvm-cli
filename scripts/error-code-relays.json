@@ -524,7 +524,13 @@
     "path": [
       "error"
     ],
-    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+    "reason": "Code read from a remote JSON response, as a string or a nested structured code; local fallback branches are traced separately.",
+    "alsoPaths": [
+      [
+        "error",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/transport/https.ts",
@@ -533,7 +539,13 @@
     "path": [
       "error"
     ],
-    "reason": "Code read from a remote JSON response; local fallback branches are traced separately."
+    "reason": "Code read from a remote JSON response, as a string or a nested structured code; local fallback branches are traced separately.",
+    "alsoPaths": [
+      [
+        "error",
+        "code"
+      ]
+    ]
   },
   {
     "file": "lib/wallet-agent/spend.ts",

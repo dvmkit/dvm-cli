@@ -8,7 +8,7 @@ import {
   withJobTokenRedaction,
 } from "../lib/job-access";
 import { readEnding, retryWhilePaymentInProgress } from "../lib/job-ending";
-import { markJobTerminal } from "../lib/job-store";
+import { clearAskPaymentBlocks, markJobTerminal } from "../lib/job-store";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { info, withOutputWarnings } from "../lib/output";
 import { guidanceJobArg, providerJobJson } from "../lib/provider-output";
@@ -46,8 +46,11 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
   const ending = await readEnding({ jobId, transport, ref, jobToken,
     persistLocalState: !access.endpointOverridden, human: opts.human,
     onTerminal: (status) => {
-      if (!access.endpointOverridden && isTerminalJobStatus(status.status)) markJobTerminal(jobId, status.status,
-        opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true, callerDeclined: true });
+      if (!access.endpointOverridden && isTerminalJobStatus(status.status)) {
+        markJobTerminal(jobId, status.status,
+          opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true, callerDeclined: true });
+        clearAskPaymentBlocks(jobId);
+      }
     } });
   transport.close();
 
