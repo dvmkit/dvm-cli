@@ -166,6 +166,7 @@ import { progressNotice } from "../lib/progress-notice";
 import { quoteWithinDeclaredLimit } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
+import { recordRequestRefusal } from "../lib/request-refusal-store";
 import { createArtifactSaveSession } from "../lib/save-artifact";
 import { applyJsonSchemaDefaults, formatAppliedDefaults } from "../lib/schema-defaults";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "../lib/stream-loop";
@@ -278,10 +279,34 @@ export interface RequestOptions {
 }
 
 export async function request(opts: RequestOptions): Promise<void> {
-  return withOutputWarnings(() => requestWithWarnings(opts));
+  const stage = { intentReached: false };
+  return withOutputWarnings(async () => {
+    try {
+      await requestWithWarnings(opts, stage);
+    } catch (error) {
+      throw stage.intentReached ? error : markRefusedBeforeSend(opts.requestId, error);
+    }
+  });
 }
 
-async function requestWithWarnings(opts: RequestOptions): Promise<void> {
+/**
+ * A failure raised before the intent step ran before any submit or payment, so
+ * the request ID was not sent. Say so, and leave the record `request-result`
+ * reads, unless an intent already exists for the ID: then this was a rerun of a
+ * submitted request, whose original outcome stays unknown.
+ */
+function markRefusedBeforeSend(requestId: string | undefined, error: unknown): unknown {
+  if (!requestId || !(error instanceof DvmError)) return error;
+  const reason = error.data?.reason;
+  if (!recordRequestRefusal(requestId, { code: error.code, reason })) return error;
+  error.data = { ...error.data, submitted: false };
+  return error;
+}
+
+async function requestWithWarnings(
+  opts: RequestOptions,
+  stage: { intentReached: boolean }
+): Promise<void> {
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const timeout = opts.timeout ? Number(opts.timeout) * 1000 : 30000;
   // Validate the money cap before warmup or quote I/O. The wallet repeats the
@@ -738,6 +763,7 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
   // The ID the submitted job is recorded and reported under: the caller's own,
   // else the one generated for the draw leg that ends up accepted.
   let jobRequestId = opts.requestId ?? drawRequestId;
+  stage.intentReached = true;
   if (jobRequestId) {
     persistRequestIntent({
       requestId: jobRequestId,

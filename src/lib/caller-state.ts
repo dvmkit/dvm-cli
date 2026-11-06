@@ -37,6 +37,7 @@ import {
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import { basename, join } from "path";
 
+import { REQUEST_REFUSALS_DIR } from "./request-refusal-store";
 import { SUBMISSION_EVIDENCE_DIR } from "./submission-evidence";
 
 /**
@@ -185,6 +186,13 @@ const FILE_SPECS: readonly FileSpec[] = [
   {
     name: "request_intents",
     path: REQUEST_INTENTS_DIR,
+    json: false,
+    secret: false,
+    directory: true,
+  },
+  {
+    name: "request_refusals",
+    path: REQUEST_REFUSALS_DIR,
     json: false,
     secret: false,
     directory: true,

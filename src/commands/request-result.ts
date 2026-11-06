@@ -34,6 +34,7 @@ import { sameEndpoint } from "../lib/job-access";
 import { parseUpfrontPayment, parseUpfrontRailPayment } from "../lib/upfront-payment";
 import { isIdentityFailure, type ProviderIdentityError, withRequestResultRecovery } from "../lib/job-identity";
 import { loadRequestIntent, type RequestIntent } from "../lib/request-intent-store";
+import { loadRequestRefusal } from "../lib/request-refusal-store";
 import { requestRecoveryPath } from "../lib/request-recovery-path";
 import { recordLocalJobCollision, recordSubmissionEvidence } from "../lib/submission-evidence";
 import { bookRecoveredSubmissions } from "../lib/wallet-agent/recovery-submissions";
@@ -59,11 +60,9 @@ export async function requestResult(
   }
   const intent = loadRequestIntent(requestId);
   if (!intent) {
-    throw new DvmError(
-      "request_not_found",
-      `No local intent exists for request ${requestId}.`,
-      "The outcome is unknown. Do not submit or pay for a replacement; restore the original caller state and retry.",
-      { request_id: requestId, status: "unknown" }
+    throw requestNotFound(
+      requestId,
+      "The outcome is unknown. Do not submit or pay for a replacement; restore the original caller state and retry."
     );
   }
   const signer = findSigningIdentityByPubkey(intent.callerPubkey);
@@ -239,6 +238,36 @@ export async function requestResult(
             hint: "Recovered the original job; check it for updates",
           },
   });
+}
+
+/**
+ * The answer for an ID with no saved intent: not submitted when this CLI
+ * recorded refusing it before sending, otherwise unknown. Callers must have
+ * read the intent first; a real intent always takes precedence.
+ */
+export function requestNotFound(requestId: string, unknownHint: string): DvmError {
+  const refusal = loadRequestRefusal(requestId);
+  if (!refusal) {
+    return new DvmError(
+      "request_not_found",
+      `No local intent exists for request ${requestId}.`,
+      unknownHint,
+      { request_id: requestId, status: "unknown" }
+    );
+  }
+  return new DvmError(
+    "request_not_submitted",
+    `Request ${requestId} was refused locally before it was sent.`,
+    "No job or payment was sent for this request id. Retrying the same approved request is safe.",
+    {
+      request_id: requestId,
+      status: "not_submitted",
+      submitted: false,
+      refusal_code: refusal.code,
+      ...(refusal.reason ? { refusal_reason: refusal.reason } : {}),
+      refused_at: new Date(refusal.refusedAt).toISOString(),
+    }
+  );
 }
 
 /** Re-sign a persisted secret-free request body with its original caller identity. */
