@@ -7,6 +7,23 @@
 * Define an additive JSON contract for core job actions, recovery identifiers and states, and existing recovery commands in the bundled recovery guide. Pay and refund `amount_msats` remain provisional; unknown action types require human review.
 * Remove the never-emitted `approve` action declaration. Pre-1.0 breaking contract changes require migration notes and a minor version bump.
 
+## [0.15.0](https://github.com/dvmkit/dvm-cli/compare/v0.14.0...v0.15.0) (2026-11-06)
+
+
+### Features
+
+* **credit:** exempt card top-ups from the first-contact trust cap ([8d01b54](https://github.com/dvmkit/dvm-cli/commit/8d01b547ea82df18c4f8e3ccf6c8bf5176cdde44))
+* enforce CLI error-code compatibility ([0a82184](https://github.com/dvmkit/dvm-cli/commit/0a821844266cfdf4f5f1fce1155886530d02db72))
+* stabilize core job recovery contracts ([1aef1a8](https://github.com/dvmkit/dvm-cli/commit/1aef1a8105a983acb9c1cc101639acffbdfa6f0b))
+
+
+### Bug Fixes
+
+* **credit:** show card funding minimum and approval guidance ([654a828](https://github.com/dvmkit/dvm-cli/commit/654a82828bf17299601b8c242196762f673bd568))
+* **credit:** stop false funding warnings and explain the real ones ([#60](https://github.com/dvmkit/dvm-cli/issues/60)) ([7a11f39](https://github.com/dvmkit/dvm-cli/commit/7a11f39f0fe106c4a283e1781acbca8209e4aa13))
+* **discovery:** preserve job access after timeouts ([ef4e7cc](https://github.com/dvmkit/dvm-cli/commit/ef4e7ccc1cf9f5cfb8bd93d5e2a8452345a8eb97))
+* **receipts:** show charges in fiat and explain every unlabelled amount ([#59](https://github.com/dvmkit/dvm-cli/issues/59)) ([4633aa3](https://github.com/dvmkit/dvm-cli/commit/4633aa349242d67a6ff0363c8b8645e10a37b575))
+
 ## [0.14.0](https://github.com/dvmkit/dvm-cli/compare/v0.13.0...v0.14.0) (2026-11-03)
 
 
