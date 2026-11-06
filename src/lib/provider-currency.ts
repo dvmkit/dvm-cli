@@ -5,7 +5,8 @@ import type { JobReceipt, JobStatus, Message, ProviderRef, Transport } from "@dv
  * local job record (portable access). The receipt names no currency, so take
  * the provider's own: the job's upfront draw, its latest ask, then `/v1/info`.
  * Read only when the receipt carries a settlement; a failed read returns
- * nothing, and the display falls back to micro-units.
+ * nothing, and the display falls back to the amount labelled "(currency not
+ * recorded)" with a hint explaining why.
  */
 export async function providerCurrency(args: {
   receipt?: JobReceipt;

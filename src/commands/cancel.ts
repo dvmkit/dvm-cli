@@ -15,6 +15,7 @@ import {
   withJobTokenRedaction,
 } from "../lib/job-access";
 import { cancelledDisplay, readEnding, retryWhilePaymentInProgress } from "../lib/job-ending";
+import { settlementCurrencyHint } from "../lib/piece-settlement";
 import { isTerminalJobStatus } from "../lib/next-action";
 import { loadMessages } from "../lib/messages";
 import { progressNotice } from "../lib/progress-notice";
@@ -60,10 +61,13 @@ async function cancelWithAccess(
   const display = settlement ? cancelledDisplay(settlement)
     : receiptPending ? `Stopped. Its receipt is not available yet; \`dvm status ${guidanceJobArg(jobId)}\` shows what was charged once it is.`
     : undefined;
+  // The labelled "(currency not recorded)" amount in `display` needs its reason beside it.
+  const hint = settlementCurrencyHint(settlement, ref.endpoint);
 
   if (opts.human) {
     info(`Job ${jobId}${identifier ? ` [${identifier}]` : ""} cancelled.`);
     if (display) info(display);
+    if (hint) info(`  ${hint}`);
   } else {
     json({
       jobId,
@@ -72,6 +76,7 @@ async function cancelWithAccess(
       ...(opts.reason ? { reason: opts.reason } : {}),
       ...(settlement ? { settlement } : {}),
       ...(display ? { display } : {}),
+      ...(hint ? { hint } : {}),
       next_action: null,
     });
   }

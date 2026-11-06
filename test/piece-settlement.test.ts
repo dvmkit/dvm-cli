@@ -126,6 +126,12 @@ describe("piece settlement ceiling", () => {
       .toMatchObject({ ceiling_micro: 360_000, overcharged: false });
   });
 
+  it("names the first recorded currency the CLI can show, past a code it cannot", () => {
+    const usdc = { ...askOne, content: { ...askOne.content, credit: { amount_micro: 200_000, currency: "USDC" } } } as Message;
+    expect(pieceSettlement(receipt("completed", 360_000, honest), { messages: [usdc], currency: "usd" }))
+      .toMatchObject({ currency: "usd", display: expect.stringContaining("Charged $0.36 USD") });
+  });
+
   it("checks only the receipt's own pieces when no message log is supplied", () => {
     expect(pieceSettlement(receipt("completed", 360_000, honest), { job: job() }))
       .toMatchObject({ ceiling_micro: 360_000, overcharged: false });

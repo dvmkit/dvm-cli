@@ -15,7 +15,7 @@ vi.mock("../job-store", () => ({ loadJob: vi.fn(() => null), updateJob: vi.fn() 
 
 import { loadJob, updateJob } from "../job-store";
 import { info } from "../output";
-import { captureFundingReceipt, captureJobReceipt, fetchMissingJobReceipt, receiptJsonFields, replayStoredReceipt } from "../receipt-capture";
+import { captureFundingReceipt, captureJobReceipt, fetchMissingJobReceipt, receiptJsonFields, renderReceiptHuman, replayStoredReceipt } from "../receipt-capture";
 import { appendFundingReceipt, appendReceipt } from "@dvmkit/sdk/internal";
 
 const DVM = attestedDvm("wordcount");
@@ -106,6 +106,30 @@ describe("captureJobReceipt", () => {
 
     expect(captureJobReceipt("job-a7571b-1", DVM.sign()).status).toBe("verified");
     expect(vi.mocked(info).mock.calls.flat().join("\n")).toContain("could not store job receipt");
+  });
+});
+
+describe("piece charges with no recorded currency", () => {
+  // Charges $0.50 of $0.50 held, though its own finished pieces add up to $0.40.
+  const pieceReceipt = () => DVM.sign({ job_id: "job-a7571b-1", settlement: { held: 500_000, charged: 500_000, released: 0,
+    pieces: [{ amount: 400_000, charged: 400_000, paid_seq: 0, state: "finished" }] } } as never);
+
+  it("labels the capture's amount and carries the reason into JSON and --human output", () => {
+    const capture = captureJobReceipt("job-a7571b-1", pieceReceipt());
+    expect(capture.display).toContain("Charged 0.50 (currency not recorded) for");
+    expect(capture.currencyHint).toContain("does not name the currency");
+    expect(receiptJsonFields(capture)).toMatchObject({ receipt_hint: capture.currencyHint });
+    renderReceiptHuman(capture);
+    expect(vi.mocked(info)).toHaveBeenCalledWith(`  ${capture.currencyHint}`);
+  });
+
+  it("explains the labelled amounts in an overcharge warning", () => {
+    vi.mocked(loadJob).mockReturnValue(jobRecord());
+    captureJobReceipt("job-a7571b-1", pieceReceipt());
+    const warning = vi.mocked(info).mock.calls.map(([line]) => String(line)).find((line) => line.startsWith("Warning: the signed receipt"));
+    expect(warning).toContain("charges 0.50 (currency not recorded)");
+    expect(warning).toContain("does not name the currency");
+    expect(warning).toContain("dvm describe https://wordcount.dvmkit.ai");
   });
 });
 

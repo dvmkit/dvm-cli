@@ -1,4 +1,5 @@
 import { DvmError } from "@dvmkit/sdk/internal";
+import { settlementCurrencyHint } from "../lib/piece-settlement";
 import { formatIdentifier } from "../lib/dvm-identifier";
 import {
   type JobAccessOptions,
@@ -69,8 +70,11 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
       ? `Declined; the job has ended. ${settlement.display}`
       : `Declined; the job has ended. Its receipt is not available yet; \`dvm status ${job}\` shows the final charge once it is.`;
 
+  const hint = settlementCurrencyHint(settlement, ref.endpoint);
+
   if (opts.human) {
     info(`Job ${jobId}${identifier ? ` [${identifier}]` : ""}: ${display}`);
+    if (hint) info(`  ${hint}`);
     return;
   }
   json({
@@ -81,6 +85,7 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
     ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
     ...(settlement ? { settlement } : {}),
     display,
+    ...(hint ? { hint } : {}),
     next_action: observed === undefined ? pollNextAction(jobId, display) : null,
   });
 }

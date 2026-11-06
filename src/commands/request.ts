@@ -71,6 +71,7 @@ import {
   receiptJsonFields,
   receiptTrustFields,
   renderReceiptHuman,
+  renderSettlementHuman,
 } from "../lib/receipt-capture";
 import {
   type Config,
@@ -1090,10 +1091,7 @@ async function requestWithWarnings(opts: RequestOptions): Promise<void> {
           if (hint) info(`📎 ${hint}`);
         }
         if (captured) renderReceiptHuman(captured, receipt.jobId);
-        else {
-          const { settlement } = terminalSettlementFields(receipt.jobId);
-          if (settlement) info(settlement.display);
-        }
+        else renderSettlementHuman(terminalSettlementFields(receipt.jobId));
         finalizeProgressLine();
         echoTraceIdHuman();
         printNextActionHuman(result.nextAction, { refunds: result.refunds, terminal: isTerminalJobStatus(receipt.status) || !!streamTerminalStatus(result.messages) });
@@ -4053,10 +4051,7 @@ async function streamAfterPayment(args: {
       if (hint) info(`📎 ${hint}`);
     }
     if (captured) renderReceiptHuman(captured, jobId);
-    else {
-      const { settlement } = terminalSettlementFields(jobId);
-      if (settlement) info(settlement.display);
-    }
+    else renderSettlementHuman(terminalSettlementFields(jobId));
     finalizeProgressLine();
     printNextActionHuman(result.nextAction, { refunds: result.refunds, terminal: !!streamTerminalStatus(result.messages) });
   } else {

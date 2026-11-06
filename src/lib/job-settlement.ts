@@ -3,7 +3,7 @@ import { formatAmount, formatPaymentAmount, formatSats } from "./currency";
 import { hasUnknownUpfrontCredit, hasUnknownUpfrontRail, loadJob, type JobRecord } from "./job-store";
 import { loadMessages } from "./messages";
 import { isTerminalJobStatus } from "./next-action";
-import { type PieceContext, pieceSettlement } from "./piece-settlement";
+import { type PieceContext, pieceSettlement, settlementCurrencyHint } from "./piece-settlement";
 
 export interface JobSettlement {
   status: "settled" | "released" | "refunded" | "free" | "pending" | "unknown";
@@ -137,16 +137,24 @@ export function terminalSettlementFields(jobId: string, options: {
   persistLocalState?: boolean;
   /** The provider's credit currency; see {@link PieceContext.currency}. */
   currency?: string;
-} = {}): { settlement?: JobSettlement } {
+} = {}): SettlementFields {
   const stored = options.persistLocalState === false ? null : loadJob(jobId);
   const status = options.status ?? stored?.status ?? options.receipt?.outcome;
   if (!status || !isTerminalJobStatus(status)) return {};
   const job: JobRecord = stored ? { ...stored, status } : { id: jobId, endpoint: "", submittedAt: 0, status };
   // Override reads must not borrow another endpoint's refunds or payment totals.
-  return { settlement: options.persistLocalState === false
+  const settlement = options.persistLocalState === false
     ? options.receipt && options.receipt.outcome === status
       ? receiptSettlement(options.receipt, verifyJobReceipt({ receipt: options.receipt, expectedJobId: jobId }).status,
         undefined, { currency: options.currency })
       : unknownSettlement(null)
-    : jobSettlement(job, options.receipt) };
+    : jobSettlement(job, options.receipt);
+  const hint = settlementCurrencyHint(settlement, stored?.endpoint || undefined);
+  return { settlement, ...(hint ? { settlement_hint: hint } : {}) };
+}
+
+export interface SettlementFields {
+  settlement?: JobSettlement;
+  /** Why `settlement.display` carries the "(currency not recorded)" label, when it does. */
+  settlement_hint?: string;
 }

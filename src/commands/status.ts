@@ -8,7 +8,6 @@ import { createArtifactSaveSession } from "../lib/save-artifact";
 import { type PaymentPolicyContext, computeNextAction, isTerminalJobStatus, type NextAction, pollNextAction } from "../lib/next-action";
 import { buildCompletionHintFields, completionSnapshot, type JobCompletion, nextStepHint } from "../lib/completion-hints";
 import {
-  getLastKnownBtcRate,
   type JobStatus,
   type Message,
   type ProviderRef,
@@ -23,6 +22,7 @@ import {
   receiptJsonFields,
   renderReceiptHuman,
   replayStoredReceipt,
+  toCapture,
 } from "../lib/receipt-capture";
 import {
   getOutputTraceId,
@@ -35,7 +35,6 @@ import {
   updateJob,
 } from "../lib/job-store";
 import {
-  receiptDisplay,
   receiptHint,
 } from "../lib/receipt-verify";
 
@@ -194,7 +193,7 @@ async function statusWithAccess(
     receipt =
       stored && !access.endpointOverridden
         ? captureTransportReceipt(jobId, result)
-        : transientReceiptCapture(jobId, result, currency);
+        : transientReceiptCapture(jobId, result, ref.endpoint, currency);
     if (stored && !access.endpointOverridden) {
       await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
     }
@@ -234,6 +233,7 @@ async function statusWithAccess(
 function transientReceiptCapture(
   jobId: string,
   response: Pick<JobStatus, "receipt" | "receiptParseError">,
+  endpoint: string,
   currency?: string
 ): ReceiptCapture {
   if (response.receiptParseError) {
@@ -247,18 +247,8 @@ function transientReceiptCapture(
   if (!response.receipt) return { status: "absent", display: receiptHint("absent") };
 
   const result = verifyJobReceipt({ receipt: response.receipt, expectedJobId: jobId });
-  return {
-    status: result.status,
-    receipt: response.receipt,
-    checks: result.checks,
-    ...(result.reason ? { reason: result.reason } : {}),
-    display: receiptDisplay(
-      response.receipt,
-      result.status,
-      getLastKnownBtcRate()?.rate ?? 0,
-      currency
-    ),
-  };
+  // An override read must not borrow another endpoint's local record.
+  return toCapture(response.receipt, result, { currency }, endpoint);
 }
 
 /**
@@ -309,6 +299,8 @@ function renderStatus(
     if (spend) renderSpendHuman(spend, info);
     else if (settlement.settlement) info(settlement.settlement.display);
     if (receipt) renderReceiptHuman(receipt);
+    // The receipt line already explained the same unlabelled amounts.
+    if (settlement.settlement_hint && !receipt?.currencyHint) info(`  ${settlement.settlement_hint}`);
     printNextActionHuman(nextAction);
     return;
   }
@@ -331,6 +323,7 @@ function renderStatus(
     // read as "this DVM doesn't issue receipts" rather than "not yet".
     ...(receipt ? receiptJsonFields(receipt) : {}),
     ...settlement,
+    ...(receipt?.currencyHint ? { settlement_hint: undefined } : {}),
     // `dvm status` is a job-terminal emission for `--no-stream`
     // jobs, so it drains the deferred-notice sinks like the request terminals
     // do. Both spread blind and are absent when nothing was stashed.

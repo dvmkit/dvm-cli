@@ -6,7 +6,8 @@ import { formatUsd, msatsToUsd } from "@dvmkit/sdk/internal";
 import { type JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
 import { receiptSettlement } from "./job-settlement";
 import { loadJob } from "./job-store";
-import { formatMicro } from "./piece-settlement";
+import { loadMessages } from "./messages";
+import { formatMicro, type PieceContext, unknownCurrencyHint } from "./piece-settlement";
 
 /**
  * Pre-rendered line an intermediary agent can relay verbatim about a set of
@@ -61,23 +62,49 @@ export function drainReceiptsHint(status: ReceiptVerification): string {
  * `rate` is the BTC/USD spot price. Pass 0 (or omit) when no rate is available
  * the line degrades to sats rather than claiming a dollar figure it can't
  * support.
+ *
+ * `context` names the currency a piece settlement is denominated in; it
+ * defaults to the local job record and message log ({@link receiptPieceContext}).
  */
 export function receiptDisplay(
   receipt: SignedJobReceipt,
   status: ReceiptVerification,
   rate = 0,
-  currency?: string
+  context: PieceContext = receiptPieceContext(receipt)
 ): string {
   const what = `${receipt.dvm}/${receipt.capability} (DVM ID ${receipt.dvm_id})`;
   const when = receiptIssuedAtIso(receipt)?.slice(0, 10);
-  // The local record names the currency a piece settlement is denominated in.
-  const settlement = receiptSettlement(receipt, status, rate, { job: loadJob(receipt.job_id), currency });
+  const settlement = receiptSettlement(receipt, status, rate, context);
   const payment = settlement.charged_micro !== undefined
     ? `Charged ${formatMicro(settlement.charged_micro, settlement.currency ?? null)}`
     : settlement.status === "settled" ? `Settled ${formatPaid(receipt.paid.msats, rate)}`
     : settlement.status === "free" ? "free job"
     : settlement.display.replace(/\.$/, "");
   return `${VERDICT_PREFIX[status]}: ${payment} for ${what}, ${receipt.outcome}${when ? ` ${when}` : ""}.`;
+}
+
+/**
+ * The local job record and message log, where a piece settlement's currency is
+ * recorded: the receipt itself names none. `currency` is the provider's credit
+ * currency when the caller read it elsewhere.
+ */
+export function receiptPieceContext(receipt: SignedJobReceipt, currency?: string): PieceContext {
+  const job = loadJob(receipt.job_id);
+  return { job, messages: job ? loadMessages(receipt.job_id) : undefined, ...(currency ? { currency } : {}) };
+}
+
+/**
+ * The `hint` for a piece-charged receipt whose currency no record names, or
+ * `undefined` when its amounts carry a currency.
+ */
+export function receiptCurrencyHint(
+  receipt: SignedJobReceipt,
+  status: ReceiptVerification,
+  context: PieceContext,
+  endpoint?: string
+): string | undefined {
+  const settlement = receiptSettlement(receipt, status, undefined, context);
+  return settlement.charged_micro !== undefined && !settlement.currency ? unknownCurrencyHint(endpoint) : undefined;
 }
 
 /**

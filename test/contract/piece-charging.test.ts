@@ -256,6 +256,26 @@ it("cancels at once, waits out a payment being verified, and names the work in p
   expect(human.stderr).toContain("Charged $0.36 USD of $0.36 USD held, $0.00 USD released.");
 });
 
+it("explains a cancel's amounts when no local record names their currency", async () => {
+  // No ask, payment, upfront record or local credit names the credit's currency.
+  seed("processing", [], { upfrontPayment: undefined });
+  endingReceipt = () => settled("cancelled", UPFRONT, [{ amount: UPFRONT, charged: UPFRONT, paid_seq: 0, state: "stopped" }]);
+  const result = await run("cancel");
+  expect(result.code).toBe(0);
+  expect(result.output.display).toBe("Stopped. The 0.16 (currency not recorded) paid for the work in progress is not refunded. " +
+    "Charged 0.16 (currency not recorded) of 0.36 (currency not recorded) held, 0.20 (currency not recorded) released.");
+  expect(result.output.hint).toContain("does not name the currency");
+  expect(result.output.hint).toContain(`dvm describe ${endpoint}`);
+  const human = await run("status", ["--human"]);
+  expect(human.stderr).toContain("Charged 0.16 (currency not recorded)");
+  expect(human.stderr.split("does not name the currency")).toHaveLength(2);
+  const listed = await run("messages");
+  expect(listed.output.settlement_hint).toContain("does not name the currency");
+  const humanMessages = await run("messages", ["--no-stream", "--human"]);
+  expect(humanMessages.stderr).toContain("Charged 0.16 (currency not recorded)");
+  expect(humanMessages.stderr).toContain("does not name the currency");
+});
+
 it("stops resending a cancel after its bounded attempts", async () => {
   history = [askOne, payOne] as Message[];
   seed("processing", history);

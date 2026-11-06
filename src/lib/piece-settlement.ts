@@ -112,9 +112,36 @@ export function overchargeClause(basis: CeilingBasis, ceiling: string): string {
       : `This charge exceeds what the receipt's own pieces add up to (${ceiling}).`;
 }
 
-/** Money in the credit's currency; bare micro-units only when no record names it. */
+/**
+ * Money in the credit's currency. When no record names it, whole units of the
+ * unnamed currency, labelled as such: relayed text must never read as a raw
+ * protocol figure. Pair that label with {@link unknownCurrencyHint}.
+ */
 export function formatMicro(micro: number, currency: string | null): string {
-  return currency ? formatFiat(micro / 1_000_000, currency) : `${micro.toLocaleString("en-US")} micro-units`;
+  if (currency) return formatFiat(micro / 1_000_000, currency);
+  const units = (micro / 1_000_000).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6 });
+  return `${units} ${UNKNOWN_CURRENCY_LABEL}`;
+}
+
+export const UNKNOWN_CURRENCY_LABEL = "(currency not recorded)";
+
+/**
+ * The hint for a piece settlement whose amounts carry {@link UNKNOWN_CURRENCY_LABEL},
+ * or `undefined` when they name a currency.
+ */
+export function settlementCurrencyHint(
+  settlement: { charged_micro?: number; currency?: string | null } | undefined,
+  endpoint?: string
+): string | undefined {
+  return settlement?.charged_micro !== undefined && !settlement.currency ? unknownCurrencyHint(endpoint) : undefined;
+}
+
+/** Why an amount carries {@link UNKNOWN_CURRENCY_LABEL}, and how to name the currency. */
+export function unknownCurrencyHint(endpoint?: string): string {
+  const describe = endpoint ? `'dvm describe ${endpoint}'` : "'dvm describe <endpoint>'";
+  return "This receipt does not name the currency it was charged in, and no local record of the job's prices or of its credit names one this CLI can show. " +
+    "The amounts are in the provider's credit currency: for a US-dollar credit, 2.06 means $2.06. " +
+    `Run ${describe} to see which currency this DVM's credits use.`;
 }
 
 function paidCeiling(
@@ -205,8 +232,8 @@ function settlementCurrency(receipt: JobReceipt, job: JobRecord | undefined, mes
   candidates.push(hint);
   const creditId = receipt.credit?.credit_id;
   if (creditId) candidates.push(safeCredits().find((credit) => credit.creditId === creditId)?.currency);
-  const found = candidates.find((currency) => typeof currency === "string" && currency.length > 0);
-  return found && /^[a-z]{3}$/i.test(found) ? found.toLowerCase() : null;
+  const found = candidates.find((currency) => typeof currency === "string" && /^[a-z]{3}$/i.test(currency));
+  return found ? found.toLowerCase() : null;
 }
 
 function safeCredits(): ReturnType<typeof listCredits> {

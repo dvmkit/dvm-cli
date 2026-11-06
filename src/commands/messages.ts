@@ -1,4 +1,4 @@
-import { observedSettlementFields } from "../lib/receipt-capture";
+import { observedSettlementFields, renderSettlementHuman } from "../lib/receipt-capture";
 import { providerCurrency } from "../lib/provider-currency";
 import { isCallerMessage } from "../lib/message-ownership";
 import { providerFields, providerJobJson } from "../lib/provider-output";
@@ -157,7 +157,7 @@ async function messagesWithAccess(
     transport.close();
 
     if (opts.human) {
-      if (settlement.settlement) info(settlement.settlement.display);
+      renderSettlementHuman(settlement);
       info(String(content.content_hint));
       if (msgs.length === 0) {
         info("No new messages.");
@@ -237,7 +237,7 @@ async function messagesWithAccess(
   transport.close();
 
   if (opts.human) {
-    if (settlement.settlement) info(settlement.settlement.display);
+    renderSettlementHuman(settlement);
     info(String(content.content_hint));
     if (result.messages.length === 0) {
       info("No new messages.");
