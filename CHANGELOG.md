@@ -7,6 +7,19 @@
 * Define an additive JSON contract for core job actions, recovery identifiers and states, and existing recovery commands in the bundled recovery guide. Pay and refund `amount_msats` remain provisional; unknown action types require human review.
 * Remove the never-emitted `approve` action declaration. Pre-1.0 breaking contract changes require migration notes and a minor version bump.
 
+## [0.15.2](https://github.com/dvmkit/dvm-cli/compare/v0.15.1...v0.15.2) (2026-11-07)
+
+
+### Bug Fixes
+
+* reconcile job read actions with local payment state ([cc1298a](https://github.com/dvmkit/dvm-cli/commit/cc1298a0a65c7e64821963889ab646258fbc6ead))
+* reflect credit posture in drawability reports ([29c0ab8](https://github.com/dvmkit/dvm-cli/commit/29c0ab85d24181dd7b6b88c28afb22c31a1cebe2))
+* report live implicit balances as released credit ([633ec55](https://github.com/dvmkit/dvm-cli/commit/633ec55b0d3a72f55aeef672653d7ca0e3f9f87c))
+* **request:** preserve definitive refusals with request IDs ([d845b0d](https://github.com/dvmkit/dvm-cli/commit/d845b0d9a72848560b0b90859170284d52bfcdd4))
+* **request:** report requests refused before sending as not submitted ([fa53244](https://github.com/dvmkit/dvm-cli/commit/fa532445ea26bd61b78f24d1c3a57a2e261b0630))
+* surface finished artifacts on ended jobs ([b7a933a](https://github.com/dvmkit/dvm-cli/commit/b7a933ad939178d47386d6d335c6d3d8469c86cc))
+* **wallet:** persist reclaim swap outputs before the mint call ([c07d34e](https://github.com/dvmkit/dvm-cli/commit/c07d34e67d1ae8a913d9ecaa2a22999973559fa8))
+
 ## [0.15.1](https://github.com/dvmkit/dvm-cli/compare/v0.15.0...v0.15.1) (2026-11-06)
 
 
