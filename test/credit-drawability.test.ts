@@ -54,6 +54,140 @@ function configure(mode: "off" | "suggest" | "auto", scope: "endpoint" | "alias"
 
 function output() { return seams.json.mock.calls.at(-1)![0]; }
 
+function releasedCredit(overrides: Partial<StoredImplicitCredit> = {}): StoredImplicitCredit {
+  return {
+    endpoint, dvmId: identity.dvmId, attestedBuilderPubkey: identity.builderPubkey,
+    callerPubkey: signer.pubkey, creditId: "imp:released", currency: "usd",
+    remainingMicro: 125_000, ledgerSeq: 1, expiryMs: expiry, status: "active",
+    releasedByJobId: "failed-job", releasedAt: 1, updatedAt: 1, ...overrides,
+  };
+}
+
+function storeReleased(implicitCredits: StoredImplicitCredit[], keepPrepaid = false): void {
+  const store = JSON.parse(readFileSync(join(root, "credits.json"), "utf8"));
+  store.implicitCredits = implicitCredits;
+  if (!keepPrepaid) store.credits = [];
+  writeFileSync(join(root, "credits.json"), JSON.stringify(store));
+}
+
+const liveReleased: CreditWire = {
+  ...primary, credit_id: "imp:released", balance_micro: 100_000, remaining_micro: 100_000,
+  ledger_seq: 2, expiry_ms: expiry - 60_000, drainable: false,
+};
+
+describe("server-returned released credit", () => {
+  it.each(["suggest", "auto", "off"] as const)("reports released value exactly once under %s", async (mode) => {
+    const config = configure(mode, "alias");
+    storeReleased([releasedCredit()]);
+    const before = readFileSync(join(root, "credits.json"), "utf8");
+    seams.credit.mockResolvedValue({ credit: liveReleased, credits: [liveReleased] });
+
+    creditList({});
+    expect(output().implicit_credits[0]).toMatchObject({ kind: "implicit", tracked: true,
+      remaining_micro: 125_000, drawable: mode !== "off" });
+    await creditBalance(endpoint, {});
+    const result = output();
+    expect(result.count).toBe(1);
+    expect(result.credits[0]).toMatchObject({ kind: "implicit", credit_id: "imp:released",
+      tracked: true, drawable: mode !== "off", drainable: false, remaining_micro: 100_000,
+      ledger_seq: 2, expiry_ms: expiry - 60_000 });
+    expect(result.credits[0]).not.toHaveProperty("drain_command");
+    expect(result.credits[0].display).toMatch(/\$0\.10.*released/i);
+    expect(result.credits[0].display).not.toMatch(/sibling|reclaimable/i);
+    if (mode === "off") {
+      expect(result.credits[0]).toMatchObject({ draw_blocked_reason: "posture_off" });
+      expect(result.credits[0].display).toMatch(/held.*switched off/i);
+    } else {
+      expect(result.credits[0]).not.toHaveProperty("draw_blocked_reason");
+      expect(result.credits[0].display).toMatch(/next eligible request.*automatically/i);
+    }
+    expect(result.totals_by_currency).toEqual([expect.objectContaining({ currency: "usd",
+      tracked_count: 1, sibling_count: 0, drawable_micro: mode === "off" ? 0 : 100_000,
+      sibling_spendable_micro: 0, spendable_micro: 100_000,
+      ...(mode === "off" ? { posture_blocked_micro: 100_000 } : {}),
+    })]);
+    expect(readFileSync(join(root, "credits.json"), "utf8")).toBe(before);
+    expect(readFileSync(join(root, "config.json"), "utf8")).toBe(config);
+
+    await creditBalance(endpoint, { human: true });
+    const human = seams.info.mock.calls.flat().join("\n");
+    expect(human).toMatch(/\$0\.10.*released/i);
+    expect(human).toMatch(mode === "off" ? /held.*switched off/i : /next eligible request.*automatically/i);
+  });
+
+  it.each([undefined, "held-credit", "imp:released"])(
+    "keeps released value separate from prepaid siblings and other currencies (selection: %s)", async (creditId) => {
+    configure("auto");
+    storeReleased([releasedCredit(), releasedCredit({ creditId: "imp:eur", currency: "eur", remainingMicro: 300_000 })], true);
+    seams.credit.mockResolvedValue({ credit: primary, credits: [primary, sibling, liveReleased,
+      { ...liveReleased, credit_id: "imp:eur", currency: "eur", balance_micro: 200_000, remaining_micro: 200_000 }],
+    });
+    if (creditId) seams.credit.mockResolvedValueOnce({ credit: creditId === "held-credit" ? primary : liveReleased });
+    await creditBalance(endpoint, { creditId });
+    const result = output();
+    expect(result.count).toBe(4);
+    expect(result.totals_by_currency).toEqual([
+      expect.objectContaining({ currency: "eur", tracked_count: 1, sibling_count: 0,
+        drawable_micro: 200_000, sibling_spendable_micro: 0, spendable_micro: 200_000 }),
+      expect.objectContaining({ currency: "usd", tracked_count: 2, sibling_count: 1,
+        drawable_micro: 850_000, sibling_spendable_micro: 250_000, spendable_micro: 1_100_000 }),
+    ]);
+    expect(result.credits.find((row: CreditWire) => row.credit_id === "sibling")).toMatchObject({
+      drawable: false, drain_command: expect.stringContaining("--credit-id sibling"),
+    });
+    const store = JSON.parse(readFileSync(join(root, "credits.json"), "utf8"));
+    expect(store.credits).toHaveLength(1);
+    expect(store.credits[0].creditId).toBe("held-credit");
+    expect(store.credits[0].siblingCredits.map((row: { creditId: string }) => row.creditId)).toEqual(["sibling"]);
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["another caller", { callerPubkey: "02".repeat(32) }],
+    ["another DVM", { dvmId: "replacement-dvm" }],
+    ["another builder", { attestedBuilderPubkey: "02".repeat(32) }],
+    ["lost", { status: "lost" }],
+    ["expired locally", { expiryMs: 1 }],
+    ["exhausted locally", { remainingMicro: 0 }],
+  ] satisfies [string, Partial<StoredImplicitCredit> | undefined][])(
+    "requires eligible local release evidence (%s)", async (_label, overrides) => {
+      configure("auto");
+      storeReleased(overrides ? [releasedCredit(overrides)] : []);
+      seams.credit.mockResolvedValue({ credits: [{ ...liveReleased, drainable: true }] });
+      await creditBalance(endpoint, {});
+      expect(output().credits).toHaveLength(1);
+      expect(output().credits[0]).toMatchObject({ kind: "implicit", drawable: false,
+        remaining_micro: 100_000, drainable: false });
+      expect(output().credits[0]).not.toHaveProperty("drain_command");
+      expect(output().credits[0].display).not.toMatch(/sibling|reclaimable|next eligible request/i);
+      expect(output().totals_by_currency[0]).toMatchObject({ drawable_micro: 0,
+        sibling_spendable_micro: 0, spendable_micro: 0 });
+      expect(JSON.parse(readFileSync(join(root, "credits.json"), "utf8")).credits).toEqual([]);
+    }
+  );
+
+  it.each([
+    ["expired", { expired: true }],
+    ["unbacked", { status: "unbacked" }],
+    ["pending", { reconciliation_pending: true }],
+    ["exhausted", { remaining_micro: 0 }],
+  ] satisfies [string, Partial<CreditWire>][])("respects unavailable server state (%s)", async (_label, overrides) => {
+    configure("auto");
+    storeReleased([releasedCredit()]);
+    const before = readFileSync(join(root, "credits.json"), "utf8");
+    seams.credit.mockResolvedValue({ credits: [{ ...liveReleased, ...overrides }] });
+    await creditBalance(endpoint, { observeOnly: true });
+    expect(output().credits).toHaveLength(1);
+    expect(output().credits[0]).toMatchObject({ kind: "implicit", tracked: true,
+      drawable: false, drainable: false });
+    expect(output().credits[0]).not.toHaveProperty("drain_command");
+    expect(output().credits[0].display).not.toMatch(/reclaimable|next eligible request/i);
+    expect(output().totals_by_currency[0]).toMatchObject({ drawable_micro: 0,
+      sibling_spendable_micro: 0, spendable_micro: 0 });
+    expect(readFileSync(join(root, "credits.json"), "utf8")).toBe(before);
+  });
+});
+
 describe("posture-aware credit reporting", () => {
   it.each((["endpoint", "alias", "global"] as const).flatMap((scope) =>
     (["list", "balance"] as const).map((command) => ({ scope, command }))

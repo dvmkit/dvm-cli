@@ -6,6 +6,7 @@ import { automaticCreditBoundRail, effectiveCreditPosture } from "../credit-poli
 import {
   type CreditOpResult,
   type CreditWire,
+  type StoredImplicitCredit,
   DvmError,
   listCredits,
   listImplicitCredits,
@@ -228,7 +229,8 @@ async function balanceAt(
   const postureOff = effectiveCreditPosture(loadConfig()?.credit, endpoint, identity).posture === "off";
   if (!providerInfo)
     throw new DvmError("provider_unavailable", "Could not read provider metadata.");
-  const implicitCredits = loadImplicitCredits(endpoint, signer.pubkey, identity).filter(
+  const localImplicitCredits = loadImplicitCredits(endpoint, signer.pubkey, identity);
+  const implicitCredits = localImplicitCredits.filter(
     (credit) => !creditId || credit.creditId === creditId
   );
   const signCredit = (body: Record<string, unknown>) =>
@@ -364,15 +366,18 @@ async function balanceAt(
   });
 
   const liveIds = new Set(credits.map((credit) => credit.credit_id));
+  const implicitById = new Map(localImplicitCredits.map((credit) => [credit.creditId, credit]));
   return {
     rows: [
       ...credits.map((credit) =>
-        wireCreditJson(
-          endpoint,
-          credit,
-          credit.credit_id === currentStored?.creditId && currentStored.selectionCleared !== true,
-          postureOff
-        )
+        credit.credit_id.startsWith("imp:")
+          ? wireImplicitCreditJson(endpoint, credit, implicitById.get(credit.credit_id), postureOff)
+          : wireCreditJson(
+              endpoint,
+              credit,
+              credit.credit_id === currentStored?.creditId && currentStored.selectionCleared !== true,
+              postureOff
+            )
       ),
       ...implicitCredits.filter((credit) => !liveIds.has(credit.creditId)).map((credit) => implicitCreditJson(credit, postureOff)),
     ],
@@ -396,6 +401,48 @@ function advisoryBtcRateOnce(): () => Promise<number | undefined> {
   return () => (pending ??= advisoryBtcRate());
 }
 
+function wireImplicitCreditJson(
+  endpoint: string,
+  credit: CreditWire,
+  local: StoredImplicitCredit | undefined,
+  postureOff: boolean
+): Record<string, unknown> {
+  const label = dvmLabelFromEndpoint(endpoint);
+  const amount = formatFiat(Math.max(credit.remaining_micro, 0) / 1_000_000, credit.currency);
+  // A live row supplies the current amount, but only receipt-backed releases
+  // in this caller/DVM scope are candidates for the draw planner.
+  const unavailable = credit.status === "unbacked"
+    ? "backing finalized before collection"
+    : credit.reconciliation_pending
+      ? "backing reconciliation pending"
+      : credit.expired
+        ? "expired"
+        : !local
+          ? "no receipt-backed release is tracked for this caller at this DVM"
+          : local.status !== "active" || local.expiryMs <= Date.now()
+            ? "the local release is lost"
+            : local.remainingMicro <= 0 || credit.remaining_micro <= 0
+              ? "no released value is available for draws"
+              : undefined;
+  const blocked = unavailable === undefined && postureOff;
+  return {
+    endpoint,
+    dvm: label,
+    ...credit,
+    kind: "implicit",
+    tracked: local !== undefined,
+    drawable: unavailable === undefined && !postureOff,
+    ...(blocked ? { draw_blocked_reason: "posture_off" } : {}),
+    drainable: false,
+    ...(local ? { released_by_job_id: local.releasedByJobId, released_at_ms: local.releasedAt } : {}),
+    display: blocked
+      ? `${amount} released per-call balance is held at ${label}, but spending it is switched off by credit posture; no drain path is available.`
+      : unavailable !== undefined
+        ? `${amount} released per-call balance at ${label} (${unavailable}; not drawable). No drain path is available.`
+        : `${amount} released by an unsuccessful per-call job at ${label}; the next eligible request spends it automatically before prepaid credit.`,
+  };
+}
+
 function wireCreditJson(
   endpoint: string,
   credit: CreditWire,
@@ -417,9 +464,8 @@ function wireCreditJson(
         : "spendable";
   const command = creditDrainCommand(endpoint, credit.credit_id);
   const active = !credit.expired && !unbacked && !credit.reconciliation_pending;
-  const implicit = credit.credit_id.startsWith("imp:");
   const eligible = tracked && active;
-  const blocked = postureOff && active && (tracked || implicit);
+  const blocked = postureOff && eligible;
   return {
     endpoint,
     dvm: label,
@@ -429,7 +475,7 @@ function wireCreditJson(
     ...(blocked ? { draw_blocked_reason: "posture_off" } : {}),
     ...(!tracked && credit.drainable ? { drain_command: command } : {}),
     display: blocked
-      ? `${amount} of credit is held at ${label}, but spending it is switched off by credit posture${implicit ? "; implicit credit has no drain path" : credit.drainable ? "; balance remains reclaimable" : ""}.`
+      ? `${amount} of credit is held at ${label}, but spending it is switched off by credit posture${credit.drainable ? "; balance remains reclaimable" : ""}.`
       : tracked
       ? unbacked
         ? `${amount} of former credit at ${label} (${state}; no action is available).`
