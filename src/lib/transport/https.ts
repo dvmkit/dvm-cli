@@ -1278,7 +1278,7 @@ function parseStructuredError(body: string): DvmError | null {
   if (err && typeof err === "object" && !Array.isArray(err)) {
     const e = err as Record<string, unknown>;
     if (typeof e.code !== "string") return null;
-    return buildStructuredError(e.code, e);
+    return buildStructuredError(e.code, e, parsed);
   }
 
   if (typeof err !== "string") return null;
@@ -1318,7 +1318,11 @@ function jobCredentialError(status: number, body: string): DvmError | null {
  * `retryable` ride on `data` — where the CLI error boundary spreads them into
  * the JSON error object — and are only included when present and well-typed.
  */
-function buildStructuredError(code: string, fields: Record<string, unknown>): DvmError {
+function buildStructuredError(
+  code: string,
+  fields: Record<string, unknown>,
+  envelope: Record<string, unknown> = fields
+): DvmError {
   const display = typeof fields.display === "string" ? fields.display : undefined;
   const providerMessage = typeof fields.message === "string" ? fields.message : undefined;
   const message =
@@ -1328,10 +1332,12 @@ function buildStructuredError(code: string, fields: Record<string, unknown>): Dv
   const data: Record<string, unknown> = {};
   if (display !== undefined) data.display = display;
   if (typeof fields.retryable === "boolean") data.retryable = fields.retryable;
-  if (fields.status === "unknown") data.status = fields.status;
+  // Outcome metadata can sit beside a nested error. Neither level may erase
+  // uncertainty reported by the other.
+  if (fields.status === "unknown" || envelope.status === "unknown") data.status = "unknown";
   if (typeof fields.request_id === "string") data.request_id = fields.request_id;
   if (fields.server_acceptance === "absent") data.server_acceptance = fields.server_acceptance;
-  if (fields.payment_state === "unknown") data.payment_state = fields.payment_state;
+  if (fields.payment_state === "unknown" || envelope.payment_state === "unknown") data.payment_state = "unknown";
 
   const detectedSources = providerProseSources(fields, data);
   const proseSources =
@@ -1442,7 +1448,7 @@ function buildPaymentError(errorBody: Record<string, unknown>): DvmError {
   if (typeof errorBody.error === "string") return buildStructuredError(errorBody.error, errorBody);
   const nested = errorBody.error && typeof errorBody.error === "object" && !Array.isArray(errorBody.error)
     ? errorBody.error as Record<string, unknown> : undefined;
-  if (typeof nested?.code === "string") return buildStructuredError(nested.code, nested);
+  if (typeof nested?.code === "string") return buildStructuredError(nested.code, nested, errorBody);
   // The provider named no code; callers must not treat this one as its answer.
   const error = buildStructuredError("payment_insufficient", errorBody);
   error.data = { ...error.data, code_source: "inferred" };
