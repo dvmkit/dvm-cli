@@ -128,6 +128,99 @@ afterAll(() => {
   vi.unstubAllGlobals();
 });
 
+describe("an explicit request ID before acceptance", () => {
+  it.each([false, true])("preserves a signed input refusal with explicit ID=%s", async (explicit) => {
+    provider.inputSchema = {
+      type: "object", properties: { topic: { type: "string", minLength: 10 } }, required: ["topic"],
+    };
+    provider.unpaid = () => answer(400, {
+      error: "invalid_input",
+      message: "topic must contain at least 10 characters",
+      hint: "Supply a longer topic.",
+      display: "The topic is too short.",
+    });
+    const walletBefore = sdk.loadAgentWallet();
+    const budgetBefore = budget.loadLedger();
+    const requestId = explicit ? "invalid-topic" : undefined;
+
+    const error = await request({
+      endpoint: provider.endpoint, data: JSON.stringify({ topic: "x" }),
+      requestId, autoPay: true, budget: "100000", autoPayBelow: "100000", stream: false,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "invalid_input",
+      message: "topic must contain at least 10 characters",
+      hint: expect.stringContaining("Supply a longer topic."),
+      data: { display: "The topic is too short.", caller_endpoint: provider.endpoint },
+    });
+    expect((error as Error & { hint: string }).hint).toContain("dvm describe");
+    expect((error as Error & { hint: string }).hint).not.toContain("request-result");
+    expect(provider.jobPosts).toMatchObject([{ paid: false, status: 400, body: { topic: "x" } }]);
+    expect(provider.jobPosts).toHaveLength(1);
+    expect(provider.jobPosts[0].body.request_id).toBe(requestId);
+    expect(provider.resultPosts).toEqual([]);
+    expect(provider.resumePosts).toEqual([]);
+    expect(provider.balancePayments).toEqual([]);
+    expect(provider.paidPosts()).toEqual([]);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+    expect(jobs.loadAllJobs()).toEqual([]);
+    expect(sdk.loadAgentWallet()).toEqual(walletBefore);
+    expect(budget.loadLedger()).toEqual(budgetBefore);
+    expect(evidence.listSubmissionEvidence()).toEqual({ records: [], unreadable: [] });
+  });
+
+  it.each([
+    { label: "a lost response", reply: () => (response: ServerResponse) => response.socket?.destroy(), code: "provider_unreachable" },
+    { label: "an unstructured 400", reply: () => answerText(400, "unreadable refusal"), code: "provider_error" },
+    { label: "an unreadable acceptance", reply: () => answerText(202, "accepted"), code: "provider_body_unreadable" },
+    { label: "an identity mismatch", reply: () => answer(202, { job_id: "job-b" }, { [FIELD]: "job-a" }), code: "provider_identity_mismatch" },
+    { label: "an existing request", reply: () => answer(409, { error: "request_id_exists" }), code: "request_id_exists" },
+    { label: "an input error with unknown payment state", reply: () => answer(400, { error: "invalid_input", payment_state: "unknown" }), code: "invalid_input" },
+    { label: "an input error with unknown status", reply: () => answer(400, { error: "invalid_input", status: "unknown" }), code: "invalid_input" },
+  ])("keeps $label unknown without submitting again", async ({ reply, code }) => {
+    provider.unpaid = () => reply();
+
+    await expect(paidRequest({ requestId: "uncertain-probe", stream: false })).rejects.toMatchObject({
+      code: "request_outcome_unknown", data: { request_id: "uncertain-probe", inner_code: code },
+      hint: expect.stringContaining("dvm request-result uncertain-probe"),
+    });
+
+    expect(provider.jobPosts).toHaveLength(1);
+    expect(provider.paidPosts()).toEqual([]);
+    expect(provider.resultPosts).toEqual([]);
+    expect(provider.resumePosts).toEqual([]);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+    expect(jobs.loadAllJobs()).toEqual([]);
+  });
+});
+
+describe("a refusal-shaped response after a Cashu payment", () => {
+  it.each([
+    { label: "a structured input error", reply: () => answer(400, { error: "invalid_input", hint: "Correct the payload." }), code: "invalid_input" },
+    { label: "an unstructured 400", reply: () => answerText(400, "bad request"), code: "provider_error" },
+    { label: "a fee-cap error from the provider", reply: () => answer(400, { error: "cashu_fee_cap_exceeded" }), code: "cashu_fee_cap_exceeded" },
+  ])("keeps $label recoverable with the committed payment evidence", async ({ reply, code }) => {
+    provider.paid = () => reply();
+
+    const error = await paidRequest({ requestId: "paid-refusal" }).catch((caught: unknown) => caught);
+
+    const journal = onlyJournalEntry();
+    expect(error).toMatchObject({
+      code: "request_outcome_unknown",
+      data: {
+        request_id: "paid-refusal", inner_code: code, spend_committed: true,
+        cashu_request_id: journal.request_id, mint, amount_sats: 1,
+      },
+    });
+    expect(provider.jobPosts).toHaveLength(2);
+    expect(provider.paidPosts()).toHaveLength(1);
+    expect(seams.prepareAgentSpend).toHaveBeenCalledOnce();
+    expect(provider.resultPosts).toEqual([]);
+    expect(jobs.loadAllJobs()).toEqual([]);
+  });
+});
+
 describe("a paid submit the provider accepts without a settled job identity", () => {
   it.each([
     {
@@ -193,6 +286,13 @@ describe("a paid submit the provider accepts without a settled job identity", ()
       },
     });
     expect(evidence.loadSubmissionEvidence(journalId)).toMatchObject({ request_id: requestId });
+    expect(onlyJournalEntry().accepted_unresolved).toMatchObject({ ambiguity_id: journalId });
+    expect(provider.resultPosts).toEqual([]);
+    const postsBefore = provider.jobPosts.length;
+    await seams.realSweep!({ fetchImpl: globalThis.fetch });
+    expect(provider.jobPosts).toHaveLength(postsBefore);
+    expect(provider.paidPosts()).toHaveLength(1);
+    expect(sdk.loadAgentWallet()?.pending_submissions).toHaveLength(1);
   });
 
   it("keeps the evidence apart from a local job that already holds an observed ID", async () => {
@@ -286,12 +386,12 @@ describe("a paid submit the provider accepts without a settled job identity", ()
 });
 
 describe("a paid submit whose response is lost", () => {
-  it("is read back through request-result on restart, with one payment and no second paid POST", async () => {
+  it.each([undefined, "lost-explicit"])("is read back on restart with request ID=%s, one payment and no second paid POST", async (explicitId) => {
     // The provider accepts the job and the connection drops before it answers.
     // The retry meets the provider's claim on the request ID.
     provider.paid = () => (response) => response.socket?.destroy();
 
-    const error = (await paidRequest().catch((caught: unknown) => caught)) as {
+    const error = (await paidRequest({ requestId: explicitId }).catch((caught: unknown) => caught)) as {
       code: string;
       hint: string;
       data: Record<string, unknown>;
@@ -854,18 +954,22 @@ describe("an x402 payment whose outcome is unknown", () => {
       innerCode: "provider_identity_mismatch",
     },
     { label: "a lost response", reply: () => (response: ServerResponse) => response.socket?.destroy(), innerCode: "provider_unreachable" },
-  ])("after $label is counted against the budget once, as unconfirmed", async ({ reply, innerCode }) => {
+  ].flatMap((scenario) => [false, true].map((explicit) => ({ ...scenario, explicit }))))(
+    "after $label with explicit ID=$explicit is counted against the budget once, as unconfirmed", async ({ reply, innerCode, explicit }) => {
     seams.x402Wallet = { privateKey: `0x${"55".repeat(32)}`, address: "", network: "eip155:84532" };
     provider.x402 = true;
     provider.paid = (_post, accepted) => reply(accepted);
 
-    const error = (await paidRequest({ rail: "x402" }).catch((caught: unknown) => caught)) as {
+    const error = (await paidRequest({ rail: "x402", ...(explicit ? { requestId: "x402-explicit" } : {}) }).catch((caught: unknown) => caught)) as {
       data: Record<string, unknown>;
     };
 
     const requestId = error.data.request_id as string;
     expect(error).toMatchObject({ code: "request_outcome_unknown", data: { inner_code: innerCode } });
     expect(provider.paidPosts()).toMatchObject([{ rail: "x402" }]);
+    expect(provider.paidPosts()).toHaveLength(1);
+    expect(provider.resultPosts).toEqual([]);
+    expect(provider.resumePosts).toEqual([]);
     expect(budget.loadLedger().entries).toMatchObject([
       { jobId: requestId, providerEndpoint: provider.endpoint, label: "unconfirmed · echo" },
     ]);
@@ -892,6 +996,7 @@ type Reply = (response: ServerResponse) => void;
 
 interface Provider {
   endpoint: string;
+  inputSchema?: Record<string, unknown>;
   /** Advertise `request_recovery`. */
   recovery: boolean;
   /** Advertise and accept x402. */
@@ -1083,7 +1188,7 @@ function info(state: Provider): Record<string, unknown> {
     name: "Test provider",
     auth: ["secp256k1-schnorr-v2"],
     auth_audience: audience,
-    capabilities: { echo: { description: "Echo" } },
+    capabilities: { echo: { description: "Echo", ...(state.inputSchema ? { input_schema: state.inputSchema } : {}) } },
     cashu: { mints: [mint], lock_pubkeys: [lockPubkey], min_locktime: 60, canonical_id: null },
     credit: { ...creditTerms, balance_payment: true },
     ...(state.recovery ? { request_recovery: true } : {}),
