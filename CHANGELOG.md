@@ -11,6 +11,16 @@
 
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.15.3](https://github.com/dvmkit/dvm-cli/compare/v0.15.2...v0.15.3) (2026-11-07)
+
+
+### Bug Fixes
+
+* **credit:** report already drained for a repeat tempo drain ([1469652](https://github.com/dvmkit/dvm-cli/commit/1469652aa18330b6660d388147dce7eee593674a))
+* drain verification diagnostics before exiting ([a65ee22](https://github.com/dvmkit/dvm-cli/commit/a65ee22fd97b1703368f00b1973df169de7458b9))
+* make reserve release swaps recoverable ([d9f5e6a](https://github.com/dvmkit/dvm-cli/commit/d9f5e6a4da12cce0c40a76896141bb6d1163c5da))
+* retry job storage locks and preserve accepted outcomes ([5e0216e](https://github.com/dvmkit/dvm-cli/commit/5e0216e2516f635684ebdbfd25d74ee129544935))
+
 ## [0.15.2](https://github.com/dvmkit/dvm-cli/compare/v0.15.1...v0.15.2) (2026-11-07)
 
 
