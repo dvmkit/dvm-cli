@@ -146,8 +146,9 @@ describe("an explicit request ID before acceptance", () => {
     const budgetBefore = budget.loadLedger();
     const requestId = explicit ? "invalid-topic" : undefined;
 
+    // An explicit empty input avoids reading the test runner's open stdin.
     const error = await request({
-      endpoint: provider.endpoint, data: JSON.stringify({ topic: "x" }),
+      endpoint: provider.endpoint, input: "", data: JSON.stringify({ topic: "x" }),
       requestId, autoPay: true, budget: "100000", autoPayBelow: "100000", stream: false,
     }).catch((caught: unknown) => caught);
 
