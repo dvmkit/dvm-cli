@@ -206,6 +206,7 @@
     "rate_unavailable",
     "receipt_not_found",
     "reclaim_pending",
+    "reclaim_unsaved",
     "request_id_exists",
     "request_identity_unavailable",
     "request_intent_contains_secret",

@@ -1,10 +1,8 @@
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import lockfile from "proper-lockfile";
-
-import { ensureConfigDir, JOBS_FILE, loadAgentWallet } from "@dvmkit/sdk/internal";
+import { loadAgentWallet } from "@dvmkit/sdk/internal";
 import { blockHeldPayment, heldCashuSubmissionAsks, releaseReclaimedSubmissions } from "../job-store";
 import { settleTakenPayment } from "../taken-payment";
+import { journalFile } from "./journal-file";
+import { allReclaimIntents, clearReclaimIntent } from "./reclaim-intents";
 
 /**
  * What a submission sweep proved about a wallet entry it dropped. The wallet
@@ -20,42 +18,10 @@ export interface SubmissionVerdict {
   amountSats?: number;
 }
 
-const verdictsFile = () => join(dirname(JOBS_FILE), "submission-verdicts.json");
-
-function readVerdicts(): SubmissionVerdict[] {
-  if (!existsSync(verdictsFile())) return [];
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(verdictsFile(), "utf8"));
-    return Array.isArray(parsed) ? parsed as SubmissionVerdict[] : [];
-  } catch {
-    return [];
-  }
-}
-
-function withVerdictsLock<T>(change: () => T): T {
-  ensureConfigDir();
-  if (!existsSync(verdictsFile())) writeFileSync(verdictsFile(), "[]\n", { mode: 0o600, flag: "a" });
-  let release: (() => void) | undefined;
-  for (let attempt = 0; !release; attempt++) {
-    try {
-      release = lockfile.lockSync(verdictsFile(), { realpath: false });
-    } catch (error) {
-      if (attempt >= 40) throw error;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-    }
-  }
-  try { return change(); } finally { release(); }
-}
-
-function writeVerdicts(verdicts: SubmissionVerdict[]): void {
-  const temporary = `${verdictsFile()}.${process.pid}.tmp`;
-  const fd = openSync(temporary, "w", 0o600);
-  try {
-    writeFileSync(fd, JSON.stringify(verdicts, null, 2) + "\n");
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-  renameSync(temporary, verdictsFile());
-}
+const verdictJournal = journalFile<SubmissionVerdict>("submission-verdicts.json");
+const readVerdicts = verdictJournal.read;
+const withVerdictsLock = verdictJournal.withLock;
+const writeVerdicts = verdictJournal.write;
 
 /** Journal verdicts before the wallet save that drops their entries. */
 export function recordSubmissionVerdicts(verdicts: SubmissionVerdict[]): void {
@@ -78,10 +44,19 @@ export function recordSubmissionVerdicts(verdicts: SubmissionVerdict[]): void {
  * verdict leaves the journal only once applied.
  */
 export async function applySubmissionVerdicts(): Promise<void> {
-  const verdicts = readVerdicts();
-  if (verdicts.length === 0) return;
+  // A reclaim that cannot be journalled yet must not hold back the verdicts
+  // already journalled, so run both and report the first failure.
+  let failure: { error: unknown } | undefined;
+  try { finalizeLandedReclaims(); } catch (error) { failure = { error }; }
+  try { await applyJournalledVerdicts(); } catch (error) { failure ??= { error }; }
+  if (failure) throw failure.error;
+}
+
+async function applyJournalledVerdicts(): Promise<void> {
+  const journalled = readVerdicts();
+  if (journalled.length === 0) return;
   const held = new Set(loadAgentWallet()?.pending_submissions.map((entry) => entry.request_id) ?? []);
-  const landed = verdicts.filter((verdict) => !held.has(verdict.requestId));
+  const landed = journalled.filter((verdict) => !held.has(verdict.requestId));
   if (landed.length === 0) return;
   releaseReclaimedSubmissions(new Set(landed.filter((verdict) => verdict.verdict === "reclaimed").map((verdict) => verdict.requestId)));
   for (const verdict of landed) {
@@ -101,4 +76,24 @@ export async function applySubmissionVerdicts(): Promise<void> {
   }
   const applied = new Set(landed.map((verdict) => verdict.requestId));
   withVerdictsLock(() => writeVerdicts(readVerdicts().filter((verdict) => !applied.has(verdict.requestId))));
+}
+
+/**
+ * Journal the verdict of every reclaim whose wallet save landed (the entry has
+ * left the wallet) and drop its intent. A crash or write failure between the
+ * save and the journal write leaves the intent behind, so the next read
+ * finishes the job; the intent is only dropped once its verdict is journalled.
+ * Throws on a journal failure, with the intent kept for the next attempt.
+ */
+export function finalizeLandedReclaims(): void {
+  const intents = allReclaimIntents();
+  if (intents.length === 0) return;
+  const wallet = loadAgentWallet();
+  if (!wallet) return;
+  const held = new Set(wallet.pending_submissions.map((entry) => entry.request_id));
+  for (const intent of intents) {
+    if (held.has(intent.requestId)) continue;
+    recordSubmissionVerdicts([intent.verdict]);
+    clearReclaimIntent(intent.requestId, intent.createdAt);
+  }
 }

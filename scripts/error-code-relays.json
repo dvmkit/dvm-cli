@@ -796,5 +796,14 @@
       "code"
     ],
     "reason": "Discovery catches and redacts an existing command or provider error. Local code producers are inventoried separately."
+  },
+  {
+    "file": "lib/wallet-agent/submission-verdicts.ts",
+    "owner": "applySubmissionVerdicts",
+    "expression": "error",
+    "path": [
+      "code"
+    ],
+    "reason": "Rethrows the first journal or intent-finalisation failure after both steps have run. Local code producers are inventoried separately."
   }
 ]
