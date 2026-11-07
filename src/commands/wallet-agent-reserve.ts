@@ -231,7 +231,8 @@ export async function walletRelease(opts: WalletReleaseOptions): Promise<void> {
         `Released ${totals.reclaimedSats} sats at ${builderHandle} (output mode: ${result.output_mode}).`
       );
       for (const mintOutcome of result.mints) {
-        info(`  ${mintOutcome.mint}:`);
+        const policy = mintOutcome.output_mode === null ? "" : ` (output mode: ${mintOutcome.output_mode})`;
+        info(`  ${mintOutcome.mint}${policy}:`);
         info(
           `    reclaimed: ${sumSats(mintOutcome.reclaimedOutputs)} sats from ${mintOutcome.reclaimedInputs.length} proof(s)`
         );
@@ -257,6 +258,7 @@ export async function walletRelease(opts: WalletReleaseOptions): Promise<void> {
         pending_sats: totals.pendingSats,
         mints: result.mints.map((m) => ({
           mint: m.mint,
+          output_mode: m.output_mode,
           reclaimed_sats: sumSats(m.reclaimedOutputs),
           reclaimed_input_count: m.reclaimedInputs.length,
           already_spent_sats: sumSats(m.alreadySpent),

@@ -1,5 +1,7 @@
 vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
  ...(await importOriginal<typeof import("@dvmkit/sdk/internal")>()),
+ getWallet: vi.fn(),
+ readAgentMnemonic: vi.fn(),
  loadAgentWallet: vi.fn(),
 saveAgentWallet: vi.fn(),
 withWalletLock: vi.fn(<T>(fn: () => Promise<T> | T) => Promise.resolve(fn()))
@@ -7,6 +9,22 @@ withWalletLock: vi.fn(<T>(fn: () => Promise<T> | T) => Promise.resolve(fn()))
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@cashu/cashu-ts", async (importOriginal) => ({ ...(await importOriginal<typeof import("@cashu/cashu-ts")>()), ...(() => ({
+  OutputData: class {
+    constructor(
+      public blindedMessage: { amount: { toNumber: () => number }; B_: string; id: string },
+      public blindingFactor: bigint,
+      public secret: Uint8Array
+    ) {}
+
+    toProof(signature: { id: string; C_: string }) {
+      return {
+        id: signature.id,
+        amount: this.blindedMessage.amount,
+        secret: new TextDecoder().decode(this.secret),
+        C: signature.C_,
+      };
+    }
+  },
   Amount: {
     from: (x: unknown) => ({
       toNumber: () =>
@@ -17,12 +35,24 @@ vi.mock("@cashu/cashu-ts", async (importOriginal) => ({ ...(await importOriginal
   },
 }))() }));
 
-import { Amount } from "@cashu/cashu-ts";
+import { Amount, MintOperationError } from "@cashu/cashu-ts";
 
 import type { ProviderInfo } from "@dvmkit/sdk/internal";
 import { releaseAgentReserve } from "../release";
 import type { AgentProof, AgentWallet } from "@dvmkit/sdk/internal";
-import { loadAgentWallet, saveAgentWallet } from "@dvmkit/sdk/internal";
+import { getWallet, loadAgentWallet, readAgentMnemonic, saveAgentWallet } from "@dvmkit/sdk/internal";
+
+import lockfile from "proper-lockfile";
+import { allReleaseIntents, clearReleaseIntent } from "../release-intents";
+
+const command = vi.hoisted(() => ({ describe: vi.fn(), close: vi.fn(), info: vi.fn(), json: vi.fn() }));
+vi.mock("../../transport", () => ({
+  createDvmTransport: () => ({ describe: command.describe, close: command.close }),
+}));
+vi.mock("../../output", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../output")>()), info: command.info, json: command.json,
+}));
+import { walletRelease } from "../../../commands/wallet-agent-reserve";
 
 const MNEMONIC =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
@@ -79,16 +109,42 @@ function makeCashuWallet(
   outputs: { id: string; amount: number; secret: string; C: string }[],
   ppk = 0
 ) {
+  const blinded = (p: { id: string; amount: number; secret: string }) => ({
+    id: p.id, amount: p.amount, B_: `blind-${p.secret}`,
+  });
+  const send = vi.fn();
   const sendBuilder = {
     asP2PK: vi.fn().mockReturnThis(),
     asRandom: vi.fn().mockReturnThis(),
+    keepAsP2PK: vi.fn().mockReturnThis(),
+    keepAsRandom: vi.fn().mockReturnThis(),
     privkey: vi.fn().mockReturnThis(),
     includeFees: vi.fn().mockReturnThis(),
-    run: vi.fn().mockResolvedValue({ send: outputs, keep: [] }),
+    prepare: vi.fn(() => Promise.resolve({
+      keysetId: "k1",
+      inputs: send.mock.calls.at(-1)?.[1] ?? [],
+      sendOutputs: outputs.map((p) => ({
+        blindedMessage: blinded(p),
+        blindingFactor: 1n,
+        secret: new TextEncoder().encode(p.secret),
+      })),
+      keepOutputs: [],
+    })),
   };
   return {
     groupProofsByState: vi.fn().mockResolvedValue(grouped),
-    ops: { send: vi.fn().mockReturnValue(sendBuilder) },
+    ops: { send: send.mockReturnValue(sendBuilder) },
+    completeSwap: vi.fn().mockResolvedValue({ send: outputs, keep: [] }),
+    keyChain: { getKeyset: vi.fn(() => ({})) },
+    mint: {
+      restore: vi.fn((request: { outputs: { B_: string }[] }) => {
+        const known = request.outputs.map((o) => outputs.find((p) => blinded(p).B_ === o.B_)).filter((p) => p !== undefined);
+        return Promise.resolve({
+          outputs: known.map(blinded),
+          signatures: known.map((p) => ({ id: p.id, amount: p.amount, C_: p.C })),
+        });
+      }),
+    },
     getKeyset: vi.fn().mockReturnValue({ id: "k1", fee: ppk, keys: {} }),
     getFeesForKeyset: vi.fn((n: number) =>
       Amount.from(Math.floor(Math.max((n * ppk + 999) / 1000, 0)))
@@ -102,6 +158,8 @@ function makeCashuWallet(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(saveAgentWallet).mockReset();
+  for (const intent of allReleaseIntents()) clearReleaseIntent(intent);
 });
 
 describe("releaseAgentReserve", () => {
@@ -280,5 +338,414 @@ describe("releaseAgentReserve", () => {
       now: () => nowMs,
     });
     expect(result.mints).toEqual([]);
+  });
+});
+
+
+describe("release durability", () => {
+  const NOW = 2_000_000_000_000;
+  const INPUT = proof("reserve", 6, { reserved_for: "builder/scrape.dvmkit.ai", t_expire: NOW - 1_000 });
+  const OUTPUT = { id: "k1", amount: 6, secret: "released", C: "02OUT" };
+  const UNSPENT = { unspent: [INPUT], spent: [], pending: [] };
+  const SPENT = { unspent: [], spent: [INPUT], pending: [] };
+
+  function persistentWallet(proofs: AgentProof[] = [INPUT]) {
+    let held = walletWith(proofs);
+    vi.mocked(loadAgentWallet).mockImplementation(() => held);
+    vi.mocked(saveAgentWallet).mockImplementation((next) => { held = next; });
+  }
+
+  function release(cashu: ReturnType<typeof makeCashuWallet>, options: { now?: () => number; outputMode?: "locked" | "unlocked" } = {}) {
+    return releaseAgentReserve({
+      builderHandle: "scrape.dvmkit.ai", providerInfo: info(), readMnemonic: () => MNEMONIC,
+      getWalletForMint: () => Promise.resolve(cashu as never), now: () => NOW,
+      ...options,
+    });
+  }
+
+  function failCleanup() {
+    vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    const original = lockfile.lockSync;
+    let writes = 0;
+    return vi.spyOn(lockfile, "lockSync").mockImplementation((file, options) => {
+      if (String(file).endsWith("release-intents.json") && ++writes > 1) throw new Error("journal unavailable");
+      return original(file, options);
+    });
+  }
+
+  it.each(["locked", "unlocked"] as const)("recovers a failed wallet save without another swap (%s outputs)", async (outputMode) => {
+    const unrelated = proof("unrelated", 2);
+    persistentWallet([INPUT, unrelated]);
+    vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+    const firstMint = makeCashuWallet(UNSPENT, [OUTPUT]);
+    firstMint.completeSwap.mockImplementationOnce(async () => {
+      expect(allReleaseIntents()).toMatchObject([{ inputs: [INPUT], outputs: [{ secret: Buffer.from("released").toString("hex") }] }]);
+      return { send: [OUTPUT], keep: [] };
+    });
+
+    const first = await release(firstMint, { outputMode });
+
+    expect(first.output_mode).toBe(outputMode);
+    expect(first.mints[0]).toMatchObject({ output_mode: null, reclaimedInputs: [], reclaimedOutputs: [], error: expect.stringContaining("disk full") });
+    expect(loadAgentWallet()?.proofs).toEqual([INPUT, unrelated]);
+    expect(allReleaseIntents()).toHaveLength(1);
+
+    const nextMint = makeCashuWallet(SPENT, [OUTPUT]);
+    const recovered = await release(nextMint, { outputMode: outputMode === "locked" ? "unlocked" : "locked" });
+
+    expect(recovered.output_mode).toBe(outputMode);
+    expect(recovered.mints[0]).toMatchObject({ output_mode: outputMode, error: null, alreadySpent: [], reclaimedInputs: [INPUT] });
+    expect(nextMint.mint.restore).toHaveBeenCalledTimes(1);
+    expect(nextMint.completeSwap).not.toHaveBeenCalled();
+    expect(nextMint._sendBuilder.prepare).not.toHaveBeenCalled();
+    expect(firstMint.completeSwap).toHaveBeenCalledTimes(1);
+    expect(loadAgentWallet()?.proofs).toEqual([
+      unrelated,
+      expect.objectContaining({ secret: "released", amount: 6, status: "valid", locked_to_pubkey: outputMode === "locked" ? walletWith([]).lock_pubkey : null }),
+    ]);
+    expect(loadAgentWallet()?.proofs[1].reserved_for).toBeUndefined();
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it.each(["fresh", "recovered", "pending"])("reports each mint's actual policy when another mint is %s", async (secondKind) => {
+    persistentWallet();
+    vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+    await release(makeCashuWallet(UNSPENT, [OUTPUT]), { outputMode: "unlocked" });
+    const secondInput = { ...INPUT, mint: "https://other-mint.example" };
+    const wallet = loadAgentWallet()!;
+    saveAgentWallet({ ...wallet, proofs: [...wallet.proofs, secondInput] });
+    const opts = {
+      builderHandle: "scrape.dvmkit.ai", providerInfo: info(), readMnemonic: () => MNEMONIC, now: () => NOW,
+    };
+    const secondOutput = { ...OUTPUT, secret: "released-other" };
+    if (secondKind === "recovered") {
+      vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+      const unavailable = await releaseAgentReserve({
+        ...opts,
+        getWalletForMint: (mint) => mint === INPUT.mint
+          ? Promise.reject(new Error("mint unavailable"))
+          : Promise.resolve(makeCashuWallet(UNSPENT, [secondOutput]) as never),
+      });
+      expect(unavailable.mints.every((m) => m.error)).toBe(true);
+      expect(allReleaseIntents()).toHaveLength(2);
+    }
+    const firstMint = makeCashuWallet(SPENT, [OUTPUT]);
+    const secondMint = makeCashuWallet(secondKind === "pending" ? { unspent: [], spent: [], pending: [secondInput] } : secondKind === "recovered" ? SPENT : UNSPENT, [secondOutput]);
+
+    const result = await releaseAgentReserve({
+      ...opts,
+      getWalletForMint: (mint) => Promise.resolve((mint === INPUT.mint ? firstMint : secondMint) as never),
+    });
+
+    expect(result.output_mode).toBe(secondKind === "pending" ? "unlocked" : "mixed");
+    expect(result.mints.map((m) => m.output_mode)).toEqual(["unlocked", secondKind === "pending" ? null : "locked"]);
+    expect(firstMint.completeSwap).not.toHaveBeenCalled();
+    expect(secondMint.completeSwap).toHaveBeenCalledTimes(secondKind === "fresh" ? 1 : 0);
+    expect(loadAgentWallet()?.proofs.find((p) => p.mint === INPUT.mint)?.locked_to_pubkey).toBeNull();
+    if (secondKind !== "pending") {
+      expect(loadAgentWallet()?.proofs.find((p) => p.mint === secondInput.mint)?.locked_to_pubkey).toBe(wallet.lock_pubkey);
+    }
+  });
+
+  it.each([false, true])("prints the recovered and fresh policies in mixed release output (human=%s)", async (human) => {
+    persistentWallet();
+    vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+    await release(makeCashuWallet(UNSPENT, [OUTPUT]), { outputMode: "unlocked" });
+    const secondInput = { ...INPUT, mint: "https://other-mint.example" };
+    const wallet = loadAgentWallet()!;
+    saveAgentWallet({ ...wallet, proofs: [...wallet.proofs, secondInput] });
+    const firstMint = makeCashuWallet(SPENT, [OUTPUT]);
+    const secondMint = makeCashuWallet(UNSPENT, [{ ...OUTPUT, secret: "released-other" }]);
+    vi.mocked(getWallet).mockImplementation((mint) => Promise.resolve((mint === INPUT.mint ? firstMint : secondMint) as never));
+    vi.mocked(readAgentMnemonic).mockReturnValue(MNEMONIC);
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    command.describe.mockResolvedValue(info());
+
+    await walletRelease({ builder: "https://scrape.dvmkit.ai", human });
+
+    if (human) {
+      expect(command.info).toHaveBeenCalledWith(expect.stringContaining("output mode: mixed"));
+      expect(command.info).toHaveBeenCalledWith(expect.stringContaining(`${INPUT.mint} (output mode: unlocked)`));
+      expect(command.info).toHaveBeenCalledWith(expect.stringContaining(`${secondInput.mint} (output mode: locked)`));
+    } else {
+      expect(command.json).toHaveBeenCalledWith(expect.objectContaining({
+        output_mode: "mixed",
+        mints: [
+          expect.objectContaining({ mint: INPUT.mint, output_mode: "unlocked", reclaimed_sats: 6 }),
+          expect.objectContaining({ mint: secondInput.mint, output_mode: "locked", reclaimed_sats: 6 }),
+        ],
+      }));
+    }
+    expect(firstMint.completeSwap).not.toHaveBeenCalled();
+    expect(secondMint.completeSwap).toHaveBeenCalledTimes(1);
+    expect(command.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts over with one swap after an interruption before reaching the mint", async () => {
+    persistentWallet();
+    const interrupted = makeCashuWallet(UNSPENT, [OUTPUT]);
+    interrupted.completeSwap.mockRejectedValueOnce(new Error("interrupted before sending"));
+    await release(interrupted);
+    expect(allReleaseIntents()).toHaveLength(1);
+
+    const nextMint = makeCashuWallet(UNSPENT, [OUTPUT]);
+    nextMint.mint.restore.mockResolvedValueOnce({ outputs: [], signatures: [] });
+    const result = await release(nextMint, { now: () => NOW + 3 * 60_000 });
+
+    expect(result.mints[0].error).toBeNull();
+    expect(nextMint.mint.restore).toHaveBeenCalledTimes(1);
+    expect(nextMint.completeSwap).toHaveBeenCalledTimes(1);
+    expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["released"]);
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it("recovers a lost response after the mint committed", async () => {
+    persistentWallet();
+    const interrupted = makeCashuWallet(UNSPENT, [OUTPUT]);
+    interrupted.completeSwap.mockRejectedValueOnce(new Error("response lost"));
+    const first = await release(interrupted);
+    expect(first.mints[0].error).toContain("response lost");
+
+    const nextMint = makeCashuWallet(SPENT, [OUTPUT]);
+    await release(nextMint);
+
+    expect(nextMint.completeSwap).not.toHaveBeenCalled();
+    expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["released"]);
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it("never sends a swap if the recovery journal cannot be written", async () => {
+    persistentWallet();
+    vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    const original = lockfile.lockSync;
+    const busy = vi.spyOn(lockfile, "lockSync").mockImplementation((file, options) => {
+      if (String(file).endsWith("release-intents.json")) throw new Error("journal unavailable");
+      return original(file, options);
+    });
+    const cashu = makeCashuWallet(UNSPENT, [OUTPUT]);
+
+    const result = await release(cashu);
+    busy.mockRestore();
+
+    expect(result.mints[0].error).toContain("nothing was swapped");
+    expect(cashu.completeSwap).not.toHaveBeenCalled();
+    expect(loadAgentWallet()?.proofs).toEqual([INPUT]);
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it.each(["partial", "unavailable", "pending"])("keeps the intent and reserve while recovery is %s", async (condition) => {
+    persistentWallet();
+    const outputs = [ { ...OUTPUT, amount: 4 }, { ...OUTPUT, secret: "released-2", amount: 2 } ];
+    const first = makeCashuWallet(UNSPENT, outputs);
+    vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+    await release(first);
+    const held = allReleaseIntents();
+    const nextMint = makeCashuWallet(condition === "pending" ? { unspent: [], spent: [], pending: [INPUT] } : SPENT, condition === "partial" ? outputs.slice(0, 1) : []);
+    if (condition === "unavailable") nextMint.mint.restore.mockRejectedValue(new Error("NUT-09 unavailable"));
+
+    const result = await release(nextMint, { now: () => NOW + 3 * 60_000 });
+
+    expect(result.mints[0].error).not.toBeNull();
+    expect(result.mints[0].alreadySpent).toEqual([]);
+    expect(nextMint.completeSwap).not.toHaveBeenCalled();
+    expect(loadAgentWallet()?.proofs).toEqual([INPUT]);
+    expect(allReleaseIntents()).toEqual(held);
+  });
+
+  it("leaves a fresh intent alone while another command may be submitting it", async () => {
+    persistentWallet();
+    const first = makeCashuWallet(UNSPENT, [OUTPUT]);
+    first.completeSwap.mockRejectedValueOnce(new Error("connection lost"));
+    await release(first);
+    const held = allReleaseIntents();
+    const nextMint = makeCashuWallet(UNSPENT, []);
+
+    const result = await release(nextMint);
+
+    expect(result.mints[0].error).toContain("in flight");
+    expect(nextMint.completeSwap).not.toHaveBeenCalled();
+    expect(allReleaseIntents()).toEqual(held);
+  });
+
+  it("cleans up a landed release without re-adding outputs already spent again", async () => {
+    persistentWallet();
+    const busy = failCleanup();
+    const first = await release(makeCashuWallet(UNSPENT, [OUTPUT]));
+    busy.mockRestore();
+    expect(first.mints[0]).toMatchObject({ reclaimedOutputs: [expect.objectContaining({ secret: "released" })], error: expect.stringContaining("cleanup failed") });
+    expect(allReleaseIntents()).toHaveLength(1);
+    // The new proofs were saved and then used by a later payment.
+    saveAgentWallet(walletWith([]));
+    const nextMint = makeCashuWallet(SPENT, [OUTPUT]);
+
+    const result = await release(nextMint);
+
+    expect(result.mints[0]).toMatchObject({ error: null, reclaimedOutputs: [], alreadySpent: [] });
+    expect(nextMint.mint.restore).not.toHaveBeenCalled();
+    expect(nextMint.completeSwap).not.toHaveBeenCalled();
+    expect(loadAgentWallet()?.proofs).toEqual([]);
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it("saves restored outputs once when two recoveries overlap", async () => {
+    persistentWallet();
+    vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+    await release(makeCashuWallet(UNSPENT, [OUTPUT]));
+    const inner = makeCashuWallet(SPENT, [OUTPUT]);
+    const outer = makeCashuWallet(SPENT, [OUTPUT]);
+    const restore = outer.mint.restore.getMockImplementation()!;
+    outer.mint.restore.mockImplementationOnce(async (request) => {
+      const overlapping = await release(inner);
+      expect(overlapping.mints[0].error).toContain("release lock");
+      return restore(request);
+    });
+    vi.mocked(saveAgentWallet).mockClear();
+
+    await release(outer);
+
+    expect(saveAgentWallet).toHaveBeenCalledTimes(1);
+    expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["released"]);
+    expect(inner.completeSwap).not.toHaveBeenCalled();
+    expect(outer.completeSwap).not.toHaveBeenCalled();
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it("keeps an active release's journal even after the retry guard expires", async () => {
+    persistentWallet();
+    const active = makeCashuWallet(UNSPENT, [OUTPUT]);
+    const overlapping = makeCashuWallet(SPENT, []);
+    active.completeSwap.mockImplementationOnce(async () => {
+      const held = allReleaseIntents();
+      const result = await release(overlapping, { now: () => NOW + 3 * 60_000 });
+      expect(result.mints[0].error).toContain("release lock");
+      expect(result.mints[0].alreadySpent).toEqual([]);
+      expect(allReleaseIntents()).toEqual(held);
+      expect(loadAgentWallet()?.proofs).toEqual([INPUT]);
+      return { send: [OUTPUT], keep: [] };
+    });
+
+    const result = await release(active);
+
+    expect(result.mints[0].error).toBeNull();
+    expect(overlapping.groupProofsByState).not.toHaveBeenCalled();
+    expect(overlapping.completeSwap).not.toHaveBeenCalled();
+    expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["released"]);
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it("blocks an overlapping release while the first command is still preparing", async () => {
+    persistentWallet();
+    const active = makeCashuWallet(UNSPENT, [OUTPUT]);
+    const overlapping = makeCashuWallet(UNSPENT, [OUTPUT]);
+    const prepare = active._sendBuilder.prepare.getMockImplementation()!;
+    active._sendBuilder.prepare.mockImplementationOnce(async () => {
+      const result = await release(overlapping);
+      expect(result.mints[0].error).toContain("release lock");
+      return prepare();
+    });
+
+    await release(active);
+
+    expect(active.completeSwap).toHaveBeenCalledTimes(1);
+    expect(overlapping.completeSwap).not.toHaveBeenCalled();
+    expect(overlapping._sendBuilder.prepare).not.toHaveBeenCalled();
+    expect(loadAgentWallet()?.proofs.map((p) => p.secret)).toEqual(["released"]);
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it("isolates mint outcomes when one wallet save fails", async () => {
+    const secondInput = { ...INPUT, mint: "https://other-mint.example" };
+    persistentWallet([INPUT, secondInput]);
+    vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+    const firstMint = makeCashuWallet(UNSPENT, [OUTPUT]);
+    const secondMint = makeCashuWallet(UNSPENT, [OUTPUT]);
+    const result = await releaseAgentReserve({
+      builderHandle: "scrape.dvmkit.ai", providerInfo: info(), readMnemonic: () => MNEMONIC,
+      now: () => NOW,
+      getWalletForMint: (mint) => Promise.resolve((mint === INPUT.mint ? firstMint : secondMint) as never),
+    });
+
+    expect(result.mints.map((m) => m.error)).toEqual([expect.stringContaining("disk full"), null]);
+    expect(loadAgentWallet()?.proofs).toEqual([
+      INPUT,
+      expect.objectContaining({ mint: secondInput.mint, secret: "released", amount: 6 }),
+    ]);
+    expect(allReleaseIntents().map((intent) => intent.mint)).toEqual([INPUT.mint]);
+
+    const recovered = await release(makeCashuWallet(SPENT, [OUTPUT]));
+    expect(recovered.mints[0].error).toBeNull();
+    expect(loadAgentWallet()?.proofs.map((p) => p.mint).sort()).toEqual([INPUT.mint, secondInput.mint].sort());
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it("releases both mint locks after independent releases overlap", async () => {
+    const secondInput = proof("reserve-other", 6, { ...INPUT, mint: "https://other-mint.example", secret: "reserve-other" });
+    persistentWallet([INPUT, secondInput]);
+    const active = makeCashuWallet(UNSPENT, [OUTPUT]);
+    const other = makeCashuWallet({ unspent: [secondInput], spent: [], pending: [] }, [{ ...OUTPUT, secret: "released-other" }]);
+    active.completeSwap.mockImplementationOnce(async () => {
+      const concurrent = await releaseAgentReserve({
+        builderHandle: "scrape.dvmkit.ai", providerInfo: info(), readMnemonic: () => MNEMONIC,
+        now: () => NOW,
+        getWalletForMint: (mint) => Promise.resolve((mint === INPUT.mint ? active : other) as never),
+      });
+      expect(concurrent.mints[1].error).toBeNull();
+      return { send: [OUTPUT], keep: [] };
+    });
+    await releaseAgentReserve({
+      builderHandle: "scrape.dvmkit.ai", providerInfo: info(), readMnemonic: () => MNEMONIC,
+      now: () => NOW,
+      getWalletForMint: (mint) => Promise.resolve((mint === INPUT.mint ? active : other) as never),
+    });
+    const nextInput = { ...INPUT, secret: "reserve-again" };
+    const wallet = loadAgentWallet()!;
+    saveAgentWallet({ ...wallet, proofs: [...wallet.proofs, nextInput] });
+    const nextMint = makeCashuWallet({ unspent: [nextInput], spent: [], pending: [] }, [{ ...OUTPUT, secret: "released-again" }]);
+
+    const result = await release(nextMint);
+
+    expect(result.mints[0].error).toBeNull();
+    expect(nextMint.completeSwap).toHaveBeenCalledTimes(1);
+    expect(loadAgentWallet()?.proofs.map((p) => p.secret).sort()).toEqual(["released", "released-again", "released-other"]);
+  });
+
+  it("drops builder-redeemed inputs only after NUT-09 confirms no release outputs", async () => {
+    persistentWallet();
+    const interrupted = makeCashuWallet(UNSPENT, [OUTPUT]);
+    interrupted.completeSwap.mockRejectedValueOnce(new Error("request not sent"));
+    await release(interrupted);
+    const redeemed = makeCashuWallet(SPENT, []);
+
+    const result = await release(redeemed, { now: () => NOW + 3 * 60_000 });
+
+    expect(result.mints[0]).toMatchObject({ error: null, alreadySpent: [INPUT], reclaimedOutputs: [] });
+    expect(redeemed.mint.restore).toHaveBeenCalledTimes(1);
+    expect(redeemed.completeSwap).not.toHaveBeenCalled();
+    expect(loadAgentWallet()?.proofs).toEqual([]);
+    expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it("keeps mint-pending reserve proofs without attempting a swap", async () => {
+    persistentWallet();
+    const cashu = makeCashuWallet({ unspent: [], spent: [], pending: [INPUT] }, []);
+
+    const result = await release(cashu);
+
+    expect(result.mints[0]).toMatchObject({ error: null, pending: [INPUT], alreadySpent: [], reclaimedOutputs: [] });
+    expect(cashu.completeSwap).not.toHaveBeenCalled();
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(loadAgentWallet()?.proofs).toEqual([INPUT]);
+  });
+
+  it("discards a definitively refused swap's intent", async () => {
+    persistentWallet();
+    const cashu = makeCashuWallet(UNSPENT, [OUTPUT]);
+    cashu.completeSwap.mockRejectedValueOnce(new MintOperationError(11001, "token already spent"));
+
+    const result = await release(cashu);
+
+    expect(result.mints[0].error).toContain("token already spent");
+    expect(allReleaseIntents()).toEqual([]);
+    expect(loadAgentWallet()?.proofs).toEqual([INPUT]);
   });
 });

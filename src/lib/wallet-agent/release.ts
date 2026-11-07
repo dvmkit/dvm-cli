@@ -10,8 +10,8 @@
  * Race-with-builder-melt is handled at the mint via NUT-7 single-spend: a
  * pre-swap NUT-7 checkstate filters proofs the builder already melted (no
  * sense submitting them), and the mint rejects whatever survives the race.
- * Already-SPENT proofs are dropped from the wallet locally — they are the
- * builder's now by definition.
+ * A prior release intent is recovered before classifying SPENT inputs;
+ * only spends without a release result are treated as builder redemptions.
  *
  * Shipped proofs do not appear in `release` by construction: they have
  * already been removed from `wallet.proofs[]` at ship time (per the
@@ -19,7 +19,9 @@
  * that the agent never handed over.
  */
 
-import { type Proof, type Wallet } from "@cashu/cashu-ts";
+import { randomUUID } from "node:crypto";
+
+import { MintOperationError, type Proof, type SwapPreview, type Wallet } from "@cashu/cashu-ts";
 
 import { deriveAgentRefundSubkey } from "@dvmkit/sdk/internal";
 import { swapFeeForProofs } from "@dvmkit/sdk/internal";
@@ -28,7 +30,7 @@ import { DvmError } from "@dvmkit/sdk/internal";
 import type { ProviderInfo } from "@dvmkit/sdk/internal";
 import { readAgentMnemonic } from "@dvmkit/sdk/internal";
 import { reservedForMarker } from "./builder-handle";
-import { toAgentProof, toCashuProofs } from "@dvmkit/sdk/internal";
+import { restoreProofsFromOutputs, serializeOutputData, toAgentProof, toCashuProofs } from "@dvmkit/sdk/internal";
 import {
   type AgentProof,
   type AgentWallet,
@@ -37,21 +39,35 @@ import {
   withWalletLock,
 } from "@dvmkit/sdk/internal";
 
+import {
+  allReleaseIntents,
+  clearReleaseIntent,
+  loadReleaseIntent,
+  recordReleaseIntent,
+  type ReleaseIntent,
+  withReleaseLock,
+} from "./release-intents";
+
+const RELEASE_IN_FLIGHT_MS = 2 * 60_000;
+
 export interface ReleaseMintOutcome {
   mint: string;
+  /** Policy of newly reclaimed outputs; null when no outputs were saved. */
+  output_mode: "locked" | "unlocked" | null;
   /** Proofs the mint marked SPENT in a prior race with the builder's melt. Dropped from the wallet. */
   alreadySpent: AgentProof[];
   /** Proofs the mint reported PENDING — kept on disk, retry next run. */
   pending: AgentProof[];
   reclaimedInputs: AgentProof[];
   reclaimedOutputs: AgentProof[];
-  /** If `null`, the refund swap succeeded; otherwise the mint error message. */
+  /** A failure at the mint or while saving or recovering the release. */
   error: string | null;
 }
 
 export interface ReleaseResult {
   builder_handle: string;
-  output_mode: "locked" | "unlocked";
+  /** Actual reclaimed policies, or the requested policy when nothing was reclaimed. */
+  output_mode: "locked" | "unlocked" | "mixed";
   /** Per-mint outcomes — release groups reserve proofs by mint and runs one swap per mint. */
   mints: ReleaseMintOutcome[];
 }
@@ -110,10 +126,6 @@ export async function releaseAgentReserve(opts: ReleaseOptions): Promise<Release
       p.t_expire < now
   );
 
-  if (candidates.length === 0) {
-    return { builder_handle: opts.builderHandle, output_mode: outputMode, mints: [] };
-  }
-
   const getWalletForMint = opts.getWalletForMint ?? getWallet;
 
   const byMint = new Map<string, AgentProof[]>();
@@ -123,21 +135,30 @@ export async function releaseAgentReserve(opts: ReleaseOptions): Promise<Release
     byMint.set(p.mint, bucket);
   }
 
-  const outcomes: ReleaseMintOutcome[] = [];
-  for (const [mintUrl, mintProofs] of byMint) {
-    outcomes.push(
-      await releaseAtMint(
-        mintUrl,
-        mintProofs,
-        refund.privkey,
-        initial,
-        outputMode,
-        getWalletForMint
-      )
-    );
+  // Include landed swaps whose journal cleanup failed, even with no reserve left.
+  for (const intent of allReleaseIntents()) {
+    if (intent.walletPubkey === initial.lock_pubkey && intent.builderHandle === opts.builderHandle && !byMint.has(intent.mint)) {
+      byMint.set(intent.mint, []);
+    }
   }
 
-  return { builder_handle: opts.builderHandle, output_mode: outputMode, mints: outcomes };
+  const outcomes: ReleaseMintOutcome[] = [];
+  for (const [mintUrl, mintProofs] of byMint) {
+    try {
+      outcomes.push(await withReleaseLock(initial.lock_pubkey, opts.builderHandle, mintUrl, () =>
+        releaseAtMint(mintUrl, mintProofs, refund.privkey, initial, outputMode, getWalletForMint, opts.builderHandle, now)
+      ));
+    } catch (err) {
+      outcomes.push({ mint: mintUrl, output_mode: null, alreadySpent: [], pending: [], reclaimedInputs: [], reclaimedOutputs: [], error: errorText(err) });
+    }
+  }
+
+  const modes = new Set(outcomes.flatMap((outcome) => outcome.output_mode === null ? [] : [outcome.output_mode]));
+  return {
+    builder_handle: opts.builderHandle,
+    output_mode: modes.size > 1 ? "mixed" : modes.values().next().value ?? outputMode,
+    mints: outcomes,
+  };
 }
 
 async function releaseAtMint(
@@ -146,21 +167,28 @@ async function releaseAtMint(
   refundPrivkey: string,
   initial: AgentWallet,
   outputMode: "locked" | "unlocked",
-  getWalletForMint: (mintUrl: string) => Promise<Wallet>
+  getWalletForMint: (mintUrl: string) => Promise<Wallet>,
+  builderHandle: string,
+  now: number
 ): Promise<ReleaseMintOutcome> {
+  const outcome: ReleaseMintOutcome = {
+    mint: mintUrl, output_mode: null, alreadySpent: [], pending: [], reclaimedInputs: [], reclaimedOutputs: [], error: null,
+  };
   let cashuWallet: Wallet;
   try {
     cashuWallet = await getWalletForMint(mintUrl);
+    const intent = loadReleaseIntent(initial.lock_pubkey, builderHandle, mintUrl);
+    if (intent) {
+      const recovered = await recoverRelease(intent, cashuWallet, outcome, now);
+      if (recovered) return recovered;
+    }
+    const available = new Set(currentWallet(initial.lock_pubkey).proofs
+      .filter((p) => p.mint === mintUrl && p.status === "valid").map(proofIdKey));
+    mintProofs = mintProofs.filter((p) => available.has(proofIdKey(p)));
   } catch (err) {
-    return {
-      mint: mintUrl,
-      alreadySpent: [],
-      pending: [],
-      reclaimedInputs: [],
-      reclaimedOutputs: [],
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return { ...outcome, error: errorText(err) };
   }
+  if (mintProofs.length === 0) return outcome;
 
   // NUT-7 checkstate before the swap — drop builder-melted proofs locally
   // (they're the builder's, not ours to reclaim), and skip mint-PENDING
@@ -169,14 +197,7 @@ async function releaseAtMint(
   try {
     grouped = await cashuWallet.groupProofsByState(toCashuProofs(mintProofs));
   } catch (err) {
-    return {
-      mint: mintUrl,
-      alreadySpent: [],
-      pending: [],
-      reclaimedInputs: [],
-      reclaimedOutputs: [],
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return { ...outcome, error: errorText(err) };
   }
   const spentSecrets = new Set(grouped.spent.map((p) => p.secret));
   const pendingSecrets = new Set(grouped.pending.map((p) => p.secret));
@@ -186,27 +207,23 @@ async function releaseAtMint(
     (p) => !spentSecrets.has(p.secret) && !pendingSecrets.has(p.secret)
   );
 
-  if (alreadySpent.length > 0) {
+  outcome.pending = pending;
+  try {
     await withWalletLock(() => {
-      const fresh = loadAgentWallet() ?? initial;
-      const spentKeys = new Set(alreadySpent.map((p) => proofIdKey(p)));
-      saveAgentWallet({
-        ...fresh,
-        proofs: fresh.proofs.filter((p) => !spentKeys.has(proofIdKey(p))),
-      });
+      // The mint round trip may have overlapped another command's release.
+      assertNoRelease(initial.lock_pubkey, builderHandle, mintUrl);
+      const fresh = currentWallet(initial.lock_pubkey);
+      if (alreadySpent.length > 0) {
+        const spentKeys = new Set(alreadySpent.map(proofIdKey));
+        saveAgentWallet({ ...fresh, proofs: fresh.proofs.filter((p) => p.mint !== mintUrl || !spentKeys.has(proofIdKey(p))) });
+      }
     });
+    outcome.alreadySpent = alreadySpent;
+  } catch (err) {
+    return { ...outcome, error: errorText(err) };
   }
 
-  if (unspent.length === 0) {
-    return {
-      mint: mintUrl,
-      alreadySpent,
-      pending,
-      reclaimedInputs: [],
-      reclaimedOutputs: [],
-      error: null,
-    };
-  }
+  if (unspent.length === 0) return outcome;
 
   // Sweep everything, less what the mint charges to swap it. The
   // agent is both sender and receiver here, so there is no receiver fee to
@@ -214,7 +231,7 @@ async function releaseAtMint(
   // inputs than exist and fail every release at a fee-charging mint.
   const totalSats = unspent.reduce((sum, p) => sum + p.amount, 0);
   const inputs = toCashuProofs(unspent);
-  let outputs: Proof[];
+  let preview: SwapPreview;
   try {
     const swapFeeSats = swapFeeForProofs(cashuWallet, inputs);
     const reclaimSats = totalSats - swapFeeSats;
@@ -224,47 +241,153 @@ async function releaseAtMint(
       );
     }
     const builder = cashuWallet.ops.send(reclaimSats, inputs).privkey(refundPrivkey);
-    const result =
-      outputMode === "locked"
-        ? await builder.asP2PK({ pubkey: initial.lock_pubkey }).run()
-        : await builder.asRandom().run();
-    outputs = result.send;
+    preview = outputMode === "locked"
+      ? await builder.asP2PK({ pubkey: initial.lock_pubkey }).keepAsP2PK({ pubkey: initial.lock_pubkey }).prepare()
+      : await builder.asRandom().keepAsRandom().prepare();
   } catch (err) {
-    // Inputs untouched at the mint (the swap is atomic) — leave them on
-    // disk for the next release attempt. PENDING entries similarly stay.
-    return {
-      mint: mintUrl,
-      alreadySpent,
-      pending,
-      reclaimedInputs: [],
-      reclaimedOutputs: [],
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return { ...outcome, error: errorText(err) };
   }
 
-  // Swap landed: remove the reserve inputs, add free-balance outputs.
-  // `null` `locked_to_pubkey` for `--output unlocked` is a typed signal that
-  // these are anyone-can-spend outputs, distinct from any real pubkey.
-  const reclaimedOutputs = outputs.map((p) =>
-    toAgentProof(p, mintUrl, outputMode === "locked" ? initial.lock_pubkey : null)
-  );
-  await withWalletLock(() => {
-    const fresh = loadAgentWallet() ?? initial;
-    const inputKeys = new Set(unspent.map((p) => proofIdKey(p)));
-    saveAgentWallet({
-      ...fresh,
-      proofs: [...fresh.proofs.filter((p) => !inputKeys.has(proofIdKey(p))), ...reclaimedOutputs],
-    });
-  });
-
-  return {
+  const selected = new Set(preview.inputs.map(proofIdKey));
+  const intent: ReleaseIntent = {
+    id: randomUUID(),
+    builderHandle,
     mint: mintUrl,
-    alreadySpent,
-    pending,
-    reclaimedInputs: unspent,
-    reclaimedOutputs,
-    error: null,
+    walletPubkey: initial.lock_pubkey,
+    lockPubkey: outputMode === "locked" ? initial.lock_pubkey : null,
+    keysetId: preview.keysetId,
+    inputs: unspent.filter((p) => selected.has(proofIdKey(p))),
+    outputs: serializeOutputData([...(preview.sendOutputs ?? []), ...(preview.keepOutputs ?? [])]),
+    createdAt: now,
   };
+  try {
+    await withWalletLock(() => {
+      const fresh = currentWallet(initial.lock_pubkey);
+      const available = new Set(fresh.proofs.filter((p) => p.mint === mintUrl && p.status === "valid").map(proofIdKey));
+      if (intent.inputs.length === 0 || !intent.inputs.every((p) => available.has(proofIdKey(p)))) {
+        throw new Error("Reserve proofs changed during release; retry `dvm wallet release`.");
+      }
+      recordReleaseIntent(intent);
+    });
+  } catch (err) {
+    return { ...outcome, error: `Could not record the release, so nothing was swapped: ${errorText(err)}` };
+  }
+
+  let outputs: Proof[];
+  try {
+    const result = await cashuWallet.completeSwap(preview, refundPrivkey);
+    // cashu-ts includes unselected inputs in `keep`; they remain reserved.
+    const inputKeys = new Set(inputs.map(proofIdKey));
+    outputs = [...result.send, ...result.keep.filter((p) => !inputKeys.has(proofIdKey(p)))];
+  } catch (err) {
+    // Transport failures can follow a committed swap. Keep its recovery data.
+    if (err instanceof MintOperationError) {
+      try { clearReleaseIntent(intent); } catch { /* retried by the next release */ }
+    }
+    return { ...outcome, error: errorText(err) };
+  }
+  return commitRelease(intent, outputs, outcome);
+}
+
+async function commitRelease(
+  intent: ReleaseIntent,
+  outputs: Proof[],
+  outcome: ReleaseMintOutcome
+): Promise<ReleaseMintOutcome> {
+  const reclaimedOutputs = outputs.map((p) => toAgentProof(p, intent.mint, intent.lockPubkey));
+  let saved = false;
+  let cleanupError: unknown;
+  try {
+    await withWalletLock(() => {
+      const fresh = currentWallet(intent.walletPubkey);
+      const active = loadReleaseIntent(intent.walletPubkey, intent.builderHandle, intent.mint);
+      if (active?.id !== intent.id) return;
+      const inputKeys = new Set(intent.inputs.map(proofIdKey));
+      // No remaining inputs means an earlier save landed. Its outputs may
+      // already have been spent again, so never re-add them from a stale journal.
+      if (fresh.proofs.some((p) => p.mint === intent.mint && inputKeys.has(proofIdKey(p)))) {
+        const existing = new Set(fresh.proofs.filter((p) => p.mint === intent.mint).map(proofIdKey));
+        saveAgentWallet({
+          ...fresh,
+          proofs: [
+            ...fresh.proofs.filter((p) => p.mint !== intent.mint || !inputKeys.has(proofIdKey(p))),
+            ...reclaimedOutputs.filter((p) => !existing.has(proofIdKey(p))),
+          ],
+        });
+        saved = true;
+      }
+      try { clearReleaseIntent(intent); } catch (err) { cleanupError = err; }
+    });
+  } catch (err) {
+    return { ...outcome, error: `Release result is not saved to the wallet: ${errorText(err)}. Retry \`dvm wallet release\` to recover it.` };
+  }
+  return {
+    ...outcome,
+    output_mode: saved && reclaimedOutputs.length > 0 ? (intent.lockPubkey === null ? "unlocked" : "locked") : null,
+    reclaimedInputs: saved ? intent.inputs : [],
+    reclaimedOutputs: saved ? reclaimedOutputs : [],
+    error: cleanupError ? `Release saved, but recovery journal cleanup failed: ${errorText(cleanupError)}. Retry \`dvm wallet release\`.` : null,
+  };
+}
+
+async function recoverRelease(
+  intent: ReleaseIntent,
+  cashuWallet: Wallet,
+  outcome: ReleaseMintOutcome,
+  now: number
+): Promise<ReleaseMintOutcome | null> {
+  const fresh = currentWallet(intent.walletPubkey);
+  const inputKeys = new Set(intent.inputs.map(proofIdKey));
+  if (!fresh.proofs.some((p) => p.mint === intent.mint && inputKeys.has(proofIdKey(p)))) {
+    return commitRelease(intent, [], outcome);
+  }
+
+  let restored: Proof[] = [];
+  let restoreError: unknown;
+  try {
+    restored = await restoreProofsFromOutputs(cashuWallet, intent.keysetId, intent.outputs);
+  } catch (err) { restoreError = err; }
+  if (restored.length === intent.outputs.length && restored.length > 0) {
+    return commitRelease(intent, restored, outcome);
+  }
+  if (restored.length > 0) {
+    return { ...outcome, error: "The mint restored only part of the release outputs; retry `dvm wallet release`." };
+  }
+
+  const states = await cashuWallet.groupProofsByState(toCashuProofs(intent.inputs));
+  // A young intent may belong to a command that has not reached the mint yet.
+  if (now - intent.createdAt < RELEASE_IN_FLIGHT_MS) {
+    return { ...outcome, error: "Another release may still be in flight; retry `dvm wallet release` shortly." };
+  }
+  const unspent = new Set(states.unspent.map((p) => proofIdKey(p)));
+  if (states.pending.length === 0 && (
+    intent.inputs.every((p) => unspent.has(proofIdKey(p))) || restoreError === undefined
+  )) {
+    // Either every input is still available, or NUT-09 answered with no signed
+    // outputs. A SPENT input in the latter case belongs to the builder's swap.
+    await withWalletLock(() => clearReleaseIntent(intent));
+    return null;
+  }
+  return {
+    ...outcome,
+    error: `Release recovery is pending${restoreError ? `: ${errorText(restoreError)}` : ": the mint still reports inputs pending"}. Retry \`dvm wallet release\`.`,
+  };
+}
+
+function currentWallet(pubkey: string): AgentWallet {
+  const wallet = loadAgentWallet();
+  if (!wallet || wallet.lock_pubkey !== pubkey) throw new Error("The agent wallet changed during release.");
+  return wallet;
+}
+
+function assertNoRelease(walletPubkey: string, builderHandle: string, mint: string): void {
+  if (loadReleaseIntent(walletPubkey, builderHandle, mint)) {
+    throw new Error("Another release is awaiting recovery; retry `dvm wallet release`.");
+  }
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function proofIdKey(p: { secret: string; C: string }): string {
