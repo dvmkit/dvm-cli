@@ -66,6 +66,7 @@ import { resolveEndpoint } from "../lib/favorites";
 import { receiptSettlement } from "../lib/job-settlement";
 import { unknownCurrencyHint } from "../lib/piece-settlement";
 import { loadMessages } from "../lib/messages";
+import { isTerminalJobStatus } from "../lib/next-action";
 import { createDvmTransport } from "../lib/transport";
 
 export interface ReceiptsListOptions {
@@ -487,7 +488,7 @@ async function refetchAnchor(endpointOrAlias: string): Promise<ReceiptTrustAncho
  * A partial log hashes to something else, so returning one would report a sound
  * receipt as `invalid` — the single worst failure mode this command has. The
  * completeness proof: the log holds the terminal message, and its artifact
- * count matches the count the provider reported on the terminal response
+ * count matches the terminal snapshot from the provider or a full-log read
  * (snapshotted on the job record as `completion`). Anything less and we return
  * `undefined`, which the verifier reports honestly as `unchecked`.
  */
@@ -497,11 +498,12 @@ function deliveredFromMessages(
 ): DeliveredResult | undefined {
   const messages = loadMessages(jobId);
   if (messages.length === 0) return undefined;
-  if (!messages.some((m) => isCompleteMessage(m) || isCancelMessage(m))) return undefined;
+  const job = loadJob(jobId);
+  if (!messages.some((m) => isCompleteMessage(m) || isCancelMessage(m) ||
+      (m.type === "decline" && job?.callerDeclined === true && isTerminalJobStatus(job.status)))) return undefined;
 
-  const completion = loadJob(jobId)?.completion;
-  // `has_artifacts` is only emitted on a completed terminal response, so a
-  // failed/cancelled job has no count to check the log against.
+  const completion = job?.completion;
+  // Terminal status fields or a full-log read supply the count to check against.
   if (completion?.hasArtifacts === undefined) return undefined;
 
   const artifacts = messages.filter(isArtifactMessage);

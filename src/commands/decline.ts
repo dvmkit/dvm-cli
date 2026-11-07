@@ -1,3 +1,4 @@
+import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
 import { DvmError } from "@dvmkit/sdk/internal";
 import { settlementCurrencyHint } from "../lib/piece-settlement";
 import { formatIdentifier } from "../lib/dvm-identifier";
@@ -48,15 +49,15 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
     onTerminal: (status) => {
       if (!access.endpointOverridden && isTerminalJobStatus(status.status)) {
         markJobTerminal(jobId, status.status,
-          opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true, callerDeclined: true });
+          { ...(stored?.status === status.status ? stored.completion : {}),
+            ...(opts.reason !== undefined ? { message: opts.reason } : {}) }, { callerCancelled: true, callerDeclined: true });
         clearAskPaymentBlocks(jobId);
       }
     } });
-  transport.close();
-
   const observed = ending.status?.status;
   // A DVM that predates decline accepts the message as ordinary conversation.
   if (observed !== undefined && !isTerminalJobStatus(observed)) {
+    transport.close();
     throw new DvmError(
       "decline_unsupported",
       `The provider accepted the decline, but the job is still ${observed}.`,
@@ -65,14 +66,31 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
     );
   }
 
+  const completion = ending.status ? await readTerminalCompletion({
+    jobId, status: ending.status, transport, ref, jobToken,
+    saved: stored && stored.status === observed ? stored.completion : undefined,
+  }) : {};
+  if (observed && isTerminalJobStatus(observed) && !access.endpointOverridden) {
+    const saved = stored?.status === observed ? stored.completion : undefined;
+    markJobTerminal(jobId, observed, {
+      ...(ending.status?.content_available === false && saved ? saved : completion),
+      ...(opts.reason !== undefined ? { message: opts.reason } : {}),
+    });
+  }
+  const artifacts = terminalCompletionOutput(jobId, observed ?? "unknown", completion, {
+    human: opts.human, contentAvailable: ending.status?.content_available,
+  });
+  transport.close();
+
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
   const { settlement } = ending;
-  const display = observed === undefined
+  const endingDisplay = observed === undefined
     ? `Decline sent, but the job's status could not be read. Check it with \`dvm status ${job}\`.`
     : settlement
       ? `Declined; the job has ended. ${settlement.display}`
       : `Declined; the job has ended. Its receipt is not available yet; \`dvm status ${job}\` shows the final charge once it is.`;
 
+  const display = [endingDisplay, artifacts.display].filter(Boolean).join(" ");
   const hint = settlementCurrencyHint(settlement, ref.endpoint);
 
   if (opts.human) {
@@ -88,6 +106,7 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
     ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
     ...(settlement ? { settlement } : {}),
     display,
+    ...artifacts.fields,
     ...(hint ? { hint } : {}),
     next_action: observed === undefined ? pollNextAction(jobId, display) : null,
   });

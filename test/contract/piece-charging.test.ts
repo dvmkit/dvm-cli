@@ -4,7 +4,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import type { JobReceipt, Message } from "@dvmkit/sdk/internal";
+import { computeResultHash, type JsonValue, type JobReceipt, type Message } from "@dvmkit/sdk/internal";
 import { attestedDvm, unsignedReceipt } from "../../src/lib/__tests__/fixtures/receipt-fixture";
 
 const binary = process.env.DVM_CLI_TEST_BINARY ?? resolve(import.meta.dirname, "../../dist/dvm.js");
@@ -143,9 +143,9 @@ function seed(status: string, messages: unknown[], record: Record<string, unknow
   writeFileSync(join(root, "messages/job.jsonl"), messages.map((message) => JSON.stringify(message)).join("\n") + "\n");
 }
 
-function run(command: string, flags: string[] = []) {
+function run(command: string | string[], flags: string[] = []) {
   return new Promise<{ code: number; stderr: string; output: Record<string, any> }>((done) => {
-    execFile(process.execPath, [binary, command, "job", ...flags], {
+    execFile(process.execPath, [binary, ...(typeof command === "string" ? [command] : command), "job", ...flags], {
       env: Object.fromEntries(Object.entries({ ...process.env, DVM_CONFIG_DIR: root })
         .filter(([key]) => !["DVM_JOB_ENDPOINT", "DVM_JOB_TOKEN", "DVM_IDENTITY_KEY"].includes(key))),
       timeout: 20_000,
@@ -205,6 +205,58 @@ it("declines the open ask, ends the job and reports the finished pieces charged"
   expect(messages.output.next_action).toBeNull();
   expect(sentPayments()).toEqual([]);
 });
+
+// Seven CLI startups share this deadline; run() also bounds each process separately.
+it.each(["payment-request", "prompt"])("retrieves and verifies finished artifacts after declining a %s", async (type) => {
+  const contents = [{ name: "first.txt", data: "First piece" }, { name: "second.txt", data: "Second piece" }];
+  history = [askOne, payOne,
+    ...contents.map((content, index) => ({ seq: index + 3, from: "provider", timestamp: index + 3, type: "artifact", content })),
+    type === "prompt"
+      ? { seq: 5, from: "provider", timestamp: 5, type: "prompt", content: { id: "continue", text: "Continue?" } }
+      : { ...askTwo(Date.now() + 3_600_000), seq: 5 },
+  ] as Message[];
+  seed("awaiting-input", [askOne, payOne], { messageCursor: 2 });
+  const makeReceipt = endingReceipt;
+  endingReceipt = (kind) => {
+    const { signature: _signature, ...unsigned } = makeReceipt(kind)!;
+    return dvm.sign({ ...unsigned, result_hash: computeResultHash(undefined, contents as JsonValue[]) });
+  };
+
+  const declined = await run("decline");
+  expect(declined.code).toBe(0);
+  expect(declined.output).toMatchObject({ status: "cancelled", declined: true,
+    has_artifacts: true, artifact_count: 2, payload_in: "messages", next_action: null,
+    next_step_hint: "Run 'dvm messages job --no-stream' to fetch the artifacts." });
+  expect(declined.output.display).toContain("2 artifacts");
+  expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0].messageCursor).toBe(2);
+  const reads = requests.length;
+  const replay = await run("status");
+  expect(replay.output).toMatchObject({ source: "local", artifact_count: 2, payload_in: "messages" });
+  expect(requests).toHaveLength(reads);
+  const unchecked = await run(["receipts", "verify"]);
+  expect(unchecked.output.receipt_checks.result_hash).toBe("unchecked");
+
+  const fetched = await run("messages", ["--no-stream"]);
+  expect(fetched.code).toBe(0);
+  expect(fetched.output.messages.filter((message: Message) => message.type === "artifact")).toHaveLength(2);
+  const verified = await run(["receipts", "verify"]);
+  expect(verified.code).toBe(0);
+  expect(verified.output.receipt_checks.result_hash).toBe("ok");
+
+  const logPath = join(root, "messages/job.jsonl");
+  const log = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const first = log.find((message: Message) => message.type === "artifact");
+  if (!first) throw new Error("Fetched artifact missing from local log");
+  first.content.data = "Altered piece";
+  writeFileSync(logPath, log.map((message) => JSON.stringify(message)).join("\n") + "\n");
+  const mismatch = await run(["receipts", "verify"]);
+  expect(mismatch.output.receipt_checks.result_hash).toBe("mismatch");
+
+  writeFileSync(logPath, log.filter((message: Message) => message.seq !== first.seq)
+    .map((message) => JSON.stringify(message)).join("\n") + "\n");
+  const incomplete = await run(["receipts", "verify"]);
+  expect(incomplete.output.receipt_checks.result_hash).toBe("unchecked");
+}, 30_000);
 
 it("explains a decline with nothing open, and one an older DVM ignores", async () => {
   history = [askOne, payOne] as Message[];
@@ -289,13 +341,14 @@ it("stops resending a cancel after its bounded attempts", async () => {
   expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0].status).toBe("processing");
 }, 30_000);
 
-it("keeps an older DVM's cancel output unchanged", async () => {
+it("reports no artifacts on an older DVM's cancel and preserves its human output", async () => {
   mode = "legacy";
   history = [strip(askOne), payOne] as Message[];
   seed("processing", history);
   const result = await run("cancel");
   expect(result.code).toBe(0);
-  expect(result.output).toEqual({ jobId: "job", status: "cancelled", next_action: null, _provider_fields: ["jobId"] });
+  expect(result.output).toEqual({ jobId: "job", status: "cancelled", has_artifacts: false,
+    next_action: null, _provider_fields: ["jobId"] });
   const human = await run("cancel", ["--human"]);
   expect(human.stderr.trim().split("\n").at(-1)).toBe("Job job cancelled.");
 });

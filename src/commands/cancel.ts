@@ -1,3 +1,4 @@
+import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
 import { guidanceJobArg, providerJobJson } from "../lib/provider-output";
 import {
   info,
@@ -49,22 +50,35 @@ async function cancelWithAccess(
   await retryWhilePaymentInProgress(() => transport.cancel(jobId, opts.reason, ref, { jobToken }), { human: opts.human });
 
   if (!access.endpointOverridden) markJobTerminal(jobId, "cancelled",
-    opts.reason !== undefined ? { message: opts.reason } : {}, { callerCancelled: true });
+    { ...(stored?.status === "cancelled" ? stored.completion : {}),
+      ...(opts.reason !== undefined ? { message: opts.reason } : {}) }, { callerCancelled: true });
 
   // A piece-charging DVM charges the work in progress on a cancel; its receipt says how much.
   // An accepted cancel can leave the ask open, so only a confirmed ending lifts its block.
   const { settlement, status } = await readEnding({ jobId, transport, ref, jobToken,
     persistLocalState: !access.endpointOverridden, human: opts.human,
     onTerminal: () => { if (!access.endpointOverridden) clearAskPaymentBlocks(jobId); } });
+  const saved = stored?.status === "cancelled" ? stored.completion : undefined;
+  const completion = await readTerminalCompletion({
+    jobId, status: status ?? { status: "cancelled" }, saved, transport, ref, jobToken,
+  });
+  if (!access.endpointOverridden) markJobTerminal(jobId, "cancelled", {
+    ...(status?.content_available === false && saved ? saved : completion),
+    ...(opts.reason !== undefined ? { message: opts.reason } : {}),
+  });
+  const artifacts = terminalCompletionOutput(jobId, "cancelled", completion, {
+    human: opts.human, contentAvailable: status?.content_available,
+  });
   transport.close();
 
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
   // A receipt that is not signed yet still decides the charge; say where it will show.
   const receiptPending = !settlement && status !== undefined && isTerminalJobStatus(status.status) &&
     !status.receipt && !status.receiptParseError && !access.endpointOverridden && expectsReceipt(jobId, stored);
-  const display = settlement ? cancelledDisplay(settlement)
+  const endingDisplay = settlement ? cancelledDisplay(settlement)
     : receiptPending ? `Stopped. Its receipt is not available yet; \`dvm status ${guidanceJobArg(jobId)}\` shows what was charged once it is.`
     : undefined;
+  const display = [endingDisplay, artifacts.display].filter(Boolean).join(" ") || undefined;
   // The labelled "(currency not recorded)" amount in `display` needs its reason beside it.
   const hint = settlementCurrencyHint(settlement, ref.endpoint);
 
@@ -80,6 +94,7 @@ async function cancelWithAccess(
       ...(opts.reason ? { reason: opts.reason } : {}),
       ...(settlement ? { settlement } : {}),
       ...(display ? { display } : {}),
+      ...artifacts.fields,
       ...(hint ? { hint } : {}),
       next_action: null,
     });
