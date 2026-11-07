@@ -340,13 +340,14 @@ it("stops resending a cancel after its bounded attempts", async () => {
   expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0].status).toBe("processing");
 }, 30_000);
 
-it("keeps an older DVM's cancel output unchanged", async () => {
+it("reports no artifacts on an older DVM's cancel and preserves its human output", async () => {
   mode = "legacy";
   history = [strip(askOne), payOne] as Message[];
   seed("processing", history);
   const result = await run("cancel");
   expect(result.code).toBe(0);
-  expect(result.output).toEqual({ jobId: "job", status: "cancelled", next_action: null, _provider_fields: ["jobId"] });
+  expect(result.output).toEqual({ jobId: "job", status: "cancelled", has_artifacts: false,
+    next_action: null, _provider_fields: ["jobId"] });
   const human = await run("cancel", ["--human"]);
   expect(human.stderr.trim().split("\n").at(-1)).toBe("Job job cancelled.");
 });
