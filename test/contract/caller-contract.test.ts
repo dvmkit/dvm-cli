@@ -207,6 +207,24 @@ beforeAll(async () => {
             }));
             return;
           }
+          if (drainId === "tempo-sent") {
+            response.end(JSON.stringify({
+              op: "drain",
+              credit: creditWire(contractCreditId, 0, 2),
+              drain: {
+                drain_id: drainId,
+                credit_id: contractCreditId,
+                method: "tempo",
+                status: "sent",
+                amount_micro: 750_000,
+                currency: "usd",
+                ledger_seq: 2,
+                created_at: 1_700_000_000_000,
+                receipts: [],
+              },
+            }));
+            return;
+          }
           if (drainId.startsWith("exit-status") || drainId === "future-status") {
             response.end(JSON.stringify({
               op: "drain",
@@ -1190,6 +1208,58 @@ describe("standalone caller contract", () => {
           expect.objectContaining({ drainId, creditId: contractCreditId }),
         ]);
       }
+    });
+
+    it("answers a repeat Tempo drain locally as already drained, without a timed-exit hint", async () => {
+      const caller = await initializedCaller();
+      await runCli(["credit", "balance", endpoint], {}, caller.root);
+      const first = await runCliOutcome([
+        "credit", "drain", endpoint, "--credit-id", contractCreditId,
+        "--drain-id", "tempo-sent", "--method", "tempo",
+        "--address", `0x${"12".repeat(20)}`,
+        "--as", caller.identityName,
+      ], {}, caller.root);
+      expect(first.code).toBe(0);
+      expect(readCredit(caller.root)).toEqual(expect.objectContaining({ status: "drained", remainingMicro: 0 }));
+      const postsBefore = creditRequestBodies().length;
+
+      const second = await runCliOutcome([
+        "credit", "drain", endpoint, "--credit-id", contractCreditId,
+        "--method", "tempo", "--as", caller.identityName,
+      ], {}, caller.root);
+      const output = JSON.parse(second.stdout) as Record<string, unknown>;
+
+      expect(second.code).toBe(0);
+      expect(output.already_drained).toBe(true);
+      expect(output.balance_micro).toBe(0);
+      expect(output.display).toEqual(expect.stringContaining("already drained"));
+      expect(JSON.stringify(output)).not.toContain("tempo-exit");
+      expect(JSON.stringify(output)).not.toContain("timed exit");
+      expect(creditRequestBodies()).toHaveLength(postsBefore);
+    });
+
+    it("maps an unregistered exit refusal on an already-drained Tempo credit to already drained", async () => {
+      const caller = await initializedCaller();
+      await runCli(["credit", "balance", endpoint], {}, caller.root);
+      await runCliOutcome([
+        "credit", "drain", endpoint, "--credit-id", contractCreditId,
+        "--drain-id", "tempo-sent", "--method", "tempo",
+        "--address", `0x${"12".repeat(20)}`,
+        "--as", caller.identityName,
+      ], {}, caller.root);
+
+      const result = await runCliOutcome([
+        "credit", "drain", endpoint, "--credit-id", contractCreditId,
+        "--drain-id", "exit-refusal-unregistered", "--method", "tempo",
+        "--address", `0x${"12".repeat(20)}`,
+        "--as", caller.identityName,
+      ], {}, caller.root);
+      const output = JSON.parse(result.stdout) as Record<string, unknown>;
+
+      expect(result.code).toBe(0);
+      expect(output.already_drained).toBe(true);
+      expect(JSON.stringify(output)).not.toContain("tempo-exit");
+      expect(readCredit(caller.root).pendingDrains).toBeUndefined();
     });
 
     it("keeps server and CLI text separate when an unregistered refusal retires the local marker", async () => {

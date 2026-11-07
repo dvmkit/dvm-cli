@@ -239,6 +239,22 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
     return;
   }
 
+  // A Tempo credit is only ever marked drained once its cooperative close was
+  // sent, and the channel is closed after that. Asking the DVM again earns
+  // `tempo_channel_exit_required`, which reads as stranded funds when nothing is
+  // owed — so answer from the record. A live local channel record (the close
+  // was not confirmed on-chain) or a pending drain still goes to the DVM.
+  if (
+    method === "tempo" &&
+    isKnownEmptyTempoCredit(stored, creditId) &&
+    !opts.drainId &&
+    !pendingDrainFor(stored, creditId) &&
+    !tempoSession
+  ) {
+    renderAlreadyDrained({ human: opts.human === true, endpoint, creditId });
+    return;
+  }
+
   // The *projection* writes only apply when the drained credit IS the tracked
   // one (or nothing is tracked yet) — adopting another credit's balances and
   // ledger sequence into this record would corrupt it. Drain bookkeeping is
@@ -701,6 +717,17 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
       // merely re-posted may still be the sole pointer to a parked payout.
       if (!stored) forgetCredit(endpoint, signer.pubkey, ...identityArg);
       else if (mintedThisRun) clearPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
+    }
+    if (
+      err instanceof DvmError &&
+      err.code === "tempo_channel_exit_required" &&
+      err.data?.drain_registered === false &&
+      isKnownEmptyTempoCredit(stored, creditId)
+    ) {
+      // The DVM registered nothing and the record shows the earlier drain was
+      // sent: the channel is closed, not stuck, so there is no exit to run.
+      renderAlreadyDrained({ human: opts.human === true, endpoint, creditId });
+      return;
     }
     if (err instanceof DvmError && err.code === "tempo_channel_exit_required") {
       const local = tempoExitRequiredCopy(exitRecovery, err.data?.channel_id, err.data?.status);
@@ -1395,6 +1422,37 @@ function localDrainCopy(
         `Unknown drain status '${wire.status}'; this version of dvm cannot determine the refund outcome.`
       );
   }
+}
+
+function isKnownEmptyTempoCredit(stored: StoredCredit | undefined, creditId: string): boolean {
+  return (
+    stored?.creditId === creditId &&
+    stored.status === "drained" &&
+    stored.remainingMicro <= 0 &&
+    !stored.provisional &&
+    !stored.discrepancy
+  );
+}
+
+function renderAlreadyDrained(args: { human: boolean; endpoint: string; creditId: string }): void {
+  const display =
+    "This credit is already drained: its earlier drain was sent, so nothing is owed and no refund is pending.";
+  const hint =
+    "Nothing remains to reclaim, so no further drain or on-chain action is needed. A fresh credit can open when you next need one.";
+  if (args.human) {
+    info(display);
+    info(hint);
+    return;
+  }
+  json({
+    op: "drain",
+    endpoint: args.endpoint,
+    credit_id: args.creditId,
+    already_drained: true,
+    balance_micro: 0,
+    display,
+    hint,
+  });
 }
 
 interface TempoExitRecovery {
