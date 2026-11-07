@@ -1,5 +1,7 @@
 vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
  ...(await importOriginal<typeof import("@dvmkit/sdk/internal")>()),
+ getWallet: vi.fn(),
+ readAgentMnemonic: vi.fn(),
  loadAgentWallet: vi.fn(),
 saveAgentWallet: vi.fn(),
 withWalletLock: vi.fn(<T>(fn: () => Promise<T> | T) => Promise.resolve(fn()))
@@ -38,10 +40,19 @@ import { Amount, MintOperationError } from "@cashu/cashu-ts";
 import type { ProviderInfo } from "@dvmkit/sdk/internal";
 import { releaseAgentReserve } from "../release";
 import type { AgentProof, AgentWallet } from "@dvmkit/sdk/internal";
-import { loadAgentWallet, saveAgentWallet } from "@dvmkit/sdk/internal";
+import { getWallet, loadAgentWallet, readAgentMnemonic, saveAgentWallet } from "@dvmkit/sdk/internal";
 
 import lockfile from "proper-lockfile";
 import { allReleaseIntents, clearReleaseIntent } from "../release-intents";
+
+const command = vi.hoisted(() => ({ describe: vi.fn(), close: vi.fn(), info: vi.fn(), json: vi.fn() }));
+vi.mock("../../transport", () => ({
+  createDvmTransport: () => ({ describe: command.describe, close: command.close }),
+}));
+vi.mock("../../output", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../output")>()), info: command.info, json: command.json,
+}));
+import { walletRelease } from "../../../commands/wallet-agent-reserve";
 
 const MNEMONIC =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
@@ -374,14 +385,16 @@ describe("release durability", () => {
 
     const first = await release(firstMint, { outputMode });
 
-    expect(first.mints[0]).toMatchObject({ reclaimedInputs: [], reclaimedOutputs: [], error: expect.stringContaining("disk full") });
+    expect(first.output_mode).toBe(outputMode);
+    expect(first.mints[0]).toMatchObject({ output_mode: null, reclaimedInputs: [], reclaimedOutputs: [], error: expect.stringContaining("disk full") });
     expect(loadAgentWallet()?.proofs).toEqual([INPUT, unrelated]);
     expect(allReleaseIntents()).toHaveLength(1);
 
     const nextMint = makeCashuWallet(SPENT, [OUTPUT]);
-    const recovered = await release(nextMint);
+    const recovered = await release(nextMint, { outputMode: outputMode === "locked" ? "unlocked" : "locked" });
 
-    expect(recovered.mints[0]).toMatchObject({ error: null, alreadySpent: [], reclaimedInputs: [INPUT] });
+    expect(recovered.output_mode).toBe(outputMode);
+    expect(recovered.mints[0]).toMatchObject({ output_mode: outputMode, error: null, alreadySpent: [], reclaimedInputs: [INPUT] });
     expect(nextMint.mint.restore).toHaveBeenCalledTimes(1);
     expect(nextMint.completeSwap).not.toHaveBeenCalled();
     expect(nextMint._sendBuilder.prepare).not.toHaveBeenCalled();
@@ -392,6 +405,80 @@ describe("release durability", () => {
     ]);
     expect(loadAgentWallet()?.proofs[1].reserved_for).toBeUndefined();
     expect(allReleaseIntents()).toEqual([]);
+  });
+
+  it.each(["fresh", "recovered", "pending"])("reports each mint's actual policy when another mint is %s", async (secondKind) => {
+    persistentWallet();
+    vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+    await release(makeCashuWallet(UNSPENT, [OUTPUT]), { outputMode: "unlocked" });
+    const secondInput = { ...INPUT, mint: "https://other-mint.example" };
+    const wallet = loadAgentWallet()!;
+    saveAgentWallet({ ...wallet, proofs: [...wallet.proofs, secondInput] });
+    const opts = {
+      builderHandle: "scrape.dvmkit.ai", providerInfo: info(), readMnemonic: () => MNEMONIC, now: () => NOW,
+    };
+    const secondOutput = { ...OUTPUT, secret: "released-other" };
+    if (secondKind === "recovered") {
+      vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+      const unavailable = await releaseAgentReserve({
+        ...opts,
+        getWalletForMint: (mint) => mint === INPUT.mint
+          ? Promise.reject(new Error("mint unavailable"))
+          : Promise.resolve(makeCashuWallet(UNSPENT, [secondOutput]) as never),
+      });
+      expect(unavailable.mints.every((m) => m.error)).toBe(true);
+      expect(allReleaseIntents()).toHaveLength(2);
+    }
+    const firstMint = makeCashuWallet(SPENT, [OUTPUT]);
+    const secondMint = makeCashuWallet(secondKind === "pending" ? { unspent: [], spent: [], pending: [secondInput] } : secondKind === "recovered" ? SPENT : UNSPENT, [secondOutput]);
+
+    const result = await releaseAgentReserve({
+      ...opts,
+      getWalletForMint: (mint) => Promise.resolve((mint === INPUT.mint ? firstMint : secondMint) as never),
+    });
+
+    expect(result.output_mode).toBe(secondKind === "pending" ? "unlocked" : "mixed");
+    expect(result.mints.map((m) => m.output_mode)).toEqual(["unlocked", secondKind === "pending" ? null : "locked"]);
+    expect(firstMint.completeSwap).not.toHaveBeenCalled();
+    expect(secondMint.completeSwap).toHaveBeenCalledTimes(secondKind === "fresh" ? 1 : 0);
+    expect(loadAgentWallet()?.proofs.find((p) => p.mint === INPUT.mint)?.locked_to_pubkey).toBeNull();
+    if (secondKind !== "pending") {
+      expect(loadAgentWallet()?.proofs.find((p) => p.mint === secondInput.mint)?.locked_to_pubkey).toBe(wallet.lock_pubkey);
+    }
+  });
+
+  it.each([false, true])("prints the recovered and fresh policies in mixed release output (human=%s)", async (human) => {
+    persistentWallet();
+    vi.mocked(saveAgentWallet).mockImplementationOnce(() => { throw new Error("disk full"); });
+    await release(makeCashuWallet(UNSPENT, [OUTPUT]), { outputMode: "unlocked" });
+    const secondInput = { ...INPUT, mint: "https://other-mint.example" };
+    const wallet = loadAgentWallet()!;
+    saveAgentWallet({ ...wallet, proofs: [...wallet.proofs, secondInput] });
+    const firstMint = makeCashuWallet(SPENT, [OUTPUT]);
+    const secondMint = makeCashuWallet(UNSPENT, [{ ...OUTPUT, secret: "released-other" }]);
+    vi.mocked(getWallet).mockImplementation((mint) => Promise.resolve((mint === INPUT.mint ? firstMint : secondMint) as never));
+    vi.mocked(readAgentMnemonic).mockReturnValue(MNEMONIC);
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    command.describe.mockResolvedValue(info());
+
+    await walletRelease({ builder: "https://scrape.dvmkit.ai", human });
+
+    if (human) {
+      expect(command.info).toHaveBeenCalledWith(expect.stringContaining("output mode: mixed"));
+      expect(command.info).toHaveBeenCalledWith(expect.stringContaining(`${INPUT.mint} (output mode: unlocked)`));
+      expect(command.info).toHaveBeenCalledWith(expect.stringContaining(`${secondInput.mint} (output mode: locked)`));
+    } else {
+      expect(command.json).toHaveBeenCalledWith(expect.objectContaining({
+        output_mode: "mixed",
+        mints: [
+          expect.objectContaining({ mint: INPUT.mint, output_mode: "unlocked", reclaimed_sats: 6 }),
+          expect.objectContaining({ mint: secondInput.mint, output_mode: "locked", reclaimed_sats: 6 }),
+        ],
+      }));
+    }
+    expect(firstMint.completeSwap).not.toHaveBeenCalled();
+    expect(secondMint.completeSwap).toHaveBeenCalledTimes(1);
+    expect(command.close).toHaveBeenCalledTimes(1);
   });
 
   it("starts over with one swap after an interruption before reaching the mint", async () => {

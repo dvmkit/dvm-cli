@@ -52,6 +52,8 @@ const RELEASE_IN_FLIGHT_MS = 2 * 60_000;
 
 export interface ReleaseMintOutcome {
   mint: string;
+  /** Policy of newly reclaimed outputs; null when no outputs were saved. */
+  output_mode: "locked" | "unlocked" | null;
   /** Proofs the mint marked SPENT in a prior race with the builder's melt. Dropped from the wallet. */
   alreadySpent: AgentProof[];
   /** Proofs the mint reported PENDING — kept on disk, retry next run. */
@@ -64,7 +66,8 @@ export interface ReleaseMintOutcome {
 
 export interface ReleaseResult {
   builder_handle: string;
-  output_mode: "locked" | "unlocked";
+  /** Actual reclaimed policies, or the requested policy when nothing was reclaimed. */
+  output_mode: "locked" | "unlocked" | "mixed";
   /** Per-mint outcomes — release groups reserve proofs by mint and runs one swap per mint. */
   mints: ReleaseMintOutcome[];
 }
@@ -146,11 +149,16 @@ export async function releaseAgentReserve(opts: ReleaseOptions): Promise<Release
         releaseAtMint(mintUrl, mintProofs, refund.privkey, initial, outputMode, getWalletForMint, opts.builderHandle, now)
       ));
     } catch (err) {
-      outcomes.push({ mint: mintUrl, alreadySpent: [], pending: [], reclaimedInputs: [], reclaimedOutputs: [], error: errorText(err) });
+      outcomes.push({ mint: mintUrl, output_mode: null, alreadySpent: [], pending: [], reclaimedInputs: [], reclaimedOutputs: [], error: errorText(err) });
     }
   }
 
-  return { builder_handle: opts.builderHandle, output_mode: outputMode, mints: outcomes };
+  const modes = new Set(outcomes.flatMap((outcome) => outcome.output_mode === null ? [] : [outcome.output_mode]));
+  return {
+    builder_handle: opts.builderHandle,
+    output_mode: modes.size > 1 ? "mixed" : modes.values().next().value ?? outputMode,
+    mints: outcomes,
+  };
 }
 
 async function releaseAtMint(
@@ -164,7 +172,7 @@ async function releaseAtMint(
   now: number
 ): Promise<ReleaseMintOutcome> {
   const outcome: ReleaseMintOutcome = {
-    mint: mintUrl, alreadySpent: [], pending: [], reclaimedInputs: [], reclaimedOutputs: [], error: null,
+    mint: mintUrl, output_mode: null, alreadySpent: [], pending: [], reclaimedInputs: [], reclaimedOutputs: [], error: null,
   };
   let cashuWallet: Wallet;
   try {
@@ -315,6 +323,7 @@ async function commitRelease(
   }
   return {
     ...outcome,
+    output_mode: saved && reclaimedOutputs.length > 0 ? (intent.lockPubkey === null ? "unlocked" : "locked") : null,
     reclaimedInputs: saved ? intent.inputs : [],
     reclaimedOutputs: saved ? reclaimedOutputs : [],
     error: cleanupError ? `Release saved, but recovery journal cleanup failed: ${errorText(cleanupError)}. Retry \`dvm wallet release\`.` : null,
