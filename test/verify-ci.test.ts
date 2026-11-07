@@ -21,6 +21,54 @@ afterEach(() => {
 });
 
 describe("CI verification diagnostics", () => {
+  it.each(["verify", "install"])("drains large %s failure diagnostics", (mode) => {
+    const root = temporaryRoot();
+    const scripts = join(root, "scripts");
+    mkdirSync(scripts);
+    copyFileSync(verifier, join(scripts, "verify-ci.mjs"));
+    const bytes = 2 * 1024 * 1024;
+    writeFileSync(
+      join(scripts, "pinned-npm.mjs"),
+      `import { writeFileSync } from "node:fs";
+writeFileSync(1, "O".repeat(${bytes}) + "\\n" + process.cwd() + "/stdout.ts: STDOUT_FINAL\\n");
+writeFileSync(2, "E".repeat(${bytes}) + "\\n" + process.cwd() + "/stderr.ts: STDERR_FINAL\\n");
+process.exitCode = 23;
+`
+    );
+
+    const args = mode === "install" ? ["--install"] : [];
+    const result = spawnSync(process.execPath, [join(scripts, "verify-ci.mjs"), ...args], {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(23);
+    expect(result.stdout.includes("stdout.ts: STDOUT_FINAL\n")).toBe(true);
+    expect(result.stdout.endsWith("stderr.ts: STDERR_FINAL\n")).toBe(true);
+    expect(result.stdout).toHaveLength(bytes * 2 + "\nstdout.ts: STDOUT_FINAL\n\nstderr.ts: STDERR_FINAL\n".length);
+    expect(result.stdout.includes(root)).toBe(false);
+    expect(result.stderr).toBe("");
+    expect(readFileSync(join(root, ".artifacts", "verify-diagnostics.txt"), "utf8")).toBe(result.stdout);
+  });
+
+  it("drains large sanitized fixture output without running verification", () => {
+    const root = temporaryRoot();
+    const fixture = join(root, "output.txt");
+    const bytes = 2 * 1024 * 1024;
+    writeFileSync(fixture, "F".repeat(bytes) + "\nFIXTURE_FINAL\n");
+
+    const result = spawnSync(process.execPath, [verifier, "--sanitize-file", fixture], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout.endsWith("\nFIXTURE_FINAL\n")).toBe(true);
+    expect(result.stdout).toHaveLength(bytes + "\nFIXTURE_FINAL\n".length);
+    expect(result.stderr).toBe("");
+  });
+
   it("rewrites workspace paths to repository-relative diagnostics", () => {
     const root = temporaryRoot();
     const workspace = join(root, "workspace");

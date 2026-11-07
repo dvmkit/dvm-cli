@@ -92,7 +92,10 @@ function npm(args, cwd, env) {
   process.stdout.write(sanitizeOutput(result.stdout ?? "", cwd));
   process.stderr.write(sanitizeOutput(result.stderr ?? "", cwd));
   if (result.error) throw new Error(`npm ${args.join(" ")} could not be started: ${result.error.message}`);
-  if (result.status !== 0) throw new Error(`npm ${args.join(" ")} failed`);
+  if (result.status !== 0) {
+    process.exitCode = result.status ?? 1;
+    throw new Error(`npm ${args.join(" ")} failed`);
+  }
 }
 
 function sanitizeOutput(output, cleanRoot) {
@@ -112,5 +115,6 @@ function secondsSince(started) {
 
 function fail(message) {
   console.error(`clean install: ${message}`);
-  process.exit(1);
+  // Preserve child failures and let both output streams drain after cleanup.
+  process.exitCode ??= 1;
 }
