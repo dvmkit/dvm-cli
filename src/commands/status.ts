@@ -5,8 +5,9 @@ import { formatMessageHuman } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { createArtifactSaveSession } from "../lib/save-artifact";
-import { type PaymentPolicyContext, computeNextAction, isTerminalJobStatus, type NextAction, paymentInFlightHint, pollNextAction } from "../lib/next-action";
-import { pendingPaymentRequest, settleRecordedPayments } from "../lib/yield-state";
+import { type PaymentPolicyContext, isTerminalJobStatus, type NextAction, pollNextAction } from "../lib/next-action";
+import { readNextAction } from "../lib/read-next-action";
+import { settleRecordedPayments } from "../lib/yield-state";
 import { buildCompletionHintFields, completionSnapshot, type JobCompletion, nextStepHint } from "../lib/completion-hints";
 import {
   type JobStatus,
@@ -154,7 +155,7 @@ async function statusWithAccess(
     timeoutMs: timeout,
     jobToken,
     context: access.endpointOverridden ? undefined : stored ?? undefined,
-    held: access.endpointOverridden ? undefined : loadJob(jobId),
+    ignoreLocalState: access.endpointOverridden,
   });
 
   // Update job store if we learned something new. A terminal read snapshots the
@@ -362,25 +363,14 @@ async function resolveNextAction(
   fetched: Message[],
   transport: Transport,
   ref: ProviderRef,
-  opts: { timeoutMs: number; jobToken?: string; context?: PaymentPolicyContext; held?: JobRecord | null }
+  opts: { timeoutMs: number; jobToken?: string; context?: PaymentPolicyContext; ignoreLocalState: boolean }
 ): Promise<NextAction> {
   if (isTerminalJobStatus(status)) return null;
   if (status === "awaiting-input") {
-    const fromBatch = computeNextAction(jobId, fetched, undefined, opts.context);
-    if (fromBatch) return withHeldPaymentHint(jobId, fromBatch, fetched, opts.held);
+    const fromBatch = readNextAction(jobId, fetched, opts);
+    if (fromBatch) return fromBatch;
     const history = await transport.getMessages(jobId, 0, ref, opts);
-    return withHeldPaymentHint(jobId, computeNextAction(jobId, history, undefined, opts.context), history, opts.held) ??
-      pollNextAction(jobId);
+    return readNextAction(jobId, history, opts) ?? pollNextAction(jobId);
   }
   return pollNextAction(jobId);
-}
-
-/** A pay action for an ask whose earlier payment is unconfirmed must say so, not just ask for payment. */
-function withHeldPaymentHint(jobId: string, action: NextAction, messages: Message[], held: JobRecord | null | undefined): NextAction {
-  if (action?.type !== "pay" || !held) return action;
-  const ask = pendingPaymentRequest(messages);
-  if (!ask || !(held.inFlightPaymentRequestSeqs?.includes(ask.seq) || held.unconfirmedPaymentSubmissions?.[ask.seq] ||
-    held.askPaymentBlocks?.[ask.seq]))
-    return action;
-  return { ...action, hint: paymentInFlightHint(jobId, held, ask.seq) };
 }

@@ -6,7 +6,8 @@ export { formatMessageHuman } from "../lib/message-human";
 import { formatMessageHuman, paymentAmount } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
 import { formatPaymentAmount } from "../lib/currency";
-import { computeNextAction, isTerminalJobStatus, paymentInFlightHint, pollNextAction, type NextAction } from "../lib/next-action";
+import { isTerminalJobStatus, pollNextAction, type NextAction } from "../lib/next-action";
+import { readNextAction } from "../lib/read-next-action";
 import {
   asProviderText,
   DvmError,
@@ -36,8 +37,7 @@ import {
   createArtifactSaveSession,
 } from "../lib/save-artifact";
 import { parseDurationMs } from "../lib/duration";
-import { loadAnsweredYieldSeqs, settleRecordedPayments } from "../lib/yield-state";
-import { loadJob } from "../lib/job-store";
+import { settleRecordedPayments } from "../lib/yield-state";
 import { waitForJob } from "../lib/wait-for-job";
 import { streamLoop } from "../lib/stream-loop";
 import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
@@ -73,15 +73,7 @@ async function messagesWithAccess(
   const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);
 
   function actionFromMessages(batch: Message[]): NextAction {
-    const answered = access.endpointOverridden ? new Set<number>() : loadAnsweredYieldSeqs(jobId);
-    const action = computeNextAction(jobId, batch.filter((message) => !answered.has(message.seq)), undefined, access.endpointOverridden ? undefined : stored ?? undefined);
-    const request = batch.findLast((message) => message.type === "payment-request");
-    const current = access.endpointOverridden ? null : loadJob(jobId);
-    if (action?.type === "pay" && request && current &&
-        (current.inFlightPaymentRequestSeqs?.includes(request.seq) || current.unconfirmedPaymentSubmissions?.[request.seq] ||
-          current.askPaymentBlocks?.[request.seq]))
-      return { ...action, hint: paymentInFlightHint(jobId, current, request.seq) };
-    return action;
+    return readNextAction(jobId, batch, { ignoreLocalState: access.endpointOverridden, context: stored ?? undefined });
   }
 
   async function resolveNextAction(action: NextAction, messages: Message[], observedStatus?: string): Promise<NextAction> {
