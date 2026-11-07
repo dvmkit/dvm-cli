@@ -193,6 +193,24 @@ describe("an explicit request ID before acceptance", () => {
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
     expect(jobs.loadAllJobs()).toEqual([]);
   });
+
+  it.each(["budget_exceeded", "rail_unsatisfiable"])("preserves the local %s refusal after an unpaid quote", async (code) => {
+    if (code === "budget_exceeded") budget.setCaps({ dailyUsd: 0 });
+    const walletBefore = sdk.loadAgentWallet();
+    const budgetBefore = budget.loadLedger();
+
+    await expect(paidRequest({ requestId: "local-refusal", ...(code === "rail_unsatisfiable" ? { rail: "tempo" } : {}) }))
+      .rejects.toMatchObject({ code });
+
+    expect(provider.jobPosts).toHaveLength(1);
+    expect(provider.jobPosts[0]).toMatchObject({ paid: false, status: 402 });
+    expect(provider.resultPosts).toEqual([]);
+    expect(provider.resumePosts).toEqual([]);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+    expect(jobs.loadAllJobs()).toEqual([]);
+    expect(sdk.loadAgentWallet()).toEqual(walletBefore);
+    expect(budget.loadLedger()).toEqual(budgetBefore);
+  });
 });
 
 describe("a refusal-shaped response after a Cashu payment", () => {
