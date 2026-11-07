@@ -28,9 +28,9 @@ export async function withReleaseLock<T>(walletPubkey: string, builderHandle: st
   const key = createHash("sha256").update(JSON.stringify([walletPubkey, builderHandle, mint])).digest("hex");
   let unlock: () => Promise<void>;
   try {
-    unlock = await lockfile.lock(dirname(JOBS_FILE), {
+    // proper-lockfile also keys its in-process ownership by the target path.
+    unlock = await lockfile.lock(join(dirname(JOBS_FILE), `release-${key}`), {
       realpath: false,
-      lockfilePath: join(dirname(JOBS_FILE), `release-${key}.lock`),
       stale: 2 * 60_000,
       retries: 0,
     });

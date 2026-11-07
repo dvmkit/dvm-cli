@@ -591,6 +591,37 @@ describe("release durability", () => {
     expect(allReleaseIntents()).toEqual([]);
   });
 
+  it("releases both mint locks after independent releases overlap", async () => {
+    const secondInput = proof("reserve-other", 6, { ...INPUT, mint: "https://other-mint.example", secret: "reserve-other" });
+    persistentWallet([INPUT, secondInput]);
+    const active = makeCashuWallet(UNSPENT, [OUTPUT]);
+    const other = makeCashuWallet({ unspent: [secondInput], spent: [], pending: [] }, [{ ...OUTPUT, secret: "released-other" }]);
+    active.completeSwap.mockImplementationOnce(async () => {
+      const concurrent = await releaseAgentReserve({
+        builderHandle: "scrape.dvmkit.ai", providerInfo: info(), readMnemonic: () => MNEMONIC,
+        now: () => NOW,
+        getWalletForMint: (mint) => Promise.resolve((mint === INPUT.mint ? active : other) as never),
+      });
+      expect(concurrent.mints[1].error).toBeNull();
+      return { send: [OUTPUT], keep: [] };
+    });
+    await releaseAgentReserve({
+      builderHandle: "scrape.dvmkit.ai", providerInfo: info(), readMnemonic: () => MNEMONIC,
+      now: () => NOW,
+      getWalletForMint: (mint) => Promise.resolve((mint === INPUT.mint ? active : other) as never),
+    });
+    const nextInput = { ...INPUT, secret: "reserve-again" };
+    const wallet = loadAgentWallet()!;
+    saveAgentWallet({ ...wallet, proofs: [...wallet.proofs, nextInput] });
+    const nextMint = makeCashuWallet({ unspent: [nextInput], spent: [], pending: [] }, [{ ...OUTPUT, secret: "released-again" }]);
+
+    const result = await release(nextMint);
+
+    expect(result.mints[0].error).toBeNull();
+    expect(nextMint.completeSwap).toHaveBeenCalledTimes(1);
+    expect(loadAgentWallet()?.proofs.map((p) => p.secret).sort()).toEqual(["released", "released-again", "released-other"]);
+  });
+
   it("drops builder-redeemed inputs only after NUT-09 confirms no release outputs", async () => {
     persistentWallet();
     const interrupted = makeCashuWallet(UNSPENT, [OUTPUT]);
