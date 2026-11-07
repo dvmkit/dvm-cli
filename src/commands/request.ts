@@ -2764,7 +2764,29 @@ function normalizedLocalCorrelationId(opts: RequestOptions): string | undefined 
     : normalizeLocalCorrelationId(opts.localCorrelationId);
 }
 
+// These validation and local policy gates refuse before acceptance or payment.
+// Unknown codes stay conservative; a status or an error-shaped body alone
+// cannot establish that the request was refused.
+const PREACCEPT_REFUSAL_CODES = new Set([
+  "invalid_input",
+  "budget_exceeded",
+  "cashu_fee_cap_exceeded",
+  "insufficient_balance",
+  "no_eligible_mint",
+  "mint_not_allowed",
+  "mint_pin_unsatisfiable",
+  "rail_unsatisfiable",
+  "tempo_network_mismatch",
+]);
+
 function requestOutcomeUnknown(requestId: string, cause: unknown): DvmError {
+  // Payment/uncertainty evidence takes precedence even when a provider uses
+  // the same code as a preaccept gate, including a structured 400 response.
+  if (cause instanceof DvmError && PREACCEPT_REFUSAL_CODES.has(cause.code) &&
+      !postPaymentErrors.has(cause) && cause.data?.spend_committed !== true &&
+      cause.data?.status !== "unknown" && cause.data?.payment_state !== "unknown") {
+    return cause;
+  }
   // A later payment refusal does not make an already accepted submit unknown.
   if (cause instanceof DvmError && typeof cause.data?.job_id === "string" &&
       loadJob(cause.data.job_id)?.requestId === requestId) {

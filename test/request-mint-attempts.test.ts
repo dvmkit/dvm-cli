@@ -267,7 +267,7 @@ describe("accepted job payment refusal recovery", () => {
     expect(loadJob("job")).toMatchObject({ totalPaidMsats: 5_000, paymentsHonoured: 1 });
   });
 
-  it("keeps pre-acceptance failures on the existing unknown-outcome path", async () => {
+  it("preserves a fee-cap refusal before acceptance or spending with an explicit request ID", async () => {
     const provider = await seams.describe();
     seams.describe.mockResolvedValue({ ...provider, requestRecovery: true });
     const wallet = mintWallet();
@@ -276,13 +276,17 @@ describe("accepted job payment refusal recovery", () => {
 
     await expect(request({ endpoint, input: "Echo", autoPay: true, budget: "100000", autoPayBelow: "100000",
       maxCashuFeeSats: "1", requestId: "unaccepted-request" })).rejects.toMatchObject({
-      code: "request_outcome_unknown", data: { request_id: "unaccepted-request", inner_code: "cashu_fee_cap_exceeded" },
+      code: "cashu_fee_cap_exceeded",
+      hint: "Raise --max-cashu-fee-sats only after approval, or fund an accepted mint with a lower swap fee.",
+      data: { mint_attempts: expect.arrayContaining([expect.objectContaining({ reason: "fee_cap_exceeded" })]) },
     });
 
     expect(loadJob("job")).toBeNull();
     expect(loadAgentWallet()).toEqual(before);
     expect(wallet.completeSwap).not.toHaveBeenCalled();
     expect(seams.sendMessage).not.toHaveBeenCalled();
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(seams.requestResult).not.toHaveBeenCalled();
   });
 });
 
