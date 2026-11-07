@@ -10,34 +10,39 @@ const fixtureIndex = process.argv.indexOf("--sanitize-file");
 const fixtureMode = fixtureIndex >= 0;
 const installMode = process.argv.includes("--install");
 
-if (fixtureMode) {
-  const fixture = process.argv[fixtureIndex + 1];
-  if (!fixture) fail("--sanitize-file requires a file");
-  const sanitized = sanitizeOutput(readFileSync(resolve(fixture), "utf8"));
-  if (containsAbsolutePath(sanitized)) fail("unsafe absolute path remained after sanitization");
+main();
+
+function main() {
+  if (fixtureMode) {
+    const fixture = process.argv[fixtureIndex + 1];
+    if (!fixture) return fail("--sanitize-file requires a file");
+    const sanitized = sanitizeOutput(readFileSync(resolve(fixture), "utf8"));
+    if (containsAbsolutePath(sanitized)) return fail("unsafe absolute path remained after sanitization");
+    process.stdout.write(sanitized);
+    return;
+  }
+
+  rmSync(diagnosticsPath, { force: true });
+  const npmArguments = installMode ? ["ci", "--ignore-scripts"] : ["run", "verify"];
+  const result = spawnSync(process.execPath, [join(root, "scripts", "pinned-npm.mjs"), ...npmArguments], {
+    cwd: root,
+    encoding: "utf8",
+    env: process.env,
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.error) return fail("verification process could not be captured");
+
+  const captured = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  const sanitized = sanitizeOutput(captured);
+  if (containsAbsolutePath(sanitized)) return fail("unsafe absolute path remained after sanitization");
+
+  mkdirSync(dirname(diagnosticsPath), { recursive: true });
+  writeFileSync(diagnosticsPath, sanitized || "verification produced no diagnostics\n");
   process.stdout.write(sanitized);
-  process.exit(0);
+  // Natural shutdown lets piped diagnostics drain before the exit status takes effect.
+  process.exitCode = result.status ?? 1;
 }
-
-rmSync(diagnosticsPath, { force: true });
-const npmArguments = installMode ? ["ci", "--ignore-scripts"] : ["run", "verify"];
-const result = spawnSync(process.execPath, [join(root, "scripts", "pinned-npm.mjs"), ...npmArguments], {
-  cwd: root,
-  encoding: "utf8",
-  env: process.env,
-  maxBuffer: 64 * 1024 * 1024,
-  stdio: ["ignore", "pipe", "pipe"],
-});
-if (result.error) fail("verification process could not be captured");
-
-const captured = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-const sanitized = sanitizeOutput(captured);
-if (containsAbsolutePath(sanitized)) fail("unsafe absolute path remained after sanitization");
-
-mkdirSync(dirname(diagnosticsPath), { recursive: true });
-writeFileSync(diagnosticsPath, sanitized || "verification produced no diagnostics\n");
-process.stdout.write(sanitized);
-process.exit(result.status ?? 1);
 
 function sanitizeOutput(output) {
   let sanitized = output.replaceAll("\r\n", "\n");
@@ -88,5 +93,5 @@ function fail(message) {
     writeFileSync(diagnosticsPath, diagnostic);
   }
   console.error(diagnostic.trimEnd());
-  process.exit(1);
+  process.exitCode = 1;
 }
