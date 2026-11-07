@@ -6,7 +6,7 @@
 import type { TrustAnchorRead } from "@dvmkit/sdk/internal";
 
 import { getLastKnownBtcRate } from "@dvmkit/sdk/internal";
-import { type JobRecord, loadJob, updateJob } from "./job-store";
+import { type JobRecord, loadJob, updateObservedJob } from "./job-store";
 import { info } from "./output";
 import { type FundingReceipt, isSignedJobReceipt, type JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
 import { appendFundingReceipt, appendReceipt } from "@dvmkit/sdk/internal";
@@ -285,7 +285,7 @@ export async function backfillTrustAnchor(
   try {
     const provider = await transport.describe(ref);
     const fields = receiptTrustFields(provider);
-    if (Object.keys(fields).length > 0) updateJob(jobId, fields);
+    if (Object.keys(fields).length > 0) updateObservedJob(jobId, fields);
     return fields.builderAnchor;
   } catch {
     return undefined;
@@ -379,7 +379,7 @@ function persist(
   job: JobRecord | null
 ): void {
   try {
-    updateJob(jobId, { receipt });
+    updateObservedJob(jobId, { receipt });
     appendReceipt({
       receipt,
       endpoint: job?.endpoint ?? "",
@@ -396,7 +396,7 @@ function persist(
 
 function persistParseError(jobId: string, receiptParseError: ReceiptParseError): void {
   try {
-    updateJob(jobId, { receiptParseError });
+    updateObservedJob(jobId, { receiptParseError });
   } catch (err) {
     info(
       `Warning: could not store job receipt diagnostic: ${err instanceof Error ? err.message : String(err)}`

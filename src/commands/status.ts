@@ -36,7 +36,7 @@ import {
   type JobRecord,
   loadJob,
   markJobTerminal,
-  updateJob,
+  updateObservedJob,
 } from "../lib/job-store";
 import {
   receiptHint,
@@ -71,7 +71,7 @@ export interface StatusOptions extends JobAccessOptions {
 
 export async function status(jobId: string, opts: StatusOptions): Promise<void> {
   const access = resolveJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => statusWithAccess(jobId, opts, access)));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => statusWithAccess(jobId, opts, access), opts.human));
 }
 
 async function statusWithAccess(
@@ -236,7 +236,7 @@ async function statusWithAccess(
     const updates: Record<string, unknown> = {};
     if (result.status === "processing") updates.status = "processing";
     if (newCursor !== undefined) updates.messageCursor = newCursor;
-    if (Object.keys(updates).length > 0) updateJob(jobId, updates);
+    if (Object.keys(updates).length > 0) updateObservedJob(jobId, updates);
   }
 
   transport.close();

@@ -28,7 +28,7 @@ export interface DeclineOptions extends JobAccessOptions {
  */
 export async function decline(jobId: string, opts: DeclineOptions): Promise<void> {
   const access = resolveJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => declineWithAccess(jobId, opts, access)));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => declineWithAccess(jobId, opts, access), opts.human));
 }
 
 async function declineWithAccess(jobId: string, opts: DeclineOptions, access: ResolvedJobAccess): Promise<void> {

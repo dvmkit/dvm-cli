@@ -12,7 +12,7 @@ import {
 } from "./output";
 import {
   loadJob,
-  updateJob,
+  updateObservedJob,
 } from "./job-store";
 
 /**
@@ -86,7 +86,7 @@ export async function claimInboundPayments(
     if (claimedMsats > 0) {
       claimedSeqs.add(msg.seq);
       claimedAmounts[msg.seq] = claimedMsats;
-      updateJob(jobId, { claimedPaymentSeqs: [...claimedSeqs], claimedPaymentAmountsMsats: claimedAmounts });
+      updateObservedJob(jobId, { claimedPaymentSeqs: [...claimedSeqs], claimedPaymentAmountsMsats: claimedAmounts });
       results.push({
         seq: msg.seq,
         amount_msats: claimedMsats,

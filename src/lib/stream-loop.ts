@@ -1,3 +1,4 @@
+import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
 import { computeNextAction, paymentInFlightHint, pollNextAction, type NextAction } from "./next-action";
 import {
@@ -94,6 +95,10 @@ export interface AutoPayment {
  */
 export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopResult> {
   const { jobId, transport, provider } = opts;
+  if (hasUnsavedJobState()) return {
+    messages: [], autoPayments: [], refunds: [], cursor: opts.afterSeq,
+    nextAction: pollNextAction(jobId, "Local state may lag; refresh this job before another payment."),
+  };
   const persistLocalState = opts.persistLocalState !== false;
   const policy = persistLocalState ? opts.policy : undefined;
   const allMessages: Message[] = [];
@@ -167,7 +172,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
 
   try {
     for (;;) {
-      if (deadline !== undefined && Date.now() >= deadline) break;
+      if (hasUnsavedJobState() || (deadline !== undefined && Date.now() >= deadline)) break;
 
       const streamFn = transport.stream?.bind(transport);
       let batchMessages: Message[];
@@ -216,11 +221,13 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
         // Book a payment whose answer was lost but the provider recorded,
         // even when the job has moved past its ask.
         await settleRecordedPayments(jobId);
+        if (hasUnsavedJobState()) break;
       }
 
       // Auto-claim any inbound Cashu payment (refund/change) into the local wallet.
       if (persistLocalState) {
         refunds.push(...(await claimInboundPayments(jobId, batchMessages)));
+        if (hasUnsavedJobState()) break;
       }
 
       justAutoPaid = false;
@@ -316,7 +323,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   // request we just auto-paid. Do one final short re-check to pick up the
   // (usually already-written) completion before deriving next_action, recovering
   // the artifact in-band instead of leaving the caller to chase it via `dvm messages`.
-  if (justAutoPaid) {
+  if (justAutoPaid && !hasUnsavedJobState()) {
     const pollOptions = nextPollOptions();
     let recheck: Message[] = [];
     try {
@@ -367,6 +374,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
 
   if (paymentUnresolved) nextAction = pollNextAction(jobId, paymentInFlightHint(jobId, heldJob,
     lastYield?.type === "payment-request" ? lastYield.seq : undefined));
+  if (hasUnsavedJobState() && !terminal)
+    nextAction = pollNextAction(jobId, "Local state may lag; refresh this job before another payment.");
   return { messages: allMessages, autoPayments, refunds, nextAction, cursor };
 }
 

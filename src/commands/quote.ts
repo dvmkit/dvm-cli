@@ -69,7 +69,7 @@ export interface QuoteOptions {
 }
 
 export async function quote(opts: QuoteOptions): Promise<void> {
-  return withOutputWarnings(() => quoteWithWarnings(opts));
+  return withOutputWarnings(() => quoteWithWarnings(opts), opts.human);
 }
 
 async function quoteWithWarnings(opts: QuoteOptions): Promise<void> {

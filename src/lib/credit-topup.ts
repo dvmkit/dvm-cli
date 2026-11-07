@@ -1,3 +1,4 @@
+import { hasUnsavedJobState } from "./job-persistence";
 /**
  * Post-job credit settlement + auto-top-up (; spec §6/§8/§11).
  *
@@ -129,6 +130,7 @@ export async function settleCreditAfterJob(args: SettleCreditArgs): Promise<void
   // Taken unconditionally, so a degraded or failed job retires the intent
   // rather than leaving it for a later command to act on out of context.
   const deferred = args.deferred ?? takeDeferredFunding();
+  if (hasUnsavedJobState()) return;
   try {
     await settle(args);
   } catch (err) {

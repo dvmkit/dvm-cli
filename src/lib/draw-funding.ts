@@ -116,7 +116,7 @@ export function captureDrawFundingReceipts(
           job.drawFundingReceipts = held;
         }
       }
-    });
+    }, true);
   } catch (error) {
     info(`Warning: could not store mid-job funding evidence: ${error instanceof Error ? error.message : String(error)}`);
   }

@@ -26,7 +26,7 @@ export async function requestResume(
   requestId: string,
   opts: RequestResumeOptions = {}
 ): Promise<void> {
-  return withOutputWarnings(() => resumeRequest(requestId, opts));
+  return withOutputWarnings(() => resumeRequest(requestId, opts), opts.human);
 }
 
 async function resumeRequest(requestId: string, opts: RequestResumeOptions): Promise<void> {
