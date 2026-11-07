@@ -124,10 +124,19 @@ type HeldJob = Pick<JobRecord, "unconfirmedPaymentSubmissions" | "askPaymentBloc
  * nothing blocks it, and for Cashu the wallet still holds its token.
  */
 export function heldPaymentResendable(job: HeldJob | null | undefined, requestSeq: number): boolean {
+  return heldPaymentResendability(job, requestSeq) === "resendable";
+}
+
+function heldPaymentResendability(job: HeldJob | null | undefined, requestSeq: number): "resendable" | "unavailable" | "unreadable" {
   const submission = job?.unconfirmedPaymentSubmissions?.[requestSeq];
-  if (!submission || submission.blocked) return false;
-  if (submission.rail !== "cashu_p2pk") return true;
-  return loadAgentWallet()?.pending_submissions.some((entry) => entry.request_id === submission.cashuRequestId) === true;
+  if (!submission || submission.blocked) return "unavailable";
+  if (submission.rail !== "cashu_p2pk") return "resendable";
+  try {
+    return loadAgentWallet()?.pending_submissions.some((entry) => entry.request_id === submission.cashuRequestId)
+      ? "resendable" : "unavailable";
+  } catch {
+    return "unreadable";
+  }
 }
 
 /**
@@ -142,9 +151,15 @@ export function paymentInFlightHint(jobId: string, job?: HeldJob | null, request
   const submission = job.unconfirmedPaymentSubmissions?.[requestSeq];
   const stop = `To stop instead, \`dvm decline ${arg}\` ends the job and keeps the finished work, or \`dvm cancel ${arg}\` halts the work now and charges the work in progress.`;
   // A token that can be re-delivered, a blocked ask's replacement included, is re-sent by `dvm pay`.
-  if (submission && !submission.blocked)
-    return heldPaymentResendable(job, requestSeq) ? resend
+  if (submission && !submission.blocked) {
+    const resendability = heldPaymentResendability(job, requestSeq);
+    if (resendability === "unreadable")
+      return "The wallet is unreadable, so the earlier Cashu payment cannot be checked or re-sent. " +
+        "Preserve the wallet file; consult `dvm wallet recover --help` for recovery from your backed-up secret. " +
+        unresendablePaymentHint(jobId);
+    return resendability === "resendable" ? resend
       : `The wallet no longer holds the earlier Cashu payment for this request, so it cannot be re-sent. ${unresendablePaymentHint(jobId)}`;
+  }
   if (submission?.blocked?.reason === "not_resendable")
     return `${submission.blocked.detail} ${unresendablePaymentHint(jobId)}`;
   const askBlock = job.askPaymentBlocks?.[requestSeq];
