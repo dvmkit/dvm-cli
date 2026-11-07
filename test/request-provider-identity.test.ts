@@ -129,16 +129,19 @@ afterAll(() => {
 });
 
 describe("an explicit request ID before acceptance", () => {
-  it.each([false, true])("preserves a signed input refusal with explicit ID=%s", async (explicit) => {
+  it.each([false, true].flatMap((explicit) => [false, true].map((nested) => ({ explicit, nested }))))(
+    "preserves a signed input refusal with explicit ID=$explicit and nested error=$nested", async ({ explicit, nested }) => {
     provider.inputSchema = {
       type: "object", properties: { topic: { type: "string", minLength: 10 } }, required: ["topic"],
     };
-    provider.unpaid = () => answer(400, {
-      error: "invalid_input",
+    const refusal = {
       message: "topic must contain at least 10 characters",
       hint: "Supply a longer topic.",
       display: "The topic is too short.",
-    });
+    };
+    provider.unpaid = () => answer(400, nested
+      ? { error: { code: "invalid_input", ...refusal } }
+      : { error: "invalid_input", ...refusal });
     const walletBefore = sdk.loadAgentWallet();
     const budgetBefore = budget.loadLedger();
     const requestId = explicit ? "invalid-topic" : undefined;
@@ -178,6 +181,11 @@ describe("an explicit request ID before acceptance", () => {
     { label: "an existing request", reply: () => answer(409, { error: "request_id_exists" }), code: "request_id_exists" },
     { label: "an input error with unknown payment state", reply: () => answer(400, { error: "invalid_input", payment_state: "unknown" }), code: "invalid_input" },
     { label: "an input error with unknown status", reply: () => answer(400, { error: "invalid_input", status: "unknown" }), code: "invalid_input" },
+    { label: "a nested input error with outer payment uncertainty", reply: () => answer(400, { error: { code: "invalid_input" }, payment_state: "unknown" }), code: "invalid_input" },
+    { label: "a nested input error with outer status uncertainty", reply: () => answer(400, { error: { code: "invalid_input" }, status: "unknown" }), code: "invalid_input" },
+    { label: "a nested 402 input error with outer payment uncertainty", reply: () => answer(402, { error: { code: "invalid_input" }, payment_state: "unknown" }), code: "invalid_input" },
+    { label: "nested refusal fields alongside outer uncertainty", reply: () => answer(400, { error: { code: "invalid_input", status: "refused", payment_state: "unpaid" }, status: "unknown", payment_state: "unknown" }), code: "invalid_input" },
+    { label: "nested uncertainty alongside outer refusal fields", reply: () => answer(400, { error: { code: "invalid_input", status: "unknown", payment_state: "unknown" }, status: "refused", payment_state: "unpaid" }), code: "invalid_input" },
   ])("keeps $label unknown without submitting again", async ({ reply, code }) => {
     provider.unpaid = () => reply();
 
