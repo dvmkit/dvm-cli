@@ -206,6 +206,7 @@ it("declines the open ask, ends the job and reports the finished pieces charged"
   expect(sentPayments()).toEqual([]);
 });
 
+// Seven CLI startups share this deadline; run() also bounds each process separately.
 it.each(["payment-request", "prompt"])("retrieves and verifies finished artifacts after declining a %s", async (type) => {
   const contents = [{ name: "first.txt", data: "First piece" }, { name: "second.txt", data: "Second piece" }];
   history = [askOne, payOne,
@@ -255,7 +256,7 @@ it.each(["payment-request", "prompt"])("retrieves and verifies finished artifact
     .map((message) => JSON.stringify(message)).join("\n") + "\n");
   const incomplete = await run(["receipts", "verify"]);
   expect(incomplete.output.receipt_checks.result_hash).toBe("unchecked");
-});
+}, 30_000);
 
 it("explains a decline with nothing open, and one an older DVM ignores", async () => {
   history = [askOne, payOne] as Message[];
