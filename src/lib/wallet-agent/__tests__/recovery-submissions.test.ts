@@ -69,7 +69,11 @@ import {
   recordSubmissionEvidence,
   SUBMISSION_EVIDENCE_DIR,
 } from "../../submission-evidence";
-import { RECEIPTS_FILE } from "@dvmkit/sdk/internal";
+import { JOBS_FILE, RECEIPTS_FILE } from "@dvmkit/sdk/internal";
+import { dirname, join } from "node:path";
+import { withOutputWarnings } from "../../output";
+import { loadLedger } from "../../budget-ledger";
+import { loadMessages } from "../../messages";
 function storedFundingReceipts() {
   return readFileSync(RECEIPTS_FILE, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 }
@@ -1559,6 +1563,45 @@ describe("refund-clause reclaim", () => {
     expect(store.loadJob("held-redeemed-late")?.unconfirmedPaymentSubmissions).toBeUndefined();
   });
 
+  it("retains spent evidence during deferred booking and recovers once in a fresh command without payment history", async () => {
+    const jobId = "held-spent-deferred";
+    const store = await holdAsk(jobId);
+    persistentWallet(baseWallet([claused()]));
+    const stub = cashuStub({ spentSecrets: ["out-1"] });
+    const verdicts = () => JSON.parse(readFileSync(join(dirname(JOBS_FILE), "submission-verdicts.json"), "utf8")) as
+      { requestId: string; verdict: string }[];
+    const spends = () => loadLedger().entries.filter((entry) => entry.jobId === jobId);
+    const release = lockfile.lockSync(JOBS_FILE, { realpath: false });
+    try {
+      await withOutputWarnings(async () => {
+        const result = await sweepPendingSubmissions(sweepOpts(stub));
+        expect(result.outcomes[0].kind).toBe("already_accepted");
+        expect(loadAgentWallet()?.pending_submissions).toEqual([]);
+        expect(store.loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([4]);
+        expect(spends()).toEqual([]);
+        expect(verdicts()).toContainEqual({ requestId: REQUEST_ID, verdict: "spent" });
+        // A second pass sees the command-local paid state, but still needs the durable evidence.
+        await applySubmissionVerdicts();
+        expect(verdicts()).toContainEqual({ requestId: REQUEST_ID, verdict: "spent" });
+      });
+    } finally { release(); }
+    expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[4]).toBeDefined();
+    expect(store.loadJob(jobId)?.totalPaidMsats).toBeUndefined();
+    expect(loadMessages(jobId)).toEqual([]);
+
+    await withOutputWarnings(() => settleRecordedPayments(jobId));
+    expect(store.loadJob(jobId)).toMatchObject({ paidPaymentRequestSeqs: [4], totalPaidMsats: 5000, paymentsHonoured: 1 });
+    expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
+    expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
+    expect(verdicts().some((verdict) => verdict.requestId === REQUEST_ID)).toBe(false);
+    expect(spends()).toHaveLength(1);
+
+    await withOutputWarnings(() => settleRecordedPayments(jobId));
+    expect(store.loadJob(jobId)).toMatchObject({ totalPaidMsats: 5000, paymentsHonoured: 1 });
+    expect(spends()).toHaveLength(1);
+    expect(stub.send).not.toHaveBeenCalled();
+  });
+
   it("blocks the job ask for an explicit choice after a partial redeem, booking nothing", async () => {
     const store = await holdAsk("held-partial");
     persistentWallet(baseWallet([
@@ -1627,6 +1670,8 @@ describe("refund-clause reclaim", () => {
     afterEach(() => { vi.mocked(saveAgentWallet).mockReset(); });
 
     function failingLock(name: string) {
+      // These injected failures are permanent; retry delays cannot change their outcomes.
+      vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
       const lockSync = lockfile.lockSync.bind(lockfile);
       return vi.spyOn(lockfile, "lockSync").mockImplementation((file, options) => {
         if (String(file).endsWith(name)) throw Object.assign(new Error(`${name} is locked`), { code: "ELOCKED" });

@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { AutoPayWarning } from "./auto-pay-warning";
 import { writeSync } from "node:fs";
+import { withJobPersistence } from "./job-persistence";
 
 export interface DrawFundingWarning {
   code: "draw_funding_unverified";
@@ -10,15 +11,28 @@ export interface DrawFundingWarning {
   display: string;
 }
 
-export type OutputWarning = AutoPayWarning | DrawFundingWarning;
+export interface LocalJobStateWarning {
+  code: "local_job_state_unsaved";
+  display: string;
+  hint: string;
+}
+
+export type OutputWarning = AutoPayWarning | DrawFundingWarning | LocalJobStateWarning;
 
 const warnings = new AsyncLocalStorage<OutputWarning[]>();
 
-export function withOutputWarnings<T>(run: () => Promise<T>): Promise<T> {
-  return warnings.run([], run);
+export function withOutputWarnings<T>(run: () => Promise<T>, human?: boolean): Promise<T> {
+  return warnings.run([], () => withJobPersistence(run, () => {
+    addOutputWarnings([{
+      code: "local_job_state_unsaved",
+      display: "The provider's outcome is unchanged, but local job state could not be saved and may lag. Automatic payments are paused for this command.",
+      hint: "Once local storage is available, refresh the job with dvm status <job_id> --messages before paying or submitting a replacement.",
+    }], human);
+  }));
 }
 
 function sameWarning(prior: OutputWarning, entry: OutputWarning): boolean {
+  if (prior.code === "local_job_state_unsaved" && entry.code === "local_job_state_unsaved") return true;
   if (prior.code === "auto_pay_bound_exceeded" && entry.code === "auto_pay_bound_exceeded") {
     return prior.auto_pay_below === entry.auto_pay_below && prior.source === entry.source;
   }

@@ -70,7 +70,7 @@ export interface PayOptions extends JobAccessOptions {
 
 export async function pay(jobId: string, opts: PayOptions): Promise<void> {
   const access = resolveStoredJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => payWithAccess(jobId, opts, access)));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => payWithAccess(jobId, opts, access), opts.human));
 }
 
 async function payWithAccess(

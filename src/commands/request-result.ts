@@ -1,3 +1,4 @@
+import { hasUnsavedJobState } from "../lib/job-persistence";
 import { completionSnapshot } from "../lib/completion-hints";
 import {
   canonicalRequestPath,
@@ -19,15 +20,16 @@ import {
 import {
   info,
   json,
+  withOutputWarnings,
 } from "../lib/output";
 import {
   loadAllJobs,
   loadJob,
   markJobTerminal,
-  saveJob,
+  saveAcceptedJob,
   recordUpfrontCreditPayment,
   recordUpfrontRailPayment,
-  updateJob,
+  updateObservedJob,
 } from "../lib/job-store";
 
 import { sameEndpoint } from "../lib/job-access";
@@ -51,6 +53,10 @@ export async function requestResult(
   requestId: string,
   opts: RequestResultOptions = {}
 ): Promise<void> {
+  return withOutputWarnings(() => requestResultWithWarnings(requestId, opts), opts.human);
+}
+
+async function requestResultWithWarnings(requestId: string, opts: RequestResultOptions): Promise<void> {
   if (!isPublicRequestId(requestId)) {
     throw new DvmError(
       "invalid_request_id",
@@ -154,9 +160,9 @@ export async function requestResult(
         "Do not overwrite the local record."
       );
     }
-    updateJob(receipt.jobId, restored);
+    updateObservedJob(receipt.jobId, restored);
   } else {
-    saveJob({
+    saveAcceptedJob({
       id: receipt.jobId,
       endpoint: intent.endpoint,
       dvmId: intent.dvmId,
@@ -192,7 +198,7 @@ export async function requestResult(
   ) {
     markJobTerminal(receipt.jobId, receipt.status, completionSnapshot(receipt), restored);
   } else {
-    updateJob(receipt.jobId, {
+    updateObservedJob(receipt.jobId, {
       status: receipt.status === "awaiting-input" ? "awaiting-input" : "processing",
       ...restored,
     });
@@ -204,7 +210,7 @@ export async function requestResult(
   }
   // A Cashu payment held for this request is confirmed by the job the provider
   // named; booking it stops the wallet holding it as unconfirmed.
-  const confirmed = await bookRecoveredSubmissions({
+  const confirmed = hasUnsavedJobState() ? [] : await bookRecoveredSubmissions({
     publicRequestId: requestId,
     endpoint: intent.endpoint,
     jobId: receipt.jobId,

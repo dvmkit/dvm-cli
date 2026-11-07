@@ -11,9 +11,9 @@ import type { ProviderRef, Transport } from "@dvmkit/sdk/internal";
 import { attestedDvm } from "./fixtures/receipt-fixture";
 
 vi.mock("../output", () => ({ info: vi.fn() }));
-vi.mock("../job-store", () => ({ loadJob: vi.fn(() => null), updateJob: vi.fn() }));
+vi.mock("../job-store", () => ({ loadJob: vi.fn(() => null), updateObservedJob: vi.fn() }));
 
-import { loadJob, updateJob } from "../job-store";
+import { loadJob, updateObservedJob } from "../job-store";
 import { info } from "../output";
 import { captureFundingReceipt, captureJobReceipt, fetchMissingJobReceipt, receiptJsonFields, renderReceiptHuman, replayStoredReceipt } from "../receipt-capture";
 import { appendFundingReceipt, appendReceipt } from "@dvmkit/sdk/internal";
@@ -45,7 +45,7 @@ describe("captureJobReceipt", () => {
 
     expect(capture.status).toBe("verified");
     expect(capture.checks).toMatchObject({ job_id: "ok", signature: true, attestation: "ok" });
-    expect(updateJob).toHaveBeenCalledWith("job-a7571b-1", { receipt });
+    expect(updateObservedJob).toHaveBeenCalledWith("job-a7571b-1", { receipt });
     expect(vi.mocked(appendReceipt).mock.calls[0][0]).toMatchObject({
       receipt,
       endpoint: "https://wordcount.dvmkit.ai",
@@ -65,7 +65,7 @@ describe("captureJobReceipt", () => {
 
     expect(capture.status).toBe("invalid");
     expect(capture.reason).toBe("job_id_mismatch");
-    expect(updateJob).not.toHaveBeenCalled();
+    expect(updateObservedJob).not.toHaveBeenCalled();
     expect(appendReceipt).not.toHaveBeenCalled();
     expect(capture.receipt).toBeDefined();
     expect(vi.mocked(info).mock.calls.flat().join("\n")).toContain("did not verify");
@@ -76,7 +76,7 @@ describe("captureJobReceipt", () => {
 
     expect(capture.status).toBe("absent");
     expect(receiptJsonFields(capture)).toEqual({ receipt_verified: "absent" });
-    expect(updateJob).not.toHaveBeenCalled();
+    expect(updateObservedJob).not.toHaveBeenCalled();
     expect(appendReceipt).not.toHaveBeenCalled();
   });
 
@@ -92,7 +92,7 @@ describe("captureJobReceipt", () => {
     expect(vi.mocked(info).mock.calls.flat().join("\n")).toContain(
       "receipt could not be parsed (shape_invalid)"
     );
-    expect(updateJob).toHaveBeenCalledWith("job-a7571b-1", {
+    expect(updateObservedJob).toHaveBeenCalledWith("job-a7571b-1", {
       receiptParseError: "shape_invalid",
     });
     expect(appendReceipt).not.toHaveBeenCalled();
@@ -100,7 +100,7 @@ describe("captureJobReceipt", () => {
 
   it("swallows an unwritable store rather than failing a paid job", () => {
     vi.mocked(loadJob).mockReturnValue(jobRecord());
-    vi.mocked(updateJob).mockImplementationOnce(() => {
+    vi.mocked(updateObservedJob).mockImplementationOnce(() => {
       throw new Error("ENOSPC: no space left on device");
     });
 

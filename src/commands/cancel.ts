@@ -32,7 +32,7 @@ export interface CancelOptions extends JobAccessOptions {
 
 export async function cancel(jobId: string, opts: CancelOptions): Promise<void> {
   const access = resolveJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => cancelWithAccess(jobId, opts, access)));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => cancelWithAccess(jobId, opts, access), opts.human));
 }
 
 async function cancelWithAccess(

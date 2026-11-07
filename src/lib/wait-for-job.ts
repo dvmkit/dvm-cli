@@ -1,3 +1,4 @@
+import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
 import { DvmError, isAbortError, type Message } from "@dvmkit/sdk/internal";
 import { loadJob } from "./job-store";
@@ -42,7 +43,7 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
     }
     return undefined;
   }
-  while (now() < deadline) {
+  while (now() < deadline && !hasUnsavedJobState()) {
     const readOptions = () => ({ jobToken: opts.jobToken, timeoutMs: Math.max(1, Math.min(idleTimeoutMs, deadline - now())) });
     const snapshot = await readWithRetry(() => opts.transport.status(opts.jobId, opts.provider, readOptions()));
     if (!snapshot) break;
@@ -141,7 +142,7 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
     const progressed = next.cursor > result.cursor;
     result.cursor = Math.min(next.cursor, cursorLimit);
     result.nextAction = next.nextAction;
-    if (next.nextAction?.type !== "poll") break;
+    if (hasUnsavedJobState() || next.nextAction?.type !== "poll") break;
     if (progressed) backoffMs = 1000;
     const delay = Math.min(backoffMs, Math.max(0, deadline - now()));
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));

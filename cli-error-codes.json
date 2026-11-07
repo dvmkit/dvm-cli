@@ -153,6 +153,7 @@
     "lightning_invoice_expired",
     "lightning_unreachable",
     "local_correlation_id_exists",
+    "local_job_state_unsaved",
     "locktime_too_short",
     "mint_amount_out_of_range",
     "mint_health_failed",

@@ -725,7 +725,7 @@
   },
   {
     "file": "commands/request-result.ts",
-    "owner": "requestResult",
+    "owner": "requestResultWithWarnings",
     "expression": "err",
     "path": [
       "data",

@@ -8,7 +8,7 @@ import {
   type JobRecord,
   loadJob,
   markJobTerminal,
-  updateJob,
+  updateObservedJob,
 } from "./job-store";
 
 import { loadMessages } from "./messages";
@@ -73,7 +73,7 @@ export function persistStreamOutcome(outcome: StreamOutcome): JobCompletion | un
     });
     return completion;
   }
-  updateJob(jobId, { messageCursor: cursor });
+  updateObservedJob(jobId, { messageCursor: cursor });
   return undefined;
 }
 

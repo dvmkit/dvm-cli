@@ -1,3 +1,4 @@
+import { hasUnsavedJobState } from "../lib/job-persistence";
 import { terminalSettlementFields } from "../lib/job-settlement";
 import { autoPayWarnings } from "../lib/auto-pay-warning";
 import { addOutputWarnings, withOutputWarnings } from "../lib/output";
@@ -59,10 +60,10 @@ import {
   recordUpfrontRailPayment,
   loadJob,
   markJobTerminal,
-  saveJob,
+  saveAcceptedJob,
   saveSubmittedJob,
   recordUpfrontCreditPayment,
-  updateJob,
+  updateObservedJob,
 } from "../lib/job-store";
 import {
   captureFundingReceipt,
@@ -286,7 +287,7 @@ export async function request(opts: RequestOptions): Promise<void> {
     } catch (error) {
       throw stage.intentReached ? error : markRefusedBeforeSend(opts.requestId, error);
     }
-  });
+  }, opts.human);
 }
 
 /**
@@ -1055,7 +1056,7 @@ async function requestWithWarnings(
       // Stream until the provider yields, then keep polling through any
       // next_action: poll responses until we hit a terminal or human-input
       // action (or until --timeout expires).
-      updateJob(receipt.jobId, {
+      updateObservedJob(receipt.jobId, {
         status: receipt.status === "awaiting-input" ? "awaiting-input" : "processing",
       });
       const result = await streamToCompletion(
@@ -2432,7 +2433,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
 
   const effectiveJobId = args.jobId || receipt.jobId;
   if (!args.jobId && receipt.jobId) {
-    saveJob({
+    saveAcceptedJob({
       id: effectiveJobId,
       ...transactionRecordFields(receipt),
       endpoint: ref.endpoint,
@@ -2532,7 +2533,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
     return;
   }
 
-  updateJob(effectiveJobId, {
+  updateObservedJob(effectiveJobId, {
     status: "processing",
     paymentMethod: "tempo",
   });
@@ -3468,7 +3469,7 @@ async function payWithAgentWallet(
 
   const effectiveJobId = jobId || receipt.jobId;
   if (!jobId && receipt.jobId) {
-    saveJob({
+    saveAcceptedJob({
       id: effectiveJobId,
       ...transactionRecordFields(receipt),
       endpoint: ref.endpoint,
@@ -3501,9 +3502,12 @@ async function payWithAgentWallet(
     });
   }
 
+  await collectCashuChange(effectiveJobId, receipt.cashuChange);
+
+  recordUpfrontRailPayment(effectiveJobId, { method: "cashu", amountMsats: chosen.priceMsats }, true);
   // Spend successful — clear the pending_submission and record the spend
   // in the recent-spends ring buffer.
-  await commitAgentSpend({
+  if (!hasUnsavedJobState()) await commitAgentSpend({
     requestId: prepared.requestId,
     recentSpend: {
       request_id: prepared.requestId,
@@ -3514,10 +3518,7 @@ async function payWithAgentWallet(
     },
   });
 
-  await collectCashuChange(effectiveJobId, receipt.cashuChange);
-
-  recordUpfrontRailPayment(effectiveJobId, { method: "cashu", amountMsats: chosen.priceMsats }, true);
-  if (fundPlan) {
+  if (!hasUnsavedJobState() && fundPlan) {
     // The funding is the spend (spec §10): the caps were charged with the
     // full funding, and the job's draw is consumption of it — visible via the
     // countersigned receipt in `dvm wallet history`, never double-counted.
@@ -3529,7 +3530,7 @@ async function payWithAgentWallet(
       providerEndpoint: ref.endpoint,
       label: `credit fund · ${identity.dvmId ?? identity.capability}`,
     });
-  } else {
+  } else if (!hasUnsavedJobState()) {
     recordSpend({
       msats: chosen.priceMsats,
       btcRate,
@@ -3592,7 +3593,7 @@ async function payWithAgentWallet(
     return;
   }
 
-  updateJob(effectiveJobId, {
+  updateObservedJob(effectiveJobId, {
     status: "processing",
     paymentMethod: "cashu",
   });
@@ -3759,7 +3760,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
 
   const effectiveJobId = args.jobId || receipt.jobId;
   if (!args.jobId && receipt.jobId) {
-    saveJob({
+    saveAcceptedJob({
       id: effectiveJobId,
       ...transactionRecordFields(receipt),
       endpoint: ref.endpoint,
@@ -3856,7 +3857,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
     return;
   }
 
-  updateJob(effectiveJobId, {
+  updateObservedJob(effectiveJobId, {
     status: "processing",
     paymentMethod: "x402",
   });
@@ -3908,7 +3909,7 @@ async function streamToCompletion(
   const allAutoPayments = [...result.autoPayments];
   const allRefunds = [...result.refunds];
 
-  while (result.nextAction?.type === "poll") {
+  while (result.nextAction?.type === "poll" && !hasUnsavedJobState()) {
     if (Date.now() >= deadlineMs) break;
     const waitMs = Math.min(
       Math.max((result.nextAction.estimate_seconds ?? 0) * 1000, MIN_POLL_WAIT_MS),
@@ -4049,7 +4050,7 @@ async function streamAfterPayment(args: {
   // aborted before any provider yield within the deadline. Before declaring
   // paid-timeout, poll the provider once — the job may have completed
   // server-side while the SSE was torn down.
-  if (result.messages.length === 0) {
+  if (result.messages.length === 0 && !hasUnsavedJobState()) {
     const recovered = await recoverViaStatusPoll({
       jobId,
       transport,
@@ -4110,7 +4111,7 @@ async function streamAfterPayment(args: {
       jobId,
       ...dvmFields,
       messages: result.messages.map(serializeMessageForOutput),
-      ...(streamedTerminal ? { status: streamedTerminal } : {}),
+      ...(streamedTerminal ? { status: streamedTerminal } : hasUnsavedJobState() ? { status: "processing" } : {}),
       ...(completion?.message !== undefined ? { message: completion.message } : {}),
       // Same as the unpaid arc above: the outcome is only knowable from the
       // streamed log here, so render it rather than leaving the agent to dig
@@ -4158,7 +4159,7 @@ async function recoverViaStatusPoll(args: {
   try {
     // anonymous-flow per-job token threaded into the recovery poll
     // so the status check on a token-gated job doesn't 404. Pulled from the
-    // locally-persisted job record (saveJob ran before this codepath).
+    // job record retained after the accepted submit.
     const jobToken = loadJob(jobId)?.jobToken;
     status = await transport.status(jobId, ref, { jobToken });
   } catch {
@@ -4272,7 +4273,7 @@ async function collectCashuChange(jobId: string, cashuChange?: string): Promise<
     // Unclaimable (mint outage / third-party lock) — leave change uncollected.
   }
   if (sats > 0) {
-    updateJob(jobId, { changeProcessed: true });
+    updateObservedJob(jobId, { changeProcessed: true });
     info(`Received ${sats} sats change.`);
   }
 }

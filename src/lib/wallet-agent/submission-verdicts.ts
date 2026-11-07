@@ -1,6 +1,7 @@
 import { loadAgentWallet } from "@dvmkit/sdk/internal";
 import { blockHeldPayment, heldCashuSubmissionAsks, releaseReclaimedSubmissions } from "../job-store";
 import { settleTakenPayment } from "../taken-payment";
+import { hasUnsavedJobState } from "../job-persistence";
 import { journalFile } from "./journal-file";
 import { allReclaimIntents, clearReclaimIntent } from "./reclaim-intents";
 
@@ -74,6 +75,9 @@ async function applyJournalledVerdicts(): Promise<void> {
           : "The reserve proofs the earlier token used are spent at the mint and the provider recorded no payment for this charge, but it may already have redeemed this token for this charge, so paying again may pay twice." });
     }
   }
+  // Command-local booking can return normally without saving the job. A fresh
+  // command still needs these verdicts, even if this command sees no held asks.
+  if (hasUnsavedJobState()) return;
   const applied = new Set(landed.map((verdict) => verdict.requestId));
   withVerdictsLock(() => writeVerdicts(readVerdicts().filter((verdict) => !applied.has(verdict.requestId))));
 }

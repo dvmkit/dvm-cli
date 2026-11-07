@@ -1,3 +1,5 @@
+import { jobPersistence, hasUnsavedJobState } from "./job-persistence";
+import { DvmError } from "@dvmkit/sdk/internal";
 import { sameEndpoint } from "./provider-endpoint";
 import { existsSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, fsyncSync } from "fs";
 
@@ -243,6 +245,11 @@ export function saveJob(job: JobRecord): void {
   mutateJobs((jobs) => { jobs.push(job); });
 }
 
+/** A provider-accepted job stays usable in this command even if its local copy cannot be saved. */
+export function saveAcceptedJob(job: JobRecord): void {
+  mutateJobs((jobs) => { jobs.push(job); }, true);
+}
+
 /** Replayed submits preserve the original record, including subsequent payments. */
 export function saveSubmittedJob(job: JobRecord): void {
   mutateJobs((jobs) => {
@@ -250,7 +257,7 @@ export function saveSubmittedJob(job: JobRecord): void {
     if (!existing) jobs.push(job);
     else if (existing.endpoint !== job.endpoint || (existing.requestId && existing.requestId !== job.requestId))
       throw new Error("Submitted job conflicts with an existing local job.");
-  });
+  }, true);
 }
 
 export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOnRail = false): void {
@@ -282,7 +289,7 @@ export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOn
     job.totalPaidMsats = (job.totalPaidMsats ?? 0) + payment.amount_msats;
     job.paymentsHonoured = (job.paymentsHonoured ?? 0) + (payment.amount_msats > 0 ? 1 : 0);
     job.upfrontCreditBooked = true;
-  });
+  }, true);
 }
 
 export function hasUnknownUpfrontCredit(job: JobRecord): boolean {
@@ -314,7 +321,7 @@ export function recordUpfrontRailPayment(jobId: string, value: unknown, freshSub
     job.paymentsHonoured = (job.paymentsHonoured ?? 0) + (payment.amountMsats > 0 ? 1 : 0);
     job.paymentMethod = payment.method;
     job.upfrontRailPayment = payment;
-  });
+  }, true);
 }
 
 export function hasUnknownUpfrontRail(job: JobRecord): boolean {
@@ -329,11 +336,19 @@ export function updateJob(id: string, update: Partial<Omit<JobRecord, "id">>): v
   });
 }
 
+/** Snapshot remote observations without turning their local storage failure into a remote failure. */
+export function updateObservedJob(id: string, update: Partial<Omit<JobRecord, "id">>): void {
+  mutateJobs((jobs) => {
+    const idx = jobs.findIndex((j) => j.id === id);
+    if (idx !== -1) jobs[idx] = { ...jobs[idx], ...update };
+  }, true);
+}
+
 export function recordCallerMessageHash(jobId: string, endpoint: string, hash: string): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId && sameEndpoint(entry.endpoint, endpoint));
     if (job) job.callerMessageHashes = [...new Set([...(job.callerMessageHashes ?? []), hash])];
-  });
+  }, true);
 }
 
 /** Persist status and completion together for offline replay. Empty completion is allowed.
@@ -346,7 +361,7 @@ export function markJobTerminal(
 ): void {
   const existing = loadJob(id);
   if (!existing) return;
-  updateJob(id, {
+  updateObservedJob(id, {
     ...extra,
     status,
     completedAt: existing.completedAt ?? Date.now(),
@@ -361,6 +376,8 @@ export function loadJob(id: string): JobRecord | null {
 
 /** Load all job records. Returns [] on missing/corrupt file. */
 export function loadAllJobs(): JobRecord[] {
+  const unsaved = jobPersistence.getStore()?.unsaved;
+  if (unsaved) return structuredClone(unsaved);
   if (!existsSync(JOBS_FILE)) return [];
   try {
     return JSON.parse(readFileSync(JOBS_FILE, "utf-8")) as JobRecord[];
@@ -374,7 +391,7 @@ export function addPayment(jobId: string, amountMsats: number, approval?: { requ
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (job) bookPayment(job, amountMsats, approval);
-  });
+  }, true);
 }
 
 function bookPayment(job: JobRecord, amountMsats: number, approval?: { requestSeq: number; approval: PaymentApproval }): void {
@@ -430,7 +447,7 @@ function clearUnconfirmedSubmission(job: JobRecord, requestSeq: number): void {
  * double-booking. Returns that submission, or undefined when none was held.
  */
 export function markPaymentRequestPaid(jobId: string, requestSeq: number): UnconfirmedPaymentSubmission | undefined {
-  return mutateJobs((jobs) => {
+  const booked = mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (!job) return undefined;
     if (!job.paidPaymentRequestSeqs?.includes(requestSeq))
@@ -450,7 +467,9 @@ export function markPaymentRequestPaid(jobId: string, requestSeq: number): Uncon
       if (!Object.keys(job.askPaymentBlocks).length) delete job.askPaymentBlocks;
     }
     return booked;
-  });
+  }, true);
+  // Only durable consumption grants ownership of the ledger and wallet booking.
+  return hasUnsavedJobState() ? undefined : booked;
 }
 
 /**
@@ -467,7 +486,7 @@ export function markPaymentRequestAnswered(jobId: string, requestSeq: number): v
     job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs?.filter((seq) => seq !== requestSeq);
     if (!job.inFlightPaymentRequestSeqs?.length) delete job.inFlightPaymentRequestSeqs;
     clearPaymentRequestStartTime(job, requestSeq);
-  });
+  }, true);
 }
 
 /** Stop re-sending a held payment; it is no longer in flight, but still held. */
@@ -489,7 +508,7 @@ export function clearAskPaymentBlocks(jobId: string): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (job) delete job.askPaymentBlocks;
-  });
+  }, true);
 }
 
 /** Release every held Cashu submission whose token the wallet reclaimed, so its ask may be paid afresh. */
@@ -543,25 +562,76 @@ function writeJobs(jobs: JobRecord[]): void {
   }
 }
 
-/** Serialize intent creation and consumption booking, including concurrent pay processes. */
-function mutateJobs<T>(change: (jobs: JobRecord[]) => T): T {
-  ensureConfigDir();
-  const release = lockfile.lockSync(JOBS_FILE, { realpath: false });
-  try {
-    const jobs = loadAllJobs();
-    const before = JSON.stringify(jobs);
-    const result = change(jobs);
-    if (JSON.stringify(jobs) !== before) writeJobs(jobs);
-    return result;
-  } finally { release(); }
+const lockWait = new Int32Array(new SharedArrayBuffer(4));
+
+function acquireJobsLock(): () => void {
+  const deadline = performance.now() + 1000;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return lockfile.lockSync(JOBS_FILE, { realpath: false });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || attempt >= 40 || performance.now() >= deadline) throw error;
+      // Mutations are synchronous and short; another process can release while this thread waits.
+      Atomics.wait(lockWait, 0, 0, Math.min(25, Math.max(0, deadline - performance.now())));
+    }
+  }
 }
 
-export function mutateCreditPayment<T>(jobId: string, change: (job: JobRecord) => T): T {
+/** Serialize intent creation and consumption booking, including concurrent pay processes. */
+function mutateJobs<T>(change: (jobs: JobRecord[]) => T, observed = false): T {
+  const session = jobPersistence.getStore();
+  const retain = (jobs: JobRecord[]) => {
+    if (!session) throw new Error("Job persistence session unavailable.");
+    session.unsaved = structuredClone(jobs);
+    session.warn();
+  };
+  if (hasUnsavedJobState()) {
+    if (!observed) throw new DvmError("local_job_state_unsaved",
+      "Local job state must be saved before another payment can be sent.",
+      "Refresh the job once local storage is available; do not submit a replacement.");
+    const jobs = loadAllJobs();
+    const result = change(jobs);
+    retain(jobs);
+    return result;
+  }
+  let release: () => void;
+  try {
+    ensureConfigDir();
+    release = acquireJobsLock();
+  } catch (error) {
+    if (!observed || !session) throw error;
+    const jobs = loadAllJobs();
+    const result = change(jobs);
+    retain(jobs);
+    return result;
+  }
+  const jobs = loadAllJobs();
+  let mutationCompleted = false;
+  try {
+    const before = JSON.stringify(jobs);
+    const result = change(jobs);
+    mutationCompleted = true;
+    try {
+      if (JSON.stringify(jobs) !== before) writeJobs(jobs);
+    } catch (error) {
+      if (!observed || !session) throw error;
+      retain(jobs);
+    }
+    return result;
+  } finally {
+    try { release(); } catch (error) {
+      if (!mutationCompleted || !observed || !session) throw error;
+      retain(jobs);
+    }
+  }
+}
+
+export function mutateCreditPayment<T>(jobId: string, change: (job: JobRecord) => T, observed = false): T {
   return mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (!job) throw new Error("Cannot persist a balance payment for an unknown job.");
     return change(job);
-  });
+  }, observed);
 }
 
 export function bookCreditPayment(jobId: string, intent: CreditPaymentIntent): void {
@@ -577,5 +647,5 @@ export function bookCreditPayment(jobId: string, intent: CreditPaymentIntent): v
     }
     if (job.pendingCreditPayment?.authorization.payment_id === intent.authorization.payment_id)
       delete job.pendingCreditPayment;
-  });
+  }, true);
 }
