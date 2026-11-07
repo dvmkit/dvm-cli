@@ -1,3 +1,4 @@
+import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
 import { providerJobJson } from "../lib/provider-output";
 import { jobSpend, renderSpendHuman } from "../lib/job-spend";
 import { terminalSettlementFields } from "../lib/job-settlement";
@@ -8,7 +9,7 @@ import { createArtifactSaveSession } from "../lib/save-artifact";
 import { type PaymentPolicyContext, isTerminalJobStatus, type NextAction, pollNextAction } from "../lib/next-action";
 import { readNextAction } from "../lib/read-next-action";
 import { settleRecordedPayments } from "../lib/yield-state";
-import { buildCompletionHintFields, completionSnapshot, type JobCompletion, nextStepHint } from "../lib/completion-hints";
+import { completionSnapshot, type JobCompletion } from "../lib/completion-hints";
 import {
   type JobStatus,
   type Message,
@@ -80,22 +81,21 @@ async function statusWithAccess(
 ): Promise<void> {
   const { stored, ref, jobToken } = access;
 
-  // a finished job answers from its stored snapshot — same field set
-  // as the wire read that produced it, and readable with the provider down.
-  // `--messages` still goes to the wire: the message log isn't in the snapshot,
-  // and a record written before this landed carries no snapshot to replay.
+  // Replay terminal evidence locally. Legacy failed/cancelled snapshots may
+  // backfill artifact counts; --messages still explicitly fetches unread output.
   if (
     stored &&
     !access.overridden &&
     isTerminalJobStatus(stored.status) &&
-    stored.completion &&
+    (stored.completion || stored.status !== "completed") &&
     !opts.messages
   ) {
     // re-verify the snapshotted receipt rather than replaying a
     // cached verdict — a tampered `jobs.json` must answer `invalid`.
     let receipt = replayStoredReceipt(stored);
     let terminalStatus = stored.status;
-    let completion = stored.completion;
+    let completion = stored.completion ?? {};
+    let content: Partial<ContentStatus> | undefined;
     const transport = createDvmTransport();
 
     // a terminal snapshot can predate the receipt that the DVM now
@@ -105,6 +105,7 @@ async function statusWithAccess(
     if (stored.receiptsSupported && receipt.status === "absent") {
       const fetched = await fetchMissingJobReceipt(jobId, transport, ref);
       if (fetched.status && isTerminalJobStatus(fetched.status)) {
+        content = fetched;
         const saved = stored.status === fetched.status ? completion : undefined;
         terminalStatus = fetched.status;
         completion = fetched.content_available === false && saved
@@ -119,11 +120,18 @@ async function statusWithAccess(
         receipt = captureTransportReceipt(jobId, fetched);
       }
     }
+    if (terminalStatus !== "completed" && completion.hasArtifacts === undefined && content?.content_available !== false) {
+      completion = await readTerminalCompletion({
+        jobId, status: { ...completion, ...content, status: terminalStatus },
+        transport, ref, jobToken,
+      });
+      markJobTerminal(jobId, terminalStatus, completion);
+    }
     await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
     transport.close();
 
     renderStatus(jobId, stored, terminalStatus, completion, "local", null, opts, {
-      receipt,
+      receipt, content,
     });
     return;
   }
@@ -160,7 +168,7 @@ async function statusWithAccess(
 
   // Update job store if we learned something new. A terminal read snapshots the
   // outcome so every later `dvm status` replays this exact payload.
-  const completion = completionSnapshot(result);
+  let completion = completionSnapshot(result);
   const reasonUnavailable = completion.message === undefined ||
     (result.content_available === false && completion.message === "");
   if (reasonUnavailable && (result.status === "failed" || result.status === "cancelled")) {
@@ -169,6 +177,12 @@ async function statusWithAccess(
     const terminal = msgs.findLast((message) => message.type === "complete" || message.type === "cancel" || message.type === "decline");
     const reason = savedReason ?? (terminal?.type === "cancel" || terminal?.type === "decline" ? terminal.content.reason : undefined);
     if (reason !== undefined) completion.message = reason;
+  }
+  if (isTerminalJobStatus(result.status)) {
+    completion = await readTerminalCompletion({
+      jobId, status: { ...result, ...completion }, transport, ref, jobToken, timeoutMs: timeout,
+      saved: !access.endpointOverridden && stored?.status === result.status ? stored.completion : undefined,
+    });
   }
   let receipt: ReceiptCapture | undefined;
   let currency: string | undefined;
@@ -273,10 +287,12 @@ function renderStatus(
   source: "local" | "provider",
   nextAction: NextAction,
   opts: StatusOptions,
-  fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: ContentStatus; currency?: string }
+  fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: Partial<ContentStatus>; currency?: string }
 ): void {
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
-  const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, opts.human);
+  const artifacts = terminalCompletionOutput(jobId, jobStatus, completion, {
+    human: opts.human, contentAvailable: fetched?.content?.content_available,
+  });
   const msgs = fetched?.msgs ?? [];
   const receipt = fetched?.receipt;
   const content = jobContentFields(jobId, fetched?.content, opts.human);
@@ -293,7 +309,7 @@ function renderStatus(
       info(`Status: ${jobStatus}${identifier ? ` [${identifier}]` : ""}`);
       if (completion.message) info(`  ${completion.message}`);
     }
-    if (jobStatus === "completed" && hint) info(`📎 ${hint}`);
+    if (artifacts.hint) info(`📎 ${artifacts.hint}`);
     info(String(content.content_hint));
     if (msgs.length > 0) {
       info(`\n${msgs.length} new message(s):`);
@@ -324,7 +340,8 @@ function renderStatus(
     ],
     ...content,
     ...(completion.summary ? { summary: completion.summary } : {}),
-    ...(jobStatus === "completed" ? buildCompletionHintFields(jobId, completion) : {}),
+    ...artifacts.fields,
+    ...(artifacts.display ? { display: artifacts.display } : {}),
     ...(completion.message ? { message: completion.message } : {}),
     // terminal responses only. On a still-running job "absent" would
     // read as "this DVM doesn't issue receipts" rather than "not yet".
