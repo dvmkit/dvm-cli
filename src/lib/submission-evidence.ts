@@ -89,12 +89,14 @@ export interface AcceptedJobAccessRecord {
   access_id: string;
   sequence: number;
   job: JobRecord;
+  /** State observed before this command's unsaved changes; absent on older records. */
+  base?: JobRecord;
 }
 
 type PrivateEvidenceRecord = SubmissionEvidenceRecord | AcceptedJobAccessRecord;
 
 /** Each snapshot has its own request-scoped key, so cleanup cannot unlink a newer observation. */
-export function recordAcceptedJobAccess(job: JobRecord, accessId: string, sequence: number): void {
+export function recordAcceptedJobAccess(job: JobRecord, accessId: string, sequence: number, base?: JobRecord): void {
   publishOnce({
     v: 1,
     kind: "accepted_job_access",
@@ -103,11 +105,21 @@ export function recordAcceptedJobAccess(job: JobRecord, accessId: string, sequen
     access_id: accessId,
     sequence,
     job,
+    ...(base ? { base } : {}),
   });
 }
 
 export function listAcceptedJobAccess(): AcceptedJobAccessRecord[] {
   return listPrivateEvidence().records.filter((record) => record.kind === "accepted_job_access");
+}
+
+/** Unknown or unreadable private state cannot authorize a payment. */
+export function hasPendingAcceptedJobAccess(jobId: string, endpoint?: string): boolean {
+  try {
+    const { records, unreadable } = listPrivateEvidence();
+    return unreadable.length > 0 || records.some((record) => record.kind === "accepted_job_access" &&
+      record.job.id === jobId && (endpoint === undefined || sameEndpoint(record.job.endpoint, endpoint)));
+  } catch { return true; }
 }
 
 /** A job ID alone is usable only when every matching access record belongs to one endpoint. */
@@ -447,7 +459,10 @@ function isAcceptedJobAccessRecord(value: unknown): value is AcceptedJobAccessRe
     value.ambiguity_id === `${value.access_id}#accepted-access#${value.sequence}` &&
     typeof value.observed_at === "string" && typeof job.id === "string" &&
     typeof job.endpoint === "string" && typeof job.submittedAt === "number" &&
-    typeof job.status === "string" && isOpaqueJobToken(job.jobToken);
+    typeof job.status === "string" && isOpaqueJobToken(job.jobToken) &&
+    (value.base === undefined || (isPlainObject(value.base) && value.base.id === job.id &&
+      value.base.endpoint === job.endpoint && value.base.jobToken === job.jobToken &&
+      value.base.requestId === job.requestId));
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

@@ -1,10 +1,14 @@
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { resolve } from "node:path";
 import * as fs from "node:fs";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import { JOBS_FILE, WALLET_VERSION, saveAgentWallet } from "@dvmkit/sdk/internal";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-const captured = vi.hoisted(() => ({ writes: [] as { fd: number; text: string }[] }));
+const captured = vi.hoisted(() => ({ writes: [] as { fd: number; text: string }[], fetch: vi.fn() }));
+vi.mock("../src/lib/http", () => ({ dvmFetch: captured.fetch }));
 vi.mock("node:fs", async (original) => {
   const actual = await original<typeof import("node:fs")>();
   return { ...actual, writeSync: vi.fn((fd: number, buffer: Uint8Array, offset = 0, length = buffer.length) => {
@@ -14,6 +18,9 @@ vi.mock("node:fs", async (original) => {
   }) };
 });
 
+import { pay } from "../src/commands/pay";
+import { handlePaymentRequest } from "../src/lib/payment-responder";
+import { HttpsTransport } from "../src/lib/transport/https";
 import { resolveJobAccess } from "../src/lib/job-access";
 import { hasUnsavedJobState } from "../src/lib/job-persistence";
 import { loadJob, recordUpfrontRailPayment, saveAcceptedJob, saveJob, saveSubmittedJob, updateJob, updateObservedJob, type JobRecord } from "../src/lib/job-store";
@@ -145,12 +152,12 @@ it("does not quote bearer secrets from damaged recovery files in evidence diagno
   expect(text()).not.toContain(token);
 });
 
-it("keeps newer jobs-file payment state when cleaning up an older access snapshot", () => {
+it("keeps newer jobs-file payment state and retains an older snapshot without known ancestry", () => {
   saveJob({ ...job, totalPaidMsats: 1500, paymentsHonoured: 2 });
   recordAcceptedJobAccess({ ...job, totalPaidMsats: 1000, paymentsHonoured: 1 }, "request-scope", 0);
   updateObservedJob(job.id, { status: "processing" });
   expect(loadJob(job.id)).toMatchObject({ status: "processing", totalPaidMsats: 1500, paymentsHonoured: 2 });
-  expect(listAcceptedJobAccess()).toEqual([]);
+  expect(listAcceptedJobAccess()).toHaveLength(1);
 });
 
 it("prints the preserved-access status route in human mode without the bearer token", async () => {
@@ -160,3 +167,121 @@ it("prints the preserved-access status route in human mode without the bearer to
   expect(text()).toContain("dvm status");
   expect(text()).not.toContain(token);
 });
+
+it("folds upfront bookkeeping when acceptance was saved but the later charge save failed", async () => {
+  await withOutputWarnings(async () => {
+    saveAcceptedJob(job);
+    const lock = denyLock();
+    recordUpfrontRailPayment(job.id, { method: "cashu", amountMsats: 1000 }, true);
+    lock.mockRestore();
+  });
+  expect(JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"))[0]).not.toHaveProperty("totalPaidMsats");
+  updateObservedJob(job.id, { status: "processing" });
+  expect(loadJob(job.id)).toMatchObject({ status: "processing", totalPaidMsats: 1000, paymentsHonoured: 1,
+    upfrontRailPayment: { method: "cashu", amountMsats: 1000 } });
+  expect(listAcceptedJobAccess()).toEqual([]);
+  const before = fs.readFileSync(JOBS_FILE, "utf8");
+  updateObservedJob(job.id, { status: "processing" });
+  expect(fs.readFileSync(JOBS_FILE, "utf8")).toBe(before);
+});
+
+it("retains conflicting bookkeeping and pauses payments without overwriting newer saved state", async () => {
+  saveJob({ ...job, totalPaidMsats: 1500, paymentsHonoured: 2 });
+  recordAcceptedJobAccess({ ...job, totalPaidMsats: 1000, paymentsHonoured: 1 }, "request-scope", 0, job);
+  await withOutputWarnings(async () => {
+    updateObservedJob(job.id, { status: "processing" });
+    expect(hasUnsavedJobState()).toBe(true);
+    expect(() => updateJob(job.id, { status: "awaiting-input" })).toThrow(expect.objectContaining({ code: "local_job_state_unsaved" }));
+    json({ jobId: job.id });
+  });
+  expect(JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"))[0]).toMatchObject({ totalPaidMsats: 1500, paymentsHonoured: 2 });
+  expect(listAcceptedJobAccess()).toHaveLength(1);
+  expect(output().warnings).toMatchObject([{ code: "local_job_state_unsaved" }]);
+  expect(text()).not.toContain(token);
+});
+
+it.each([false, true])("refuses an exhausted recovered job before any payment work (ambiguous=%s)", async (ambiguous) => {
+  const exhausted = { ...job, totalPaidMsats: 2000, paymentsHonoured: 2 };
+  recordAcceptedJobAccess(exhausted, "first-request", 0);
+  if (ambiguous) recordAcceptedJobAccess({ ...job, endpoint: "https://second.example", jobToken: "cd".repeat(32) }, "second-request", 0);
+  captured.fetch.mockResolvedValue(new Response(JSON.stringify({ status: "awaiting-input" }), { status: 200 }));
+  // Read access can select an endpoint; the ID-keyed payment path must first have durable, unambiguous state.
+  expect(resolveJobAccess(job.id, { endpoint: job.endpoint }).jobToken).toBe(token);
+  await expect(pay(job.id, { endpoint: job.endpoint })).rejects.toMatchObject({ code: "job_payment_state_required" });
+  await expect(handlePaymentRequest(job.id, { amount_msats: 1000, reason: "More work" }, job.policy!,
+    new HttpsTransport(), { endpoint: job.endpoint }, { requestSeq: 4, jobToken: token }))
+    .rejects.toMatchObject({ code: "local_job_state_unsaved" });
+  expect(captured.fetch).not.toHaveBeenCalled();
+  expect(fs.existsSync(JOBS_FILE)).toBe(false);
+  expect(text()).not.toContain(token);
+});
+
+it("rejects payment while a saved acceptance still has unmerged upfront bookkeeping", async () => {
+  saveJob(job);
+  recordAcceptedJobAccess({ ...job, totalPaidMsats: 2000, paymentsHonoured: 2 }, "request-scope", 0, job);
+  await expect(pay(job.id, {})).rejects.toMatchObject({ code: "job_payment_state_required" });
+  expect(captured.fetch).not.toHaveBeenCalled();
+  updateObservedJob(job.id, { status: "processing" });
+  expect(loadJob(job.id)).toMatchObject({ totalPaidMsats: 2000, paymentsHonoured: 2 });
+  expect(listAcceptedJobAccess()).toEqual([]);
+  captured.fetch.mockImplementation(async (url: string) => new Response(JSON.stringify(
+    url.includes("/messages") ? { messages: [{ seq: 4, from: "provider", type: "payment-request", timestamp: 1,
+      content: { amount_msats: 1000, reason: "More work", mints: ["https://mint.example"] } }] }
+      : { status: "awaiting-input" }), { status: 200 }));
+  await expect(pay(job.id, {})).rejects.toMatchObject({ code: "over_budget" });
+  expect(captured.fetch.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+  expect(loadJob(job.id)).toMatchObject({ totalPaidMsats: 2000, paymentsHonoured: 2 });
+});
+
+it("preserves later bookkeeping when another process folds an early access snapshot first", async () => {
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(request.method!);
+    if (request.headers["x-job-token"] !== token) {
+      response.writeHead(403).end("{}");
+      return;
+    }
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify(request.url?.includes("/messages") ? { messages: [] } : { status: "processing" }));
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Recovery provider did not bind TCP");
+  const submitted = { ...job, endpoint: `http://127.0.0.1:${address.port}` };
+  const read = () => new Promise<{ code: number | null; stdout: string }>((done, reject) => {
+    const child = spawn(process.execPath, [resolve(import.meta.dirname, "../dist/dvm.js"), "status", job.id, "--messages"], {
+      env: process.env, stdio: ["ignore", "pipe", "pipe"], timeout: 15_000,
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8").on("data", (data) => { stdout += data; });
+    child.stderr.resume();
+    child.once("error", reject);
+    child.once("close", (code) => done({ code, stdout }));
+  });
+  try {
+    await withOutputWarnings(async () => {
+      const lock = denyLock();
+      saveAcceptedJob(submitted);
+      lock.mockRestore();
+      const early = await read();
+      expect(early.code).toBe(0);
+      expect(JSON.parse(early.stdout).status).toBe("processing");
+      expect(JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"))[0]).not.toHaveProperty("totalPaidMsats");
+      expect(listAcceptedJobAccess()).toEqual([]);
+      recordUpfrontRailPayment(job.id, { method: "cashu", amountMsats: 1000 }, true);
+      expect(hasUnsavedJobState()).toBe(true);
+    });
+    expect(listAcceptedJobAccess()).toHaveLength(1);
+    const later = await read();
+    expect(later.code).toBe(0);
+    expect(later.stdout).not.toContain(token);
+    const saved = JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"))[0];
+    expect(saved).toMatchObject({ status: "processing", totalPaidMsats: 1000, paymentsHonoured: 1,
+      upfrontRailPayment: { method: "cashu", amountMsats: 1000 } });
+    expect(listAcceptedJobAccess()).toEqual([]);
+    expect(requests.every((method) => method === "GET")).toBe(true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((done, reject) => server.close((error) => error ? reject(error) : done()));
+  }
+}, 20_000);

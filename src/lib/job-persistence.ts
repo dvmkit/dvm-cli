@@ -8,7 +8,7 @@ export interface JobPersistenceWarning {
 
 interface JobPersistenceSession {
   unsaved?: JobRecord[];
-  accepted?: { id: string; endpoint: string; accessId: string; sequence: number; preserved: boolean; snapshot?: string }[];
+  accepted?: { id: string; endpoint: string; accessId: string; sequence: number; preserved: boolean; base: JobRecord; snapshot?: string }[];
   warn: (state: JobPersistenceWarning) => void;
 }
 

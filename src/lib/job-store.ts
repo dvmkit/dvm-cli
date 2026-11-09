@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
 import {
   findAcceptedJobAccess, latestAcceptedJobAccess, listAcceptedJobAccess,
@@ -582,13 +583,34 @@ function acquireJobsLock(): () => void {
   }
 }
 
+/** Apply only changes whose baseline still agrees, leaving conflicting observations private. */
+function mergeAcceptedJobAccess(current: JobRecord, record: AcceptedJobAccessRecord): JobRecord | null {
+  const { job, base } = record;
+  if (!sameEndpoint(current.endpoint, job.endpoint) || current.jobToken !== job.jobToken || current.requestId !== job.requestId) return null;
+  const saved = current as unknown as Record<string, unknown>;
+  const observed = job as unknown as Record<string, unknown>;
+  if (!base) {
+    // Older records have no ancestry: credential equality cannot prove bookkeeping was saved.
+    return Object.keys(observed).every((key) => isDeepStrictEqual(saved[key], observed[key])) ? current : null;
+  }
+  const before = base as unknown as Record<string, unknown>;
+  const merged = { ...saved };
+  for (const key of new Set([...Object.keys(before), ...Object.keys(observed)])) {
+    if (isDeepStrictEqual(before[key], observed[key]) || isDeepStrictEqual(saved[key], observed[key])) continue;
+    if (!isDeepStrictEqual(saved[key], before[key])) return null;
+    if (key in observed) merged[key] = observed[key];
+    else delete merged[key];
+  }
+  return merged as unknown as JobRecord;
+}
+
 /** Serialize intent creation and consumption booking, including concurrent pay processes. */
 function mutateJobs<T>(change: (jobs: JobRecord[]) => T, observed = false, accepted?: JobRecord): T {
   const session = jobPersistence.getStore();
   if (session && accepted?.jobToken && !session.accepted?.some((entry) =>
     entry.id === accepted.id && sameEndpoint(entry.endpoint, accepted.endpoint))) {
     (session.accepted ??= []).push({ id: accepted.id, endpoint: accepted.endpoint,
-      accessId: randomUUID(), sequence: 0, preserved: false });
+      accessId: randomUUID(), sequence: 0, preserved: false, base: structuredClone(accepted) });
   }
   const retain = (jobs: JobRecord[]) => {
     if (!session) throw new Error("Job persistence session unavailable.");
@@ -599,7 +621,7 @@ function mutateJobs<T>(change: (jobs: JobRecord[]) => T, observed = false, accep
       const snapshot = JSON.stringify(job);
       if (snapshot === entry.snapshot) continue;
       try {
-        recordAcceptedJobAccess(job, entry.accessId, entry.sequence++);
+        recordAcceptedJobAccess(job, entry.accessId, entry.sequence++, entry.base);
         entry.preserved = true;
         entry.snapshot = snapshot;
       } catch { /* Never replace an accepted remote outcome with a local storage error. */ }
@@ -636,22 +658,44 @@ function mutateJobs<T>(change: (jobs: JobRecord[]) => T, observed = false, accep
     let access: AcceptedJobAccessRecord[] = [];
     try { access = listAcceptedJobAccess(); } catch { /* The ordinary jobs store remains independently writable. */ }
     const latest = latestAcceptedJobAccess(access);
-    for (const record of [...latest].reverse()) {
-      if (jobs.some((job) => job.id === record.job.id)) continue;
-      // The jobs file is keyed by ID; conflicting endpoints must stay in evidence.
-      if (latest.some((other) => other.job.id === record.job.id && !sameEndpoint(other.job.endpoint, record.job.endpoint))) continue;
-      jobs.push(record.job);
-    }
+    const folded = new Set<string>();
+    const fold = () => {
+      for (const record of [...latest].reverse()) {
+        if (folded.has(record.access_id)) continue;
+        const index = jobs.findIndex((job) => job.id === record.job.id);
+        if (index !== -1) {
+          const merged = mergeAcceptedJobAccess(jobs[index], record);
+          if (!merged) continue;
+          jobs[index] = merged;
+        } else {
+          // The jobs file is keyed by ID; conflicting endpoints must stay in evidence.
+          if (latest.some((other) => other.job.id === record.job.id && !sameEndpoint(other.job.endpoint, record.job.endpoint))) continue;
+          jobs.push(structuredClone(record.job));
+        }
+        folded.add(record.access_id);
+      }
+    };
+    const hasUnmerged = () => latest.some((record) => !folded.has(record.access_id) && jobs.some((job) =>
+      job.id === record.job.id && sameEndpoint(job.endpoint, record.job.endpoint)));
+    fold();
+    if (hasUnmerged() && !observed) throw new DvmError("local_job_state_unsaved",
+      "Private recovery state must be reconciled before another payment can be sent.",
+      "Refresh the job with dvm status <job_id> --messages; conflicting recovery observations remain preserved.");
     const result = change(jobs);
+    fold();
+    const unmerged = hasUnmerged();
     mutationCompleted = true;
     try {
       if (JSON.stringify(jobs) !== before) writeJobs(jobs);
       for (const entry of session?.accepted ?? []) {
-        if (jobs.some((job) => job.id === entry.id && sameEndpoint(job.endpoint, entry.endpoint) && job.jobToken)) entry.preserved = true;
+        const saved = jobs.find((job) => job.id === entry.id && sameEndpoint(job.endpoint, entry.endpoint) && job.jobToken);
+        if (saved) {
+          entry.preserved = true;
+          entry.base = structuredClone(saved);
+        }
       }
-      removeAcceptedJobAccess(access.filter(({ job }) => jobs.some((saved) =>
-        saved.id === job.id && sameEndpoint(saved.endpoint, job.endpoint) &&
-        saved.jobToken === job.jobToken && saved.requestId === job.requestId)));
+      removeAcceptedJobAccess(access.filter((record) => folded.has(record.access_id)));
+      if (unmerged && session) retain(jobs);
     } catch (error) {
       if (!observed || !session) throw error;
       retain(jobs);
