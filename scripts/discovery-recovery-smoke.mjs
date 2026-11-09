@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { fork, spawn } from "node:child_process";
-import { cpSync, createWriteStream, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, createWriteStream, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -86,6 +86,61 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
         assert.ok(requests.every((request) => request.authenticated === signed));
       }
     }
+    phase = "jobs-lock access recovery";
+    const root = mkdtempSync(join(tmpdir(), "dvm-locked-caller-"));
+    roots.push(root);
+    writeFileSync(join(root, "config.json"), JSON.stringify({ credit: { posture: "off" }, feedback: { posture: "off" } }), { mode: 0o600 });
+    const jobsFile = join(root, "jobs.json");
+    writeFileSync(jobsFile, "[]", { mode: 0o600 });
+    const holder = await holdJobsLock(packageRoot, jobsFile);
+    let accepted;
+    let access;
+    const before = await send("snapshot", "snapshot");
+    try {
+      await send("defer", "deferred");
+      accepted = await cli(binary, root, ["request", "--endpoint", `${ready.anonymous}/search`,
+        "--data", JSON.stringify({ query: "locked", mode: "keyword", limit: 1 }), "--no-stream"]);
+      assert.equal(accepted.code, 0);
+      const output = JSON.parse(accepted.stdout);
+      assert.equal(output.warnings[0].code, "local_job_state_unsaved");
+      assert.match(output.warnings[0].hint, /dvm status/);
+      assert.deepEqual(JSON.parse(readFileSync(jobsFile, "utf8")), []);
+      const directory = join(root, "submission-evidence");
+      access = readdirSync(directory).filter((name) => name.endsWith(".json"))
+        .map((name) => JSON.parse(readFileSync(join(directory, name), "utf8")))
+        .find((record) => record.kind === "accepted_job_access");
+      assert.ok(access, "accepted job access must survive outside the locked jobs file");
+      assert.equal(access.job.id, output.jobId);
+    } finally {
+      if (holder.exitCode === null && holder.signalCode === null) {
+        const exited = new Promise((done) => holder.once("close", done));
+        const timeout = setTimeout(() => holder.kill("SIGKILL"), 5_000);
+        try {
+          if (holder.connected) holder.send("release");
+          await exited;
+        } finally { clearTimeout(timeout); }
+      }
+    }
+    await send("release", "released");
+    const resumed = await cli(binary, root, ["status", access.job.id, "--messages"]);
+    assert.equal(resumed.code, 0);
+    const output = JSON.parse(resumed.stdout);
+    assert.equal(output.status, "completed");
+    assert.equal(output.next_action, null);
+    assert.ok(output.messages.some((message) => message.type === "complete"));
+    const saved = JSON.parse(readFileSync(jobsFile, "utf8"));
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].jobToken, access.job.jobToken);
+    assert.equal(saved[0].status, "completed");
+    assert.equal(readdirSync(join(root, "submission-evidence")).filter((name) => name.endsWith(".json")).length, 0);
+    const again = await cli(binary, root, ["status", access.job.id]);
+    assert.equal(again.code, 0);
+    assert.equal(JSON.parse(readFileSync(jobsFile, "utf8")).length, 1);
+    assert.ok(!(accepted.stdout + accepted.stderr + resumed.stdout + resumed.stderr + again.stdout + again.stderr).includes(access.job.jobToken));
+    const after = await send("snapshot", "snapshot");
+    assert.equal(after.submissions.length - before.submissions.length, 1);
+    assert.deepEqual(after.requests.slice(before.requests.length).filter((request) => request.method === "POST")
+      .map((request) => request.path), ["/v1/job"]);
   } catch (error) {
     // Provider spans and assertion details can contain raw routes and credentials.
     diagnostics.write(String(error.stack ?? error));
@@ -102,7 +157,7 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
     }
   }
   if (failed || providerCode !== 0) throw new Error(`Installed discovery recovery fixture failed during ${phase}; diagnostics retained privately.`);
-  console.log("installed discovery recovery ok: search/browse, anonymous/signed, exact timeout hints, no resubmission or payment");
+  console.log("installed discovery recovery ok: search/browse, anonymous/signed, exact timeout hints, jobs-lock recovery, no resubmission or payment");
 
   function receive(type) {
     return new Promise((done, reject) => {
@@ -152,4 +207,21 @@ function cli(binary, root, args) {
     child.once("error", reject);
     child.once("close", (code) => done({ code, stdout, stderr }));
   });
+}
+
+async function holdJobsLock(packageRoot, jobsFile) {
+  const child = spawn(process.execPath, ["-e", `
+    const { createRequire } = require("node:module");
+    const requirePackage = createRequire(process.argv[1]);
+    const release = requirePackage("proper-lockfile").lockSync(process.argv[2], { realpath: false });
+    process.on("message", () => { release(); process.exit(0); });
+    process.send("locked");
+  `, join(packageRoot, "package.json"), jobsFile], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  await new Promise((done, reject) => {
+    const timeout = setTimeout(() => { child.kill(); reject(new Error("Jobs lock holder did not start")); }, 10_000);
+    child.once("message", () => { clearTimeout(timeout); done(); });
+    child.once("error", () => { clearTimeout(timeout); reject(new Error("Jobs lock holder unavailable")); });
+    child.once("exit", () => { clearTimeout(timeout); reject(new Error("Jobs lock holder exited early")); });
+  });
+  return child;
 }

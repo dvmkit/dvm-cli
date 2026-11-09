@@ -42,7 +42,8 @@ export interface ResolvedStoredJobAccess extends ResolvedJobAccess {
  * behaviour as `request --endpoint`.
  */
 export function resolveJobAccess(jobId: string, opts: JobAccessOptions): ResolvedJobAccess {
-  const stored = loadJob(jobId);
+  const endpoint = opts.endpoint ?? process.env.DVM_JOB_ENDPOINT;
+  const stored = loadJob(jobId, endpoint === undefined ? undefined : resolveEndpoint(endpoint));
   return resolveJobAccessWithRecord(jobId, opts, stored);
 }
 
@@ -112,7 +113,8 @@ export function resolveStoredJobAccess(
   jobId: string,
   opts: JobAccessOptions
 ): ResolvedStoredJobAccess {
-  const stored = loadJob(jobId);
+  const endpoint = opts.endpoint ?? process.env.DVM_JOB_ENDPOINT;
+  const stored = loadJob(jobId, endpoint === undefined ? undefined : resolveEndpoint(endpoint));
   if (!stored) {
     throw new DvmError(
       "job_payment_state_required",

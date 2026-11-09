@@ -22,11 +22,15 @@ export type OutputWarning = AutoPayWarning | DrawFundingWarning | LocalJobStateW
 const warnings = new AsyncLocalStorage<OutputWarning[]>();
 
 export function withOutputWarnings<T>(run: () => Promise<T>, human?: boolean): Promise<T> {
-  return warnings.run([], () => withJobPersistence(run, () => {
+  return warnings.run([], () => withJobPersistence(run, ({ accessPreserved, accessUnpreserved }) => {
+    const hint = accessUnpreserved
+      ? "Job access was not preserved. Supply --endpoint <url> and --job-token <hex>, or DVM_JOB_ENDPOINT and DVM_JOB_TOKEN, to read this job; do not submit or pay again."
+      : "Refresh the job with dvm status <job_id> --messages before paying or submitting a replacement.";
     addOutputWarnings([{
       code: "local_job_state_unsaved",
-      display: "The provider's outcome is unchanged, but local job state could not be saved and may lag. Automatic payments are paused for this command.",
-      hint: "Once local storage is available, refresh the job with dvm status <job_id> --messages before paying or submitting a replacement.",
+      display: "The provider's outcome is unchanged, but local job state could not be saved and may lag. Automatic payments are paused for this command." +
+        (accessUnpreserved ? ` ${hint}` : accessPreserved ? ` Job access is preserved privately. ${hint}` : ""),
+      hint,
     }], human);
   }));
 }
@@ -48,7 +52,14 @@ export function addOutputWarnings(entries: OutputWarning[], human?: boolean): Ou
   const pending = warnings.getStore();
   const added: OutputWarning[] = [];
   for (const entry of entries) {
-    if (pending?.some((prior) => sameWarning(prior, entry))) continue;
+    const index = pending?.findIndex((prior) => sameWarning(prior, entry)) ?? -1;
+    if (index !== -1) {
+      const prior = pending![index];
+      if (entry.code !== "local_job_state_unsaved" || JSON.stringify(prior) === JSON.stringify(entry)) continue;
+      pending![index] = entry;
+      if (human) info(`Warning: ${entry.display}`);
+      continue;
+    }
     pending?.push(entry);
     added.push(entry);
     if (human) info(`Warning: ${entry.display}`);
