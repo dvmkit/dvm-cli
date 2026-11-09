@@ -182,12 +182,14 @@ const sdk = await createDVMServer(descriptor, {
   },
   // `live` runs the same DVM against Stripe test mode; the key arrives in the
   // environment only and is never echoed.
+  // An explicit $0.50 floor keeps the $1–$2 charge and refund scenarios eligible.
   stripeCredit: LIVE
-    ? createStripeCreditRail({ secretKey: LIVE, networkId: "internal", hmacSecret: HMAC })
+    ? createStripeCreditRail({ secretKey: LIVE, networkId: "internal", hmacSecret: HMAC, minUsd: "0.50" })
     : createStripeCreditRail({
         secretKey: "sk_test_fake",
         networkId: NETWORK_ID,
         hmacSecret: HMAC,
+        minUsd: "0.50",
         apiBase: "https://stripe.invalid",
         fetch: stripeFetch,
       }),
