@@ -17,6 +17,8 @@ import {
   writeFileSync,
 } from "fs";
 import { join } from "path";
+import type { JobRecord } from "./job-store";
+import { sameEndpoint } from "./provider-endpoint";
 
 import {
   type IdentityFailureKind,
@@ -29,7 +31,7 @@ import {
 } from "./job-identity";
 
 /**
- * Evidence of submissions a provider accepted without a settled job identity.
+ * Private evidence of accepted submissions, including jobs whose local save failed.
  * It lives outside the job store on purpose: the job store resolves the first
  * record with a matching ID, so evidence filed under a provider-chosen ID could
  * be hidden behind an existing job. Records are keyed by a request-scoped value
@@ -77,6 +79,73 @@ export interface SubmissionEvidenceRecord {
   unstorable_job_ids?: UnstorableJobIds;
   /** No router feedback claim was stored for any observed job ID. */
   claim_stored: false;
+}
+
+export interface AcceptedJobAccessRecord {
+  v: 1;
+  kind: "accepted_job_access";
+  ambiguity_id: string;
+  observed_at: string;
+  access_id: string;
+  sequence: number;
+  job: JobRecord;
+  /** State observed before this command's unsaved changes; absent on older records. */
+  base?: JobRecord;
+}
+
+type PrivateEvidenceRecord = SubmissionEvidenceRecord | AcceptedJobAccessRecord;
+
+/** Each snapshot has its own request-scoped key, so cleanup cannot unlink a newer observation. */
+export function recordAcceptedJobAccess(job: JobRecord, accessId: string, sequence: number, base?: JobRecord): void {
+  publishOnce({
+    v: 1,
+    kind: "accepted_job_access",
+    ambiguity_id: `${accessId}#accepted-access#${sequence}`,
+    observed_at: new Date().toISOString(),
+    access_id: accessId,
+    sequence,
+    job,
+    ...(base ? { base } : {}),
+  });
+}
+
+export function listAcceptedJobAccess(): AcceptedJobAccessRecord[] {
+  return listPrivateEvidence().records.filter((record) => record.kind === "accepted_job_access");
+}
+
+/** Unknown or unreadable private state cannot authorize a payment. */
+export function hasPendingAcceptedJobAccess(jobId: string, endpoint?: string): boolean {
+  try {
+    const { records, unreadable } = listPrivateEvidence();
+    return unreadable.length > 0 || records.some((record) => record.kind === "accepted_job_access" &&
+      record.job.id === jobId && (endpoint === undefined || sameEndpoint(record.job.endpoint, endpoint)));
+  } catch { return true; }
+}
+
+/** A job ID alone is usable only when every matching access record belongs to one endpoint. */
+export function findAcceptedJobAccess(jobId: string, endpoint?: string): JobRecord | null {
+  let records;
+  try { records = listAcceptedJobAccess(); } catch { return null; }
+  const matches = latestAcceptedJobAccess(records).filter(({ job }) =>
+    job.id === jobId && (endpoint === undefined || sameEndpoint(job.endpoint, endpoint)));
+  if (!matches.length || matches.some(({ job }) => !sameEndpoint(job.endpoint, matches[0].job.endpoint))) return null;
+  return matches.at(-1)!.job;
+}
+
+export function latestAcceptedJobAccess(records: AcceptedJobAccessRecord[]): AcceptedJobAccessRecord[] {
+  const latest = new Map<string, AcceptedJobAccessRecord>();
+  for (const record of records) {
+    const previous = latest.get(record.access_id);
+    if (!previous || previous.sequence < record.sequence) latest.set(record.access_id, record);
+  }
+  return [...latest.values()].sort((a, b) => a.observed_at.localeCompare(b.observed_at));
+}
+
+/** Remove only snapshots already covered by a durable jobs-file write. */
+export function removeAcceptedJobAccess(records: AcceptedJobAccessRecord[]): void {
+  for (const record of records) {
+    try { unlinkSync(evidencePath(record.ambiguity_id)); } catch { /* A leftover snapshot is safe to fold again. */ }
+  }
 }
 
 export interface SubmissionEvidenceInput {
@@ -205,6 +274,11 @@ export function identityFailureRecorded(err: ProviderIdentityError): boolean {
 }
 
 export function loadSubmissionEvidence(ambiguityId: string): SubmissionEvidenceRecord | null {
+  const record = loadPrivateEvidence(ambiguityId);
+  return record?.kind === "accepted_job_access" ? null : record;
+}
+
+function loadPrivateEvidence(ambiguityId: string): PrivateEvidenceRecord | null {
   const path = evidencePath(ambiguityId);
   if (!existsSync(path)) return null;
   const record = readRecord(path);
@@ -225,8 +299,13 @@ export function listSubmissionEvidence(): {
   records: SubmissionEvidenceRecord[];
   unreadable: UnreadableSubmissionEvidence[];
 } {
+  const listed = listPrivateEvidence();
+  return { ...listed, records: listed.records.filter((record) => record.kind !== "accepted_job_access") };
+}
+
+function listPrivateEvidence(): { records: PrivateEvidenceRecord[]; unreadable: UnreadableSubmissionEvidence[] } {
   if (!existsSync(SUBMISSION_EVIDENCE_DIR)) return { records: [], unreadable: [] };
-  const records: SubmissionEvidenceRecord[] = [];
+  const records: PrivateEvidenceRecord[] = [];
   const unreadable: UnreadableSubmissionEvidence[] = [];
   for (const name of readdirSync(SUBMISSION_EVIDENCE_DIR).filter((n) => n.endsWith(".json"))) {
     const path = join(SUBMISSION_EVIDENCE_DIR, name);
@@ -257,7 +336,7 @@ export function journalMarkerFor(record: SubmissionEvidenceRecord): PendingSubmi
   };
 }
 
-function publishOnce(record: SubmissionEvidenceRecord): SubmissionEvidenceRecord {
+function publishOnce<T extends PrivateEvidenceRecord>(record: T): T {
   const ambiguityId = record.ambiguity_id;
   ensureConfigSubdir(SUBMISSION_EVIDENCE_DIR);
   const target = evidencePath(ambiguityId);
@@ -278,7 +357,9 @@ function publishOnce(record: SubmissionEvidenceRecord): SubmissionEvidenceRecord
     unlinkSync(temp);
   }
   fsyncDirectory(SUBMISSION_EVIDENCE_DIR);
-  return loadSubmissionEvidence(ambiguityId) ?? record;
+  const stored = loadPrivateEvidence(ambiguityId) ?? record;
+  if (stored.kind !== record.kind) throw unreadable(target, "kind mismatch");
+  return stored as T;
 }
 
 function boundedIds(
@@ -312,14 +393,15 @@ function evidencePath(ambiguityId: string): string {
   return join(SUBMISSION_EVIDENCE_DIR, `${name}.json`);
 }
 
-function readRecord(path: string): SubmissionEvidenceRecord {
+function readRecord(path: string): PrivateEvidenceRecord {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
-  } catch (error) {
-    throw unreadable(path, error instanceof Error ? error.message : String(error));
+  } catch {
+    // JSON parser diagnostics can quote the bearer secret from a damaged file.
+    throw unreadable(path, "invalid JSON or unreadable file");
   }
-  if (!isEvidenceRecord(parsed)) throw unreadable(path, "invalid shape");
+  if (!isEvidenceRecord(parsed) && !isAcceptedJobAccessRecord(parsed)) throw unreadable(path, "invalid shape");
   return parsed;
 }
 
@@ -366,6 +448,21 @@ function isEvidenceRecord(value: unknown): value is SubmissionEvidenceRecord {
       "accepted_job_id",
     ].every(optionalString)
   );
+}
+
+function isAcceptedJobAccessRecord(value: unknown): value is AcceptedJobAccessRecord {
+  if (!isPlainObject(value) || !isPlainObject(value.job)) return false;
+  const job = value.job;
+  return value.v === 1 && value.kind === "accepted_job_access" &&
+    typeof value.ambiguity_id === "string" && typeof value.access_id === "string" &&
+    Number.isSafeInteger(value.sequence) && (value.sequence as number) >= 0 &&
+    value.ambiguity_id === `${value.access_id}#accepted-access#${value.sequence}` &&
+    typeof value.observed_at === "string" && typeof job.id === "string" &&
+    typeof job.endpoint === "string" && typeof job.submittedAt === "number" &&
+    typeof job.status === "string" && isOpaqueJobToken(job.jobToken) &&
+    (value.base === undefined || (isPlainObject(value.base) && value.base.id === job.id &&
+      value.base.endpoint === job.endpoint && value.base.jobToken === job.jobToken &&
+      value.base.requestId === job.requestId));
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

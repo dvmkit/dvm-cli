@@ -10,7 +10,7 @@ import {
 } from "./job-store";
 
 import { resolveEndpoint } from "./favorites";
-import { listSubmissionEvidence } from "./submission-evidence";
+import { hasPendingAcceptedJobAccess, listSubmissionEvidence } from "./submission-evidence";
 
 export interface JobAccessOptions {
   /** Provider base URL. Falls back through DVM_JOB_ENDPOINT to the stored job. */
@@ -42,7 +42,8 @@ export interface ResolvedStoredJobAccess extends ResolvedJobAccess {
  * behaviour as `request --endpoint`.
  */
 export function resolveJobAccess(jobId: string, opts: JobAccessOptions): ResolvedJobAccess {
-  const stored = loadJob(jobId);
+  const endpoint = opts.endpoint ?? process.env.DVM_JOB_ENDPOINT;
+  const stored = loadJob(jobId, endpoint === undefined ? undefined : resolveEndpoint(endpoint));
   return resolveJobAccessWithRecord(jobId, opts, stored);
 }
 
@@ -112,12 +113,13 @@ export function resolveStoredJobAccess(
   jobId: string,
   opts: JobAccessOptions
 ): ResolvedStoredJobAccess {
+  // Payment machinery resolves this ID without an endpoint too; it must see the same state.
   const stored = loadJob(jobId);
-  if (!stored) {
+  if (!stored || hasPendingAcceptedJobAccess(jobId, stored.endpoint)) {
     throw new DvmError(
       "job_payment_state_required",
       `Cannot pay job ${jobId} without its local payment state.`,
-      "Run 'dvm pay' where the job record and message history are available (normally the submitting machine). An endpoint and job token cannot reconstruct its pending request and spending policy."
+      "Inspect with 'dvm status <job_id> --messages', retaining your endpoint options. Fold recovery records and restore unambiguous local payment state before paying; portable access alone cannot establish it."
     );
   }
   return { ...resolveJobAccessWithRecord(jobId, opts, stored), stored };

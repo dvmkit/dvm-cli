@@ -1,3 +1,4 @@
+import { hasPendingAcceptedJobAccess } from "./submission-evidence";
 import { withJobPaymentLock } from "./payment-lock";
 import { loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest, settleRecordedPayments } from "./yield-state";
 import { finishBookedSubmission, midJobSpendLabel } from "./taken-payment";
@@ -160,6 +161,9 @@ async function handleLockedPaymentRequest(
   provider: ProviderRef,
   opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean }
 ): Promise<PaymentResult> {
+  if (hasPendingAcceptedJobAccess(jobId, provider.endpoint)) throw new DvmError("local_job_state_unsaved",
+    "Private recovery state must be folded before another payment can be sent.",
+    "Run dvm status <job_id> --messages before paying; unresolved recovery records remain preserved.");
   const approval: { requestSeq: number; approval: PaymentApproval } | undefined = opts?.requestSeq === undefined ? undefined : {
     requestSeq: opts.requestSeq, approval: opts.approval ?? "auto",
   };

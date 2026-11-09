@@ -31,6 +31,7 @@ import {
 } from "../src/lib/job-store";
 import { withOutputWarnings, json } from "../src/lib/output";
 import { hasUnsavedJobState } from "../src/lib/job-persistence";
+import { SUBMISSION_EVIDENCE_DIR } from "../src/lib/submission-evidence";
 import { streamLoop } from "../src/lib/stream-loop";
 import { HttpsTransport } from "../src/lib/transport/https";
 
@@ -73,6 +74,7 @@ async function holdJobsLock(): Promise<ChildProcessWithoutNullStreams> {
 beforeEach(() => {
   fs.mkdirSync(root, { recursive: true });
   fs.rmSync(JOBS_FILE, { force: true });
+  fs.rmSync(SUBMISSION_EVIDENCE_DIR, { recursive: true, force: true });
   fs.writeFileSync(join(root, "config.json"), JSON.stringify({ credit: { posture: "off" }, feedback: { posture: "off" } }));
   saveJob({ id: jobId, endpoint, status: "processing", submittedAt: 1, policy });
   captured.writes.length = 0;
@@ -181,14 +183,14 @@ it("does not grant wallet booking ownership until held-payment consumption is du
   expect(loadJob(jobId)?.unconfirmedPaymentSubmissions?.[4]).toEqual(held);
 });
 
-it("keeps a newly accepted job and token in memory without leaking it to another command", async () => {
+it("preserves a newly accepted job token for another command without printing it", async () => {
   await holdJobsLock();
   await withOutputWarnings(async () => {
     saveAcceptedJob({ id: "accepted", endpoint, submittedAt: 2, status: "processing", jobToken: "private-token" });
     expect(loadJob("accepted")?.jobToken).toBe("private-token");
     json({ jobId: "accepted", status: "processing" });
   });
-  expect(loadJob("accepted")).toBeNull();
+  expect(loadJob("accepted")?.jobToken).toBe("private-token");
   expect(stdout()).not.toContain("private-token");
 });
 
@@ -246,7 +248,7 @@ it.each([false, true])("reports an accepted request promptly when local storage 
   expect(output()).toMatchObject({ jobId: "new-job", next_action: { type: "poll" },
     warnings: [{ code: "local_job_state_unsaved" }] });
   expect(captured.fetch.mock.calls.filter(([url, init]) => String(url).endsWith("/job") && init?.method === "POST")).toHaveLength(1);
-  expect(loadJob("new-job")).toBeNull();
+  expect(loadJob("new-job")?.jobToken).toBe("ab".repeat(32));
 });
 
 it("does not turn a provider refusal into cancellation success", async () => {
