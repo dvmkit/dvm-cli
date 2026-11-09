@@ -1,8 +1,7 @@
 import type { Quote } from "@dvmkit/sdk/internal";
 
 /**
- * Check a quote against a caller-declared limit, preferring the rail's native
- * dollar units where that rail exposes an exact amount.
+ * Compare exact dollar prices before advisory BTC conversions to avoid FX rounding.
  */
 export function quoteWithinDeclaredLimit(
   quote: Quote,
@@ -20,9 +19,15 @@ function quoteWithinNativeDollarLimit(
   rail: string | undefined
 ): boolean | undefined {
   const normalizedRail = rail?.trim().toLowerCase();
-  if (normalizedRail === "x402") return x402QuoteWithinDollarLimit(quote, declaredLimit);
-  if (normalizedRail === "tempo") return tempoQuoteWithinDollarLimit(quote, declaredLimit);
-  return undefined;
+  if (normalizedRail === "x402") {
+    const native = x402QuoteWithinDollarLimit(quote, declaredLimit);
+    if (native !== undefined) return native;
+  }
+  const upfront = upfrontQuoteWithinDollarLimit(quote, declaredLimit);
+  if (normalizedRail === "tempo" && declaredLimit?.trim().startsWith("$")) {
+    return upfront ?? false;
+  }
+  return upfront;
 }
 
 function x402QuoteWithinDollarLimit(
@@ -35,21 +40,21 @@ function x402QuoteWithinDollarLimit(
   return BigInt(quote.requiredUsdcMicro) <= limitMicro;
 }
 
-function tempoQuoteWithinDollarLimit(
+function upfrontQuoteWithinDollarLimit(
   quote: Quote,
   declaredLimit: string | undefined
 ): boolean | undefined {
   if (!declaredLimit?.trim().startsWith("$")) return undefined;
   const limitMicro = dollarLimitMicro(declaredLimit);
-  const amountMicro = quote.upfront.amount_micro;
+  const amountMicro = quote.upfront?.amount_micro;
   if (
     limitMicro === undefined ||
-    quote.upfront.currency !== "usd" ||
+    quote.upfront?.currency !== "usd" ||
     amountMicro === undefined ||
     !Number.isSafeInteger(amountMicro) ||
     amountMicro <= 0
   ) {
-    return false;
+    return undefined;
   }
   return BigInt(amountMicro) <= limitMicro;
 }

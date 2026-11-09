@@ -55,8 +55,45 @@ describe("native-dollar quote limits", () => {
     expect(quoteWithinDeclaredLimit(tempoQuote, 24_503, "24503", "tempo")).toBe(false);
   });
 
-  it("does not apply Tempo native-dollar limits without an explicit Tempo rail", () => {
-    expect(quoteWithinDeclaredLimit(tempoQuote, 24_503, "$0.02", undefined)).toBe(false);
+  it.each(["cashu", undefined, "lightning", "x402", "tempo"])(
+    "compares exact USD prices with dollar limits on rail %s",
+    (rail) => {
+      const quote: Quote = {
+        upfront: { amount: 0.99, amount_micro: 990_000, currency: "usd" },
+        description: "fixed USD price",
+        priceMsats: 1_312_000,
+      };
+      expect(quoteWithinDeclaredLimit(quote, 1_311_750, "$0.99", rail)).toBe(true);
+      expect(quoteWithinDeclaredLimit(quote, 1_298_500, "$0.98", rail)).toBe(false);
+      expect(quoteWithinDeclaredLimit(quote, 2_000_000, "$0.98", rail)).toBe(false);
+    }
+  );
+
+  it.each(["cashu", undefined])("keeps millisat-only quotes on the millisat comparison with rail %s", (rail) => {
+    const quote: Quote = { upfront: { amount: 0, currency: "usd" }, description: "millisat price", priceMsats: 1_312_000 };
+    expect(quoteWithinDeclaredLimit(quote, 1_312_000, "1312000", rail)).toBe(true);
+    expect(quoteWithinDeclaredLimit(quote, 1_311_999, "1311999", rail)).toBe(false);
+    expect(quoteWithinDeclaredLimit(quote, 1_311_750, "$0.99", rail)).toBe(false);
+  });
+
+  it.each(["eur", "usdc"])("keeps non-USD %s prices on the millisat comparison", (currency) => {
+    const quote = { ...tempoQuote, upfront: { ...tempoQuote.upfront, currency } };
+    expect(quoteWithinDeclaredLimit(quote, 24_503, "$0.02", "cashu")).toBe(false);
+    expect(quoteWithinDeclaredLimit(quote, 25_000, "$0.02", "cashu")).toBe(true);
+  });
+
+  it.each([undefined, -1, 0, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+    "falls back to millisats for an unvalidated USD microunit amount %s",
+    (amountMicro) => {
+      const quote = { ...tempoQuote, upfront: { ...tempoQuote.upfront, amount_micro: amountMicro } };
+      expect(quoteWithinDeclaredLimit(quote, 24_503, "$0.02", "cashu")).toBe(false);
+      expect(quoteWithinDeclaredLimit(quote, 25_000, "$0.02", "cashu")).toBe(true);
+    }
+  );
+
+  it("keeps explicit millisat limits on the millisat comparison for a USD quote", () => {
+    expect(quoteWithinDeclaredLimit(tempoQuote, 24_503, "24503", "cashu")).toBe(false);
+    expect(quoteWithinDeclaredLimit(tempoQuote, 25_000, "25000", "cashu")).toBe(true);
   });
 
   it("preserves x402's exact USDC microunit comparison", () => {
