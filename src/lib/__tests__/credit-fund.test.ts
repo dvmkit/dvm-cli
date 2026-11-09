@@ -529,7 +529,9 @@ describe("fundCredit over x402 batch settlement", () => {
         commitment: "345ea049de6dd25b06ff6c802b4ae4748d243995937cf503fa5a2ba87f451459",
       },
     });
-    expect(processX402BatchResponse).toHaveBeenCalledWith(expect.anything(), "settled-response");
+    expect(processX402BatchResponse).toHaveBeenCalledWith(
+      expect.anything(), "settled-response", `0x${"44".repeat(32)}`
+    );
     expect(acknowledgeX402ChannelOwner).toHaveBeenCalledWith({
       channelId: `0x${"44".repeat(32)}`,
       endpoint: ENDPOINT,

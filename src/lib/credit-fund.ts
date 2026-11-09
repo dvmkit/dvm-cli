@@ -1983,12 +1983,14 @@ async function fundOverX402(
     });
     if (!result.x402PaymentResponse && result.replayed) {
       await acknowledgeReplayedX402Payment(pending.paymentHeader);
-    } else if (scheme) await processX402BatchResponse(scheme, result.x402PaymentResponse);
-    else {
+    } else if (scheme) {
+      await processX402BatchResponse(scheme, result.x402PaymentResponse, pending.channelId);
+    } else {
       await processX402BatchResponseForWallet({
         wallet,
         depositMicro: pending.targetMicro,
         paymentResponse: result.x402PaymentResponse,
+        channelId: pending.channelId,
       });
     }
     // The metadata write at signing time is crash-recovery state, not evidence
