@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { JobEnvelope, Payment, ProviderInfo } from "@dvmkit/sdk/internal";
 
@@ -16,6 +16,8 @@ const seams = vi.hoisted(() => ({
   quote: vi.fn(),
   submit: vi.fn(),
   close: vi.fn(),
+  getMessages: vi.fn(),
+  status: vi.fn(),
   prepareAgentSpend: vi.fn(),
   info: vi.fn(),
   json: vi.fn(),
@@ -28,6 +30,8 @@ vi.mock("../src/lib/transport", () => ({
     quote: seams.quote,
     submit: seams.submit,
     close: seams.close,
+    getMessages: seams.getMessages,
+    status: seams.status,
   }),
 }));
 
@@ -320,6 +324,111 @@ describe("capability-scoped credit draws", () => {
   });
 });
 
+describe("prepaid credit suggestion frequency", () => {
+  const week = 7 * 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    seams.rate = 100_000;
+    writeConfig("suggest");
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("offers credit once per DVM per week, on the JSON block alone", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.parse("2026-11-01T00:00:00Z") });
+    await paidRequest();
+    expect(terminal()).not.toHaveProperty("credit_suggestion");
+
+    await paidRequest();
+    expect(terminal()).toMatchObject({
+      paidWith: "cashu_p2pk",
+      credit_suggestion: { code: "credit_purchase_suppressed", reason: "open", endpoint },
+    });
+    expect(suggestionLines()).toEqual([]);
+
+    vi.setSystemTime(Date.now() + week - 60_000);
+    await paidRequest();
+    expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk" });
+    expect(terminal()).not.toHaveProperty("credit_suggestion");
+
+    vi.setSystemTime(Date.now() + 120_000);
+    await paidRequest();
+    expect(terminal()).toMatchObject({ credit_suggestion: { reason: "open" } });
+    expect(suggestionLines()).toEqual([]);
+  });
+
+  it("prints the suggestion to stderr under --human, with no JSON block left behind", async () => {
+    await paidRequest();
+    seams.json.mockClear();
+    await paidRequest(true);
+
+    expect(suggestionLines()).toEqual([expect.stringContaining("Nothing was funded")]);
+    expect(seams.json).not.toHaveBeenCalled();
+    expect(notices.takeCreditNoticeFields()).toEqual({});
+  });
+
+  it("says nothing about credit when the wallet cannot pay, and keeps the offer for a paid request", async () => {
+    await paidRequest();
+    seams.prepareAgentSpend.mockResolvedValueOnce({
+      error: { code: "insufficient_balance", message: "Mint balance cannot cover the price and swap fee." },
+    });
+    await paidRequest();
+
+    expect(terminal()).toMatchObject({ jobId: "", next_action: { type: "fund_wallet" } });
+    expect(terminal()).not.toHaveProperty("credit_suggestion");
+    expect(suggestionLines()).toEqual([]);
+
+    await paidRequest();
+    expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk", credit_suggestion: { reason: "open" } });
+  });
+
+  it("keeps the offer off a paid job that fails, and leaves its week unspent", async () => {
+    await paidRequest();
+    const completing = seams.submit.getMockImplementation()!;
+    seams.submit.mockImplementation(async (ref, envelope: JobEnvelope, payment?: Payment) =>
+      payment ? { jobId: "job-failing", status: "processing" } : completing(ref, envelope, payment));
+    seams.getMessages.mockResolvedValue([
+      { seq: 1, from: "provider", timestamp: 1, type: "cancel", content: { reason: "Provider failed" } },
+    ]);
+    seams.status.mockRejectedValue(new Error("status unavailable"));
+    await paidRequest();
+
+    expect(terminal()).toMatchObject({ jobId: "job-failing", status: "failed", paidWith: "cashu_p2pk" });
+    expect(terminal()).not.toHaveProperty("credit_suggestion");
+    expect(suggestionLines()).toEqual([]);
+    expect(existsSync(join(root, "credit-suggestions.json"))).toBe(false);
+
+    seams.submit.mockImplementation(completing);
+    await paidRequest();
+    expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk", credit_suggestion: { reason: "open" } });
+  });
+
+  it.each([
+    ["still running at the deadline", [{ seq: 1, from: "provider", timestamp: 1, type: "progress", content: { percent_complete: 50 } }], undefined],
+    ["recovered as completed by a status read", [], "completed"],
+  ] as const)("offers credit on a paid job %s", async (_arc, streamed, recovered) => {
+    await paidRequest();
+    const completing = seams.submit.getMockImplementation()!;
+    seams.submit.mockImplementation(async (ref, envelope: JobEnvelope, payment?: Payment) =>
+      payment ? { jobId: "job-async", status: "processing" } : completing(ref, envelope, payment));
+    seams.getMessages.mockResolvedValueOnce(streamed).mockResolvedValue([]);
+    if (recovered) seams.status.mockResolvedValue({ jobId: "job-async", status: recovered, summary: "Done" });
+    else seams.status.mockRejectedValue(new Error("status unavailable"));
+    await request({ endpoint, input: "Echo", autoPay: true, budget: "100000", autoPayBelow: "100000", timeout: "2" });
+
+    expect(terminal()).toMatchObject({ jobId: "job-async", paidWith: "cashu_p2pk", credit_suggestion: { reason: "open" } });
+    expect(terminal()).not.toHaveProperty("status", "failed");
+    expect(existsSync(join(root, "credit-suggestions.json"))).toBe(true);
+  }, 30_000);
+
+  it("reads a last-shown time in the future as no memory", async () => {
+    writeFileSync(join(root, "credit-suggestions.json"),
+      JSON.stringify({ [endpoint]: new Date(Date.now() + 86_400_000).toISOString() }));
+    await paidRequest();
+    await paidRequest();
+    expect(terminal()).toMatchObject({ credit_suggestion: { reason: "open" } });
+  });
+});
+
 function writeConfig(posture: "auto" | "off" | "suggest"): void {
   writeFileSync(join(root, "config.json"), JSON.stringify({ credit: { posture }, feedback: { posture: "off" } }));
 }
@@ -347,6 +456,10 @@ function seedCredit(remainingMicro = 0): void {
 
 async function paidRequest(human = false): Promise<void> {
   await request({ endpoint, input: "Echo", autoPay: true, budget: "100000", autoPayBelow: "100000", human });
+}
+
+function suggestionLines(): string[] {
+  return seams.info.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith("Prepaid credit is available"));
 }
 
 function terminal(): Record<string, unknown> {

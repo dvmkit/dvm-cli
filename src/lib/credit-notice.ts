@@ -8,7 +8,8 @@ import { fundingRailLabel } from "./rail-labels";
  * frames later and in one of nine places. So the prose goes to stderr at the
  * moment it happens — the surrounding credit path already narrates itself that
  * way in both output modes — and the structured block is stashed here for the
- * terminal emission to spread in with {@link takeCreditNoticeFields}.
+ * terminal emission to spread in with {@link takeCreditNoticeFields}. The
+ * suggestion is the exception: see {@link noteCreditSuggestion}.
  *
  * `take` clears: the fields land on exactly one output line, so every terminal
  * emission can spread them without any of them having to know whether another
@@ -37,6 +38,7 @@ import {
 import {
   info,
 } from "./output";
+import { creditSuggestionDue, recordCreditSuggestionShown } from "./credit-suggestion-cooldown";
 import {
   x402NetworkLabel,
 } from "./x402/networks";
@@ -848,17 +850,42 @@ export function buildCreditRefillDrainPending(args: {
 }
 
 /**
- * Surface a suppressed purchase.
+ * Surface a suppressed purchase, at most once per DVM per week.
  *
- * The prose goes to stderr in **both** modes, which is how the rest of the
- * credit path narrates itself (stderr is human-visible and ignored by JSON
- * consumers), and the structured block is stashed for the JSON emission. A
- * second suggestion in one command replaces the first — the last one describes
- * what the caller is actually left holding.
+ * Unlike the other notices it is said exactly once: on stderr under `--human`,
+ * otherwise only as the JSON block, because an agent reading merged streams
+ * took the duplicate for the loudest instruction on the screen. A suggestion
+ * inside the DVM's cooldown is dropped, and showing one starts the cooldown,
+ * so a second suggestion for the same DVM in one command is dropped too.
+ *
+ * Call this only for a job that was paid and did not fail. The request path
+ * sizes its offer at quote time, before it knows whether the wallet can pay
+ * or how the job ends, so it goes through {@link stageCreditSuggestion}.
  */
 export function noteCreditSuggestion(suggestion: CreditSuggestion, human?: boolean): void {
-  info(`${suggestion.display} ${suggestion.hint}`);
-  if (!human) pending.credit_suggestion = suggestion;
+  if (!creditSuggestionDue(suggestion.endpoint)) return;
+  if (human) info(`${suggestion.display} ${suggestion.hint}`);
+  else pending.credit_suggestion = suggestion;
+  recordCreditSuggestionShown(suggestion.endpoint);
+}
+
+/**
+ * Hold a quote-time suggestion until {@link commitCreditSuggestion}. A request
+ * that reaches no commit shows nothing and starts no cooldown.
+ */
+export function stageCreditSuggestion(suggestion: CreditSuggestion, human?: boolean): void {
+  staged = { suggestion, human };
+}
+
+/**
+ * Show a staged suggestion. The request path calls this where a paid job is
+ * known to have completed or to be still running, never on an error output.
+ * A no-op when none is staged.
+ */
+export function commitCreditSuggestion(): void {
+  const held = staged;
+  staged = undefined;
+  if (held) noteCreditSuggestion(held.suggestion, held.human);
 }
 
 /**
@@ -1070,11 +1097,13 @@ export function noteCreditRefillUnavailable(
 export function takeCreditNoticeFields(): CreditNoticeFields {
   const taken = { ...pending };
   pending = {};
+  staged = undefined;
   return taken;
 }
 
 export function resetCreditNotices(): void {
   pending = {};
+  staged = undefined;
 }
 
 
@@ -1315,3 +1344,4 @@ function exactUsd(micro: number): string {
 }
 
 let pending: CreditNoticeFields = {};
+let staged: { suggestion: CreditSuggestion; human: boolean | undefined } | undefined;

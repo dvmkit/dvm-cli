@@ -37,6 +37,7 @@ import {
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import { basename, join } from "path";
 
+import { CREDIT_SUGGESTIONS_FILE } from "./credit-suggestion-cooldown";
 import { REQUEST_REFUSALS_DIR } from "./request-refusal-store";
 import { SUBMISSION_EVIDENCE_DIR } from "./submission-evidence";
 
@@ -165,6 +166,16 @@ const FILE_SPECS: readonly FileSpec[] = [
   // A store written by an older dvm keeps its old mode until the next write
   // replaces it — doctor warns, and the write repairs it.
   { name: "credits", path: CREDITS_FILE, json: true, secret: true, directory: false },
+  // When the prepaid-credit suggestion was last shown at each DVM. 0600 for
+  // the reason the feedback cooldowns are: it records which DVMs this caller
+  // pays and when.
+  {
+    name: "credit_suggestions",
+    path: CREDIT_SUGGESTIONS_FILE,
+    json: true,
+    secret: true,
+    directory: false,
+  },
   {
     name: "x402_channels",
     path: X402_CHANNELS_FILE,
