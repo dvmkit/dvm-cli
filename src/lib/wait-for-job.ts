@@ -5,7 +5,9 @@ import { loadJob } from "./job-store";
 import { createMessageAppendSession, maxSeq } from "./messages";
 import { loadAnsweredYieldSeqs, answeredYieldSeqs, reconcilePaymentRequestHistory, settleRecordedPayments, JOB_READ_TIMEOUT_MS } from "./yield-state";
 import { claimInboundPayments, withRefundNextAction } from "./refund-claim";
-import { isTerminalJobStatus, pollNextAction } from "./next-action";
+import { isTerminalJobStatus, paymentInFlightHint, pollNextAction, type NextAction } from "./next-action";
+import { formatDurationMs } from "./duration";
+import { guidanceJobArg } from "./provider-output";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "./stream-loop";
 
 export async function waitForJob(opts: StreamLoopOptions, durationMs: number, now: () => number = Date.now): Promise<StreamLoopResult> {
@@ -31,6 +33,10 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
     : (opts.messageAppendSession ?? createMessageAppendSession(opts.jobId));
   let backoffMs = 1000;
   let firstRead = true;
+  // Whether the last read left a payment unresolved; its hint must survive the wait limit.
+  let paymentInFlight = false;
+  // Whether any status read showed the job still open, which the wait-limit hint states.
+  let seenRunning = false;
   const idleTimeoutMs = opts.timeoutMs ?? JOB_READ_TIMEOUT_MS;
   async function readWithRetry<T>(read: () => Promise<T>): Promise<T | undefined> {
     while (now() < deadline) {
@@ -47,6 +53,7 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
     const readOptions = () => ({ jobToken: opts.jobToken, timeoutMs: Math.max(1, Math.min(idleTimeoutMs, deadline - now())) });
     const snapshot = await readWithRetry(() => opts.transport.status(opts.jobId, opts.provider, readOptions()));
     if (!snapshot) break;
+    seenRunning = !isTerminalJobStatus(snapshot.status);
     if (isTerminalJobStatus(snapshot.status)) {
       result.providerStatus = snapshot;
       result.nextAction = null;
@@ -117,6 +124,7 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
       }
       if (unresolved && !newerYield) {
         result.nextAction = pollNextAction(opts.jobId);
+        paymentInFlight = true;
         await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelayMs, Math.max(0, deadline - now()))));
         backoffMs = Math.min(backoffMs * 2, 30_000);
         continue;
@@ -142,6 +150,7 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
     const progressed = next.cursor > result.cursor;
     result.cursor = Math.min(next.cursor, cursorLimit);
     result.nextAction = next.nextAction;
+    paymentInFlight = next.paymentInFlight === true;
     if (hasUnsavedJobState() || next.nextAction?.type !== "poll") break;
     if (progressed) backoffMs = 1000;
     const delay = Math.min(backoffMs, Math.max(0, deadline - now()));
@@ -153,5 +162,35 @@ export async function waitForJob(opts: StreamLoopOptions, durationMs: number, no
     result.cursor = Math.min(result.cursor, ...remaining.map((seq) => seq - 1));
   }
   result.messages.sort((a, b) => a.seq - b.seq);
+  if (now() >= deadline && result.nextAction?.type === "poll" && !hasUnsavedJobState())
+    result.nextAction = waitLimitAction(opts, durationMs, result.nextAction, { paymentInFlight, seenRunning });
   return result;
+}
+
+// The wait ended on its own limit, not on anything the job did, so the hint
+// says that. A payment still unresolved keeps its own guidance, which is what
+// stops an agent paying the same charge twice.
+function waitLimitAction(opts: StreamLoopOptions, durationMs: number, current: NonNullable<NextAction> & { type: "poll" },
+  state: { paymentInFlight: boolean; seenRunning: boolean }): NextAction {
+  const { jobId } = opts;
+  const limit = formatDurationMs(durationMs);
+  const job = opts.persistLocalState === false ? undefined : loadJob(jobId);
+  // A submission kept for an ask answered some other way awaits the sweep's
+  // verdict; nothing about it is for the agent to act on.
+  const answered = job ? loadAnsweredYieldSeqs(jobId) : new Set<number>();
+  const heldSeq = job?.inFlightPaymentRequestSeqs?.[0] ??
+    Object.keys(job?.unconfirmedPaymentSubmissions ?? {}).map(Number).find((seq) => !answered.has(seq));
+  if (heldSeq !== undefined)
+    return pollNextAction(jobId, `The wait limit (${limit}) was reached while an earlier payment for this job is unconfirmed. ` +
+      paymentInFlightHint(jobId, job, heldSeq));
+  if (state.paymentInFlight) return current;
+  const arg = guidanceJobArg(jobId);
+  if (!state.seenRunning)
+    return pollNextAction(jobId, `The wait limit (${limit}) passed before this job could be read, so its state is unknown. ` +
+      `Check it with \`dvm status ${arg}\`, or keep watching with \`dvm messages ${arg} --wait\`.`);
+  return {
+    ...pollNextAction(jobId, `The wait limit (${limit}) was reached and the job was still running when last read. ` +
+      `Keep watching with \`dvm messages ${arg} --wait --until ${limit}\`.`),
+    ...(current.estimate_seconds !== undefined ? { estimate_seconds: current.estimate_seconds } : {}),
+  };
 }

@@ -1,6 +1,6 @@
 # Use and reclaim prepaid credit
 
-Use this procedure for repeated work at a service, an existing credit balance, credit settings, or reclaiming unused funds. Ordinary per-call payment does not require prepayment. A suggestion to fund credit is an offer to consider, not permission to buy it.
+Use this procedure for repeated work at a service, an existing credit balance, credit settings, or reclaiming unused funds. Ordinary per-call payment does not require prepayment. A suggestion to fund credit is an offer to consider, not permission to buy it. Where no credit is held yet, its `fund_command` names the suggested `--amount`, so it needs no further argument; the provider and wallet can still refuse the funding.
 
 ## Inspect before funding
 

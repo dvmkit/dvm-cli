@@ -603,3 +603,86 @@ describe("wait metadata read retries", () => {
     expect(stream).toHaveBeenCalledTimes(boundary === "terminal history" ? 0 : 1);
   });
 });
+
+// A metered job's paid ask stays the last yield while the work carries on, so
+// the expired wait must not read as a payment still being finalised.
+it("names the wait limit when --until expires on a running job with nothing in flight", async () => {
+  vi.useFakeTimers();
+  const jobId = "until-expired";
+  saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+  const stream = transport([[msg(1, "payment-request", { amount_msats: 1000, reason: "Hour two" })]]);
+  // After the payment the stream stays attached, collecting progress until the wait limit cuts it.
+  stream.mockImplementationOnce((_job, _after, _provider, options) => new Promise((resolve) => {
+    options.signal.addEventListener("abort", () => resolve({ messages: [msg(2, "progress", { percent_complete: 10 })] }));
+  }));
+  const pending = messages(jobId, { wait: true, until: "30s" });
+  await vi.runAllTimersAsync();
+  await pending;
+  expect(output().auto_payments).toHaveLength(1);
+  const action = output().next_action;
+  expect(action).toMatchObject({ type: "poll", job_id: jobId });
+  expect(action.hint).toContain("wait limit (30s)");
+  expect(action.hint).toContain(`dvm messages ${jobId} --wait`);
+  expect(action.hint).not.toMatch(/payment|finalising|pay again/i);
+});
+
+// Figures from a USD budget converted once at submit: 961 sats paid, a 69-sat ask,
+// a 1,029.527-sat budget. Rounded to whole sats the ask would appear to fit.
+it("names the budget, the spend so far and the ask when an ask would exceed the job's budget", async () => {
+  const jobId = "budget-exhausted";
+  const budgetPolicy: JobPolicy = { maxTotalMsats: 1_029_527, autoPayBelowMsats: 823_621, maxIncrementMsats: 0, maxPayments: 8 };
+  saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0,
+    policy: budgetPolicy, totalPaidMsats: 961_000, paymentsHonoured: 4 });
+  transport([[msg(9, "payment-request", { amount_msats: 69_000, reason: "Hour five" })]], "awaiting-input");
+  seams.pay.mockResolvedValue("over-budget");
+  await messages(jobId, { wait: true, until: "1m" });
+  const action = output().next_action;
+  expect(action).toMatchObject({ type: "pay", amount_msats: 69_000 });
+  const text = `${action.display} ${action.hint}`;
+  expect(text).toContain("budget");
+  expect(text).toContain("961 sats");
+  expect(text).toContain("1029.53 sats");
+  expect(text).toContain("69 sats");
+  expect(text).toContain("473 msats");
+  expect(action.hint).toContain(`dvm decline ${jobId}`);
+  // `dvm pay` refuses an ask over the job's budget, so the hint must not send the agent there.
+  expect(action.hint).not.toContain("then run `dvm pay");
+});
+
+// The limit must not bury a held payment: its guidance is what stops a second payment for the same charge.
+it.each(["processing", "awaiting-input"])("keeps the held-payment guidance when the wait limit passes (provider %s)", async (status) => {
+  vi.useFakeTimers();
+  const jobId = `held-at-limit-${status}`;
+  const submission = { rail: "x402", content: { x402_payment: "signed" }, requestAmountMsats: 1000, amountMsats: 1000, btcRate: 100_000 };
+  saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy,
+    inFlightPaymentRequestSeqs: [5], inFlightPaymentRequestStartedAtMs: { 5: Date.now() },
+    unconfirmedPaymentSubmissions: { 5: submission } } as never);
+  const stream = transport([], status);
+  stream.mockImplementation((_job, _after, _provider, options) => new Promise((resolve) => {
+    options.signal?.addEventListener("abort", () => resolve({ messages: [] }));
+  }));
+  vi.mocked(seams.transport.getMessages).mockResolvedValue([msg(5, "payment-request", { amount_msats: 1000, reason: "One block" })]);
+  const pending = messages(jobId, { wait: true, until: "30s" });
+  await vi.runAllTimersAsync();
+  await pending;
+  const hint = output().next_action.hint;
+  expect(output().next_action.type).toBe("poll");
+  expect(hint).toContain("wait limit (30s)");
+  expect(hint).toContain("earlier payment for this job is unconfirmed");
+  expect(hint).toContain("re-sends that same payment rather than signing a new one");
+  expect(hint).not.toContain("still running");
+  expect(seams.pay).not.toHaveBeenCalled();
+});
+
+it("does not claim a job is running when the wait limit passes before any read", async () => {
+  const jobId = "zero-wait";
+  saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+  const stream = transport([]);
+  await messages(jobId, { wait: true, until: "0s" });
+  const hint = output().next_action.hint;
+  expect(stream).not.toHaveBeenCalled();
+  expect(hint).toContain("state is unknown");
+  expect(hint).toContain(`dvm status ${jobId}`);
+  expect(hint).not.toContain("still running");
+  expect(hint).not.toContain("--until 0s");
+});

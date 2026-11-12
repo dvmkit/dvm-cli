@@ -19,3 +19,10 @@ export function parseDurationMs(input: string): number {
   };
   return count * unitMs[match[2]];
 }
+
+/** Inverse of {@link parseDurationMs}: the largest unit that states `ms` exactly. */
+export function formatDurationMs(ms: number): string {
+  for (const [unit, size] of [["d", 86_400_000], ["h", 3_600_000], ["m", 60_000]] as const)
+    if (ms >= size && ms % size === 0) return `${ms / size}${unit}`;
+  return `${Math.ceil(ms / 1000)}s`;
+}

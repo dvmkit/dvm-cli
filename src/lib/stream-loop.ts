@@ -76,6 +76,8 @@ export interface StreamLoopResult {
   refunds: RefundClaim[];
   nextAction: NextAction;
   cursor: number;
+  /** A payment this read sent or found is still unresolved; `nextAction` carries its hint. */
+  paymentInFlight?: boolean;
 }
 
 export interface AutoPayment {
@@ -143,7 +145,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       });
     } catch (error) {
       if (error instanceof DvmError && error.code === "payment_settling")
-        return { messages: [], autoPayments, refunds, cursor, nextAction: pollNextAction(jobId, paymentInFlightHint(jobId, loadJob(jobId), pending.authorization.request_seq)) };
+        return { messages: [], autoPayments, refunds, cursor, paymentInFlight: true,
+          nextAction: pollNextAction(jobId, paymentInFlightHint(jobId, loadJob(jobId), pending.authorization.request_seq)) };
       throw error;
     }
     if (typeof result === "object") await recordAutoPayment(result, pending.request, pending.authorization.request_seq);
@@ -376,7 +379,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     lastYield?.type === "payment-request" ? lastYield.seq : undefined));
   if (hasUnsavedJobState() && !terminal)
     nextAction = pollNextAction(jobId, "Local state may lag; refresh this job before another payment.");
-  return { messages: allMessages, autoPayments, refunds, nextAction, cursor };
+  return { messages: allMessages, autoPayments, refunds, nextAction, cursor, ...(paymentUnresolved && { paymentInFlight: true }) };
 }
 
 function isMessagePollTimeout(err: unknown): boolean {

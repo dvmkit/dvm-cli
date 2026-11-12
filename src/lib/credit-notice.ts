@@ -442,7 +442,10 @@ export function buildCreditSuggestion(args: {
 }): CreditSuggestion {
   const { dvm, suppressed } = args;
   const amount = `$${formatUsd(suppressed.fundMicro / 1_000_000)}`;
-  const fundCommand = `dvm credit fund ${shellQuoteArg(dvm)}`;
+  // With no credit tracked yet, `dvm credit fund` has no refill gap to infer
+  // and refuses without an amount, so an open names the suggested one, to the
+  // micro-unit: `display` rounds to cents, which can fall below the DVM's minimum.
+  const fundCommand = `dvm credit fund ${shellQuoteArg(dvm)}${suppressed.reason === "open" ? ` --amount ${shellQuoteArg(`$${exactUsd(suppressed.fundMicro)}`)}` : ""}`;
   const optIn = `dvm credit posture auto --dvm ${shellQuoteArg(dvm)}`;
   const covers =
     args.coversJobs !== undefined && args.coversJobs > 1
@@ -467,7 +470,7 @@ export function buildCreditSuggestion(args: {
     opt_in_command: optIn,
     opt_in_command_global: "dvm credit posture auto",
     display,
-    hint: `Fund it once with '${fundCommand}', or run '${optIn}' (drop --dvm for every DVM) and funding is handled automatically.`,
+    hint: `Fund it once with \`${fundCommand}\`, or run \`${optIn}\` (drop --dvm for every DVM) and funding is handled automatically.`,
   };
 }
 
@@ -1303,6 +1306,12 @@ function inFlightLine(report: CreditFundingReport): string {
     `Funding ${amount} of prepaid credit at ${report.dvm} — ${route}, because ${whyFunded(report.reason)}. ` +
     `It lands when the job does. ${POSTURE_FOOTER}`
   );
+}
+
+/** Integer micro-dollars as a plain decimal, at least to the cent and never rounded. */
+function exactUsd(micro: number): string {
+  const fraction = String(micro % 1_000_000).padStart(6, "0").replace(/0+$/, "").padEnd(2, "0");
+  return `${Math.floor(micro / 1_000_000)}.${fraction}`;
 }
 
 let pending: CreditNoticeFields = {};
