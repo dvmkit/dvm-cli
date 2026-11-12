@@ -12,6 +12,21 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.16.0](https://github.com/dvmkit/dvm-cli/compare/v0.15.3...v0.16.0) (2026-11-12)
+
+
+### Features
+
+* **wallet:** hand off funding invoices without waiting ([b11cfef](https://github.com/dvmkit/dvm-cli/commit/b11cfef56d7afdce90528fbb0f0d01e4442977cd))
+
+
+### Bug Fixes
+
+* compare USD quote limits across payment rails ([a507961](https://github.com/dvmkit/dvm-cli/commit/a5079610170dec6bcef8a10c51c275df7eb8d55b))
+* **credit:** bind x402 settlement state to the paid channel ([d6a6ffa](https://github.com/dvmkit/dvm-cli/commit/d6a6ffaad8b4667461ad094d6f1ea871afba5652))
+* **credit:** suggest wallet invoices for Lightning funding refusals ([ea7d665](https://github.com/dvmkit/dvm-cli/commit/ea7d6651b68f28da28ff7d8f0e5fb57e3d173fb5))
+* preserve accepted job access when local saves fail ([fd202f8](https://github.com/dvmkit/dvm-cli/commit/fd202f81492dc7f8ec83cf6cbed677155a4cf717))
+
 ## [0.15.3](https://github.com/dvmkit/dvm-cli/compare/v0.15.2...v0.15.3) (2026-11-07)
 
 
