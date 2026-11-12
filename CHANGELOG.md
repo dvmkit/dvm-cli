@@ -12,6 +12,14 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.17.0](https://github.com/dvmkit/dvm-cli/compare/v0.16.0...v0.17.0) (2026-11-12)
+
+
+### Features
+
+* tell the caller what is left in the agent wallet when a job ends ([#84](https://github.com/dvmkit/dvm-cli/issues/84)) ([a87f134](https://github.com/dvmkit/dvm-cli/commit/a87f134e87495764ea78ee04639a9a4f9df09292))
+* **wallet:** let cash-out pay a Lightning invoice ([#83](https://github.com/dvmkit/dvm-cli/issues/83)) ([09c0a21](https://github.com/dvmkit/dvm-cli/commit/09c0a2121d537f4cd9bd452047b35da8c65dedf6))
+
 ## [0.16.0](https://github.com/dvmkit/dvm-cli/compare/v0.15.3...v0.16.0) (2026-11-12)
 
 
