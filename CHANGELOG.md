@@ -12,6 +12,25 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.18.0](https://github.com/dvmkit/dvm-cli/compare/v0.17.0...v0.18.0) (2026-11-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **messages:** `dvm messages <job> --wait` no longer prints a single JSON document. Read stdout line by line: act on the `next_action` of the last line (`event: "result"`), or handle its `error` (`event: "error"`). Collect messages and auto-payments from the `message` and `payment` lines instead of the removed `messages` and `auto_payments` arrays.
+
+### Features
+
+* **messages:** stream --wait events as JSON lines ([#89](https://github.com/dvmkit/dvm-cli/issues/89)) ([d3db1ad](https://github.com/dvmkit/dvm-cli/commit/d3db1ad8aea7d57dbc8f72d17e860032006ff201))
+* **pay:** approve a new total budget for a running job ([#90](https://github.com/dvmkit/dvm-cli/issues/90)) ([965e3b4](https://github.com/dvmkit/dvm-cli/commit/965e3b4a33bd42f92695386e6cdd4953c75f9eab))
+
+
+### Bug Fixes
+
+* **budget:** hold a dollar budget to dollar-priced asks in dollars ([#88](https://github.com/dvmkit/dvm-cli/issues/88)) ([bf533f8](https://github.com/dvmkit/dvm-cli/commit/bf533f89ad1350f48456e025f61b79c60dc38789))
+* **credit:** show the prepaid-credit suggestion once a week per DVM, only after a paid request ([#87](https://github.com/dvmkit/dvm-cli/issues/87)) ([a8a4f51](https://github.com/dvmkit/dvm-cli/commit/a8a4f515200fbf0c8f5d95a8c7e4a76d7d74f08d))
+* **messages:** state the true reason in wait, budget and credit next steps ([#86](https://github.com/dvmkit/dvm-cli/issues/86)) ([690c8cf](https://github.com/dvmkit/dvm-cli/commit/690c8cfc8ee6020fc79feb4010e50db967ffde7a))
+
 ## [0.17.0](https://github.com/dvmkit/dvm-cli/compare/v0.16.0...v0.17.0) (2026-11-12)
 
 
