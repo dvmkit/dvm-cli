@@ -152,7 +152,7 @@ async function messagesWithAccess(
     const resolvedAction = await resolveNextAction(nextAction, msgs, providerStatus?.status);
     const currency = access.endpointOverridden
       ? await providerCurrency({ receipt: providerStatus?.receipt, status: providerStatus, messages: msgs, transport, ref }) : undefined;
-    const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden, currency);
+    const settlement = await observedSettlementFields(jobId, providerStatus, !access.endpointOverridden, currency);
     transport.close();
 
     if (opts.human) {
@@ -232,7 +232,7 @@ async function messagesWithAccess(
   const observed = providerStatus ?? result.providerStatus;
   const currency = access.endpointOverridden
     ? await providerCurrency({ receipt: observed?.receipt, status: observed, messages: result.messages, transport, ref }) : undefined;
-  const settlement = observedSettlementFields(jobId, observed, !access.endpointOverridden, currency);
+  const settlement = await observedSettlementFields(jobId, observed, !access.endpointOverridden, currency);
   transport.close();
 
   if (opts.human) {

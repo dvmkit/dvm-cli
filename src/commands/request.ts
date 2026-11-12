@@ -1,5 +1,5 @@
 import { hasUnsavedJobState } from "../lib/job-persistence";
-import { terminalSettlementFields } from "../lib/job-settlement";
+import { terminalSettlementReport } from "../lib/job-settlement";
 import { autoPayWarnings } from "../lib/auto-pay-warning";
 import { addOutputWarnings, withOutputWarnings } from "../lib/output";
 import { providerFields, providerJobJson as json } from "../lib/provider-output";
@@ -1031,7 +1031,7 @@ async function requestWithWarnings(
         console.log(receipt.summary);
         const hint = nextStepHint(receipt.jobId, receipt.payloadIn, receipt.artifactCount, true);
         if (hint) info(`📎 ${hint}`);
-        renderReceiptHuman(captured, receipt.jobId);
+        await renderReceiptHuman(captured, receipt.jobId);
         echoTraceIdHuman();
       } else {
         json({
@@ -1042,7 +1042,7 @@ async function requestWithWarnings(
           summary: receipt.summary,
           _provider_fields: ["summary"],
           ...buildCompletionHintFields(receipt.jobId, receipt),
-          ...receiptJsonFields(captured, receipt.jobId),
+          ...await receiptJsonFields(captured, receipt.jobId),
           ...takeCreditNoticeFields(),
           ...takeFeedbackNoticeFields(),
           next_action: null,
@@ -1119,8 +1119,8 @@ async function requestWithWarnings(
           const hint = nextStepHint(receipt.jobId, completion.payloadIn, completion.artifactCount, true);
           if (hint) info(`📎 ${hint}`);
         }
-        if (captured) renderReceiptHuman(captured, receipt.jobId);
-        else renderSettlementHuman(terminalSettlementFields(receipt.jobId));
+        if (captured) await renderReceiptHuman(captured, receipt.jobId);
+        else renderSettlementHuman(await terminalSettlementReport(receipt.jobId));
         finalizeProgressLine();
         echoTraceIdHuman();
         printNextActionHuman(result.nextAction, { refunds: result.refunds, terminal: isTerminalJobStatus(receipt.status) || !!streamTerminalStatus(result.messages) });
@@ -1144,7 +1144,7 @@ async function requestWithWarnings(
             ...(completion?.message !== undefined ? ["message"] : []),
           ],
           ...(completion ? buildCompletionHintFields(receipt.jobId, completion) : {}),
-          ...(captured ? receiptJsonFields(captured, receipt.jobId) : terminalSettlementFields(receipt.jobId)),
+          ...(captured ? await receiptJsonFields(captured, receipt.jobId) : await terminalSettlementReport(receipt.jobId)),
           ...takeCreditNoticeFields(),
           ...takeFeedbackNoticeFields(),
           next_action: result.nextAction,
@@ -1202,15 +1202,16 @@ async function requestWithWarnings(
         human: opts.human,
       });
       transport.close();
+      const report = await terminalSettlementReport(receipt.jobId, { receipt: captured.receipt });
       if (opts.human) {
         for (const msg of failureMessages) {
           formatMessageHuman(msg, receipt.jobId, artifactSession);
         }
-        renderReceiptHuman(captured, receipt.jobId);
+        await renderReceiptHuman(captured, receipt.jobId, report);
       }
       throw new DvmError(terminalStatus === "failed" ? "job_failed" : "cancelled", completion?.message ?? `Job ${terminalStatus}.`, undefined, {
         status: terminalStatus,
-        ...receiptJsonFields(captured, receipt.jobId),
+        ...await receiptJsonFields(captured, receipt.jobId, report),
         ...(failureMessages.length > 0
           ? { messages: failureMessages.map(serializeMessageForOutput) }
           : {}),
@@ -2512,7 +2513,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
       console.log(receipt.summary);
       const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
-      renderReceiptHuman(captured, effectiveJobId);
+      await renderReceiptHuman(captured, effectiveJobId);
     } else {
       json({
         jobId: effectiveJobId,
@@ -2522,7 +2523,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
         summary: receipt.summary,
         _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
-        ...receiptJsonFields(captured, effectiveJobId),
+        ...await receiptJsonFields(captured, effectiveJobId),
         paidWith: "tempo",
         account: account.address,
         ...takeCreditNoticeFields(),
@@ -3568,7 +3569,7 @@ async function payWithAgentWallet(
       console.log(receipt.summary);
       const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
-      renderReceiptHuman(captured, effectiveJobId);
+      await renderReceiptHuman(captured, effectiveJobId);
     } else {
       json({
         jobId: effectiveJobId,
@@ -3576,7 +3577,7 @@ async function payWithAgentWallet(
         summary: receipt.summary,
         _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
-        ...receiptJsonFields(captured, effectiveJobId),
+        ...await receiptJsonFields(captured, effectiveJobId),
         paidWith: "cashu_p2pk",
         mint: prepared.mint,
         amountSats: prepared.totalSats,
@@ -3836,7 +3837,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
       console.log(receipt.summary);
       const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
-      renderReceiptHuman(captured, effectiveJobId);
+      await renderReceiptHuman(captured, effectiveJobId);
     } else {
       json({
         jobId: effectiveJobId,
@@ -3846,7 +3847,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
         summary: receipt.summary,
         _provider_fields: ["summary"],
         ...buildCompletionHintFields(effectiveJobId, receipt),
-        ...receiptJsonFields(captured, effectiveJobId),
+        ...await receiptJsonFields(captured, effectiveJobId),
         paidWith: "x402",
         account: wallet.address,
         ...takeCreditNoticeFields(),
@@ -4102,8 +4103,8 @@ async function streamAfterPayment(args: {
       const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
     }
-    if (captured) renderReceiptHuman(captured, jobId);
-    else renderSettlementHuman(terminalSettlementFields(jobId));
+    if (captured) await renderReceiptHuman(captured, jobId);
+    else renderSettlementHuman(await terminalSettlementReport(jobId));
     finalizeProgressLine();
     printNextActionHuman(result.nextAction, { refunds: result.refunds, terminal: !!streamTerminalStatus(result.messages) });
   } else {
@@ -4122,7 +4123,7 @@ async function streamAfterPayment(args: {
         ...(completion?.message !== undefined ? ["message"] : []),
       ],
       ...(completion ? buildCompletionHintFields(jobId, completion) : {}),
-      ...(captured ? receiptJsonFields(captured, jobId) : terminalSettlementFields(jobId)),
+      ...(captured ? await receiptJsonFields(captured, jobId) : await terminalSettlementReport(jobId)),
       ...takeCreditNoticeFields(),
       ...takeFeedbackNoticeFields(),
       next_action: result.nextAction,
@@ -4200,7 +4201,7 @@ async function recoverViaStatusPoll(args: {
 
     if (human) {
       info(status.summary ?? "Job completed (recovered via status check).");
-      renderReceiptHuman(captured, jobId);
+      await renderReceiptHuman(captured, jobId);
     } else {
       json({
         jobId,
@@ -4210,7 +4211,7 @@ async function recoverViaStatusPoll(args: {
         _provider_fields: ["summary"],
         recovered: true,
         ...paymentFields,
-        ...receiptJsonFields(captured, jobId),
+        ...await receiptJsonFields(captured, jobId),
         ...takeCreditNoticeFields(),
         ...takeFeedbackNoticeFields(),
         next_action: null,
@@ -4237,7 +4238,7 @@ async function recoverViaStatusPoll(args: {
     const errorMsg = status.message ?? `Job ${status.status}.`;
     if (human) {
       info(errorMsg);
-      renderReceiptHuman(captured, jobId);
+      await renderReceiptHuman(captured, jobId);
     } else {
       json({
         jobId,
@@ -4246,7 +4247,7 @@ async function recoverViaStatusPoll(args: {
         message: errorMsg,
         ...(status.message !== undefined ? { _provider_fields: ["message"] } : {}),
         ...paymentFields,
-        ...receiptJsonFields(captured, jobId),
+        ...await receiptJsonFields(captured, jobId),
         ...takeCreditNoticeFields(),
         ...takeFeedbackNoticeFields(),
         next_action: null,

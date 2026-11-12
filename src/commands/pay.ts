@@ -251,7 +251,7 @@ async function payWithAccess(
   }
   const currency = access.endpointOverridden
     ? await providerCurrency({ receipt: providerStatus?.receipt, status: providerStatus, messages: streamResult.messages, transport, ref }) : undefined;
-  const settlement = observedSettlementFields(jobId, providerStatus, !access.endpointOverridden, currency);
+  const settlement = await observedSettlementFields(jobId, providerStatus, !access.endpointOverridden, currency);
   transport.close();
 
   const identifier = stored.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;

@@ -222,7 +222,7 @@ export async function walletX402Connect(
       qrImagePath: opts.qrImage,
     });
     return {
-      connected: { ...(await saveX402Wallet(privateKey, network)), generated: true },
+      connected: { ...(await saveX402Wallet(privateKey, network, true)), generated: true },
       handoff,
     };
   });

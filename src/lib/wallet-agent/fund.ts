@@ -1,3 +1,4 @@
+import { rememberKeysetFees } from "../wallet-keyset-fees";
 import { prepareP2PKMint, maxKeysetDenomination } from "@dvmkit/sdk/internal";
 /**
  * NUT-20 quotes bind issuance to the wallet key. Persist the quote before
@@ -102,6 +103,7 @@ export async function createPendingMintQuote(
   }
 
   const cashuWallet = await (opts.getWalletForMint ?? getWallet)(opts.mintUrl);
+  rememberKeysetFees(opts.mintUrl, cashuWallet);
   const quote = await cashuWallet.createLockedMintQuote(sats, initial.lock_pubkey);
 
   const pending: PendingMint = {
