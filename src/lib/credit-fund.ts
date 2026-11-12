@@ -15,6 +15,7 @@ import {
  */
 
 import { randomUUID } from "crypto";
+import { walletInvoiceFundingAdvice } from "./credit-wallet-funding";
 import { sha256hex } from "@dvmkit/sdk/internal";
 import { Challenge, Credential } from "mppx";
 import { privateKeyToAccount } from "viem/accounts";
@@ -312,6 +313,7 @@ export interface CreditFundOutcome {
   /** Relayable prose for the agent's human, always populated. CLI-authored. */
   display: string;
   hint?: string;
+  walletFundCommand?: string;
   /**
    * The DVM's own copy about this funding, where it sent any — kept apart from
    * `display`/`hint` because those are the fields an agent is told to act on
@@ -588,12 +590,18 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
   };
 
   if (args.rail && pick.order.length === 0) {
+    const hint = forcedRailHint(args, args.rail);
+    const walletFunding = args.rail === "lightning" &&
+      (!args.menu || args.menu.funding.includes("lightning"))
+      ? walletInvoiceFundingAdvice(args.amountMicro)
+      : undefined;
     return {
       ...base,
       ...railFields,
       status: "unavailable",
-      display: unavailableDisplay(args, args.rail),
-      hint: forcedRailHint(args, args.rail),
+      display: walletFunding ? hint : unavailableDisplay(args, args.rail),
+      hint,
+      ...(walletFunding ? { walletFundCommand: walletFunding.command } : {}),
     };
   }
 
@@ -4283,7 +4291,7 @@ function forcedRailHint(args: FundCreditArgs, rail: CreditFundRail): string {
     return `This DVM advertises credit funding over ${advertised.join(", ") || "no rail at all"}, not ${rail}. ${release.text}`;
   }
   if (rail === "lightning") {
-    const connect = `No Lightning wallet is connected here, so there is nothing to pay an invoice with. Connect one with 'dvm wallet connect', piping the connection string in`;
+    const connect = `No Lightning wallet is connected here, so direct Lightning credit funding cannot proceed. No money moved. ${walletInvoiceFundingAdvice(args.amountMicro).text} Or connect a wallet that supports it with 'dvm wallet connect', piping the connection string in`;
     // Only an instruction can be offered as the alternative half of "do this,
     // or that". A binding is a statement of fact, and splicing it after "or"
     // reads as nonsense — it gets its own sentence.

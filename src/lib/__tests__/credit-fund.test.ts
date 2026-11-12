@@ -2688,6 +2688,25 @@ describe("fundCredit rail selection", () => {
     expect(outcome.hint).not.toContain("advertises");
   });
 
+  it.each([1_000_000, 1_234_567])("offers a human-paid invoice for the requested %i micro-units before connecting a wallet", async (amountMicro) => {
+    const outcome = await fundCredit(args({ rail: "lightning", menu: undefined, float: null, amountMicro }));
+    const command = amountMicro === 1_000_000
+      ? "dvm wallet fund '$1.00' --no-float"
+      : "dvm wallet fund '$1.234567' --no-float";
+
+    expect(outcome.status).toBe("unavailable");
+    expect(outcome.walletFundCommand).toBe(command);
+    for (const prose of [outcome.hint ?? "", outcome.display]) {
+      expect(prose).toContain(command);
+      expect(prose).toContain("any Lightning wallet");
+      expect(prose).toContain("No money moved");
+      expect(prose).toContain("dvm wallet connect");
+      expect(prose.indexOf(command)).toBeLessThan(prose.indexOf("dvm wallet connect"));
+    }
+    expect(mockCreditOp).not.toHaveBeenCalled();
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+
   it("points a forced Tempo rail with no wallet at tempo-connect, not Cashu", async () => {
     const outcome = await fundCredit(
       args({

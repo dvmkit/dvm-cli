@@ -33,6 +33,7 @@ import {
   resolveSigningIdentity,
 } from "../cli-identity-resolve";
 import { type CreditFundOutcome, type CreditRailSource, fundCredit } from "../credit-fund";
+import { walletInvoiceFundingAdvice } from "../credit-wallet-funding";
 import { effectiveCreditPosture, effectiveFundingRail } from "../credit-policy";
 import { statusSnapshot } from "../budget-ledger";
 import { tryResolveBtcUsdRate } from "../btc-rate";
@@ -291,6 +292,7 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
         providerInfo,
         opts,
         config,
+        rail,
       });
     }
 
@@ -356,6 +358,7 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
         adopted ? `${baseHint ? `${baseHint} ` : ""}${adopted.advice}` : baseHint,
         {
           ...(err?.data ?? {}),
+          ...(outcome.walletFundCommand ? { wallet_fund_command: outcome.walletFundCommand } : {}),
           display: outcome.display,
           endpoint,
           credit_id: outcome.creditId,
@@ -878,6 +881,7 @@ async function enforceTrustTier(args: {
   providerInfo: ProviderInfo;
   opts: CreditFundOptions;
   config: Config | null;
+  rail: CreditFundRail | undefined;
 }): Promise<void> {
   const receipts = loadReceipts();
   // A pre-grant is a money-policy bypass, so only the live builder block may
@@ -948,19 +952,33 @@ async function enforceTrustTier(args: {
     held > 0
       ? ` On top of the $${formatUsd(held / 1_000_000)} already on deposit, that would leave $${formatUsd(exposureMicro / 1_000_000)} here.`
       : "";
+  const lightningMinimum = args.menu?.lightning_min_micro;
+  const walletFunding = args.rail === "lightning" && lightningMinimum !== undefined && lightningMinimum > cap
+    ? {
+        ...walletInvoiceFundingAdvice(args.amountMicro),
+        minimumUsd: `$${formatUsd(lightningMinimum / 1_000_000)}`,
+      }
+    : undefined;
+  const walletGuidance = walletFunding
+    ? `Lightning top-ups here start at ${walletFunding.minimumUsd}, above the ${capUsd} this caller can load at the current trust tier. ${walletFunding.text} `
+    : "";
   throw withHeadroom(
     new DvmError(
       "amount_exceeds_trust_tier",
       `Funding ${amountUsd} at ${args.endpoint} would exceed this DVM's ${capUsd} trust-tier cap.`,
-      `Nothing moved. Re-run with --over-trust to fund it anyway, or pre-grant every DVM signed by this builder with 'dvm credit trust ${args.endpoint} <builder-max|$amount>'. Or fund ${capUsd} or less.`,
+      walletFunding
+        ? `No money moved. ${walletGuidance}Re-run with --over-trust to fund credit over Lightning anyway, or pre-grant every DVM signed by this builder with 'dvm credit trust ${args.endpoint} <builder-max|$amount>'.`
+        : `Nothing moved. Re-run with --over-trust to fund it anyway, or pre-grant every DVM signed by this builder with 'dvm credit trust ${args.endpoint} <builder-max|$amount>'. Or fund ${capUsd} or less.`,
       {
         display:
           `This agent has only earned ${capUsd} of credit at ${args.endpoint} so far, and ${amountUsd} was asked for.${heldClause} No money moved. ` +
+          walletGuidance +
           `Loading more than the earned amount is allowed, but it has to be asked for explicitly — re-run with --over-trust, or pre-grant every DVM signed by this builder with 'dvm credit trust ${args.endpoint} <builder-max|$amount>'.`,
         endpoint: args.endpoint,
         amount_micro: args.amountMicro,
         exposure_micro: exposureMicro,
         cap_micro: cap,
+        ...(walletFunding ? { wallet_fund_command: walletFunding.command } : {}),
       }
     ),
     headroom
