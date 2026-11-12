@@ -1,12 +1,12 @@
 import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
-import { computeNextAction, paymentInFlightHint, pollNextAction, type NextAction } from "./next-action";
+import { computeNextAction, paymentInFlightHint, pollNextAction, type NextAction, type PaymentPolicyContext } from "./next-action";
+import type { JobBudgetPolicy } from "./job-budget";
 import {
   asProviderText,
   DvmError,
   isAbortError,
   shellQuoteArg,
-  type JobPolicy,
   type JobStatus,
   type Message,
   type MessagePollOptions,
@@ -17,7 +17,7 @@ import {
   type StreamResult,
   type Transport,
 } from "@dvmkit/sdk/internal";
-import { loadJob, markPaymentRequestAnswered } from "./job-store";
+import { loadJob, markPaymentRequestAnswered, type JobRecord } from "./job-store";
 
 import {
   createMessageAppendSession,
@@ -34,7 +34,7 @@ export interface StreamLoopOptions {
   jobId: string;
   transport: Transport;
   provider: ProviderRef;
-  policy?: JobPolicy;
+  policy?: JobBudgetPolicy;
   afterSeq: number;
   /** An explicit caller cursor must never be rewound to an older yield. */
   afterSeqExplicit?: boolean;
@@ -153,7 +153,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     else pendingAction = computeNextAction(jobId, [{
       seq: pending.authorization.request_seq, from: "provider", timestamp: 0,
       type: "payment-request", content: pending.request,
-    }], undefined, policy ? { policy, totalPaidMsats: loadJob(jobId)?.totalPaidMsats } : undefined);
+    }], undefined, policy ? budgetContext(policy, loadJob(jobId)) : undefined);
   }
   const deadline =
     opts.timeoutMs === undefined ? undefined : Date.now() + Math.max(0, opts.timeoutMs);
@@ -353,7 +353,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   if (persistLocalState) for (const seq of loadAnsweredYieldSeqs(jobId)) answeredSeqs.add(seq);
   for (const seq of answeredYieldSeqs(allMessages)) answeredSeqs.add(seq);
   const terminal = allMessages.some((msg) => msg.type === "complete" || msg.type === "cancel") || declined();
-  const yieldAction = computeNextAction(jobId, allMessages.filter((message) => !answeredSeqs.has(message.seq)), undefined, policy ? { policy, totalPaidMsats: loadJob(jobId)?.totalPaidMsats } : undefined)
+  const yieldAction = computeNextAction(jobId, allMessages.filter((message) => !answeredSeqs.has(message.seq)), undefined, policy ? budgetContext(policy, loadJob(jobId)) : undefined)
     ?? (terminal ? null : pendingAction);
   let nextAction = withRefundNextAction(jobId, yieldAction ?? (terminal ? null : pollNextAction(jobId)), refunds);
 
@@ -392,4 +392,9 @@ function findLastYield(messages: Message[]): Message | undefined {
     if (yieldTypes.has(messages[i].type)) return messages[i];
   }
   return undefined;
+}
+
+function budgetContext(policy: JobBudgetPolicy, job: JobRecord | null): PaymentPolicyContext {
+  return { policy, totalPaidMsats: job?.totalPaidMsats, paidUsdMicro: job?.paidUsdMicro, paidUsdMsats: job?.paidUsdMsats,
+    budgetRefusals: job?.budgetRefusals };
 }

@@ -58,10 +58,13 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   ].some((rail) => rail === "tempo" || rail === "x402");
   const valuationLabel = converted ? " (BTC valuation)" : "";
   const totalDisplay = formatPaymentAmount(total, fiat, { anchor: false }) + valuationLabel;
-  // The policy stores only msats. Express its ceiling at the bill's aggregate
+  // A dollar budget shows the dollars the caller declared. An older or sat
+  // policy stores only msats: express its ceiling at the bill's aggregate
   // fiat/msat ratio, without consulting a different, current exchange rate.
   const budgetDisplay = job.policy
-    ? formatPaymentAmount(job.policy.maxTotalMsats, fiat && total > 0
+    ? formatPaymentAmount(job.policy.maxTotalMsats, job.policy.maxTotalUsdMicro !== undefined
+      ? { currency: "usd", amount: job.policy.maxTotalUsdMicro / 1_000_000 }
+      : fiat && total > 0
       ? { currency: fiat.currency, amount: fiat.amount * job.policy.maxTotalMsats / total } : undefined,
     { anchor: false }) : undefined;
   const logMismatch = isTerminalJobStatus(job.status) && (chargeTotal > total

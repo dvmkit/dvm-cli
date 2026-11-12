@@ -1,7 +1,7 @@
 import { parseBudget } from "./currency";
 import { DvmError } from "@dvmkit/sdk/internal";
-
-import type { JobPolicy } from "@dvmkit/sdk/internal";
+import type { JobBudgetPolicy } from "./job-budget";
+import { dollarLimitMicro } from "./quote-limit";
 
 /**
  * Build a JobPolicy from CLI options and/or config values.
@@ -11,7 +11,7 @@ import type { JobPolicy } from "@dvmkit/sdk/internal";
 export function buildPolicy(
   opts: { budget?: string; autoPayBelow?: string; maxIncrement?: string; maxPayments?: number },
   btcRate: number
-): JobPolicy {
+): JobBudgetPolicy {
   if (opts.maxPayments === undefined) {
     throw new DvmError(
       "missing_max_payments",
@@ -35,5 +35,10 @@ export function buildPolicy(
     ? parseBudget(opts.maxIncrement, btcRate)
     : maxTotalMsats;
 
-  return { maxTotalMsats, autoPayBelowMsats, maxIncrementMsats, maxPayments: opts.maxPayments };
+  // Keep a dollar budget in dollars too, so dollar-priced asks are held to the
+  // figure the caller approved rather than its one-time sat conversion.
+  const maxTotalUsdMicro = opts.budget?.trim().startsWith("$") ? dollarLimitMicro(opts.budget) : undefined;
+  return { maxTotalMsats, autoPayBelowMsats, maxIncrementMsats, maxPayments: opts.maxPayments,
+    ...(maxTotalUsdMicro !== undefined && Number.isSafeInteger(Number(maxTotalUsdMicro))
+      ? { maxTotalUsdMicro: Number(maxTotalUsdMicro) } : {}) };
 }

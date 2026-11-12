@@ -10,12 +10,12 @@ import {
   msatsToMicro,
   usdToMsats,
   withinAdvertisedTolerance,
-  type JobPolicy,
   type PaymentRequestContent,
   type ProviderRef,
   type Transport,
 } from "@dvmkit/sdk/internal";
 import { dvmFetch } from "./http";
+import { budgetVerdict, usdMicro, type JobBudgetPolicy } from "./job-budget";
 import { tryResolveBtcUsdRate } from "./btc-rate";
 import { findSigningIdentityByPubkey } from "./cli-identity-resolve";
 import { effectiveCreditPosture } from "./credit-policy";
@@ -126,7 +126,7 @@ export async function tryCreditPayment(args: {
   transport: Transport;
   provider: ProviderRef;
   jobToken?: string;
-  policy: JobPolicy;
+  policy: JobBudgetPolicy;
 }): Promise<number | false> {
   const { jobId, request, requestSeq, transport, provider, jobToken } = args;
   const job = loadJob(jobId);
@@ -177,8 +177,9 @@ export async function tryCreditPayment(args: {
       "Refresh the ask or have the provider correct its amount; no balance authorization was sent.");
   const amountMsats = Math.max(1, usdToMsats(ask.amount_micro / 1_000_000, rate));
   if (!Number.isSafeInteger(amountMsats)) return false;
+  const budgetAsk = { msats: amountMsats, usdMicro: usdMicro(ask.amount_micro, ask.currency), rate };
   if ((args.policy.maxIncrementMsats > 0 && amountMsats > args.policy.maxIncrementMsats) ||
-      (job.totalPaidMsats ?? 0) + amountMsats > args.policy.maxTotalMsats)
+      !budgetVerdict(args.policy, job, budgetAsk).fits)
     throw new DvmError("over_budget", "The exact balance charge would exceed this job's budget.");
   if (amountMsats > args.policy.autoPayBelowMsats) return false;
   const selectedBinding = binding;
@@ -198,7 +199,7 @@ export async function tryCreditPayment(args: {
     if (booked) return booked;
     if ((current.paymentsHonoured ?? 0) >= args.policy.maxPayments)
       throw new DvmError("payment_cap_exceeded", "Job has reached its maximum payment count.");
-    if ((current.totalPaidMsats ?? 0) + amountMsats > args.policy.maxTotalMsats)
+    if (!budgetVerdict(args.policy, current, budgetAsk).fits)
       throw new DvmError("over_budget", "The exact balance charge would exceed this job's budget.");
     current.creditBinding = selectedBinding;
     current.pendingCreditPayment = { authorization, request, amountMsats, approval: args.approval,

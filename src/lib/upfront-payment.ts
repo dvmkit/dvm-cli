@@ -4,6 +4,8 @@ import type { PendingSubmissionContext } from "@dvmkit/sdk/internal";
 export interface UpfrontRailPayment {
   method: "cashu" | "x402" | "tempo";
   amountMsats: number;
+  /** Exact dollar price, in micro-dollars, when the quote or the signed charge carried one. */
+  usdMicro?: number;
 }
 
 export interface PricedSubmissionContext extends PendingSubmissionContext {
@@ -11,12 +13,18 @@ export interface PricedSubmissionContext extends PendingSubmissionContext {
   upfront_rail_payment?: UpfrontRailPayment;
 }
 
+/** The rail price as booked, carrying its exact dollar figure when there is one. */
+export function upfrontRailPayment(method: UpfrontRailPayment["method"], amountMsats: number, usdMicro: number | undefined): UpfrontRailPayment {
+  return { method, amountMsats, ...(usdMicro !== undefined ? { usdMicro } : {}) };
+}
+
 export function parseUpfrontRailPayment(value: unknown): UpfrontRailPayment | undefined {
   if (!value || typeof value !== "object") return undefined;
   const raw = value as UpfrontRailPayment;
   if (!["cashu", "x402", "tempo"].includes(raw.method) ||
       !Number.isSafeInteger(raw.amountMsats) || raw.amountMsats < 0) return undefined;
-  return { method: raw.method, amountMsats: raw.amountMsats };
+  return { method: raw.method, amountMsats: raw.amountMsats,
+    ...(Number.isSafeInteger(raw.usdMicro) && raw.usdMicro! >= 0 ? { usdMicro: raw.usdMicro } : {}) };
 }
 
 /** Missing or malformed evidence is unknown, never a zero-price payment. */

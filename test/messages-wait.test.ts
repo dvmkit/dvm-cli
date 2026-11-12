@@ -627,7 +627,8 @@ it("names the wait limit when --until expires on a running job with nothing in f
 });
 
 // Figures from a USD budget converted once at submit: 961 sats paid, a 69-sat ask,
-// a 1,029.527-sat budget. Rounded to whole sats the ask would appear to fit.
+// a 1,029.527-sat budget. Rounded to whole sats the ask would appear to fit, so
+// every figure is stated in exact msats.
 it("names the budget, the spend so far and the ask when an ask would exceed the job's budget", async () => {
   const jobId = "budget-exhausted";
   const budgetPolicy: JobPolicy = { maxTotalMsats: 1_029_527, autoPayBelowMsats: 823_621, maxIncrementMsats: 0, maxPayments: 8 };
@@ -640,10 +641,8 @@ it("names the budget, the spend so far and the ask when an ask would exceed the 
   expect(action).toMatchObject({ type: "pay", amount_msats: 69_000 });
   const text = `${action.display} ${action.hint}`;
   expect(text).toContain("budget");
-  expect(text).toContain("961 sats");
-  expect(text).toContain("1029.53 sats");
-  expect(text).toContain("69 sats");
-  expect(text).toContain("473 msats");
+  expect(text).toContain("961,000 msats spent so far plus 69,000 msats asked comes to 1,030,000 msats, " +
+    "473 msats over the 1,029,527 msats budget.");
   expect(action.hint).toContain(`dvm decline ${jobId}`);
   // `dvm pay` refuses an ask over the job's budget, so the hint must not send the agent there.
   expect(action.hint).not.toContain("then run `dvm pay");

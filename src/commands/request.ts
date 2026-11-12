@@ -168,6 +168,8 @@ import { progressNotice } from "../lib/progress-notice";
 import { quoteWithinDeclaredLimit } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
+import { upfrontRailPayment, type UpfrontRailPayment } from "../lib/upfront-payment";
+import { dollarBoundUsdMicro, usdMicro } from "../lib/job-budget";
 import { clearRequestRefusal, recordRequestRefusal } from "../lib/request-refusal-store";
 import { createArtifactSaveSession } from "../lib/save-artifact";
 import { applyJsonSchemaDefaults, formatAppliedDefaults } from "../lib/schema-defaults";
@@ -2210,6 +2212,14 @@ interface RailAttemptArgs {
  * The capability, plus the input size when there is input text. Free to derive
  * — both are already in scope at every upfront `recordSpend` call site.
  */
+// The quote's exact dollar price rides with the booked sats only when those
+// sats are held to it at the caller's rate; otherwise the job's dollar total
+// stays incomplete and its later asks compare in millisats.
+function cashuUpfrontPayment(chosen: Quote, btcRate: number): UpfrontRailPayment {
+  return upfrontRailPayment("cashu", chosen.priceMsats, dollarBoundUsdMicro({ msats: chosen.priceMsats,
+    usdMicro: usdMicro(chosen.upfront?.amount_micro, chosen.upfront?.currency), rate: btcRate }));
+}
+
 function buildSpendLabel(capability: string, input: string): string {
   return input.length > 0
     ? `${capability} · ${input.length.toLocaleString("en-US")} chars`
@@ -2369,7 +2379,8 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
   // money that moves. The rate is `tryTempoPayment`'s, always > 0.
   const usdcMicroUnits = Number(tempoCredentialAmountMicro(credential));
   const paidMsats = usdcToMsats(usdcMicroUnits / 1e6, btcRate);
-  if (opts.requestId) recordRequestRailPayment(opts.requestId, { method: "tempo", amountMsats: paidMsats });
+  const railPayment = upfrontRailPayment("tempo", paidMsats, usdMicro(usdcMicroUnits, "usd"));
+  if (opts.requestId) recordRequestRailPayment(opts.requestId, railPayment);
   const usd = usdcMicroUnits / 1e6;
   const priceLabel = `$${formatUsd(usd)} USDC`;
   const accountShort = `${account.address.slice(0, 6)}…${account.address.slice(-4)}`;
@@ -2478,7 +2489,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
     );
   }
 
-  recordUpfrontRailPayment(effectiveJobId, { method: "tempo", amountMsats: paidMsats }, true);
+  recordUpfrontRailPayment(effectiveJobId, railPayment, true);
   recordSpend({
     msats: paidMsats,
     btcRate: args.btcRate,
@@ -2916,7 +2927,7 @@ async function tryAgentWalletPayment(
   const priceSats = Math.ceil(chosen.priceMsats / 1000);
   const maxCashuFeeSats = parseMaxCashuFeeSats(opts.maxCashuFeeSats);
   const baseContext = {
-    upfront_rail_payment: { method: "cashu" as const, amountMsats: chosen.priceMsats },
+    upfront_rail_payment: cashuUpfrontPayment(chosen, btcRate),
     dvm_id: identity.dvmId,
     capability: identity.capability,
     pinned_mint: opts.mint,
@@ -3098,7 +3109,7 @@ async function tryAgentWalletPayment(
   }
 
   const pricedRequestId = opts.requestId ?? generatedRequestId;
-  if (pricedRequestId) recordRequestRailPayment(pricedRequestId, { method: "cashu", amountMsats: chosen.priceMsats });
+  if (pricedRequestId) recordRequestRailPayment(pricedRequestId, cashuUpfrontPayment(chosen, btcRate));
 
   // The fund leg is on its way — record the credit locally as provisional so
   // the countersigned receipt (or a later balance op) can adopt the server's
@@ -3507,7 +3518,7 @@ async function payWithAgentWallet(
 
   await collectCashuChange(effectiveJobId, receipt.cashuChange);
 
-  recordUpfrontRailPayment(effectiveJobId, { method: "cashu", amountMsats: chosen.priceMsats }, true);
+  recordUpfrontRailPayment(effectiveJobId, cashuUpfrontPayment(chosen, btcRate), true);
   // Spend successful — clear the pending_submission and record the spend
   // in the recent-spends ring buffer.
   if (!hasUnsavedJobState()) await commitAgentSpend({
@@ -3697,7 +3708,8 @@ async function tryX402UpfrontPayment(args: X402AttemptArgs): Promise<boolean> {
 
 async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Promise<void> {
   const { transport, ref, envelope, chosen, opts, identity, policy, wallet } = args;
-  if (opts.requestId) recordRequestRailPayment(opts.requestId, { method: "x402", amountMsats: proof.amountMsats });
+  const railPayment = upfrontRailPayment("x402", proof.amountMsats, usdMicro(Number(proof.amountUsdcMicro), "usd"));
+  if (opts.requestId) recordRequestRailPayment(opts.requestId, railPayment);
   const dvmFields = dvmIdentity(identity.dvmId, identity.capability);
   const usdcMicroUnits = Number(proof.amountUsdcMicro);
   const usd = usdcMicroUnits / 1e6;
@@ -3801,7 +3813,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
     );
   }
 
-  recordUpfrontRailPayment(effectiveJobId, { method: "x402", amountMsats: proof.amountMsats }, true);
+  recordUpfrontRailPayment(effectiveJobId, railPayment, true);
   recordSpend({
     msats: proof.amountMsats,
     btcRate: proof.btcRate,

@@ -15,6 +15,7 @@ import lockfile from "proper-lockfile";
 import type { PaymentContent, UpfrontPayment } from "@dvmkit/sdk";
 import { parseUpfrontPayment, parseUpfrontRailPayment, type UpfrontRailPayment } from "./upfront-payment";
 import type { PaymentRequestContent } from "@dvmkit/sdk/internal";
+import { usdMicro, type BudgetOverrun } from "./job-budget";
 import type { JobCompletion } from "./completion-hints";
 import { ensureConfigDir } from "@dvmkit/sdk/internal";
 import type { TerminalJobStatus } from "./next-action";
@@ -40,6 +41,8 @@ interface SubmissionBooking {
   requestAmountMsats: number;
   /** Amount booked once the provider takes the payment. */
   amountMsats: number;
+  /** Exact dollars booked with it, in micro-dollars; absent when the charge has no exact dollar figure. */
+  usdMicro?: number;
   btcRate: number;
   /** Approval of the send that signed this payment; a re-delivery keeps it. */
   approval?: PaymentApproval;
@@ -189,6 +192,12 @@ export interface JobRecord {
   messageCursor?: number;
   /** Running total of payments sent (millisatoshis) */
   totalPaidMsats?: number;
+  /** Asks the payer refused on budget, keyed by request seq, with the figures that decided. */
+  budgetRefusals?: Record<string, BudgetOverrun>;
+  /** Dollars booked beside {@link totalPaidMsats}, in micro-dollars, for payments whose exact dollars are known. */
+  paidUsdMicro?: number;
+  /** The millisats of the payments {@link paidUsdMicro} covers; short of {@link totalPaidMsats} when any payment had no exact dollars. */
+  paidUsdMsats?: number;
   /** Number of payments honoured for this job (auto + manual). */
   paymentsHonoured?: number;
   /** Approval of mid-job asks, keyed by provider request sequence. Absent on older records. */
@@ -201,6 +210,8 @@ export interface JobRecord {
     autoPayBelowMsats: number;
     maxIncrementMsats: number;
     maxPayments: number;
+    /** The budget as declared in dollars, in micro-dollars. Absent on sat budgets and older records. */
+    maxTotalUsdMicro?: number;
   };
   /**
    * opaque per-job token issued by the DVM at create-time when the
@@ -293,6 +304,7 @@ export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOn
     job.paymentMethod = "credit";
     if (job.upfrontCreditBooked) return;
     job.totalPaidMsats = (job.totalPaidMsats ?? 0) + payment.amount_msats;
+    bookUsd(job, payment.amount_msats, usdMicro(payment.amount_micro, payment.currency));
     job.paymentsHonoured = (job.paymentsHonoured ?? 0) + (payment.amount_msats > 0 ? 1 : 0);
     job.upfrontCreditBooked = true;
   }, true);
@@ -324,6 +336,7 @@ export function recordUpfrontRailPayment(jobId: string, value: unknown, freshSub
       return;
     }
     job.totalPaidMsats = (job.totalPaidMsats ?? 0) + payment.amountMsats;
+    bookUsd(job, payment.amountMsats, payment.usdMicro);
     job.paymentsHonoured = (job.paymentsHonoured ?? 0) + (payment.amountMsats > 0 ? 1 : 0);
     job.paymentMethod = payment.method;
     job.upfrontRailPayment = payment;
@@ -392,21 +405,39 @@ export function loadAllJobs(): JobRecord[] {
   }
 }
 
-/** Add a payment to a job's running total and increment its honoured-payment count. No-op if job not found. */
-export function addPayment(jobId: string, amountMsats: number, approval?: { requestSeq: number; approval: PaymentApproval }): void {
+/** Add a payment to a job's running totals and increment its honoured-payment count. No-op if job not found. */
+export function addPayment(jobId: string, amountMsats: number, approval?: { requestSeq: number; approval: PaymentApproval }, usdMicro?: number): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
-    if (job) bookPayment(job, amountMsats, approval);
+    if (job) bookPayment(job, amountMsats, approval, usdMicro);
   }, true);
 }
 
-function bookPayment(job: JobRecord, amountMsats: number, approval?: { requestSeq: number; approval: PaymentApproval }): void {
+function bookPayment(job: JobRecord, amountMsats: number, approval?: { requestSeq: number; approval: PaymentApproval }, usdMicro?: number): void {
   job.totalPaidMsats = (job.totalPaidMsats ?? 0) + amountMsats;
+  bookUsd(job, amountMsats, usdMicro);
   job.paymentsHonoured = (job.paymentsHonoured ?? 0) + 1;
   if (approval) (job.paymentApprovals ??= []).push(approval);
   // A rail may bind a previously free job to an implicit credit whose IDs
   // this message response does not expose. Future balance payments must not guess.
   if (job.creditBinding && "unbound" in job.creditBinding) delete job.creditBinding;
+}
+
+// Every site that grows totalPaidMsats calls this in the same write. A payment
+// without exact dollars, or one booked by an older CLI, leaves paidUsdMsats
+// short of totalPaidMsats, which keeps the job on the millisat budget.
+function bookUsd(job: JobRecord, amountMsats: number, usdMicro: number | undefined): void {
+  if (usdMicro === undefined || !Number.isSafeInteger(usdMicro) || usdMicro < 0) return;
+  job.paidUsdMicro = (job.paidUsdMicro ?? 0) + usdMicro;
+  job.paidUsdMsats = (job.paidUsdMsats ?? 0) + amountMsats;
+}
+
+/** Keep the figures a budget refusal was decided on, so `dvm pay` and the next step can state them. */
+export function recordBudgetRefusal(jobId: string, requestSeq: number, overrun: BudgetOverrun): void {
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (job) (job.budgetRefusals ??= {})[String(requestSeq)] = overrun;
+  }, true);
 }
 
 /** A `submission` is persisted in the same write, so no dispatch exists without its re-delivery record. */
@@ -465,7 +496,7 @@ export function markPaymentRequestPaid(jobId: string, requestSeq: number): Uncon
     clearPaymentRequestStartTime(job, requestSeq);
     const booked = job.unconfirmedPaymentSubmissions?.[requestSeq];
     clearUnconfirmedSubmission(job, requestSeq);
-    if (booked) bookPayment(job, booked.amountMsats, booked.approval ? { requestSeq, approval: booked.approval } : undefined);
+    if (booked) bookPayment(job, booked.amountMsats, booked.approval ? { requestSeq, approval: booked.approval } : undefined, booked.usdMicro);
     // A token that can still be re-delivered, recorded taken on a blocked ask,
     // is the replacement an explicit pay approved; the blocked token is not.
     if (booked && !booked.blocked && job.askPaymentBlocks?.[requestSeq]) {
@@ -721,7 +752,9 @@ export function bookCreditPayment(jobId: string, intent: CreditPaymentIntent): v
   mutateCreditPayment(jobId, (job) => {
     if (!job.bookedCreditPayments?.some((entry) =>
       entry.authorization.payment_id === intent.authorization.payment_id)) {
-      job.totalPaidMsats = (job.totalPaidMsats ?? 0) + (intent.amountMsats ?? intent.request.amount_msats);
+      const amountMsats = intent.amountMsats ?? intent.request.amount_msats;
+      job.totalPaidMsats = (job.totalPaidMsats ?? 0) + amountMsats;
+      bookUsd(job, amountMsats, usdMicro(intent.authorization.amount_micro, intent.authorization.currency));
       job.paymentsHonoured = (job.paymentsHonoured ?? 0) + 1;
       (job.bookedCreditPayments ??= []).push(intent);
       if (intent.approval) (job.paymentApprovals ??= []).push({

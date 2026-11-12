@@ -606,7 +606,7 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     const entry = onlyJournalEntry();
     const requestId = provider.paidPosts()[0].body.request_id as string;
     expect(jobs.loadJob("job-a")).toBeNull();
-    expect(intents.loadRequestIntent(requestId)?.railPayment).toEqual({ method: "cashu", amountMsats: 1000 });
+    expect(intents.loadRequestIntent(requestId)?.railPayment).toEqual({ method: "cashu", amountMsats: 1000, usdMicro: 1000 });
     expect(entry.amount_sats).toBeGreaterThan(1);
     const before = budget.loadLedger();
     const postsBeforeRecovery = provider.jobPosts.length;

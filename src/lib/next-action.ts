@@ -1,10 +1,11 @@
 import { guidanceJobArg } from "./provider-output";
 import { answeredYieldSeqs } from "./yield-state";
-import { formatPaymentAmount, formatSats } from "./currency";
+import { formatPaymentAmount } from "./currency";
+import { askUsdMicro, budgetVerdict, describeBudgetOverrun, type JobBudgetLedger, type JobBudgetPolicy } from "./job-budget";
 import { formatFiat } from "@dvmkit/sdk";
-import type { JobPolicy, Message, PaymentRequestContent } from "@dvmkit/sdk/internal";
+import type { Message, PaymentRequestContent } from "@dvmkit/sdk/internal";
 import type { JobRecord } from "./job-store";
-import { asProviderText, loadAgentWallet, shellQuoteArg, type ProviderText } from "@dvmkit/sdk/internal";
+import { asProviderText, getLastKnownBtcRate, loadAgentWallet, shellQuoteArg, type ProviderText } from "@dvmkit/sdk/internal";
 
 export type NextAction =
   | null
@@ -197,9 +198,8 @@ const TERMINAL_STATUSES: ReadonlySet<string> = new Set<TerminalJobStatus>([
   "cancelled",
 ]);
 
-export interface PaymentPolicyContext {
-  policy?: JobPolicy;
-  totalPaidMsats?: number;
+export interface PaymentPolicyContext extends JobBudgetLedger {
+  policy?: JobBudgetPolicy;
 }
 
 /**
@@ -256,9 +256,13 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
         const deadline = deadlineClause(expiresAtMs === validDeadline(c.expires_at_ms) ? "Pay" : "Reply", expiresAtMs, nowMs, jobId);
         const expired = expiresAtMs !== undefined && expiresAtMs <= nowMs;
         const policy = context?.policy;
-        const thresholdHint = !expired && policy && Number.isSafeInteger(c.amount_msats) &&
+        // The payer's own refusal wins: it may have judged the amount a rail signed.
+        const budget = policy && (context?.budgetRefusals?.[String(msg.seq)] ?? (Number.isSafeInteger(c.amount_msats)
+          ? budgetVerdict(policy, context, { msats: c.amount_msats, usdMicro: askUsdMicro(c),
+            // The payer resolves a live rate; a next step reads the last one this machine saw.
+            rate: getLastKnownBtcRate()?.rate }) : undefined));
+        const thresholdHint = !expired && policy && budget?.fits &&
           c.amount_msats > policy.autoPayBelowMsats &&
-          (context?.totalPaidMsats ?? 0) + c.amount_msats <= policy.maxTotalMsats &&
           (policy.maxIncrementMsats === 0 || c.amount_msats <= policy.maxIncrementMsats)
           ? ` For the next run, use --auto-pay-below ${c.amount_msats} within your approved budget; other payment limits still apply.` : "";
         const stopping = declineTerms(c);
@@ -271,8 +275,7 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
         const declineHint = stopping
           ? ` If your human does not approve, run \`dvm decline ${guidanceJobArg(jobId)}\`: ${stopping.clause} Letting the deadline pass also ends the job.`
           : "";
-        const overBudget = !expired && policy && Number.isSafeInteger(c.amount_msats)
-          ? budgetOverrun(policy, context?.totalPaidMsats ?? 0, c.amount_msats) : undefined;
+        const overBudget = !expired && budget && !budget.fits ? describeBudgetOverrun(budget, policy) : undefined;
         return {
           type: "pay",
           job_id: jobId,
@@ -305,22 +308,9 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
   return null;
 }
 
-/**
- * Why an ask cannot be paid under the job's saved budget, from the same
- * comparison the payer makes. Exact sats, because a USD budget converted once
- * at submit can miss by less than one sat.
- */
-function budgetOverrun(policy: JobPolicy, spentMsats: number, askMsats: number): string | undefined {
-  const totalMsats = spentMsats + askMsats;
-  if (totalMsats <= policy.maxTotalMsats) return undefined;
-  return `This charge would take the job past its budget: ${formatSats(spentMsats)} spent so far plus ` +
-    `${formatSats(askMsats)} asked comes to ${formatSats(totalMsats)}, ${formatSats(totalMsats - policy.maxTotalMsats)} ` +
-    `over the ${formatSats(policy.maxTotalMsats)} budget.`;
-}
-
 // `dvm pay` applies the same budget and nothing raises it on a running job,
 // so the only commands named are ones that work.
-function overBudgetHint(jobId: string, overrun: string, declineClause?: string): string {
+export function overBudgetHint(jobId: string, overrun: string, declineClause?: string): string {
   const job = guidanceJobArg(jobId);
   return `${overrun} The CLI will not pay it automatically, and \`dvm pay ${job}\` refuses it while this budget stands; ` +
     "a running job's budget cannot be raised. Relay this to your human. " +
