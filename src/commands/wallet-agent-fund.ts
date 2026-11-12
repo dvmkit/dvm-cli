@@ -987,7 +987,7 @@ async function fundX402Rail(amount: string, opts: WalletFundOptions): Promise<vo
     return existing
       ? { connected: await ensureAddress(existing), isNew: false }
       : {
-          connected: await saveX402Wallet(await generateX402PrivateKey(), X402_DEFAULT_NETWORK),
+          connected: await saveX402Wallet(await generateX402PrivateKey(), X402_DEFAULT_NETWORK, true),
           isNew: true,
         };
   });

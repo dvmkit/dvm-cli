@@ -1,3 +1,4 @@
+import { terminalSettlementReport } from "../lib/job-settlement";
 import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
 import { guidanceJobArg, providerJobJson } from "../lib/provider-output";
 import {
@@ -82,8 +83,10 @@ async function cancelWithAccess(
   // The labelled "(currency not recorded)" amount in `display` needs its reason beside it.
   const hint = settlementCurrencyHint(settlement, ref.endpoint);
 
+  const { wallet_remaining } = await terminalSettlementReport(jobId, { status: "cancelled", persistLocalState: !access.endpointOverridden });
   if (opts.human) {
     info(`Job ${jobId}${identifier ? ` [${identifier}]` : ""} cancelled.`);
+    if (wallet_remaining) info(wallet_remaining.display);
     if (display) info(display);
     if (hint) info(`  ${hint}`);
   } else {
@@ -93,6 +96,7 @@ async function cancelWithAccess(
       status: "cancelled",
       ...(opts.reason ? { reason: opts.reason } : {}),
       ...(settlement ? { settlement } : {}),
+      ...(wallet_remaining ? { wallet_remaining } : {}),
       ...(display ? { display } : {}),
       ...artifacts.fields,
       ...(hint ? { hint } : {}),

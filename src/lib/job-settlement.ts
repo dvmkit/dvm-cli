@@ -1,3 +1,4 @@
+import { walletRemaining, type WalletRemaining } from "./wallet-leftover";
 import { isSignedJobReceipt, verifyJobReceipt, type JobReceipt, type ReceiptVerification } from "@dvmkit/sdk/internal";
 import { formatAmount, formatPaymentAmount, formatSats } from "./currency";
 import { hasUnknownUpfrontCredit, hasUnknownUpfrontRail, loadJob, type JobRecord } from "./job-store";
@@ -154,7 +155,17 @@ export function terminalSettlementFields(jobId: string, options: {
 }
 
 export interface SettlementFields {
+  wallet_remaining?: WalletRemaining;
   settlement?: JobSettlement;
   /** Why `settlement.display` carries the "(currency not recorded)" label, when it does. */
   settlement_hint?: string;
+}
+
+/** Assemble the optional wallet report at the same boundary as terminal settlement. */
+export async function terminalSettlementReport(jobId: string, options: Parameters<typeof terminalSettlementFields>[1] = {}): Promise<SettlementFields> {
+  const fields = terminalSettlementFields(jobId, options);
+  if (!fields.settlement || options.persistLocalState === false) return fields;
+  const stored = loadJob(jobId);
+  const remaining = stored ? await walletRemaining({ ...stored, ...(options.receipt ? { receipt: options.receipt } : {}), status: (options.status ?? stored.status) as JobRecord["status"] }) : undefined;
+  return { ...fields, ...(remaining ? { wallet_remaining: remaining } : {}) };
 }

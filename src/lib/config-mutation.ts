@@ -615,8 +615,8 @@ interface ShapeNode {
  */
 const CONFIG_PATH_SHAPE: ShapeNode = {
   float: { statedBudget: {}, connectedAt: {}, alias: {}, methods: {} },
-  x402: { privateKey: {}, network: {} },
-  tempo: { method: {}, accountId: {}, apiKey: {}, network: {} },
+  x402: { privateKey: {}, network: {}, generated: {} },
+  tempo: { method: {}, accountId: {}, apiKey: {}, network: {}, generated: {} },
   credit: {
     targetJobs: {},
     posture: {},

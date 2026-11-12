@@ -16,7 +16,7 @@ import type { JobStatus, ProviderInfo, ProviderRef, ReceiptParseError, Transport
 import { captureDrawFundingReceipts } from "./draw-funding";
 import { completionSnapshot } from "./completion-hints";
 import { parseJobContent, type ContentStatus } from "./job-content";
-import { receiptSettlement, type SettlementFields, terminalSettlementFields } from "./job-settlement";
+import { receiptSettlement, type SettlementFields, terminalSettlementReport } from "./job-settlement";
 import { isTerminalJobStatus } from "./next-action";
 import { loadMessages } from "./messages";
 import { formatMicro, pieceSettlement, type PieceContext, settlementCurrencyHint } from "./piece-settlement";
@@ -156,9 +156,9 @@ export function captureTransportReceipt(
  * Emit only on terminal responses: absent during a running job means not yet
  * issued, rather than unsupported receipts.
  */
-export function receiptJsonFields(capture: ReceiptCapture, jobId?: string): Record<string, unknown> {
+export async function receiptJsonFields(capture: ReceiptCapture, jobId?: string, report?: SettlementFields): Promise<Record<string, unknown>> {
   const out: Record<string, unknown> = { receipt_verified: capture.status };
-  if (jobId) Object.assign(out, terminalSettlementFields(jobId, { receipt: capture.receipt }));
+  if (jobId) Object.assign(out, report ?? await terminalSettlementReport(jobId, { receipt: capture.receipt }));
   else if (capture.receipt) out.settlement = receiptSettlement(capture.receipt, capture.status);
   if (capture.status !== "absent") out.receipt_display = capture.display;
   // One explanation per output: the receipt line and the settlement share it.
@@ -174,9 +174,10 @@ export function receiptJsonFields(capture: ReceiptCapture, jobId?: string): Reco
   return out;
 }
 
-export function renderReceiptHuman(capture: ReceiptCapture, jobId?: string): void {
-  const fields = jobId ? terminalSettlementFields(jobId, { receipt: capture.receipt }) : {};
+export async function renderReceiptHuman(capture: ReceiptCapture, jobId?: string, report?: SettlementFields): Promise<void> {
+  const fields = report ?? (jobId ? await terminalSettlementReport(jobId, { receipt: capture.receipt }) : {});
   if (fields.settlement) info(fields.settlement.display);
+  if (fields.wallet_remaining) info(fields.wallet_remaining.display);
   if (capture.status !== "absent") info(`🧾 ${capture.display}`);
   const hint = capture.status !== "absent" && capture.currencyHint ? capture.currencyHint : fields.settlement_hint;
   if (hint) info(`  ${hint}`);
@@ -185,13 +186,14 @@ export function renderReceiptHuman(capture: ReceiptCapture, jobId?: string): voi
 /** The settlement line, and below it why its amounts name no currency when they don't. */
 export function renderSettlementHuman(fields: SettlementFields): void {
   if (fields.settlement) info(fields.settlement.display);
+  if (fields.wallet_remaining) info(fields.wallet_remaining.display);
   if (fields.settlement_hint) info(`  ${fields.settlement_hint}`);
 }
 
 export function observedSettlementFields(jobId: string, response?: Partial<ContentStatus>, persistLocalState = true, currency?: string) {
   if (persistLocalState && response?.status && isTerminalJobStatus(response.status)
     && (response.receipt || response.receiptParseError)) captureTransportReceipt(jobId, response);
-  return terminalSettlementFields(jobId, { status: response?.status, receipt: response?.receipt, persistLocalState, currency });
+  return terminalSettlementReport(jobId, { status: response?.status, receipt: response?.receipt, persistLocalState, currency });
 }
 
 /**

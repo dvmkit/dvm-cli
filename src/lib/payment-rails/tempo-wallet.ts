@@ -99,7 +99,7 @@ export async function generateTempoKey(
     reason: "tempo_wallet_generate",
     patch: () => ({
       set: {
-        tempo: { method: "tempo", apiKey: privateKey, network: generated.network },
+        tempo: { method: "tempo", apiKey: privateKey, network: generated.network, generated: true },
       },
     }),
   });

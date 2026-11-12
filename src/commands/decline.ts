@@ -1,3 +1,4 @@
+import { terminalSettlementReport } from "../lib/job-settlement";
 import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
 import { DvmError } from "@dvmkit/sdk/internal";
 import { settlementCurrencyHint } from "../lib/piece-settlement";
@@ -93,8 +94,10 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
   const display = [endingDisplay, artifacts.display].filter(Boolean).join(" ");
   const hint = settlementCurrencyHint(settlement, ref.endpoint);
 
+  const { wallet_remaining } = await terminalSettlementReport(jobId, { status: observed, persistLocalState: !access.endpointOverridden });
   if (opts.human) {
     info(`Job ${jobId}${identifier ? ` [${identifier}]` : ""}: ${display}`);
+    if (wallet_remaining) info(wallet_remaining.display);
     if (hint) info(`  ${hint}`);
     return;
   }
@@ -105,6 +108,7 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
     declined: true,
     ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
     ...(settlement ? { settlement } : {}),
+    ...(wallet_remaining ? { wallet_remaining } : {}),
     display,
     ...artifacts.fields,
     ...(hint ? { hint } : {}),

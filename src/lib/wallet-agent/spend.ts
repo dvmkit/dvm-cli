@@ -1,3 +1,4 @@
+import { rememberKeysetFees } from "../wallet-keyset-fees";
 import {
   getEncodedToken,
   MintOperationError,
@@ -440,6 +441,7 @@ export async function prepareAgentSpend(args: {
     let candidateWallet: Wallet;
     try {
       candidateWallet = await getWalletForMint(mint);
+      rememberKeysetFees(mint, candidateWallet);
     } catch (err) {
       attempts.push({ mint, reason: "unreachable", message: errorText(err) });
       continue;

@@ -51,7 +51,7 @@ export async function repinX402WalletNetwork(network: string): Promise<X402Repin
         const privateKey = current.x402?.privateKey;
         if (privateKey === undefined) throw x402WalletMissingError();
         if (!isValidEvmPrivateKey(privateKey)) throw invalidX402PrivateKey();
-        return { set: { x402: { privateKey, network } } };
+        return { set: { x402: { privateKey, network, ...(current.x402?.generated === true ? { generated: true } : {}) } } };
       },
     });
 
@@ -82,7 +82,8 @@ export async function repinX402WalletNetwork(network: string): Promise<X402Repin
  */
 export async function saveX402Wallet(
   privateKey: string,
-  network?: string
+  network?: string,
+  generated = false
 ): Promise<X402ConnectedWallet> {
   if (network !== undefined) assertSupportedX402Network(network);
   if (!isValidEvmPrivateKey(privateKey)) throw invalidX402PrivateKey();
@@ -94,7 +95,7 @@ export async function saveX402Wallet(
     patch: (current) => {
       resolved = network ?? current?.x402?.network;
       return {
-        set: { x402: resolved === undefined ? { privateKey } : { privateKey, network: resolved } },
+        set: { x402: { privateKey, ...(resolved === undefined ? {} : { network: resolved }), ...(generated ? { generated: true } : {}) } },
       };
     },
   });

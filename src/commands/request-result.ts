@@ -1,3 +1,4 @@
+import { terminalSettlementReport } from "../lib/job-settlement";
 import { hasUnsavedJobState } from "../lib/job-persistence";
 import { completionSnapshot } from "../lib/completion-hints";
 import {
@@ -216,12 +217,14 @@ async function requestResultWithWarnings(requestId: string, opts: RequestResultO
     jobId: receipt.jobId,
   });
 
+  const { wallet_remaining } = await terminalSettlementReport(receipt.jobId);
   if (opts.human) {
     info(`Recovered request ${requestId} as job ${receipt.jobId} (${receipt.status}).`);
+    if (wallet_remaining) info(wallet_remaining.display);
     if (confirmed.length > 0) {
       info(`The wallet payment held for this request is now confirmed as spent on that job.`);
     }
-    renderReceiptHuman(captured);
+    await renderReceiptHuman(captured);
     return;
   }
   json({
@@ -232,7 +235,8 @@ async function requestResultWithWarnings(requestId: string, opts: RequestResultO
     ...dvmIdentity(intent.dvmId, intent.capability),
     ...(receipt.summary !== undefined ? { summary: receipt.summary } : {}),
     ...(confirmed.length > 0 ? { confirmed_pending_submissions: confirmed } : {}),
-    ...receiptJsonFields(captured),
+    ...await receiptJsonFields(captured),
+    ...(wallet_remaining ? { wallet_remaining } : {}),
     next_action:
       receipt.status === "completed" ||
       receipt.status === "failed" ||

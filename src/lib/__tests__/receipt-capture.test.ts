@@ -71,19 +71,19 @@ describe("captureJobReceipt", () => {
     expect(vi.mocked(info).mock.calls.flat().join("\n")).toContain("did not verify");
   });
 
-  it("reports absent with no side effects when the response carried no receipt", () => {
+  it("reports absent with no side effects when the response carried no receipt", async () => {
     const capture = captureJobReceipt("job-a7571b-1", undefined);
 
     expect(capture.status).toBe("absent");
-    expect(receiptJsonFields(capture)).toEqual({ receipt_verified: "absent" });
+    expect(await receiptJsonFields(capture)).toEqual({ receipt_verified: "absent" });
     expect(updateObservedJob).not.toHaveBeenCalled();
     expect(appendReceipt).not.toHaveBeenCalled();
   });
 
-  it("warns and reports unparseable when a response offered an invalid shape", () => {
+  it("warns and reports unparseable when a response offered an invalid shape", async () => {
     const capture = captureJobReceipt("job-a7571b-1", undefined, "shape_invalid");
 
-    expect(receiptJsonFields(capture)).toEqual({
+    expect(await receiptJsonFields(capture)).toEqual({
       receipt_verified: "unparseable",
       receipt_display:
         "UNREADABLE receipt: this DVM returned a receipt block that does not match the signed receipt protocol shape. The job itself is unaffected.",
@@ -114,12 +114,12 @@ describe("piece charges with no recorded currency", () => {
   const pieceReceipt = () => DVM.sign({ job_id: "job-a7571b-1", settlement: { held: 500_000, charged: 500_000, released: 0,
     pieces: [{ amount: 400_000, charged: 400_000, paid_seq: 0, state: "finished" }] } } as never);
 
-  it("labels the capture's amount and carries the reason into JSON and --human output", () => {
+  it("labels the capture's amount and carries the reason into JSON and --human output", async () => {
     const capture = captureJobReceipt("job-a7571b-1", pieceReceipt());
     expect(capture.display).toContain("Charged 0.50 (currency not recorded) for");
     expect(capture.currencyHint).toContain("does not name the currency");
-    expect(receiptJsonFields(capture)).toMatchObject({ receipt_hint: capture.currencyHint });
-    renderReceiptHuman(capture);
+    expect(await receiptJsonFields(capture)).toMatchObject({ receipt_hint: capture.currencyHint });
+    await renderReceiptHuman(capture);
     expect(vi.mocked(info)).toHaveBeenCalledWith(`  ${capture.currencyHint}`);
   });
 
@@ -260,10 +260,10 @@ describe("replayStoredReceipt", () => {
     expect(capture.receipt).toBeUndefined();
   });
 
-  it("replays a stored transport parse error instead of degrading it to absent", () => {
+  it("replays a stored transport parse error instead of degrading it to absent", async () => {
     const capture = replayStoredReceipt(jobRecord({ receiptParseError: "shape_invalid" }));
 
-    expect(receiptJsonFields(capture)).toMatchObject({
+    expect(await receiptJsonFields(capture)).toMatchObject({
       receipt_verified: "unparseable",
       receipt_error: "shape_invalid",
     });

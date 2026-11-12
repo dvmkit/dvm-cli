@@ -43,9 +43,10 @@ export interface Config {
    */
   cashuMints?: string[];
 
-  x402?: { privateKey: string; network?: string };
+  x402?: { privateKey: string; network?: string; generated?: boolean };
 
   tempo?: {
+    generated?: boolean;
     method: string;
     accountId?: string;
     apiKey?: string;

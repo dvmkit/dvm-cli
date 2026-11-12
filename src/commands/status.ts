@@ -1,7 +1,7 @@
 import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
 import { providerJobJson } from "../lib/provider-output";
 import { jobSpend, renderSpendHuman } from "../lib/job-spend";
-import { terminalSettlementFields } from "../lib/job-settlement";
+import { terminalSettlementReport } from "../lib/job-settlement";
 import { formatMessageHuman } from "../lib/message-human";
 import { printNextActionHuman } from "../lib/next-action-human";
 import { finalizeProgressLine } from "../lib/progress-bar";
@@ -130,7 +130,7 @@ async function statusWithAccess(
     await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
     transport.close();
 
-    renderStatus(jobId, stored, terminalStatus, completion, "local", null, opts, {
+    await renderStatus(jobId, stored, terminalStatus, completion, "local", null, opts, {
       receipt, content,
     });
     return;
@@ -241,7 +241,7 @@ async function statusWithAccess(
 
   transport.close();
 
-  renderStatus(jobId, stored, result.status, completion, "provider", nextAction, opts, {
+  await renderStatus(jobId, stored, result.status, completion, "provider", nextAction, opts, {
     msgs,
     cursor: newCursor,
     receipt,
@@ -279,7 +279,7 @@ function transientReceiptCapture(
  * one did: `"local"` is a replay of the snapshot taken at the first terminal
  * read, `"provider"` a fresh read.
  */
-function renderStatus(
+async function renderStatus(
   jobId: string,
   stored: JobRecord | null,
   jobStatus: string,
@@ -288,7 +288,7 @@ function renderStatus(
   nextAction: NextAction,
   opts: StatusOptions,
   fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: Partial<ContentStatus>; currency?: string }
-): void {
+): Promise<void> {
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
   const artifacts = terminalCompletionOutput(jobId, jobStatus, completion, {
     human: opts.human, contentAvailable: fetched?.content?.content_available,
@@ -298,7 +298,7 @@ function renderStatus(
   const content = jobContentFields(jobId, fetched?.content, opts.human);
   const spend = stored ? jobSpend({ ...(loadJob(jobId) ?? stored),
     status: jobStatus as JobRecord["status"] }, receipt?.receipt) : undefined;
-  const settlement = terminalSettlementFields(jobId, { status: jobStatus, receipt: receipt?.receipt,
+  const settlement = await terminalSettlementReport(jobId, { status: jobStatus, receipt: receipt?.receipt,
     persistLocalState: !!stored, currency: fetched?.currency });
 
   if (opts.human) {
@@ -321,7 +321,8 @@ function renderStatus(
     if (traceId) info(`Trace: ${traceId}`);
     if (spend) renderSpendHuman(spend, info);
     else if (settlement.settlement) info(settlement.settlement.display);
-    if (receipt) renderReceiptHuman(receipt);
+    if (settlement.wallet_remaining) info(settlement.wallet_remaining.display);
+    if (receipt) await renderReceiptHuman(receipt);
     // The receipt line already explained the same unlabelled amounts.
     if (settlement.settlement_hint && !receipt?.currencyHint) info(`  ${settlement.settlement_hint}`);
     printNextActionHuman(nextAction);
@@ -345,7 +346,7 @@ function renderStatus(
     ...(completion.message ? { message: completion.message } : {}),
     // terminal responses only. On a still-running job "absent" would
     // read as "this DVM doesn't issue receipts" rather than "not yet".
-    ...(receipt ? receiptJsonFields(receipt) : {}),
+    ...(receipt ? await receiptJsonFields(receipt) : {}),
     ...settlement,
     ...(receipt?.currencyHint ? { settlement_hint: undefined } : {}),
     // `dvm status` is a job-terminal emission for `--no-stream`
