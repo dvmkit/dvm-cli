@@ -336,6 +336,8 @@ describe("pending-mint reconcile against a mint that won't answer", () => {
     expect(event).toMatchObject({
       status: "ok",
       sweep: {
+        pending: [],
+        collected: [],
         unchecked: [
           {
             quote_id: "quote-1",

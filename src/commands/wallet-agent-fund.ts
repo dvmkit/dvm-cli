@@ -81,6 +81,7 @@ import {
   resolveFundingAmountSats,
 } from "../lib/wallet-agent/amount";
 import { loadMintFeeProfiles, summarizeMints } from "../lib/wallet-agent/balance";
+import { createPendingMintQuote, type FundOptions } from "../lib/wallet-agent/fund";
 import { fundWithRecoverableWait } from "../lib/wallet-agent/fund-wait";
 import {
   reconcilePendingMelts,
@@ -142,6 +143,8 @@ export interface WalletFundOptions {
    * to `true`, which is what makes funding autonomous.
    */
   float?: boolean;
+  /** Set to false by --no-wait to persist and relay an invoice without polling. */
+  wait?: boolean;
 }
 
 export interface WalletShowOptions {
@@ -165,11 +168,12 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
       opts.timeout !== undefined ||
       opts.sats ||
       opts.testSkipLightning ||
-      opts.float === false
+      opts.float === false ||
+      opts.wait === false
     ) {
       throw new DvmError(
         "invalid_flags_for_rail",
-        "--mint, --timeout, --sats, --test-skip-lightning, and --no-float only apply to --rail cashu.",
+        "--mint, --timeout, --sats, --test-skip-lightning, --no-float, and --no-wait only apply to --rail cashu.",
         `Drop these flags when running \`dvm wallet fund --rail ${rail}\`.`
       );
     }
@@ -182,6 +186,22 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
       "invalid_rail",
       `Unknown rail: ${rail}.`,
       "Supported rails: cashu (default), tempo, x402."
+    );
+  }
+
+  if (opts.wait === false && opts.testSkipLightning) {
+    throw new DvmError(
+      "invalid_fund_options",
+      "--no-wait cannot be combined with --test-skip-lightning: there is no human-paid invoice to hand off.",
+      "Drop --no-wait to wait for the test mint to settle."
+    );
+  }
+  const float = opts.float === false || opts.testSkipLightning ? null : loadFloat();
+  if (opts.wait === false && float) {
+    throw new DvmError(
+      "invalid_fund_options",
+      "--no-wait cannot be used while the connected Lightning float pays the invoice.",
+      "Add --no-float to hand the invoice to a human, or drop --no-wait for autonomous funding."
     );
   }
 
@@ -217,7 +237,6 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
   // quote exists so the CLI knows which story it's telling, and check the
   // spend against the local caps *before* opening a quote — a cap refusal
   // should leave no pending state behind.
-  const float = opts.float === false || opts.testSkipLightning ? null : loadFloat();
   const btcRate = float ? await assertFloatBudget(sats * 1000) : null;
   /** Set once the float path opens a quote, so the ledger row can name it. */
   let fundedQuoteId: string | undefined;
@@ -296,6 +315,80 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
     }
   }
 
+  const onInvoice: NonNullable<FundOptions["onInvoice"]> = async (invoice, quote) => {
+    const expiresAt = quote.expiry !== null ? new Date(quote.expiry * 1000).toISOString() : null;
+    const previousUnpaid = sweep.still_pending.map((entry) => ({
+      quote_id: entry.quote_id,
+      mint: entry.mint,
+      amount_sats: entry.amount_sats,
+    }));
+    const warning = opts.wait === false && previousUnpaid.length > 0
+      ? `An unpaid quote already exists: ${previousUnpaid.map((entry) => `${entry.quote_id} at ${entry.mint} (${entry.amount_sats} sats)`).join(", ")}. This is a new invoice; avoid asking a human to pay both for the same top-up.`
+      : undefined;
+    if (human) {
+      if (warning) info(`Warning: ${warning}`);
+      info("");
+      info("Pay this Lightning invoice from any Lightning wallet:");
+      info("");
+      info(invoice);
+      info("");
+      const ascii = await renderQrTerminal(invoice.toUpperCase());
+      info(ascii);
+      // Human mode only writes a PNG when --qr-image is set explicitly; the
+      // terminal QR above already serves the in-shell use case.
+      if (opts.qrImage !== undefined) {
+        await writeInvoicePng(invoice, opts.qrImage);
+        info(`QR PNG written to ${opts.qrImage}`);
+      }
+      if (opts.wait === false) {
+        info(`Quote ID: ${quote.quote}`);
+        if (expiresAt) info(`Invoice expires: ${expiresAt}`);
+        info("After payment, run `dvm wallet show` to collect the sats and check the new balance.");
+      } else {
+        info(
+          "Polling for payment every 2s; press Ctrl-C to bail (the quote will be recoverable on next run)."
+        );
+      }
+    } else {
+      // JSON mode always writes a PNG — agents typically relay it through
+      // image channels. Default to a tmpdir path; --qr-image overrides.
+      const qrImagePath = opts.qrImage ?? defaultQrImagePath();
+      await writeInvoicePng(invoice, qrImagePath);
+      // Agent-friendly: emit the invoice as a single-line JSON event so a
+      // wrapping agent can relay it to its user without juggling stderr/stdout.
+      json({
+        status: "awaiting_payment",
+        mint: mintUrl,
+        mint_selection: mintSelection,
+        amount_sats: sats,
+        ...amountSourceFields(amt),
+        invoice,
+        quote_id: quote.quote,
+        next_step: "dvm wallet show",
+        qr_image_path: qrImagePath,
+        relay: { copy_text: invoice, standalone: true },
+        expires_at: expiresAt,
+        lock_pubkey: wallet.lock_pubkey,
+        display: `Pay ${sats} sats to the Lightning invoice to fund ${amountPhrase} into the agent wallet at ${mintUrl} (${selectionPhrase}). Scannable QR at ${qrImagePath}.`,
+        ...(opts.wait === false ? {
+          existing_unpaid_quotes: previousUnpaid,
+          ...(warning ? { warning } : {}),
+          sweep: summarizeSweep(sweep),
+          melt_sweep: summarizeMeltSweep(meltSweep),
+        } : {}),
+        hint: opts.wait === false
+          ? "Forward the QR PNG (or raw invoice) to a human. After payment, run `dvm wallet show` to collect the sats and check the new balance. Funding is still pending."
+          : "Forward the QR PNG (or raw invoice) to a human; the CLI will mint P2PK-locked Cashu proofs into ~/.dvm/wallet.json once paid.",
+      });
+    }
+  };
+
+  if (opts.wait === false) {
+    const { quote } = await createPendingMintQuote(sats, { mintUrl });
+    await onInvoice(quote.request, quote);
+    return;
+  }
+
   const result = await fundWithRecoverableWait(sats, {
     mintUrl,
     timeoutMs,
@@ -371,48 +464,7 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
         });
       }
     },
-    onInvoice: async (invoice, quote) => {
-      const expiresAt = quote.expiry !== null ? new Date(quote.expiry * 1000).toISOString() : null;
-      if (human) {
-        info("");
-        info("Pay this Lightning invoice from any Lightning wallet:");
-        info("");
-        info(invoice);
-        info("");
-        const ascii = await renderQrTerminal(invoice.toUpperCase());
-        info(ascii);
-        // Human mode only writes a PNG when --qr-image is set explicitly; the
-        // terminal QR above already serves the in-shell use case.
-        if (opts.qrImage !== undefined) {
-          await writeInvoicePng(invoice, opts.qrImage);
-          info(`QR PNG written to ${opts.qrImage}`);
-        }
-        info(
-          "Polling for payment every 2s; press Ctrl-C to bail (the quote will be recoverable on next run)."
-        );
-      } else {
-        // JSON mode always writes a PNG — agents typically relay it through
-        // image channels. Default to a tmpdir path; --qr-image overrides.
-        const qrImagePath = opts.qrImage ?? defaultQrImagePath();
-        await writeInvoicePng(invoice, qrImagePath);
-        // Agent-friendly: emit the invoice as a single-line JSON event so a
-        // wrapping agent can relay it to its user without juggling stderr/stdout.
-        json({
-          status: "awaiting_payment",
-          mint: mintUrl,
-          mint_selection: mintSelection,
-          amount_sats: sats,
-          ...amountSourceFields(amt),
-          invoice,
-          qr_image_path: qrImagePath,
-          relay: { copy_text: invoice, standalone: true },
-          expires_at: expiresAt,
-          lock_pubkey: wallet.lock_pubkey,
-          display: `Pay ${sats} sats to the Lightning invoice to fund ${amountPhrase} into the agent wallet at ${mintUrl} (${selectionPhrase}). Scannable QR at ${qrImagePath}.`,
-          hint: "Forward the QR PNG (or raw invoice) to a human; the CLI will mint P2PK-locked Cashu proofs into ~/.dvm/wallet.json once paid.",
-        });
-      }
-    },
+    onInvoice,
   });
 
   const totalProofSats = result.proofs.reduce((sum, p) => sum + p.amount, 0);
@@ -596,6 +648,9 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
     if (sweep.recovered_proofs.length > 0) {
       const recovered = sweep.recovered_proofs.reduce((sum, p) => sum + p.amount, 0);
       info(`Recovered ${recovered} sats from ${sweep.recovered_proofs.length} pending mint(s).`);
+    }
+    for (const collected of summarizeSweep(sweep).collected) {
+      info(`${collected.display} Added ${collected.sats_collected} sats at ${collected.mint}.`);
     }
     for (const expired of expiredMints) {
       info(
@@ -1242,7 +1297,7 @@ function formatPending(p: PendingMint, unchecked?: UncheckedMint): string {
   // mint just declined to confirm.
   return unchecked
     ? `${row}\n    ↳ ${uncheckedPendingNote(unchecked)}`
-    : `${row} — awaiting payment`;
+    : `${row} — not paid yet; awaiting payment`;
 }
 
 function reportUncheckedMints(unchecked: UncheckedMint[]): void {
@@ -1316,6 +1371,22 @@ function summarizeMeltSweep(sweep: MeltReconcileResult) {
  */
 function summarizeSweep(sweep: ReconcileResult) {
   return {
+    pending: sweep.still_pending.map((entry) => ({
+      quote_id: entry.quote_id,
+      mint: entry.mint,
+      amount_sats: entry.amount_sats,
+      display: `Mint quote ${entry.quote_id} is not paid yet.`,
+    })),
+    collected: sweep.outcomes.flatMap((outcome) =>
+      outcome.kind === "minted" || outcome.kind === "restored"
+        ? [{
+            quote_id: outcome.entry.quote_id,
+            mint: outcome.entry.mint,
+            sats_collected: outcome.proofs.reduce((sum, proof) => sum + proof.amount, 0),
+            display: `Mint quote ${outcome.entry.quote_id} was paid and collected.`,
+          }]
+        : []
+    ),
     recovered_count: sweep.recovered_proofs.length,
     recovered_sats: sweep.recovered_proofs.reduce((s, p) => s + p.amount, 0),
     // Additive to `dropped`, which remains the compatibility field for callers

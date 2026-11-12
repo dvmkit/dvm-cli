@@ -112,6 +112,7 @@
     "invalid_endpoint",
     "invalid_flags",
     "invalid_flags_for_rail",
+    "invalid_fund_options",
     "invalid_history_cursor",
     "invalid_history_kind",
     "invalid_identity_name",
