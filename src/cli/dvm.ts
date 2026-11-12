@@ -599,8 +599,9 @@ export function buildProgram(): Command {
     )
     .option(
       "--spt <token>",
-      "Pay by card: the shared payment token (spt_…) your human approved in Stripe Link, or '-' to read it from stdin. Implies --rail stripe; without it, --rail stripe prints the link-cli approval steps"
+      "Pay by card: the shared payment token (spt_…) your human approved in Stripe Link, or '-' to read it from stdin. Implies --rail stripe; without it, --rail stripe offers a card checkout link when supported, otherwise the link-cli approval steps"
     )
+    .option("--no-wait", "Print the card checkout link and exit; re-run to resume and confirm payment")
     .option("--credit-id <id>", "Fund a specific credit id instead of the tracked one")
     .option("--as <name>", "Caller signing identity to sign the funding as")
     .option("--human", "Human-readable output instead of JSON")

@@ -23,6 +23,7 @@ import {
   type ProviderInfo,
   signDvmRequestData,
   signedRequestDomain,
+  shellQuoteArg,
   type StoredCredit,
 } from "@dvmkit/sdk/internal";
 import {
@@ -76,7 +77,7 @@ import {
 import type { CreditFundOptions } from "./options";
 import { listPendingCardFundings } from "../card-credit/journal";
 import { readSecretStdin } from "../secret-input";
-import { info } from "../output";
+import { info, json } from "../output";
 
 /**
  * Load a prepaid balance at one DVM, deliberately.
@@ -90,6 +91,7 @@ import { info } from "../output";
  * pre-check hold on first contact too.
  */
 export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promise<void> {
+  const invocationStartedAt = Date.now();
   const endpoint = resolveCreditEndpoint(dvm);
   const config = loadConfig();
   const signer = resolveSigningIdentity({ as: opts.as, config });
@@ -254,6 +256,9 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
     // resumed intent, whose invoice is already issued and whose rail is
     // already pinned.
     const menu =
+      (stored?.menu && rail === "stripe" && cardSpt === undefined && !pending && !signedPending
+        ? await discoverCreditMenu(transport, endpoint, signer)
+        : undefined) ??
       stored?.menu ??
       ((pending ?? signedPending)
         ? undefined
@@ -303,9 +308,8 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
       creditId:
         pending?.creditId ??
         opts.creditId ??
-        (canRefillStoredCredit(stored)
-          ? stored.creditId
-          : (signedPending?.creditId ?? randomUUID())),
+        signedPending?.creditId ??
+        (canRefillStoredCredit(stored) ? stored.creditId : randomUUID()),
       amountMicro: fundMicro,
       human: opts.human,
       providerInfo,
@@ -319,6 +323,14 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
       ...(maxCashuFeeSats !== undefined ? { maxCashuFeeSats } : {}),
       ...(cardSpt !== undefined ? { cardSpt } : {}),
       cardApprovalSteps: true,
+      cardWait: opts.wait !== false,
+      cardCreditIdExplicit: opts.creditId !== undefined,
+      cardInvocationStartedAt: invocationStartedAt,
+      ...(signer.source.kind !== "env" ? { cardIdentity: signer.source.name } : {}),
+      cardCheckoutProgress: (handoff) => {
+        if (opts.human) info(String(handoff.display));
+        else json({ op: "fund", endpoint, ...handoff });
+      },
     });
 
     // The verb was asked for a funding. `refused` and `unavailable` both mean
@@ -422,6 +434,7 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
         op: "fund",
         endpoint,
         status: outcome.status,
+        ...(outcome.checkoutHandoff ?? {}),
         credit_id: outcome.creditId,
         fund_id: outcome.fundId,
         ...(resumedNote ? { resumed: resumedNote } : {}),
@@ -504,7 +517,11 @@ function pendingSignedResume(args: {
   stored: StoredCredit | undefined;
   journalled: PendingFunding | undefined;
 }): { creditId: string; amountMicro: number } | undefined {
-  if (args.opts.creditId || args.journalled || canRefillStoredCredit(args.stored)) return undefined;
+  if (args.journalled) return undefined;
+  const card = listPendingCardFundings({ endpoint: args.endpoint, callerPubkey: args.signer.pubkey })
+    .find((entry) => !args.opts.creditId || entry.creditId === args.opts.creditId);
+  if (card?.v === 2) return card;
+  if (args.opts.creditId || canRefillStoredCredit(args.stored)) return undefined;
   const scope = { endpoint: args.endpoint, callerPubkey: args.signer.pubkey };
   return [
     ...listResumableX402Fundings(scope),
@@ -959,8 +976,11 @@ async function enforceTrustTier(args: {
         minimumUsd: `$${formatUsd(lightningMinimum / 1_000_000)}`,
       }
     : undefined;
+  const cardGuidance = args.menu?.stripe?.checkout
+    ? `Pay by card: dvm credit fund ${shellQuoteArg(args.endpoint)} --rail stripe --amount ${shellQuoteArg(`$${formatUsd(args.amountMicro / 1_000_000)}`)}. `
+    : "";
   const walletGuidance = walletFunding
-    ? `Lightning top-ups here start at ${walletFunding.minimumUsd}, above the ${capUsd} this caller can load at the current trust tier. ${walletFunding.text} `
+    ? `${cardGuidance}Lightning top-ups here start at ${walletFunding.minimumUsd}, above the ${capUsd} this caller can load at the current trust tier. ${walletFunding.text} `
     : "";
   throw withHeadroom(
     new DvmError(
@@ -968,11 +988,11 @@ async function enforceTrustTier(args: {
       `Funding ${amountUsd} at ${args.endpoint} would exceed this DVM's ${capUsd} trust-tier cap.`,
       walletFunding
         ? `No money moved. ${walletGuidance}Re-run with --over-trust to fund credit over Lightning anyway, or pre-grant every DVM signed by this builder with 'dvm credit trust ${args.endpoint} <builder-max|$amount>'.`
-        : `Nothing moved. Re-run with --over-trust to fund it anyway, or pre-grant every DVM signed by this builder with 'dvm credit trust ${args.endpoint} <builder-max|$amount>'. Or fund ${capUsd} or less.`,
+        : `Nothing moved. ${cardGuidance}Re-run with --over-trust to fund it anyway, or pre-grant every DVM signed by this builder with 'dvm credit trust ${args.endpoint} <builder-max|$amount>'. Or fund ${capUsd} or less.`,
       {
         display:
           `This agent has only earned ${capUsd} of credit at ${args.endpoint} so far, and ${amountUsd} was asked for.${heldClause} No money moved. ` +
-          walletGuidance +
+          (walletGuidance || cardGuidance) +
           `Loading more than the earned amount is allowed, but it has to be asked for explicitly — re-run with --over-trust, or pre-grant every DVM signed by this builder with 'dvm credit trust ${args.endpoint} <builder-max|$amount>'.`,
         endpoint: args.endpoint,
         amount_micro: args.amountMicro,

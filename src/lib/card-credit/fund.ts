@@ -4,8 +4,9 @@
  *
  * The agent runs `link-cli` itself, because the human's approval can take up to
  * thirty minutes and a signed request lives five. So this leg never pays on its
- * own initiative: without a shared payment token (`spt_…`) it hands back the
- * `link-cli` steps, and with one it does a fresh signed discovery, builds the
+ * own initiative: without a shared payment token (`spt_…`) it offers hosted
+ * checkout when advertised, or hands back the `link-cli` steps. With a token
+ * it does a fresh signed discovery, builds the
  * credential for that challenge, binds its SHA-256 as `fund.commitment`, and
  * presents it once.
  *
@@ -14,6 +15,7 @@
  * DVM's challenge (see ./journal).
  */
 
+import { fundOverCheckout } from "./checkout";
 import { Challenge, Credential } from "mppx";
 import {
   type CreditOpResult,
@@ -33,7 +35,9 @@ import {
   clearPendingCardFunding,
   loadPendingCardFunding,
   type PendingCardFunding,
+  type CardFundingEntry,
   recordPendingCardFunding,
+  retireCheckoutFunding,
   sha256Hex,
 } from "./journal";
 
@@ -94,7 +98,7 @@ export interface CardFundBase {
 }
 
 /** The journalled card top-up for this credit, when one awaits confirmation. */
-export function pendingCardFundingForCredit(args: FundCreditArgs): PendingCardFunding | undefined {
+export function pendingCardFundingForCredit(args: FundCreditArgs): CardFundingEntry | undefined {
   return loadPendingCardFunding(args.ref.endpoint, args.signing.pubkey, args.creditId);
 }
 
@@ -109,6 +113,14 @@ export async function fundOverStripe(
   deps: CardFundDeps
 ): Promise<CreditFundOutcome> {
   const journalled = pendingCardFundingForCredit(args);
+  if (journalled?.v === 2 && !args.cardApprovalSteps) {
+    return approvalNeededOutcome(args, { creditId: journalled.creditId, fundId: journalled.fundId, rail: "stripe" });
+  }
+  if (journalled?.v === 2 || (!journalled && args.menu?.stripe?.checkout &&
+    args.cardSpt === undefined && args.cardApprovalSteps)) {
+    return fundOverCheckout(args, fundId, deps, journalled, async (pending, result) =>
+      booked(args, pending, deps.settled({ creditId: pending.creditId, fundId: pending.fundId, rail: "stripe" }, result)));
+  }
   if (journalled) return resumeCardFunding(args, journalled, deps);
 
   const base: CardFundBase = { creditId: args.creditId, fundId, rail: "stripe" };
@@ -334,15 +346,16 @@ async function present(
 /** Record the outflow and retire the journal. Each step is safe to repeat after a crash. */
 async function booked(
   args: FundCreditArgs,
-  pending: PendingCardFunding,
+  pending: CardFundingEntry,
   outcome: CreditFundOutcome
 ): Promise<CreditFundOutcome> {
   await recordCardSpend(args, pending);
-  clearPendingCardFunding(pending);
+  if (pending.v === 2) await retireCheckoutFunding(pending);
+  else clearPendingCardFunding(pending);
   return {
     ...outcome,
     chargedMicro: pending.amountMicro,
-    display: `${outcome.display} $${usd(pending.amountMicro)} was charged to the card approved in Stripe Link.`,
+    display: `${outcome.display} $${usd(pending.amountMicro)} was charged to the card${pending.v === 1 ? " approved in Stripe Link" : " through checkout"}.`,
     hint: `${outcome.hint ?? ""} Unspent credit goes back to that card, less its share of Stripe's processing fee: 'dvm credit drain ${shellQuoteArg(args.ref.endpoint)} --method stripe'.`.trim(),
   };
 }
@@ -354,7 +367,7 @@ async function booked(
  * caps are in USD, so without a BTC/USD rate the row is recorded at a nominal
  * rate that keeps the USD figure exact, and the label says the sats are not.
  */
-async function recordCardSpend(args: FundCreditArgs, pending: PendingCardFunding): Promise<void> {
+async function recordCardSpend(args: FundCreditArgs, pending: CardFundingEntry): Promise<void> {
   const resolved = (await tryResolveBtcUsdRate())?.rate;
   const known = resolved !== undefined && resolved > 0;
   const rate = known ? resolved : NOMINAL_BTC_USD;
