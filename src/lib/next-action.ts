@@ -1,6 +1,6 @@
 import { guidanceJobArg } from "./provider-output";
 import { answeredYieldSeqs } from "./yield-state";
-import { formatPaymentAmount } from "./currency";
+import { formatPaymentAmount, formatSats } from "./currency";
 import { formatFiat } from "@dvmkit/sdk";
 import type { JobPolicy, Message, PaymentRequestContent } from "@dvmkit/sdk/internal";
 import type { JobRecord } from "./job-store";
@@ -271,6 +271,8 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
         const declineHint = stopping
           ? ` If your human does not approve, run \`dvm decline ${guidanceJobArg(jobId)}\`: ${stopping.clause} Letting the deadline pass also ends the job.`
           : "";
+        const overBudget = !expired && policy && Number.isSafeInteger(c.amount_msats)
+          ? budgetOverrun(policy, context?.totalPaidMsats ?? 0, c.amount_msats) : undefined;
         return {
           type: "pay",
           job_id: jobId,
@@ -280,9 +282,10 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           ...(stopping ? { charged_if_declined_micro: stopping.micro } : {}),
           ...(providerFields.length ? { _provider_fields: providerFields } : {}),
           ...(expiresAtMs !== undefined ? { expires_at_ms: expiresAtMs } : {}),
-          display: withDeadline(stopping ? `${withPeriod(display)} ${stopping.clause}` : display, deadline),
+          display: withDeadline(overBudget || stopping
+            ? [withPeriod(display), overBudget, stopping?.clause].filter(Boolean).join(" ") : display, deadline),
           reason: asProviderText(c.reason),
-          hint: expired ? deadline : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.${declineHint}`, deadline) + thresholdHint,
+          hint: expired ? deadline : overBudget ? withDeadline(overBudgetHint(jobId, overBudget, stopping?.clause), deadline) : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.${declineHint}`, deadline) + thresholdHint,
         };
       }
 
@@ -300,6 +303,29 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
   }
 
   return null;
+}
+
+/**
+ * Why an ask cannot be paid under the job's saved budget, from the same
+ * comparison the payer makes. Exact sats, because a USD budget converted once
+ * at submit can miss by less than one sat.
+ */
+function budgetOverrun(policy: JobPolicy, spentMsats: number, askMsats: number): string | undefined {
+  const totalMsats = spentMsats + askMsats;
+  if (totalMsats <= policy.maxTotalMsats) return undefined;
+  return `This charge would take the job past its budget: ${formatSats(spentMsats)} spent so far plus ` +
+    `${formatSats(askMsats)} asked comes to ${formatSats(totalMsats)}, ${formatSats(totalMsats - policy.maxTotalMsats)} ` +
+    `over the ${formatSats(policy.maxTotalMsats)} budget.`;
+}
+
+// `dvm pay` applies the same budget and nothing raises it on a running job,
+// so the only commands named are ones that work.
+function overBudgetHint(jobId: string, overrun: string, declineClause?: string): string {
+  const job = guidanceJobArg(jobId);
+  return `${overrun} The CLI will not pay it automatically, and \`dvm pay ${job}\` refuses it while this budget stands; ` +
+    "a running job's budget cannot be raised. Relay this to your human. " +
+    `To stop, run \`dvm decline ${job}\`${declineClause ? `: ${declineClause}` : "."} ` +
+    "To get the work, submit a new request with a higher --budget. Waiting again returns this same charge.";
 }
 
 /**
