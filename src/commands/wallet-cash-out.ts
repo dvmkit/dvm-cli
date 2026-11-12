@@ -1,16 +1,16 @@
 /**
- * `dvm wallet cash-out <ln-address>` — move value out of the agent wallet to a
- * Lightning address the operator controls.
+ * `dvm wallet cash-out <destination>` — move value out of the agent wallet to a
+ * Lightning destination the operator controls.
  *
  * The mint operation this uses (NUT-05 melt)
  * is also the one a mint in recovery keeps serving after it has stopped
  * issuing, so this is frequently the only way to move a balance at all.
  *
  * The command is the multi-mint driver; the per-mint melt engine is
- * the SDK's wallet-agent cash-out engine. Each Cashu mint is a separate custodial
+ * the wallet-agent cash-out engine. Each Cashu mint is a separate custodial
  * issuer, so a balance spanning mints cashes out as N Lightning payments, and
  * every mint reports its own outcome — one mint refusing does not fail the
- * command.
+ * command. A fixed invoice is paid once from a single mint.
  */
 
 import {
@@ -30,6 +30,7 @@ import {
   type CashOutQuote,
   spendableAt,
 } from "../lib/wallet-agent/cash-out";
+import { assertInvoiceNotPending, invoiceAmountSats, invoiceDestination } from "../lib/wallet-agent/invoice";
 import { loadConfiguredMints } from "../lib/wallet-agent/mint-inventory";
 import { sweepPendingMelts } from "../lib/wallet-agent/recovery-melt";
 import { sweepPendingMints } from "../lib/wallet-agent/recovery";
@@ -60,7 +61,7 @@ export interface WalletCashOutOptions {
 }
 
 /**
- * Melt agent-wallet proofs to a Lightning address or `lnurl1…` string.
+ * Melt agent-wallet proofs to a Lightning address, `lnurl1…` string, or invoice.
  *
  * Mint order is largest balance first, so the fewest Lightning payments cover
  * the request. With `--amount`, each mint contributes what it can and the
@@ -73,13 +74,24 @@ export async function walletCashOut(
 ): Promise<void> {
   const human = opts.human ?? false;
 
-  if ((opts.amount === undefined) === (opts.all !== true)) {
+  const bolt11 = invoiceDestination(destination);
+  if (bolt11 && (opts.amount !== undefined || opts.all === true || opts.sats === true)) {
+    throw new DvmError(
+      "invalid_flags",
+      "The invoice fixes the amount; --amount, --all, and --sats cannot be used with it. No money moved.",
+      "Run `dvm wallet cash-out <invoice>` without --amount, --all, or --sats."
+    );
+  }
+
+  if (!bolt11 && (opts.amount === undefined) === (opts.all !== true)) {
     throw new DvmError(
       "invalid_flags",
       "Pass exactly one of --amount <amount> or --all.",
       "`--amount 1000` sends 1000 sats and draws the fees on top; `--all` empties the wallet, with fees coming out of the balance."
     );
   }
+
+  const invoiceSats = bolt11 ? invoiceAmountSats(bolt11) : undefined;
 
   await loadConfiguredMints();
   const wallet = loadAgentWallet();
@@ -97,13 +109,14 @@ export async function walletCashOut(
   await sweepPendingMints().catch(() => undefined);
   await sweepPendingMelts().catch(() => undefined);
   const fresh = loadAgentWallet() ?? wallet;
+  if (bolt11) assertInvoiceNotPending(fresh, bolt11);
 
   const requested = opts.amount ? await resolveFundingAmountSats(opts.amount, opts.sats) : null;
   const maxFeeSats = parseMaxFee(opts.maxFee);
 
   // Fail on a typo'd destination before any proof is committed. LNURL-pay
   // metadata is a cheap GET; a melt quote is not.
-  await validateLnAddress(destination);
+  if (!bolt11) await validateLnAddress(destination);
 
   const mints = resolveMints(fresh, opts.mint);
   if (mints.length === 0) {
@@ -117,9 +130,9 @@ export async function walletCashOut(
   }
 
   if (human) {
-    const what = requested ? describeAmount(requested) : "everything";
+    const what = bolt11 ? "the invoice amount" : requested ? describeAmount(requested) : "everything";
     info(
-      `Cashing out ${what} to ${destination} across ${mints.length} mint(s)${opts.dryRun ? " (dry run — nothing will be paid)" : ""}…`
+      `Cashing out ${what} to ${destination}${bolt11 ? " from one mint" : ` across ${mints.length} mint(s)`}${opts.dryRun ? " (dry run — nothing will be paid)" : ""}…`
     );
   }
 
@@ -131,6 +144,7 @@ export async function walletCashOut(
       mintUrl,
       target: requested ? { kind: "exact", sats: remaining } : { kind: "all" },
       destination,
+      bolt11,
       maxFeeSats,
       dryRun: opts.dryRun,
       onQuote: (quote) => {
@@ -138,6 +152,9 @@ export async function walletCashOut(
       },
     });
     outcomes.push(outcome);
+    // A fixed invoice is one payment. Never retry elsewhere after a melt attempt,
+    // even after rollback: only pre-commit refusals are safe to route onward.
+    if (bolt11 && (outcome.kind !== "skipped" && !(outcome.kind === "failed" && !outcome.quote))) break;
     if (requested && (outcome.kind === "sent" || outcome.kind === "quoted")) {
       remaining -= outcome.quote.amount_sats;
     }
@@ -169,7 +186,7 @@ export async function walletCashOut(
 
   const status = opts.dryRun ? "quoted" : sentSats > 0 ? "cashed_out" : "nothing_sent";
   const display = opts.dryRun
-    ? `Quoted ${quotedSats} sats to ${destination} across ${rows.length} mint(s). Nothing was paid.`
+    ? `Quoted ${quotedSats} sats to ${destination}${bolt11 ? " from one mint" : ` across ${rows.length} mint(s)`}. Nothing was paid.`
     : sentSats > 0
       ? `Sent ${sentSats} sats to ${destination}${feeSats > 0 ? `, plus ${feeSats} sats in fees` : ""}${shortfall > 0 ? ` — ${shortfall} sats short of what you asked for` : ""}.`
       : `Nothing was sent to ${destination}.`;
@@ -194,7 +211,7 @@ export async function walletCashOut(
       status,
       destination,
       ...(requested ? amountSourceFields(requested) : { source_currency: "sats" }),
-      requested_sats: requested?.sats ?? null,
+      requested_sats: requested?.sats ?? invoiceSats ?? null,
       sats_sent: sentSats,
       fee_sats: feeSats,
       change_sats: changeSats,
@@ -211,7 +228,11 @@ export async function walletCashOut(
   if (!opts.dryRun && sentSats === 0) {
     throw new DvmError(
       "cash_out_failed",
-      `No mint could pay ${destination}.`,
+      bolt11 && outcomes.every((o) => o.kind === "skipped" && o.reason === "fees_exceed_balance")
+        ? "No single mint could cover this invoice and its fees. No money moved; invoice payments cannot be split across mints."
+        : bolt11 && unresolved.length === 0
+          ? outcomes.map((o) => "message" in o ? o.message : "").filter(Boolean).join(" ")
+          : `No mint could pay ${destination}.`,
       unresolved.length > 0
         ? "At least one melt's outcome is unknown — run `dvm wallet show` to reconcile it against the mint before retrying."
         : "See the per-mint reasons above. `dvm wallet mint-health` reports whether a mint is currently able to melt."

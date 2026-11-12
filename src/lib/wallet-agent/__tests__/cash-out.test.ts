@@ -1,6 +1,8 @@
 vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
  ...(await importOriginal<typeof import("@dvmkit/sdk/internal")>()),
  loadAgentWallet: vi.fn(),
+ validateLnAddress: vi.fn(),
+ fetchLnurlPayInvoice: vi.fn(),
 saveAgentWallet: vi.fn(),
 withWalletLock: vi.fn(<T>(fn: () => Promise<T> | T) => Promise.resolve(fn())),
 fetchMeltQuote: vi.fn(),
@@ -8,6 +10,16 @@ getInputFeesForProofs: vi.fn(),
 getWallet: vi.fn(),
 serializeOutputData: (data: unknown[]) => data
 }));
+vi.mock("../mint-inventory", () => ({ loadConfiguredMints: vi.fn() }));
+vi.mock("../recovery", () => ({ sweepPendingMints: vi.fn().mockResolvedValue({}) }));
+vi.mock("../recovery-melt", () => ({ sweepPendingMelts: vi.fn().mockResolvedValue({}) }));
+vi.mock("../../output", () => ({ info: vi.fn(), json: vi.fn() }));
+import { walletCashOut } from "../../../commands/wallet-cash-out";
+import { getWallet, validateLnAddress, fetchLnurlPayInvoice } from "@dvmkit/sdk/internal";
+import { CASH_OUT_INVOICE, EXPIRED_INVOICE, invoiceHeader } from "../../../../test/support/lightning-invoices";
+import { sweepPendingMelts } from "../recovery-melt";
+import { info } from "../../output";
+import { json } from "../../output";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@cashu/cashu-ts", async (importOriginal) => ({ ...(await importOriginal<typeof import("@cashu/cashu-ts")>()), ...(() => ({
@@ -542,4 +554,237 @@ describe("cashOutFromMint melt amount bounds", () => {
 
     expect(outcome).toMatchObject({ kind: "sent" });
   });
+});
+
+
+describe("invoice cash-out", () => {
+  const invoice = CASH_OUT_INVOICE;
+  let cashuWallet: ReturnType<typeof makeCashuWallet>;
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-12T12:00:00Z"));
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 64)]));
+    stubQuotes(2, [{ amount: 60, feeReserve: 2 }]);
+    cashuWallet = makeCashuWallet();
+    vi.mocked(getWallet).mockResolvedValue(cashuWallet as never);
+  });
+
+  it.each(["recipient@example.com", "lnurl1destination", "lnbcfan@example.com", "lntbot@example.com"])("keeps LNURL resolution for %s", async (destination) => {
+    vi.mocked(fetchLnurlPayInvoice).mockResolvedValue("lnbc600n1resolved");
+    await walletCashOut(destination, { amount: "60", sats: true });
+    expect(validateLnAddress).toHaveBeenCalledWith(destination);
+    expect(fetchLnurlPayInvoice).toHaveBeenCalledWith(destination, 60_000);
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an expired melt quote even when the mint returns it", async () => {
+    vi.mocked(fetchMeltQuote).mockResolvedValue({ amountSats: 60, feeReserveSats: 2, rawQuote: { quote: "old", expiry: 1 } as never });
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("No money moved");
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ mints: [expect.objectContaining({ reason: "quote_expired" })] }));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it("refuses an invoice above a mint's cap instead of shrinking it", async () => {
+    cashuWallet = makeCashuWallet({ meltBounds: { max_amount: 50 } });
+    vi.mocked(getWallet).mockResolvedValue(cashuWallet as never);
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("payout limits");
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ mints: [expect.objectContaining({ display: expect.stringContaining("payout limits") })] }));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it("pays the fixed amount without LNURL resolution and records the invoice before committing", async () => {
+    await walletCashOut("LIGHTNING:" + invoice.toUpperCase(), {});
+    expect(validateLnAddress).not.toHaveBeenCalled();
+    expect(fetchMeltQuote).toHaveBeenCalledWith(MINT, invoice);
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(saveAgentWallet).mock.calls[0][0].pending_melts[0]).toMatchObject({
+      bolt11: invoice, amount_sats: 60, input_proofs: [expect.objectContaining({ amount: 64 })],
+    });
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ sats_sent: 60, requested_sats: 60 }));
+  });
+
+  it.each([{ amount: "50" }, { all: true }, { sats: true }])("refuses conflicting flags %j before quoting", async (opts) => {
+    await expect(walletCashOut(invoice, opts)).rejects.toThrow("invoice fixes the amount");
+    expect(fetchMeltQuote).not.toHaveBeenCalled();
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it.each([invoiceHeader("lnbc"), invoiceHeader("lntb600n"), invoiceHeader("lntbs600n"), invoiceHeader("lnbcrt600n")])("refuses a non-payable invoice before any commitment", async (destination) => {
+    await expect(walletCashOut(destination, {})).rejects.toMatchObject({ code: "invalid_invoice", message: expect.stringMatching(/amountless|wrong network/) });
+    expect(fetchMeltQuote).not.toHaveBeenCalled();
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it("refuses a real expired invoice locally even if the mint would quote it", async () => {
+    await expect(walletCashOut(EXPIRED_INVOICE, {})).rejects.toMatchObject({ code: "invalid_invoice", message: expect.stringContaining("expired") });
+    expect(fetchMeltQuote).not.toHaveBeenCalled();
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it("reports the balance and largest replacement invoice without resizing or committing", async () => {
+    stubQuotes(2, [{ amount: 60, feeReserve: 4 }]);
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("No single mint");
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ mints: [expect.objectContaining({
+      display: expect.stringMatching(/64 sat balance.*largest invoice amount.*58 sats/),
+    })] }));
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it("quotes the fixed amount under --dry-run without committing", async () => {
+    await walletCashOut(invoice, { dryRun: true });
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ status: "quoted", requested_sats: 60 }));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it("refuses invoice fees above --max-fee without committing", async () => {
+    await expect(walletCashOut(invoice, { maxFee: "3" })).rejects.toThrow("over the 3 sat cap");
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ mints: [expect.objectContaining({ reason: "fee_cap_exceeded" })] }));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it("uses one mint that covers the invoice when the richest mint cannot cover its fee", async () => {
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 128), proof("b", 64, { mint: OTHER_MINT })]));
+    vi.mocked(fetchMeltQuote).mockImplementation(async (mint) => ({
+      amountSats: 60, feeReserveSats: mint === MINT ? 70 : 2,
+      rawQuote: { quote: "q1", expiry: 1_800_000_000 } as never,
+    }));
+    await walletCashOut(invoice, {});
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(saveAgentWallet).mock.calls[0][0].pending_melts[0].mint).toBe(OTHER_MINT);
+  });
+
+  it("refuses a split even when the combined balance covers the invoice", async () => {
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 32), proof("b", 32, { mint: OTHER_MINT })]));
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("cannot be split");
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it.each(["PENDING", "UNPAID"] as const)("never tries a second mint after a failed melt with state %s", async (quoteState) => {
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 64), proof("b", 64, { mint: OTHER_MINT })]));
+    cashuWallet = makeCashuWallet({ meltError: new Error("connection lost"), quoteState });
+    vi.mocked(getWallet).mockResolvedValue(cashuWallet as never);
+    await expect(walletCashOut(invoice, {})).rejects.toThrow(quoteState === "PENDING" ? "No mint could pay" : "mint confirms the invoice is unpaid");
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(saveAgentWallet).mock.calls[0][0].pending_melts[0]).toMatchObject({ bolt11: invoice, amount_sats: 60 });
+  });
+
+  it("refuses a quote whose amount differs from the signed invoice", async () => {
+    stubQuotes(0, [{ amount: 59, feeReserve: 1 }]);
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("quoted 59 sats for a 60 sat invoice");
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ mints: [expect.objectContaining({ reason: "quote_amount_mismatch" })] }));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it.each(["quote", "fee"])("reports a %s outage without requesting a replacement invoice", async (boundary) => {
+    if (boundary === "quote") vi.mocked(fetchMeltQuote).mockRejectedValue(new Error("mint offline"));
+    else vi.mocked(getInputFeesForProofs).mockRejectedValue(new Error("fee lookup offline"));
+    await expect(walletCashOut(invoice, {})).rejects.toThrow(/offline.*No money moved.*mint-health/);
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ mints: [expect.objectContaining({
+      status: "failed", display: expect.not.stringContaining("replacement invoice"),
+    })] }));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it("recomputes fees as more proofs are selected", async () => {
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 32), proof("b", 32), proof("c", 8)]));
+    vi.mocked(getInputFeesForProofs).mockImplementation(async (_, proofs) => proofs.length * 2);
+
+    await walletCashOut(invoice, {});
+    expect(vi.mocked(saveAgentWallet).mock.calls[0][0].pending_melts[0]).toMatchObject({
+      amount_sats: 60, input_fee_sats: 6, input_proofs: expect.arrayContaining([expect.objectContaining({ secret: "c" })]),
+    });
+    expect(json).toHaveBeenNthCalledWith(1, expect.objectContaining({ input_fee_sats: 6, debit_sats: 72 }));
+  });
+
+  it.each([
+    { balance: 2, reserve: 2, min: 1, max: 100, expected: "No invoice can be paid" },
+    { balance: 64, reserve: 4, min: 59, max: 100, expected: "No invoice can be paid" },
+    { balance: 64, reserve: 4, min: 1, max: 40, expected: "largest invoice amount that fits at the quoted fees is 40 sats" },
+    { balance: 128, reserve: 4, min: 100, max: 120, expected: "largest invoice amount that fits at the quoted fees is 120 sats" },
+  ])("reports a payable replacement within known limits: %j", async ({ balance, reserve, min, max, expected }) => {
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", balance)]));
+    stubQuotes(2, [{ amount: 60, feeReserve: reserve }]);
+    vi.mocked(getWallet).mockResolvedValue(makeCashuWallet({ meltBounds: { min_amount: min, max_amount: max } }) as never);
+    await expect(walletCashOut(invoice, {})).rejects.toThrow(/No single mint|payout limits/);
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ mints: [expect.objectContaining({ display: expect.stringContaining(expected) })] }));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it("returns an empty dry-run quote without throwing and describes one mint in human output", async () => {
+    await walletCashOut(invoice, { dryRun: true, maxFee: "0", human: true });
+    expect(info).toHaveBeenCalledWith(expect.stringContaining("over the 0 sat cap"));
+    expect(info).not.toHaveBeenCalledWith(expect.stringContaining("across"));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it.each(["PENDING", "UNPAID"] as const)("refuses replay while the real sweep retains a %s melt", async (quoteState) => {
+    await walletCashOut(invoice, {});
+    const pending = vi.mocked(saveAgentWallet).mock.calls[0][0].pending_melts[0];
+    vi.mocked(loadAgentWallet).mockReturnValue({ ...walletWith([proof("free", 128)]), pending_melts: [pending] });
+    cashuWallet = makeCashuWallet({ quoteState });
+    vi.mocked(getWallet).mockResolvedValue(cashuWallet as never);
+    const recovery = await vi.importActual<typeof import("../recovery-melt")>("../recovery-melt");
+    vi.mocked(sweepPendingMelts).mockImplementationOnce(() => recovery.sweepPendingMelts());
+    vi.mocked(saveAgentWallet).mockClear();
+    vi.mocked(fetchMeltQuote).mockClear();
+    await expect(walletCashOut("LIGHTNING:" + invoice.toUpperCase(), {})).rejects.toMatchObject({
+      code: "cash_out_pending", message: expect.stringContaining("No money moved"), hint: expect.stringContaining("dvm wallet show"),
+    });
+    expect(cashuWallet.checkMeltQuoteBolt11).toHaveBeenCalled();
+    expect(fetchMeltQuote).not.toHaveBeenCalled();
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+
+  it("refuses a concurrent pending entry at commitment even after preparation succeeds", async () => {
+    await walletCashOut(invoice, {});
+    const pending = vi.mocked(saveAgentWallet).mock.calls[0][0].pending_melts[0];
+    const free = walletWith([proof("free", 128)]);
+    vi.mocked(loadAgentWallet).mockReturnValueOnce(free).mockReturnValue({ ...free, pending_melts: [pending] });
+    vi.mocked(saveAgentWallet).mockClear();
+    cashuWallet.completeMelt.mockClear();
+    await expect(cashOutFromMint({ mintUrl: MINT, target: { kind: "all" }, bolt11: invoice, destination: invoice })).rejects.toMatchObject({ code: "cash_out_pending" });
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+
+  it.each([0, 59_000])("refuses an invoice with %i ms left after melt preparation before committing", async (remainingMs) => {
+    let now = Date.now();
+    vi.mocked(fetchMeltQuote).mockResolvedValue({ amountSats: 60, feeReserveSats: 2, rawQuote: { quote: "q1", expiry: 2_000_000_000 } as never });
+    const preview = await cashuWallet._builder.prepare();
+    cashuWallet._builder.prepare.mockImplementation(async () => {
+      now = 1821536000_000 - remainingMs;
+      return preview;
+    });
+    await expect(cashOutFromMint({ mintUrl: MINT, target: { kind: "all" }, bolt11: invoice, destination: invoice, now: () => now })).rejects.toThrow(/expired|60 seconds/);
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it("refuses an invoice with 59 seconds left before requesting a quote", async () => {
+    vi.mocked(Date.now).mockReturnValue(1821535941_000);
+    await expect(walletCashOut(invoice, {})).rejects.toMatchObject({
+      code: "invalid_invoice", message: expect.stringContaining("No money moved"),
+      hint: expect.stringContaining("dvm wallet cash-out <invoice>"),
+    });
+    expect(fetchMeltQuote).not.toHaveBeenCalled();
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it("applies the expiry margin when the melt engine prepares an invoice directly", async () => {
+    await expect(cashOutFromMint({ mintUrl: MINT, target: { kind: "all" }, bolt11: invoice, destination: invoice, now: () => 1821535941_000 })).rejects.toThrow("60 seconds");
+    expect(fetchMeltQuote).not.toHaveBeenCalled();
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
 });
