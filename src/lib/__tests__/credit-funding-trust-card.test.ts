@@ -32,7 +32,7 @@ vi.mock("../identity", async (original) => ({
   loadConfig: vi.fn(() => ({})),
 }));
 vi.mock("../cli-identity-resolve", () => ({
-  resolveSigningIdentity: () => ({ pubkey: "a".repeat(64), privkey: "1".repeat(64) }),
+  resolveSigningIdentity: () => ({ pubkey: "a".repeat(64), privkey: "1".repeat(64), source: { kind: "env" } }),
 }));
 vi.mock("../credit-fund", async (original) => ({
   ...(await original<typeof import("../credit-fund")>()),

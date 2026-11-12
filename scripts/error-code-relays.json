@@ -805,5 +805,62 @@
       "code"
     ],
     "reason": "Rethrows the first journal or intent-finalisation failure after both steps have run. Local code producers are inventoried separately."
+  },
+  {
+    "file": "lib/card-credit/checkout.ts",
+    "owner": "fundOverCheckout",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ],
+    "reason": "Relays the DVM or transport error; local construction sites are scanned separately."
+  },
+  {
+    "file": "lib/card-credit/checkout.ts",
+    "owner": "fundOverCheckout",
+    "expression": "booked(entry, result)",
+    "path": [
+      "error",
+      "code"
+    ],
+    "alsoPaths": [
+      [
+        "error",
+        "data",
+        "code"
+      ]
+    ],
+    "local": {
+      "file": "lib/card-credit/fund.ts",
+      "name": "booked"
+    },
+    "reason": "Checkout uses the existing local card booking callback; trace its result."
+  },
+  {
+    "file": "lib/card-credit/fund.ts",
+    "owner": "fundOverStripe",
+    "expression": "deps.settled({ creditId: pending.creditId, fundId: pending.fundId, rail: \"stripe\" }, result)",
+    "path": [
+      "error",
+      "code"
+    ],
+    "alsoPaths": [
+      [
+        "error",
+        "data",
+        "code"
+      ]
+    ],
+    "local": {
+      "file": "lib/credit-fund.ts",
+      "name": "settled"
+    },
+    "reason": "Checkout uses the same local settled result callback as token card funding."
   }
 ]

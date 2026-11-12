@@ -1,5 +1,7 @@
 /**
- * The crash journal for card top-ups.
+ * The crash journal for token and hosted-checkout card top-ups.
+ * Checkout entries retain the fund id before session creation and the link
+ * before display, so a resume can book a paid session even after link expiry.
  *
  * A card top-up is presented once and charged by the DVM, so the one window
  * that can cost the caller money is a response lost after the charge. The
@@ -13,6 +15,7 @@
  * values recorded here prove the rebuilt credential is the one already sent.
  */
 
+import lockfile from "proper-lockfile";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -20,16 +23,19 @@ import {
   fsyncSync,
   openSync,
   readdirSync,
+  renameSync,
   linkSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { CONFIG_DIR, ensureConfigSubdir, normalizeCreditEndpoint } from "@dvmkit/sdk/internal";
 
 export const CARD_FUNDINGS_DIR = join(CONFIG_DIR, "card-fundings");
+const RETIRED_CHECKOUTS_DIR = join(CARD_FUNDINGS_DIR, "retired");
+const RETIRED_CHECKOUT_TTL_MS = 24 * 60 * 60 * 1_000;
 
 export interface PendingCardFunding {
   v: 1;
@@ -51,6 +57,125 @@ export interface PendingCardFunding {
   presentedAt: number;
 }
 
+export interface PendingCheckoutFunding {
+  v: 2;
+  endpoint: string;
+  callerPubkey: string;
+  creditId: string;
+  fundId: string;
+  amountMicro: number;
+  targetMicro: number;
+  presentedAt: number;
+  checkout?: { url: string; expires_at: number };
+}
+
+interface RetiredCheckoutFunding {
+  endpoint: string;
+  callerPubkey: string;
+  creditId: string;
+  fundId: string;
+  retiredAt: number;
+}
+
+export type CardFundingEntry = PendingCardFunding | PendingCheckoutFunding;
+
+/** Keep discovery and reservation together; network calls happen after releasing this lock. */
+export async function withCardFundingLock<T>(
+  scope: { endpoint: string; callerPubkey: string },
+  reserve: () => T
+): Promise<T> {
+  ensureConfigSubdir(CARD_FUNDINGS_DIR);
+  const key = sha256Hex(`${normalizeCreditEndpoint(scope.endpoint)}\n${scope.callerPubkey}`);
+  const release = await lockfile.lock(join(CARD_FUNDINGS_DIR, `scope-${key}`), {
+    realpath: false,
+    stale: 30_000,
+    retries: { retries: 100, factor: 1, minTimeout: 50, maxTimeout: 50 },
+  });
+  try {
+    return reserve();
+  } finally {
+    await release();
+  }
+}
+
+/** Call under the scope lock so a stale discovery cannot miss a completed intent. */
+export function checkoutRetiredSince(
+  scope: { endpoint: string; callerPubkey: string },
+  startedAt: number
+): RetiredCheckoutFunding | undefined {
+  const endpoint = normalizeCreditEndpoint(scope.endpoint);
+  return recentCheckoutRetirements()
+    .filter((entry) => normalizeCreditEndpoint(entry.endpoint) === endpoint &&
+      entry.callerPubkey === scope.callerPubkey && entry.retiredAt > startedAt)
+    .sort((a, b) => b.retiredAt - a.retiredAt)[0];
+}
+
+export async function retireCheckoutFunding(entry: PendingCheckoutFunding): Promise<void> {
+  await withCardFundingLock(entry, () => {
+    if (loadPendingCardFunding(entry.endpoint, entry.callerPubkey, entry.creditId)?.fundId !== entry.fundId) return;
+    const previous = recentCheckoutRetirements().find((retired) =>
+      normalizeCreditEndpoint(retired.endpoint) === normalizeCreditEndpoint(entry.endpoint) &&
+      retired.callerPubkey === entry.callerPubkey && retired.creditId === entry.creditId && retired.fundId === entry.fundId);
+    ensureConfigSubdir(RETIRED_CHECKOUTS_DIR);
+    const retired: RetiredCheckoutFunding = previous ?? {
+      endpoint: entry.endpoint, callerPubkey: entry.callerPubkey,
+      creditId: entry.creditId, fundId: entry.fundId, retiredAt: Date.now(),
+    };
+    const key = sha256Hex(`${normalizeCreditEndpoint(entry.endpoint)}\n${entry.callerPubkey}\n${entry.creditId}\n${entry.fundId}`);
+    // Commit the fence before removing the resumable intent, including across a crash.
+    writeSyncedJson(join(RETIRED_CHECKOUTS_DIR, `${key}.json`), retired);
+    fsyncDirectory(CARD_FUNDINGS_DIR);
+    clearPendingCardFunding(entry);
+    fsyncDirectory(CARD_FUNDINGS_DIR);
+  });
+}
+
+function recentCheckoutRetirements(): RetiredCheckoutFunding[] {
+  if (!existsSync(RETIRED_CHECKOUTS_DIR)) return [];
+  const entries: RetiredCheckoutFunding[] = [];
+  let pruned = false;
+  for (const name of readdirSync(RETIRED_CHECKOUTS_DIR).filter((name) => name.endsWith(".json"))) {
+    const path = join(RETIRED_CHECKOUTS_DIR, name);
+    let parsed: Partial<RetiredCheckoutFunding>;
+    try {
+      parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RetiredCheckoutFunding>;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (!parsed || typeof parsed.endpoint !== "string" || typeof parsed.callerPubkey !== "string" ||
+      typeof parsed.creditId !== "string" || typeof parsed.fundId !== "string" ||
+      typeof parsed.retiredAt !== "number" || !Number.isSafeInteger(parsed.retiredAt)) {
+      throw new Error("Invalid checkout retirement record");
+    }
+    if (parsed.retiredAt <= Date.now() - RETIRED_CHECKOUT_TTL_MS) {
+      rmSync(path, { force: true });
+      pruned = true;
+    } else entries.push(parsed as RetiredCheckoutFunding);
+  }
+  if (pruned) fsyncDirectory(RETIRED_CHECKOUTS_DIR);
+  return entries;
+}
+
+export function updatePendingCheckout(entry: PendingCheckoutFunding): void {
+  const path = entryPath(entry.endpoint, entry.callerPubkey, entry.creditId);
+  if (readEntry(path)?.fundId !== entry.fundId) throw new Error("Checkout journal changed during funding");
+  writeSyncedJson(path, entry);
+}
+
+function writeSyncedJson(path: string, value: unknown): void {
+  const temp = `${path}.${String(process.pid)}.tmp`;
+  const fd = openSync(temp, "w", 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(value, null, 2) + "\n");
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(temp, path);
+  fsyncDirectory(dirname(path));
+}
+
 export function sha256Hex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -62,7 +187,7 @@ export function sha256Hex(value: string): string {
  * each other's record. The entry is complete on disk before it appears under
  * its name (hard link of a synced temp file), so a reader never sees half.
  */
-export function recordPendingCardFunding(entry: PendingCardFunding): boolean {
+export function recordPendingCardFunding(entry: CardFundingEntry): boolean {
   ensureConfigSubdir(CARD_FUNDINGS_DIR);
   const target = entryPath(entry.endpoint, entry.callerPubkey, entry.creditId);
   const temp = `${target}.${String(process.pid)}.${entry.fundId}.tmp`;
@@ -97,7 +222,7 @@ export function loadPendingCardFunding(
   endpoint: string,
   callerPubkey: string,
   creditId: string
-): PendingCardFunding | undefined {
+): CardFundingEntry | undefined {
   return readEntry(entryPath(endpoint, callerPubkey, creditId));
 }
 
@@ -105,14 +230,14 @@ export function loadPendingCardFunding(
 export function listPendingCardFundings(scope: {
   endpoint: string;
   callerPubkey: string;
-}): PendingCardFunding[] {
+}): CardFundingEntry[] {
   if (!existsSync(CARD_FUNDINGS_DIR)) return [];
   const endpoint = normalizeCreditEndpoint(scope.endpoint);
   return readdirSync(CARD_FUNDINGS_DIR)
     .filter((name) => name.endsWith(".json"))
     .map((name) => readEntry(join(CARD_FUNDINGS_DIR, name)))
     .filter(
-      (entry): entry is PendingCardFunding =>
+      (entry): entry is CardFundingEntry =>
         entry !== undefined &&
         normalizeCreditEndpoint(entry.endpoint) === endpoint &&
         entry.callerPubkey === scope.callerPubkey
@@ -141,25 +266,26 @@ function entryPath(endpoint: string, callerPubkey: string, creditId: string): st
   return join(CARD_FUNDINGS_DIR, `${key}.json`);
 }
 
-function readEntry(path: string): PendingCardFunding | undefined {
+function readEntry(path: string): CardFundingEntry | undefined {
   if (!existsSync(path)) return undefined;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<PendingCardFunding>;
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Omit<PendingCardFunding, "v"> & Omit<PendingCheckoutFunding, "v">> & { v?: number };
     if (
-      parsed.v !== 1 ||
+      (parsed.v !== 1 && parsed.v !== 2) ||
       typeof parsed.endpoint !== "string" ||
       typeof parsed.callerPubkey !== "string" ||
       typeof parsed.creditId !== "string" ||
       typeof parsed.fundId !== "string" ||
       typeof parsed.amountMicro !== "number" ||
-      typeof parsed.challenge !== "string" ||
-      typeof parsed.sptSha256 !== "string" ||
-      typeof parsed.commitment !== "string" ||
+      (parsed.v === 1 && (typeof parsed.challenge !== "string" ||
+        typeof parsed.sptSha256 !== "string" || typeof parsed.commitment !== "string")) ||
+      (parsed.v === 2 && parsed.checkout !== undefined &&
+        (typeof parsed.checkout.url !== "string" || !Number.isFinite(parsed.checkout.expires_at))) ||
       typeof parsed.presentedAt !== "number"
     ) {
       return undefined;
     }
-    return parsed as PendingCardFunding;
+    return parsed as CardFundingEntry;
   } catch {
     return undefined;
   }

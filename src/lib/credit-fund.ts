@@ -16,7 +16,7 @@ import {
 
 import { randomUUID } from "crypto";
 import { walletInvoiceFundingAdvice } from "./credit-wallet-funding";
-import { sha256hex } from "@dvmkit/sdk/internal";
+import { sha256hex, shellQuoteArg } from "@dvmkit/sdk/internal";
 import { Challenge, Credential } from "mppx";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -262,6 +262,8 @@ export interface CreditRailPick {
 export type CreditFundStatus =
   /** The credit was funded (or a replay confirmed it already had been). */
   | "funded"
+  /** A durable hosted card session awaits payment or confirmation. */
+  | "checkout_pending"
   /**
    * The money left the Lightning wallet and is recorded, but the DVM hadn't
    * observed settlement by the time we stopped asking. Crediting is
@@ -275,6 +277,7 @@ export type CreditFundStatus =
 
 export interface CreditFundOutcome {
   status: CreditFundStatus;
+  checkoutHandoff?: Record<string, unknown>;
   /** The rail actually used, when one was. */
   rail?: CreditFundRail;
   creditId: string;
@@ -417,6 +420,12 @@ export interface FundCreditArgs {
    * it; an automatic refill just reports that a human has to approve.
    */
   cardApprovalSteps?: boolean;
+  cardWait?: boolean;
+  cardCreditIdExplicit?: boolean;
+  cardInvocationStartedAt?: number;
+  /** Public named caller selector to preserve in checkout resume commands. */
+  cardIdentity?: string;
+  cardCheckoutProgress?: (handoff: Record<string, unknown>) => void;
   /** Test seam for the card leg's resend backoff. */
   cardSleep?: (ms: number) => Promise<void>;
   /** Test seam around mppx's challenge-aware fetch lifecycle. */
@@ -590,7 +599,7 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
   };
 
   if (args.rail && pick.order.length === 0) {
-    const hint = forcedRailHint(args, args.rail);
+    const hint = cardCheckoutAlternative(args) + forcedRailHint(args, args.rail);
     const walletFunding = args.rail === "lightning" &&
       (!args.menu || args.menu.funding.includes("lightning"))
       ? walletInvoiceFundingAdvice(args.amountMicro)
@@ -643,7 +652,7 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
       ...railFields,
       status: "unavailable",
       display: unavailableDisplay(args),
-      hint: "Fund the agent's Cashu wallet ('dvm wallet fund'), connect a Lightning wallet ('dvm wallet connect', with the connection string piped in), or connect Tempo ('dvm wallet tempo-connect') when the DVM offers that rail.",
+      hint: cardCheckoutAlternative(args) + "Fund the agent's Cashu wallet ('dvm wallet fund'), connect a Lightning wallet ('dvm wallet connect', with the connection string piped in), or connect Tempo ('dvm wallet tempo-connect') when the DVM offers that rail.",
     }
   );
 }
@@ -3425,6 +3434,7 @@ async function fundOverLightning(
         ...base,
         status: "unavailable",
         display: "No Lightning wallet is connected, so the credit can't be funded that way.",
+        ...(args.menu?.stripe?.checkout ? { hint: cardCheckoutAlternative(args) + walletInvoiceFundingAdvice(args.amountMicro).text } : {}),
       };
     }
 
@@ -4277,6 +4287,12 @@ function budgetRefusal(
       `${display} Nothing was charged, and any prepaid balance already at this DVM keeps working.`.trim(),
     hint: mapped?.hint,
   };
+}
+
+function cardCheckoutAlternative(args: FundCreditArgs): string {
+  return args.menu?.stripe?.checkout
+    ? `Pay by card: dvm credit fund ${shellQuoteArg(args.ref.endpoint)} --rail stripe --amount ${shellQuoteArg(`$${formatUsd(args.amountMicro / 1_000_000)}`)}. `
+    : "";
 }
 
 /**

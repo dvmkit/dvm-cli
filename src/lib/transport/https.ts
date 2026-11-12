@@ -1525,6 +1525,7 @@ function withCreditErrorContext(err: DvmError, body: Record<string, unknown>): D
   }
   const menu = parseCreditMenu(body.credit);
   if (menu) extra.credit = menu;
+  if (Number.isSafeInteger(body.stripe_status)) extra.stripe_status = body.stripe_status;
   const lightning = parseLightningOffer(body.lightning);
   if (lightning) extra.lightning = lightning;
   // The ids the retry must re-state verbatim: a funding is idempotent on
@@ -1542,6 +1543,7 @@ function withCreditErrorContext(err: DvmError, body: Record<string, unknown>): D
   // holds the credit in `blocking_drain_id`, which the CLI adopts and polls.
   for (const key of [
     "reason",
+    "cause",
     "stripe_error_code",
     "decline_code",
     "blocking_drain_id",

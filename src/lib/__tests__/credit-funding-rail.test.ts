@@ -14,7 +14,7 @@ vi.mock("@dvmkit/sdk/internal", async (original) => ({
   loadReceipts: vi.fn(() => []),
 }));
 vi.mock("../identity", async (original) => ({ ...(await original<typeof import("../identity")>()), loadConfig: () => ({}) }));
-vi.mock("../cli-identity-resolve", () => ({ resolveSigningIdentity: () => ({ pubkey: "a".repeat(64), privkey: "1".repeat(64) }) }));
+vi.mock("../cli-identity-resolve", () => ({ resolveSigningIdentity: () => ({ pubkey: "a".repeat(64), privkey: "1".repeat(64), source: { kind: "env" } }) }));
 vi.mock("../credit-fund", async (original) => ({ ...(await original<typeof import("../credit-fund")>()), fundCredit: fund }));
 vi.mock("../credit-per-dvm", async (original) => ({ ...(await original<typeof import("../credit-per-dvm")>()), reconcilePerDvmIdentity: vi.fn() }));
 vi.mock("../credit/shared", async (original) => ({
