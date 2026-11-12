@@ -1,6 +1,6 @@
 import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
-import { computeNextAction, paymentInFlightHint, pollNextAction, type NextAction, type PaymentPolicyContext } from "./next-action";
+import { computeNextAction, paymentCountHint, paymentInFlightHint, pollNextAction, type NextAction, type PaymentPolicyContext } from "./next-action";
 import type { JobBudgetPolicy } from "./job-budget";
 import {
   asProviderText,
@@ -145,7 +145,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     let result: PaymentResult;
     try {
       result = await handlePaymentRequest(jobId, pending.request, policy, transport, provider, {
-        jobToken, requestSeq: pending.authorization.request_seq,
+        jobToken, requestSeq: pending.authorization.request_seq, useStoredPolicy: true,
       });
     } catch (error) {
       if (error instanceof DvmError && error.code === "payment_settling")
@@ -273,14 +273,15 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       }
       if (lastYield?.type === "payment-request" && lastYield.seq === pendingPayment?.seq && policy && !declined()) {
         const req = lastYield.content;
+        const activePolicy = persistLocalState ? loadJob(jobId)?.policy ?? policy : policy;
         if (
-          req.amount_msats <= policy.autoPayBelowMsats &&
-          (policy.maxIncrementMsats === 0 || req.amount_msats <= policy.maxIncrementMsats)
+          req.amount_msats <= activePolicy.autoPayBelowMsats &&
+          (activePolicy.maxIncrementMsats === 0 || req.amount_msats <= activePolicy.maxIncrementMsats)
         ) {
           let result: PaymentResult;
           try {
             result = await handlePaymentRequest(jobId, req, policy, transport, provider, {
-              jobToken, requestSeq: lastYield.seq,
+              jobToken, requestSeq: lastYield.seq, useStoredPolicy: true,
             });
           } catch (error) {
             if (error instanceof DvmError && ["payment_settling", "payment_unconfirmed"].includes(error.code)) {
@@ -305,7 +306,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
             throw new DvmError(
               "payment_cap_exceeded",
               "Job has reached its maximum payment count.",
-              `The provider has sent more payment-requests than --max-payments allows. Inspect with 'dvm messages ${jobId}' and 'dvm cancel ${jobId}' if unintended. Raise with '--max-payments ${cap + 1}' or investigate why this provider is asking for many small payments.`,
+              paymentCountHint(jobId, cap),
               {
                 anchor: "max_payments_exceeded",
                 display: `Payment cap reached (${cap} payment${cap === 1 ? "" : "s"})`,
@@ -399,6 +400,6 @@ function findLastYield(messages: Message[]): Message | undefined {
 }
 
 function budgetContext(policy: JobBudgetPolicy, job: JobRecord | null): PaymentPolicyContext {
-  return { policy, totalPaidMsats: job?.totalPaidMsats, paidUsdMicro: job?.paidUsdMicro, paidUsdMsats: job?.paidUsdMsats,
+  return { policy: job?.policy ?? policy, paymentsHonoured: job?.paymentsHonoured, totalPaidMsats: job?.totalPaidMsats, paidUsdMicro: job?.paidUsdMicro, paidUsdMsats: job?.paidUsdMsats,
     budgetRefusals: job?.budgetRefusals };
 }

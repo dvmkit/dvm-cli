@@ -40,7 +40,7 @@ import {
   withJobTokenRedaction,
 } from "../lib/job-access";
 import { loadMessages } from "../lib/messages";
-import { isTerminalJobStatus, overBudgetHint } from "../lib/next-action";
+import { isTerminalJobStatus, overBudgetHint, paymentCountHint } from "../lib/next-action";
 import { describeBudgetOverrun } from "../lib/job-budget";
 import { JOB_READ_TIMEOUT_MS, pendingPaymentRequest, reconcileInFlightPaymentRequest } from "../lib/yield-state";
 import { applyMintPin } from "../lib/mint-pin";
@@ -56,6 +56,8 @@ import { formatMessageHuman, serializeMessageForOutput } from "./messages";
 
 export interface PayOptions extends JobAccessOptions {
   human?: boolean;
+  /** Human-approved replacement for the job's total spending cap. */
+  budget?: string;
   /** Timeout in seconds for streaming (default: 30) */
   timeout?: string;
   /**
@@ -178,13 +180,18 @@ async function payWithAccess(
     requestSeq,
     approval: "explicit",
     creditRecoveryOnly: pending !== undefined,
+    budget: opts.budget,
+    useStoredPolicy: true,
   });
 
   if (result === "over-budget") {
     transport.close();
     const refusal = requestSeq === undefined ? undefined : loadJob(jobId)?.budgetRefusals?.[String(requestSeq)];
+    const current = loadJob(jobId);
+    const countHint = current?.policy && (current.paymentsHonoured ?? 0) >= current.policy.maxPayments
+      ? paymentCountHint(jobId, current.policy.maxPayments) : undefined;
     throw new DvmError("over_budget", "Payment would exceed the job's budget.",
-      refusal ? overBudgetHint(jobId, describeBudgetOverrun(refusal, stored.policy)) : undefined);
+      countHint ?? (refusal ? overBudgetHint(jobId, describeBudgetOverrun(refusal, loadJob(jobId)?.policy)) : undefined));
   }
 
   if (result === "payment-cap-exceeded") {
@@ -193,7 +200,7 @@ async function payWithAccess(
     throw new DvmError(
       "payment_cap_exceeded",
       "Job has reached its maximum payment count.",
-      `The provider has sent more payment-requests than --max-payments allows. Inspect with 'dvm messages ${jobId}' and 'dvm cancel ${jobId}' if unintended. Raise with '--max-payments ${cap + 1}' or investigate why this provider is asking for many small payments.`,
+      paymentCountHint(jobId, cap),
       {
         anchor: "max_payments_exceeded",
         display: `Payment cap reached (${cap} payment${cap === 1 ? "" : "s"})`,
@@ -217,7 +224,7 @@ async function payWithAccess(
     jobId,
     transport,
     provider: ref,
-    policy: stored.policy,
+    policy: loadJob(jobId)?.policy ?? stored.policy,
     afterSeq,
     timeoutMs,
     jobToken,

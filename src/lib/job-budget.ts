@@ -8,6 +8,8 @@ import { formatSats } from "./currency";
  */
 export interface JobBudgetPolicy extends JobPolicy {
   maxTotalUsdMicro?: number;
+  /** False means the increment follows the total; absent on older saved policies. */
+  maxIncrementExplicit?: boolean;
 }
 
 /** The spend counters a budget check reads from a job record. */
@@ -115,7 +117,7 @@ export function describeBudgetOverrun(verdict: BudgetOverrun, policy?: JobBudget
     : figures.every((msats) => msats % 1000 === 0) ? formatSats : (msats: number) => `${msats.toLocaleString("en-US")} msats`;
   // A dollar budget held to sats: say which dollar figure those sats stand for.
   const declared = verdict.unit === "msats" && policy?.maxTotalUsdMicro !== undefined
-    ? ` (your ${formatUsdMicro(policy.maxTotalUsdMicro)} budget, converted to sats when the job started)` : "";
+    ? ` (your ${formatUsdMicro(policy.maxTotalUsdMicro)} budget, converted to sats when the budget was set)` : "";
   return `This charge would take the job past its budget: ${format(verdict.spent)} spent so far plus ` +
     `${format(verdict.ask)} asked comes to ${format(verdict.total)}, ${format(verdict.total - verdict.cap)} ` +
     `over the ${format(verdict.cap)} budget${declared}.`;

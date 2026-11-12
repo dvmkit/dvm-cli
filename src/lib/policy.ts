@@ -38,7 +38,7 @@ export function buildPolicy(
   // Keep a dollar budget in dollars too, so dollar-priced asks are held to the
   // figure the caller approved rather than its one-time sat conversion.
   const maxTotalUsdMicro = opts.budget?.trim().startsWith("$") ? dollarLimitMicro(opts.budget) : undefined;
-  return { maxTotalMsats, autoPayBelowMsats, maxIncrementMsats, maxPayments: opts.maxPayments,
+  return { maxTotalMsats, autoPayBelowMsats, maxIncrementMsats, maxPayments: opts.maxPayments, maxIncrementExplicit: opts.maxIncrement !== undefined,
     ...(maxTotalUsdMicro !== undefined && Number.isSafeInteger(Number(maxTotalUsdMicro))
       ? { maxTotalUsdMicro: Number(maxTotalUsdMicro) } : {}) };
 }

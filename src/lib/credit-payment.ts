@@ -178,8 +178,10 @@ export async function tryCreditPayment(args: {
   const amountMsats = Math.max(1, usdToMsats(ask.amount_micro / 1_000_000, rate));
   if (!Number.isSafeInteger(amountMsats)) return false;
   const budgetAsk = { msats: amountMsats, usdMicro: usdMicro(ask.amount_micro, ask.currency), rate };
-  if ((args.policy.maxIncrementMsats > 0 && amountMsats > args.policy.maxIncrementMsats) ||
-      !budgetVerdict(args.policy, job, budgetAsk).fits)
+  const budget = budgetVerdict(args.policy, job, budgetAsk);
+  const explicitIncrement = args.policy.maxIncrementExplicit ?? args.policy.maxIncrementMsats !== args.policy.maxTotalMsats;
+  if ((args.policy.maxIncrementMsats > 0 && amountMsats > args.policy.maxIncrementMsats &&
+      (explicitIncrement || budget.unit !== "usd")) || !budget.fits)
     throw new DvmError("over_budget", "The exact balance charge would exceed this job's budget.");
   if (amountMsats > args.policy.autoPayBelowMsats) return false;
   const selectedBinding = binding;

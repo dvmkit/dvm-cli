@@ -1,5 +1,5 @@
 import { hasPendingAcceptedJobAccess } from "./submission-evidence";
-import { askUsdMicro, budgetVerdict, dollarBoundUsdMicro, usdMicro, type BudgetOverrun, type JobBudgetPolicy } from "./job-budget";
+import { askUsdMicro, describeBudgetOverrun, formatUsdMicro, budgetVerdict, dollarBoundUsdMicro, usdMicro, type BudgetOverrun, type JobBudgetPolicy } from "./job-budget";
 import { withJobPaymentLock } from "./payment-lock";
 import { loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest, settleRecordedPayments } from "./yield-state";
 import { finishBookedSubmission, midJobSpendLabel } from "./taken-payment";
@@ -29,6 +29,7 @@ import {
 import { getEncodedToken } from "@cashu/cashu-ts";
 import {
   addPayment,
+  updateJob,
   recordBudgetRefusal,
   clearPaymentRequestInFlight,
   loadJob,
@@ -56,7 +57,8 @@ import {
 } from "./wallet-agent/spend";
 import { sweepPendingSubmissions } from "./wallet-agent/recovery-submissions";
 import { enforceGlobalBudget, recordSpend } from "./budget-ledger";
-import { tryResolveBtcUsdRate } from "./btc-rate";
+import { buildPolicy } from "./policy";
+import { resolveBtcUsdRate, tryResolveBtcUsdRate } from "./btc-rate";
 
 import { withAgentWalletPaymentRetry } from "./agent-wallet-retry";
 import { dvmFetch } from "./http";
@@ -64,7 +66,7 @@ import { applyMintPin } from "./mint-pin";
 import { assertTempoChallengeNetwork, resolveTempoNetworkSelection } from "./tempo-network";
 import { captureDrawFundingReceipts } from "./draw-funding";
 import { loadRequestIntent } from "./request-intent-store";
-import { heldPaymentResendable, paymentInFlightHint, pollNextAction, unresendablePaymentHint } from "./next-action";
+import { heldPaymentResendable, overBudgetHint, paymentInFlightHint, pollNextAction, unresendablePaymentHint } from "./next-action";
 import { guidanceJobArg, providerFields } from "./provider-output";
 
 export interface PaidPaymentResult {
@@ -89,28 +91,79 @@ export async function handlePaymentRequest(
   provider: ProviderRef,
   // `jobToken` is the anonymous-flow per-job token threaded into
   // every `payment` `sendMessage`.
-  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean }
+  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean; budget?: string; useStoredPolicy?: boolean }
 ): Promise<PaymentResult> {
   const seq = opts?.requestSeq;
   // An explicit `dvm pay` on an ask blocked from automatic payment is a
   // replacement attempt: its errors are about the new payment.
   let replacing = false;
-  return withJobPaymentLock(jobId, (assertOwned) => {
+  let budgetSaved = false;
+  let approvedPolicy: JobBudgetPolicy | undefined;
+  return withJobPaymentLock(jobId, async (assertOwned) => {
+    // A waiting caller may carry a policy snapshot from before explicit approval.
+    const current = loadJob(jobId);
+    const localEndpoint = current && provider.endpoint && sameEndpoint(current.endpoint, provider.endpoint);
+    if (opts?.useStoredPolicy && localEndpoint && current.policy) policy = current.policy;
+    if (opts?.budget !== undefined) {
+      if (opts.approval !== "explicit" || !localEndpoint || !current.policy) {
+        throw new DvmError("invalid_budget", "Cannot change this job's budget here.",
+          "Use dvm pay --budget on the saved job at its original endpoint after your human approves the new total.");
+      }
+      const raw = opts.budget;
+      if (!/^(?:\$(?:\d+(?:\.\d{1,6})?|\.\d{1,6})|\d+)$/.test(raw)) {
+        throw new DvmError("invalid_budget", "Invalid --budget total.",
+          'Use a dollar amount such as "$1.00" or an integer number of millisats, as on dvm request.');
+      }
+      const rate = raw.startsWith("$") ? (await resolveBtcUsdRate("payment")).rate : 0;
+      const parsed = buildPolicy({ budget: raw, maxPayments: current.policy.maxPayments }, rate);
+      if (!Number.isSafeInteger(parsed.maxTotalMsats) || parsed.maxTotalMsats < 0 ||
+          (raw.startsWith("$") && parsed.maxTotalUsdMicro === undefined)) {
+        throw new DvmError("invalid_budget", "Invalid --budget total.", "Pass a non-negative total within the supported integer range.");
+      }
+      assertBudgetNotBelowSpend(parsed, current);
+      const { maxTotalUsdMicro: _oldDollars, ...preserved } = current.policy;
+      const explicitIncrement = current.policy.maxIncrementExplicit ??
+        current.policy.maxIncrementMsats !== current.policy.maxTotalMsats;
+      approvedPolicy = { ...preserved, maxTotalMsats: parsed.maxTotalMsats,
+        maxIncrementExplicit: explicitIncrement,
+        maxIncrementMsats: explicitIncrement ? current.policy.maxIncrementMsats : parsed.maxTotalMsats,
+        ...(parsed.maxTotalUsdMicro !== undefined ? { maxTotalUsdMicro: parsed.maxTotalUsdMicro } : {}) };
+      policy = approvedPolicy;
+    }
+    if (opts?.approval === "explicit") policy = { ...policy, autoPayBelowMsats: Number.MAX_SAFE_INTEGER };
     replacing = opts?.approval === "explicit" && seq !== undefined && loadJob(jobId)?.askPaymentBlocks?.[seq] !== undefined;
+    let newPayment = false;
+    // Recovery sends retain the original authorization; only a new send saves a proposed total.
     // Guard every rail, balance recovery, and retry at the dispatch boundary.
     const guardedTransport = new Proxy(transport, {
       get(target, key) {
         if (key === "sendMessage") return async (...args: Parameters<Transport["sendMessage"]>) => {
           assertOwned();
+          if (newPayment && approvedPolicy && !budgetSaved) {
+            assertBudgetNotBelowSpend(approvedPolicy, loadJob(jobId));
+            updateJob(jobId, { policy: approvedPolicy, budgetRefusals: {} });
+            budgetSaved = true;
+          }
           return target.sendMessage(...args);
         };
         const value = Reflect.get(target, key, target);
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    return handleLockedPaymentRequest(jobId, request, policy, guardedTransport, provider, opts);
+    const result = await handleLockedPaymentRequest(jobId, request, policy, guardedTransport, provider, opts,
+      () => { newPayment = true; });
+    if (budgetSaved && typeof result === "string")
+      throw new DvmError(result === "over-budget" ? "over_budget" : "payment_failed", "The payment was not completed.");
+    return result;
   }).catch((error: unknown) => {
+    if (budgetSaved && !(error instanceof DvmError)) error = new DvmError("payment_failed", "The payment was not completed.");
     if (!(error instanceof DvmError)) throw error;
+    if (error.code === "budget_below_spend" || error.code === "invalid_budget" ||
+        (error.code === "over_budget" && opts?.budget !== undefined && !budgetSaved)) {
+      error.data = providerFields({ ...error.data, job_id: jobId, next_step: error.hint,
+        next_action: providerFields({ type: "pay", job_id: jobId, amount_msats: request.amount_msats, display: error.message, hint: error.hint }, ["job_id"]) }, ["job_id"]);
+      throw error;
+    }
     const job = loadJob(jobId);
     if (!job || !provider.endpoint || !sameEndpoint(job.endpoint, provider.endpoint)) throw error;
     let requestId: string | undefined;
@@ -139,6 +192,7 @@ export async function handlePaymentRequest(
       }, ["job_id"]);
       throw error;
     }
+    if (budgetSaved) throw error;
     const command = requestId
       ? `dvm request-result ${shellQuoteArg(requestId)}`
       : `dvm status ${guidanceJobArg(jobId)}`;
@@ -151,7 +205,36 @@ export async function handlePaymentRequest(
       next_step: [typeof error.data?.next_step === "string" ? error.data.next_step : undefined, recovery].filter(Boolean).join(" "),
     }, ["job_id"]);
     throw error;
+  }).catch((error: unknown) => {
+    if (!budgetSaved || !(error instanceof DvmError)) throw error;
+    const total = approvedPolicy?.maxTotalUsdMicro !== undefined
+      ? formatUsdMicro(approvedPolicy.maxTotalUsdMicro) : `${approvedPolicy?.maxTotalMsats} msats`;
+    const action = error.data?.next_action as Record<string, unknown> | undefined;
+    // A held payment that cannot be re-sent keeps its poll guidance; `dvm pay` would refuse it.
+    const saved = action?.type === "poll"
+      ? `The new total budget of ${total} was saved.`
+      : `The new total budget of ${total} was saved. Retry with \`dvm pay ${guidanceJobArg(jobId)}\`; it resolves any earlier send before paying again.`;
+    error.hint = [error.hint, saved].filter(Boolean).join(" ");
+    error.data = providerFields({ ...error.data, job_id: jobId, budget_saved: true,
+      next_step: [error.data?.next_step, saved].filter(Boolean).join(" "),
+      next_action: providerFields(action
+        ? { ...action, hint: [action.hint, saved].filter(Boolean).join(" ") }
+        : { type: "pay", job_id: jobId, amount_msats: request.amount_msats, display: error.message, hint: error.hint }, ["job_id"]),
+    }, ["job_id"]);
+    throw error;
   });
+}
+
+function assertBudgetNotBelowSpend(policy: JobBudgetPolicy, job: JobRecord | null): void {
+  const dollars = policy.maxTotalUsdMicro !== undefined && (job?.paidUsdMsats ?? 0) === (job?.totalPaidMsats ?? 0);
+  const spent = dollars ? job?.paidUsdMicro ?? 0 : job?.totalPaidMsats ?? 0;
+  const proposed = dollars ? policy.maxTotalUsdMicro! : policy.maxTotalMsats;
+  if (proposed >= spent) return;
+  const format = dollars ? formatUsdMicro : (value: number) => `${value.toLocaleString("en-US")} msats`;
+  const display = `The new total ${format(proposed)} is below the amount already spent: ${format(spent)}.`;
+  throw new DvmError("budget_below_spend", display,
+    `Ask your human to approve a higher total of at least ${format(spent)}, then retry dvm pay --budget with that approved total.`,
+    { display, spent, proposed, unit: dollars ? "usd" : "msats" });
 }
 
 async function handleLockedPaymentRequest(
@@ -160,7 +243,8 @@ async function handleLockedPaymentRequest(
   policy: JobBudgetPolicy,
   transport: Transport,
   provider: ProviderRef,
-  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean }
+  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean; budget?: string; useStoredPolicy?: boolean },
+  beforeNewPayment?: () => void
 ): Promise<PaymentResult> {
   if (hasPendingAcceptedJobAccess(jobId, provider.endpoint)) throw new DvmError("local_job_state_unsaved",
     "Private recovery state must be folded before another payment can be sent.",
@@ -243,9 +327,7 @@ async function handleLockedPaymentRequest(
   const latest = loadJob(jobId);
   const paymentsHonoured = latest?.paymentsHonoured ?? 0;
 
-  if (policy.maxIncrementMsats > 0 && request.amount_msats > policy.maxIncrementMsats) {
-    return "over-budget";
-  }
+  if (opts?.budget !== undefined && paymentsHonoured >= policy.maxPayments) return "payment-cap-exceeded";
 
   // A dollar budget holds the ask's sats to its dollars at this caller's own
   // rate; a rail that signs another amount is checked again on that amount.
@@ -255,17 +337,27 @@ async function handleLockedPaymentRequest(
   const budget = budgetVerdict(policy, latest ?? undefined, budgetAsk);
   // A refused ask keeps the figures it was refused on, for `dvm pay` and the next step.
   const refuse = (overrun: BudgetOverrun): "over-budget" => {
+    if (opts?.budget !== undefined) {
+      const total = policy.maxTotalUsdMicro !== undefined ? formatUsdMicro(policy.maxTotalUsdMicro) : `${policy.maxTotalMsats} msats`;
+      const display = `Proposed total ${total}: ${describeBudgetOverrun(overrun, policy)}`;
+      throw new DvmError("over_budget", display, overBudgetHint(jobId, display), { display, proposed_total: overrun.cap, unit: overrun.unit });
+    }
     if (matchingEndpoint && opts?.requestSeq !== undefined) recordBudgetRefusal(jobId, opts.requestSeq, overrun);
     return "over-budget";
   };
   if (!budget.fits) return refuse(budget);
+  const explicitIncrement = policy.maxIncrementExplicit ?? policy.maxIncrementMsats !== policy.maxTotalMsats;
+  // An implicit increment is the total itself; on the dollar path its sat proxy must not add another cap.
+  if (policy.maxIncrementMsats > 0 && request.amount_msats > policy.maxIncrementMsats &&
+      (explicitIncrement || budget.unit !== "usd")) {
+    if (opts?.budget !== undefined) throw new DvmError("over_budget", "The proposed budget does not change the explicit per-ask limit.",
+      `This ask exceeds --max-increment. To stop, run \`dvm decline ${guidanceJobArg(jobId)}\`; further work needs a new request with approved limits.`);
+    return "over-budget";
+  }
   // Set when a rail's signed amount does not fit; a later rail may still sign one that does.
   let signedRefusal: BudgetOverrun | undefined;
 
-  // Check payment count cap (drip-attack defence)
-  if (paymentsHonoured >= policy.maxPayments) {
-    return "payment-cap-exceeded";
-  }
+  if (paymentsHonoured >= policy.maxPayments) return "payment-cap-exceeded";
 
   // Strict direct-Cashu is intentionally one upfront payment. A later ask has
   // no exact `/v1/job` recovery body and may not fall through to another rail.
@@ -296,6 +388,8 @@ async function handleLockedPaymentRequest(
   // token stays in the wallet journal for the sweep's verdict.
   if (opts?.requestSeq !== undefined && loadJob(jobId)?.askPaymentBlocks?.[opts.requestSeq] && opts.approval !== "explicit")
     return "needs-approval";
+
+  beforeNewPayment?.();
 
   if (matchingEndpoint && !balanceRefused && opts?.rail === undefined) {
     const creditPaid = await tryCreditPayment({ jobId, request, policy,

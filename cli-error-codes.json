@@ -12,6 +12,7 @@
     "body_contains_nul",
     "body_file_unreadable",
     "browse_failed",
+    "budget_below_spend",
     "budget_exceeded",
     "builder_identity_invalid",
     "builder_identity_unavailable",
