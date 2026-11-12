@@ -78,14 +78,11 @@ export interface FundOptions {
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_TIMEOUT_SEC = 600;
 
-/**
- * Run the full Lightning → Cashu fund flow for the agent wallet. Persists
- * the in-flight `PendingMint` before payment is observed and the
- * pre-built blinded outputs (`PendingMint.minting`) before the mint signs
- * them, so a CLI crash mid-flow can be recovered by {@link sweepPendingMints}
- * on the next run.
- */
-export async function fundAgentWallet(amountSats: number, opts: FundOptions): Promise<FundResult> {
+/** Persist the quote under the wallet lock before an invoice can be relayed or paid. */
+export async function createPendingMintQuote(
+  amountSats: number,
+  opts: Pick<FundOptions, "mintUrl" | "getWalletForMint">
+) {
   if (!Number.isFinite(amountSats) || amountSats <= 0) {
     throw new DvmError(
       "invalid_amount",
@@ -121,6 +118,20 @@ export async function fundAgentWallet(amountSats: number, opts: FundOptions): Pr
       pending_mints: [...fresh.pending_mints, pending],
     });
   });
+
+  return { initial, cashuWallet, quote, pending };
+}
+
+/**
+ * Run the full Lightning → Cashu fund flow for the agent wallet. Persists
+ * the in-flight `PendingMint` before payment is observed and the
+ * pre-built blinded outputs (`PendingMint.minting`) before the mint signs
+ * them, so a CLI crash mid-flow can be recovered by {@link sweepPendingMints}
+ * on the next run.
+ */
+export async function fundAgentWallet(amountSats: number, opts: FundOptions): Promise<FundResult> {
+  const { initial, cashuWallet, quote, pending } = await createPendingMintQuote(amountSats, opts);
+  const sats = pending.amount_sats;
 
   // Three ways this invoice gets paid, in priority order:
   //

@@ -18,7 +18,7 @@ For a trusted local connection, pass credentials through the CLI's documented fi
 
 Check the required amount and existing balance before topping up. Wallet funding and job payments both count toward spending caps; leave enough authorized headroom for both. Quote shell amounts containing a dollar sign, for example `dvm wallet fund '$5'`, so the shell does not substitute them.
 
-For autonomous funding, follow the output until it reports the observed result. For human-assisted funding, send one short explanation, the exact invoice or address in its own code block, and the QR separately if supported. Never present a payment request as proof that funding completed. Confirm the balance through the CLI before continuing the job.
+For autonomous funding, follow the output until it reports the observed result. When a human pays a Cashu Lightning invoice, run `dvm wallet fund '<amount>' --no-float --no-wait` so the command returns promptly; show the invoice at once, then run the returned `next_step` (`dvm wallet show`) after payment to collect it. An existing unpaid-quote warning names an earlier invoice: avoid asking the human to pay both for the same top-up. For human-assisted funding, send one short explanation, the exact invoice or address in its own code block, and the QR separately if supported. Never present a payment request as proof that funding completed. Confirm the balance through the CLI before continuing the job.
 
 If funding or settlement is uncertain, keep its records and enter [recovery](recovery.md) before initiating another deposit. A low balance alone does not prove the previous attempt moved no money.
 

@@ -1029,6 +1029,10 @@ Docs:
     .option("--mint <url>", "Cashu mint URL (default: configured mint, or Coinos)")
     .option("--timeout <sec>", "Override DVM_FUND_TIMEOUT_SEC (default 600s)")
     .option(
+      "--no-wait",
+      "Print a human-paid Lightning invoice and exit; collect after payment with 'dvm wallet show'. Cashu only; use --no-float if a float is connected."
+    )
+    .option(
       "--test-skip-lightning",
       "Skip Lightning — for test mints that auto-pay invoices (FakeWallet). Cashu rail only."
     )
