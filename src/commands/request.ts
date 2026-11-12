@@ -134,12 +134,13 @@ import {
   buildCreditFundingSkipped,
   buildCreditSuggestion,
   buildSiblingCreditAvailable,
+  commitCreditSuggestion,
   noteCreditDrawSkipped,
   noteCreditFunding,
   noteCreditFundingSkipped,
-  noteCreditSuggestion,
   noteSiblingCreditAvailable,
   type SiblingCreditAvailable,
+  stageCreditSuggestion,
   takeCreditNoticeFields,
 } from "../lib/credit-notice";
 import { providerDvmIdentity, reconcilePerDvmIdentity } from "../lib/credit-per-dvm";
@@ -1857,7 +1858,7 @@ async function handleAutoPayQuotes(
     if (plan.mode === "none" && plan.suppressed) {
       const posture = effectiveCreditPosture(loadConfig()?.credit, ref.endpoint, attestedIdentity);
       const priceMicro = planRate > 0 ? msatsToMicro(chosen.priceMsats, planRate) : 0;
-      noteCreditSuggestion(
+      stageCreditSuggestion(
         buildCreditSuggestion({
           dvm: identity.dvmId ?? ref.endpoint,
           endpoint: ref.endpoint,
@@ -2487,6 +2488,7 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
   });
 
   if (receipt.status === "completed" && receipt.summary) {
+    commitCreditSuggestion();
     markJobTerminal(effectiveJobId, "completed", completionSnapshot(receipt), {
       costMsats: paidMsats,
       paymentMethod: "tempo",
@@ -3542,6 +3544,7 @@ async function payWithAgentWallet(
   }
 
   if (receipt.status === "completed" && receipt.summary) {
+    commitCreditSuggestion();
     markJobTerminal(effectiveJobId, "completed", completionSnapshot(receipt), {
       costMsats: chosen.priceMsats,
       paymentMethod: "cashu",
@@ -3808,6 +3811,7 @@ async function payWithX402(args: X402AttemptArgs, proof: X402PaymentProof): Prom
   });
 
   if (receipt.status === "completed" && receipt.summary) {
+    commitCreditSuggestion();
     markJobTerminal(effectiveJobId, "completed", completionSnapshot(receipt), {
       costMsats: proof.amountMsats,
       paymentMethod: "x402",
@@ -4092,6 +4096,9 @@ async function streamAfterPayment(args: {
     throw new DvmError("timeout", paidTimeoutMessage);
   }
 
+  // A paid job still running, or done, may carry the offer; one that failed
+  // or was cancelled may not, and the week stays unspent.
+  if (streamedTerminal !== "failed" && streamedTerminal !== "cancelled") commitCreditSuggestion();
   if (human) {
     if (streamedTerminal === "failed" || streamedTerminal === "cancelled")
       info(`Status: ${streamedTerminal}${completion?.message ? `: ${completion.message}` : ""}`);
@@ -4172,6 +4179,7 @@ async function recoverViaStatusPoll(args: {
       costMsats: chosen.priceMsats,
       paymentMethod,
     });
+    commitCreditSuggestion();
     await collectCashuChange(jobId, status.cashuChange);
     // the SSE dropped, so the submit path never saw a receipt — this
     // read is the one that carries it.
