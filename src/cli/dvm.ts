@@ -1,4 +1,4 @@
-import { CREDIT_DRAIN_RAILS, CREDIT_FUND_RAILS, CREDIT_FUNDING_MODES } from "@dvmkit/sdk/internal";
+import { CREDIT_DRAIN_RAILS, CREDIT_FUND_RAILS, CREDIT_FUNDING_MODES, DvmError } from "@dvmkit/sdk/internal";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -145,7 +145,7 @@ import {
   walletX402WithdrawInitiate,
 } from "../commands/wallet-x402";
 import { CALLER_VERSION } from "../lib/caller-version";
-import { catchErrors } from "../lib/error-handler";
+import { catchErrors, handleError } from "../lib/error-handler";
 import { installGlobalAcceptEncoding } from "../lib/http";
 import { BLOCKED_SECRET_PATHS_LIST } from "../lib/secret-input";
 
@@ -650,19 +650,31 @@ export function buildProgram(): Command {
       return catchErrors(() => creditReceipts(dvm, opts), opts.human);
     });
 
+  // A JSON --wait reader takes stdout's last line as the outcome, so a command
+  // line the parser rejects still ends with an error line there.
+  const jsonWait = () => {
+    const args = program.args.slice(1);
+    return args.includes("--wait") && !args.includes("--human");
+  };
   program
     .command("messages <job-id>")
+    .configureOutput({ outputError: (text, write) => { if (!jsonWait()) write(text); } })
+    .exitOverride((error) => {
+      if (error.exitCode === 0 || !jsonWait()) process.exit(error.exitCode);
+      handleError(new DvmError("invalid_arguments", error.message.replace(/^error: /, "")), false, { event: "error" });
+    })
     .description("Fetch messages from a job conversation")
     .option("--endpoint <url>", "Provider URL override (env: DVM_JOB_ENDPOINT)")
     .option("--job-token <hex>", "Job bearer token override (env: DVM_JOB_TOKEN)")
     .option("--after <seq>", "Only show messages with seq > N")
     .option("--no-stream", "Non-blocking snapshot instead of streaming until yield")
     .option("--human", "Human-readable output instead of JSON")
-    .option("--wait", "Stay attached until the job needs input or ends")
+    .option("--wait", "Stay attached until the job needs input or ends; JSON output is one line per event")
     .option("--until <duration>", "Wait limit with --wait (default: 12h; e.g. 30s, 5m, 12h)")
     .option("--timeout <sec>", "Read timeout (default: 5s, or 60s with --wait)")
     .action((jobId: string, opts: MessagesOptions) => {
-      return catchErrors(() => messages(jobId, opts), opts.human);
+      // --wait streams JSON lines, so its error is the last event of that stream.
+      return catchErrors(() => messages(jobId, opts), opts.human, opts.wait && !opts.human ? { event: "error" } : undefined);
     });
 
   program

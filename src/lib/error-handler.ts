@@ -27,16 +27,25 @@ import { takeFeedbackNoticeFields } from "./feedback-notice";
  * the explicit terminal exit, so it cannot keep an otherwise completed CLI
  * alive.
  */
-export async function catchErrors(fn: () => void | Promise<void>, human?: boolean): Promise<void> {
+export async function catchErrors(fn: () => void | Promise<void>, human?: boolean, jsonFields?: ErrorJsonFields): Promise<void> {
   const lifetimeHold = setInterval(() => undefined, 60 * 60 * 1000);
   try {
     await fn();
   } catch (err) {
-    handleError(err, human);
+    handleError(err, human, jsonFields);
   } finally {
     clearInterval(lifetimeHold);
   }
   process.exit(process.exitCode ?? 0);
+}
+
+/**
+ * Top-level fields for a JSON error document. A command whose stdout is a
+ * JSON-lines stream passes `{ event: "error" }` so its error is the stream's
+ * last line in the same shape as its other lines.
+ */
+export interface ErrorJsonFields {
+  event?: "error";
 }
 
 /**
@@ -60,7 +69,7 @@ export async function catchErrors(fn: () => void | Promise<void>, human?: boolea
  * Human mode doesn't drain: the prose already went to stderr when the notice
  * was stashed.
  */
-export function handleError(err: unknown, human?: boolean): never {
+export function handleError(err: unknown, human?: boolean, jsonFields?: ErrorJsonFields): never {
   if (err instanceof DvmError) {
     if (human) {
       if (err.code === "client_upgrade_required") {
@@ -93,6 +102,7 @@ export function handleError(err: unknown, human?: boolean): never {
         }
       }
       json({
+        ...jsonFields,
         error,
         ...takeCreditNoticeFields(),
         ...takeFeedbackNoticeFields(),
@@ -109,6 +119,7 @@ export function handleError(err: unknown, human?: boolean): never {
     info(`Error: ${message}`);
   } else {
     json({
+      ...jsonFields,
       error: {
         code: "internal",
         message,

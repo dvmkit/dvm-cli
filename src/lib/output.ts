@@ -114,6 +114,16 @@ export function json(data: unknown): void {
   writeAllSync(1, JSON.stringify(out) + "\n");
 }
 
+/**
+ * Write one event of a JSON-lines stream to stdout, synchronously. Unlike
+ * `json`, it adds no warnings or trace_id. The stream's `result` line, written
+ * with `json`, carries the warnings; an `error` line is written at the error
+ * boundary, outside the command's warning scope, and carries none.
+ */
+export function jsonEvent(data: Record<string, unknown>): void {
+  writeAllSync(1, JSON.stringify(data) + "\n");
+}
+
 /** Write informational messages to stderr (visible to humans, ignored by JSON consumers). */
 export function info(msg: string): void {
   writeAllSync(2, msg + "\n");

@@ -87,10 +87,11 @@ describe.each(commands)("$capability signed discovery", (command) => {
       await control("release");
       const resumed = await runCli(args, root);
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
-      const output = JSON.parse(resumed.stdout);
-      expect(output.jobId).toBe(job.id);
-      expect(output.messages).toEqual(expect.arrayContaining([expect.objectContaining({ type: "complete" })]));
-      const complete = output.messages.find((message: { type: string }) => message.type === "complete");
+      const lines = resumed.stdout.trimEnd().split("\n").map((line) => JSON.parse(line));
+      const output = lines.at(-1);
+      expect(output).toMatchObject({ event: "result", jobId: job.id });
+      const complete = lines.find((line: { event: string; type: string }) => line.event === "message" && line.type === "complete");
+      expect(complete).toBeDefined();
       expect(complete.content.summary).toEqual({ _source: "provider", text: expect.any(String) });
       expect(JSON.parse(complete.content.summary.text)).toMatchObject(command.output);
       expect(output.next_action).toBeNull();

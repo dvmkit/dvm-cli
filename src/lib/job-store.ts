@@ -5,6 +5,7 @@ import {
   recordAcceptedJobAccess, removeAcceptedJobAccess, type AcceptedJobAccessRecord,
 } from "./submission-evidence";
 import { jobPersistence, hasUnsavedJobState } from "./job-persistence";
+import { notifyPaymentBooked } from "./payment-bookings";
 import { DvmError } from "@dvmkit/sdk/internal";
 import { sameEndpoint } from "./provider-endpoint";
 import { existsSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, fsyncSync } from "fs";
@@ -190,6 +191,12 @@ export interface JobRecord {
   paidPaymentRequestSeqs?: number[];
   /** Last seen message sequence number for cursor-based polling */
   messageCursor?: number;
+  /**
+   * Highest message seq a JSON `messages --wait` has written. The cursor can
+   * stay behind it (an error exit, an ask kept for recovery), so a later wait
+   * skips those lines instead of repeating them.
+   */
+  waitDeliveredSeq?: number;
   /** Running total of payments sent (millisatoshis) */
   totalPaidMsats?: number;
   /** Asks the payer refused on budget, keyed by request seq, with the figures that decided. */
@@ -506,7 +513,11 @@ export function markPaymentRequestPaid(jobId: string, requestSeq: number): Uncon
     return booked;
   }, true);
   // Only durable consumption grants ownership of the ledger and wallet booking.
-  return hasUnsavedJobState() ? undefined : booked;
+  if (!booked || hasUnsavedJobState()) return undefined;
+  notifyPaymentBooked({ jobId, requestSeq, approval: booked.approval, rail: booked.rail,
+    amountMsats: booked.amountMsats, reason: booked.reason,
+    ...(booked.rail !== "cashu_p2pk" && booked.amountUsdcMicro !== undefined ? { amountUsdcMicro: booked.amountUsdcMicro } : {}) });
+  return booked;
 }
 
 /**
@@ -749,9 +760,11 @@ export function mutateCreditPayment<T>(jobId: string, change: (job: JobRecord) =
 }
 
 export function bookCreditPayment(jobId: string, intent: CreditPaymentIntent): void {
-  mutateCreditPayment(jobId, (job) => {
+  const booked = mutateCreditPayment(jobId, (job) => {
+    let booked = false;
     if (!job.bookedCreditPayments?.some((entry) =>
       entry.authorization.payment_id === intent.authorization.payment_id)) {
+      booked = true;
       const amountMsats = intent.amountMsats ?? intent.request.amount_msats;
       job.totalPaidMsats = (job.totalPaidMsats ?? 0) + amountMsats;
       bookUsd(job, amountMsats, usdMicro(intent.authorization.amount_micro, intent.authorization.currency));
@@ -763,5 +776,9 @@ export function bookCreditPayment(jobId: string, intent: CreditPaymentIntent): v
     }
     if (job.pendingCreditPayment?.authorization.payment_id === intent.authorization.payment_id)
       delete job.pendingCreditPayment;
+    return booked;
   }, true);
+  if (booked && !hasUnsavedJobState()) notifyPaymentBooked({ jobId, requestSeq: intent.authorization.request_seq,
+    approval: intent.approval, rail: "credit", amountMsats: intent.amountMsats ?? intent.request.amount_msats,
+    reason: intent.request.reason });
 }

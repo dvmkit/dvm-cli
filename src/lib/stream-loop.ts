@@ -39,6 +39,8 @@ export interface StreamLoopOptions {
   /** An explicit caller cursor must never be rewound to an older yield. */
   afterSeqExplicit?: boolean;
   onMessage?: (msg: Message) => void;
+  /** Called once per auto-payment this loop sends, after it is booked, with the ask's seq. */
+  onAutoPayment?: (payment: AutoPayment, requestSeq: number) => void;
   /** Timeout in milliseconds. If exceeded, returns whatever has been collected. */
   timeoutMs?: number;
   /**
@@ -123,17 +125,19 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   // A decline the provider confirmed ended the job, even when its message is not in this batch.
   const declined = () => persistLocalState && loadJob(jobId)?.callerDeclined === true;
   async function recordAutoPayment(result: PaidPaymentResult, request: PaymentRequestContent, seq: number): Promise<void> {
-    autoPayments.push({
+    const payment: AutoPayment = {
       amount_msats: result.amountMsats,
       rail: result.rail,
       reason: asProviderText(request.reason),
       ...(result.amountUsdcMicro !== undefined && { amount_usdc_microunits: result.amountUsdcMicro }),
       display: paidConfirmationDisplay(result, request.fiat_amount),
-    });
+    };
+    autoPayments.push(payment);
     // The payer already booked what it sent; this only records the ask answered.
     if (persistLocalState) markPaymentRequestAnswered(jobId, seq);
     answeredSeqs.add(seq);
     justAutoPaid = true;
+    opts.onAutoPayment?.(payment, seq);
   }
   let pendingAction: NextAction = null;
   const pending = persistLocalState ? loadJob(jobId)?.pendingCreditPayment : undefined;

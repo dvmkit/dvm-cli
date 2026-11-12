@@ -15,6 +15,7 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   info,
+  jsonEvent,
   withOutputWarnings,
 } from "../lib/output";
 
@@ -26,6 +27,7 @@ import {
 } from "../lib/job-access";
 import { jobContentFields, observeJobContent } from "../lib/job-content";
 import { appendMessages, loadMessages, maxSeq } from "../lib/messages";
+import { loadJob, updateObservedJob } from "../lib/job-store";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
 import {
@@ -37,9 +39,9 @@ import {
   createArtifactSaveSession,
 } from "../lib/save-artifact";
 import { parseDurationMs } from "../lib/duration";
-import { settleRecordedPayments } from "../lib/yield-state";
+import { loadAnsweredYieldSeqs, settleRecordedPayments } from "../lib/yield-state";
 import { waitForJob } from "../lib/wait-for-job";
-import { streamLoop } from "../lib/stream-loop";
+import { streamLoop, type AutoPayment } from "../lib/stream-loop";
 import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
 import { createDvmTransport } from "../lib/transport";
 
@@ -182,6 +184,17 @@ async function messagesWithAccess(
   }
 
   progressNotice("Streaming messages...", opts.human);
+  // JSON --wait writes each message and auto-payment as its own line the
+  // moment it happens, so a redirected log is never empty while the job runs;
+  // the final line is the result document without the streamed arrays.
+  const streamEvents = opts.wait === true && !opts.human;
+  const recordDelivery = streamEvents && !access.endpointOverridden;
+  const delivered = recordDelivery ? stored?.waitDeliveredSeq ?? 0 : 0;
+  // An explicit --after asks to read those messages again; it still never lowers what was delivered.
+  const skipThrough = opts.after === undefined ? delivered : 0;
+  let lastDelivered = delivered;
+  let messageLines = 0;
+  let paymentLines = 0;
   // Render `progress` heartbeats live in --human mode so multi-minute jobs
   // give the operator continuous feedback. Other types are batch-rendered
   // after the stream returns; progress is skipped there to avoid duplication.
@@ -200,6 +213,20 @@ async function messagesWithAccess(
         if (msg.type === "progress") formatMessageHuman(msg);
       },
     }),
+    ...(streamEvents && {
+      onMessage: (msg: Message) => {
+        // An ask is repeated while it may still need an answer; anything else already written is not.
+        if (msg.seq <= skipThrough && !((msg.type === "payment-request" || msg.type === "prompt") &&
+          !loadAnsweredYieldSeqs(jobId).has(msg.seq))) return;
+        jsonEvent({ event: "message", ...serialize(msg) });
+        messageLines++;
+        lastDelivered = Math.max(lastDelivered, msg.seq);
+      },
+      onAutoPayment: (payment: AutoPayment) => {
+        jsonEvent({ event: "payment", ...payment });
+        paymentLines++;
+      },
+    }),
   };
   const waitDeadline = waitDuration === undefined ? undefined : Date.now() + waitDuration;
   let result;
@@ -210,6 +237,13 @@ async function messagesWithAccess(
   } catch (err) {
     transport.close();
     throw err;
+  } finally {
+    if (recordDelivery && lastDelivered > delivered) {
+      // Best effort: failing to save this only lets a later wait repeat lines.
+      try {
+        if (lastDelivered > (loadJob(jobId)?.waitDeliveredSeq ?? 0)) updateObservedJob(jobId, { waitDeliveredSeq: lastDelivered });
+      } catch { /* keep the wait's own outcome */ }
+    }
   }
 
   const providerStatus = waitDeadline !== undefined && Date.now() >= waitDeadline ? undefined
@@ -248,6 +282,18 @@ async function messagesWithAccess(
       finalizeProgressLine();
     }
     printNextActionHuman(resolvedAction, { refunds: result.refunds });
+  } else if (streamEvents) {
+    json({
+      event: "result",
+      jobId,
+      ...content,
+      ...settlement,
+      message_count: messageLines,
+      auto_payment_count: paymentLines,
+      cursor: result.cursor,
+      next_action: resolvedAction,
+      ...(await refundJsonField(result.refunds)),
+    });
   } else {
     json({
       jobId,
