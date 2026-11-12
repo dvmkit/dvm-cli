@@ -12,6 +12,13 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.19.0](https://github.com/dvmkit/dvm-cli/compare/v0.18.0...v0.19.0) (2026-11-12)
+
+
+### Features
+
+* **credit:** top up prepaid credit by card through a hosted checkout link ([#92](https://github.com/dvmkit/dvm-cli/issues/92)) ([9b181a9](https://github.com/dvmkit/dvm-cli/commit/9b181a9917ba5a359d552631bc8284520b422bea))
+
 ## [0.18.0](https://github.com/dvmkit/dvm-cli/compare/v0.17.0...v0.18.0) (2026-11-12)
 
 
