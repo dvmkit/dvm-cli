@@ -1050,9 +1050,9 @@ Docs:
     });
 
   wallet
-    .command("cash-out <ln-address>")
+    .command("cash-out <destination>")
     .description(
-      "Move value out of the agent wallet to a Lightning address (or lnurl1… string). Fees are drawn from the wallet on top of --amount, so the stated amount is what arrives"
+      "Move value out of the agent wallet to a Lightning address, lnurl1… string, or BOLT11 invoice (optionally lightning:). An invoice fixes the amount; otherwise pass --amount or --all. Fees are drawn on top of --amount"
     )
     .option(
       "--amount <amount>",
@@ -1067,8 +1067,8 @@ Docs:
     .option("--max-fee <sats>", "Refuse a mint whose routing reserve + input fee exceeds this")
     .option("--dry-run", "Quote the melt and report the fee without paying anything")
     .option("--human", "Human-readable output instead of JSON")
-    .action((lnAddress: string, opts: WalletCashOutOptions) => {
-      return catchErrors(() => walletCashOut(lnAddress, opts), opts.human);
+    .action((destination: string, opts: WalletCashOutOptions) => {
+      return catchErrors(() => walletCashOut(destination, opts), opts.human);
     });
 
   wallet
