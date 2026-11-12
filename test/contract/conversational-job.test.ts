@@ -177,7 +177,7 @@ it("drives a conversational metered job across CLI processes, from quote to veri
     const balance = JSON.parse((await run(["credit", "balance", endpoint])).stdout);
     expect(balance).toMatchObject({ credits: [{ credit_id: "conversation-credit", remaining_micro: 5_000_000, drawable: true }] });
 
-    const question = JSON.parse((await run(["messages", jobId, "--wait", "--until", "60s"])).stdout);
+    const question = waitStream((await run(["messages", jobId, "--wait", "--until", "60s"])).stdout);
     expect(question).toMatchObject({ jobId, next_action: { type: "respond", job_id: jobId, prompt_id: "cadence",
       prompt: { _source: "provider", text: "Cloud moving in. Which cadence?" }, options: choices } });
     expect(question.next_action.expires_at_ms).toBe(promptExpiresAtMs);
@@ -221,11 +221,11 @@ it("drives a conversational metered job across CLI processes, from quote to veri
     expect(payments).toHaveLength(5);
 
     charge(500_000, "Extended observing block");
-    const approval = JSON.parse((await run(["messages", jobId, "--wait", "--until", "60s"])).stdout);
+    const approval = waitStream((await run(["messages", jobId, "--wait", "--until", "60s"])).stdout);
     expect(approval).toMatchObject({ jobId, next_action: { type: "pay", job_id: jobId, amount_msats: 500_000,
       fiat_amount: { amount: 0.5, currency: "usd" }, hint: expect.stringContaining("`dvm pay conversation`") } });
     expect(approval.messages.map((message: Message) => [message.seq, message.type])).toEqual([[17, "payment-request"]]);
-    expect(approval).not.toHaveProperty("auto_payments");
+    expect(approval.auto_payments).toEqual([]);
     const humanApproval = await run(["status", jobId, "--human"]);
     expect(humanApproval.stdout).toBe("");
     const payNext = humanApproval.stderr.split("\n").find((line) => line.startsWith("Next:"));
@@ -300,3 +300,17 @@ it("drives a conversational metered job across CLI processes, from quote to veri
       PATH: `${join(root, "bin")}:${dirname(process.execPath)}:${process.env.PATH ?? ""}` };
   }
 }, 240_000);
+
+// `messages --wait` writes one JSON line per message and auto-payment, then the result line.
+function waitStream(stdout: string) {
+  const lines = stdout.trimEnd().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  const result = lines.at(-1)!;
+  expect(result.event).toBe("result");
+  expect(result).not.toHaveProperty("messages");
+  const events = lines.slice(0, -1);
+  expect(events.every((line) => line.event === "message" || line.event === "payment")).toBe(true);
+  const messages = events.filter((line) => line.event === "message");
+  const payments = events.filter((line) => line.event === "payment");
+  expect([result.message_count, result.auto_payment_count]).toEqual([messages.length, payments.length]);
+  return { ...result, messages, auto_payments: payments } as Record<string, any>;
+}

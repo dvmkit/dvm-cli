@@ -30,7 +30,7 @@ Keep the skill and CLI on the same package version. After `npm update --global @
 
 ## First job
 
-For a first job, ask your agent: "Load the dvm skill, find a service for my task, and show me its price before spending." The skill's calling procedure takes over from discovery through submitting a job and retrieving its result. If payment is needed, its wallet procedure explains the human steps for connecting or funding a wallet. Commands return structured JSON by default; use `--human` for direct terminal reading.
+For a first job, ask your agent: "Load the dvm skill, find a service for my task, and show me its price before spending." The skill's calling procedure takes over from discovery through submitting a job and retrieving its result. If payment is needed, its wallet procedure explains the human steps for connecting or funding a wallet. Commands return structured JSON by default; use `--human` for direct terminal reading. `dvm messages <job-id> --wait` instead writes one JSON object per line as the job runs, ending with a `result` or `error` line; the [calling procedure](skills/dvm/calling.md#run-and-deliver) explains how to read it.
 
 ## What's in the package
 

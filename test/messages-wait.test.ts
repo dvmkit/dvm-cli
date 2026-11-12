@@ -6,8 +6,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const seams = vi.hoisted(() => ({
   transport: {} as Transport,
-  pay: vi.fn(), claim: vi.fn(), json: vi.fn(), info: vi.fn(),
+  pay: vi.fn(), claim: vi.fn(), json: vi.fn(), jsonEvent: vi.fn(), info: vi.fn(),
+  // Every stdout write in order: streamed events and the final document.
+  lines: [] as Record<string, any>[],
+  settlement: undefined as Record<string, unknown> | undefined,
 }));
+vi.mock("../src/lib/receipt-capture", async (original) => {
+  const actual = await original<typeof import("../src/lib/receipt-capture")>();
+  return { ...actual, observedSettlementFields: (...args: Parameters<typeof actual.observedSettlementFields>) =>
+    seams.settlement ? Promise.resolve(seams.settlement) : actual.observedSettlementFields(...args) };
+});
 vi.mock("../src/lib/transport", () => ({ createDvmTransport: () => seams.transport }));
 vi.mock("../src/lib/payment-responder", () => ({ handlePaymentRequest: seams.pay }));
 vi.mock("../src/lib/refund-claim", async (original) => ({
@@ -16,7 +24,7 @@ vi.mock("../src/lib/refund-claim", async (original) => ({
   refundJsonField: async (claims: unknown[]) => claims.length ? { refund: claims.at(-1) } : {},
 }));
 vi.mock("../src/lib/output", () => ({
-  info: seams.info, json: seams.json, addOutputWarnings: (entries: unknown[]) => entries,
+  info: seams.info, json: seams.json, jsonEvent: seams.jsonEvent, addOutputWarnings: (entries: unknown[]) => entries,
   withOutputWarnings: <T>(run: () => Promise<T>) => run(),
 }));
 vi.mock("../src/lib/job-content", async (original) => ({
@@ -30,20 +38,26 @@ vi.mock("../src/lib/job-access", () => ({
 }));
 
 import { messages } from "../src/commands/messages";
+import { catchErrors } from "../src/lib/error-handler";
 import { pay } from "../src/commands/pay";
 import { message } from "../src/commands/message";
 import { streamLoop } from "../src/lib/stream-loop";
 import { appendMessages } from "../src/lib/messages";
-import { loadJob, saveJob, bookCreditPayment, markPaymentRequestInFlight } from "../src/lib/job-store";
+import { loadJob, saveJob, bookCreditPayment, markPaymentRequestInFlight, markPaymentRequestPaid } from "../src/lib/job-store";
+import { createWaitPaymentLines } from "../src/lib/wait-payment-lines";
 const provider = { endpoint: "https://dvm.example" };
 const policy: JobPolicy = { maxTotalMsats: 100_000, autoPayBelowMsats: 2000, maxIncrementMsats: 0, maxPayments: 5 };
 function msg(seq: number, type: string, content: unknown = {}): Message {
   return { seq, from: "provider", timestamp: seq, type, content } as Message;
 }
+// Like the HTTPS transport, the fake reports each message through onMessage as it reads it.
 function transport(batches: Message[][], status = "processing") {
-  const stream = vi.fn();
-  for (const batch of batches) stream.mockResolvedValueOnce({ messages: batch });
-  stream.mockResolvedValue({ messages: [] });
+  const queue = [...batches];
+  const stream = vi.fn(async (_job: string, _after: number, _provider: unknown, options: { onMessage?: (m: Message) => void; signal: AbortSignal }) => {
+    const batch = queue.shift() ?? [];
+    for (const message of batch) options?.onMessage?.(message);
+    return { messages: batch };
+  });
   seams.transport = {
     stream, status: vi.fn().mockResolvedValue({ status }),
     getMessages: vi.fn().mockResolvedValue([]), close: vi.fn(), sendMessage: vi.fn().mockResolvedValue(undefined),
@@ -51,7 +65,13 @@ function transport(batches: Message[][], status = "processing") {
   return stream;
 }
 const output = () => seams.json.mock.calls.at(-1)![0];
+const streamed = (event: string) => seams.lines.filter((line) => line.event === event);
+const streamedSeqs = () => streamed("message").map((line) => line.seq);
 beforeEach(() => {
+  seams.lines.length = 0;
+  seams.settlement = undefined;
+  seams.json.mockImplementation((line) => { seams.lines.push(line); });
+  seams.jsonEvent.mockImplementation((line) => { seams.lines.push(line); });
   seams.claim.mockResolvedValue([]);
   seams.pay.mockResolvedValue({ status: "paid", rail: "cashu_p2pk", amountMsats: 1000 });
 });
@@ -73,9 +93,15 @@ describe("messages wait", () => {
     await vi.runAllTimersAsync();
     await pending;
     expect(seams.json).toHaveBeenCalledTimes(1);
-    expect(output().next_action).toMatchObject({ type: "respond", prompt_id: "choice", options: ["yes", "no"] });
-    expect(output().auto_payments).toHaveLength(3);
-    expect(output().messages.map((m: Message) => m.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(output()).toMatchObject({ event: "result", message_count: 6, auto_payment_count: 3,
+      next_action: { type: "respond", prompt_id: "choice", options: ["yes", "no"] } });
+    expect(output()).not.toHaveProperty("messages");
+    expect(output()).not.toHaveProperty("auto_payments");
+    // Each payment line follows the ask it answered, and the result line comes last.
+    expect(seams.lines.map((line) => line.event === "message" ? line.seq : line.event))
+      .toEqual([1, 2, "payment", 3, 4, "payment", 5, "payment", 6, "result"]);
+    expect(streamed("payment")[0]).toMatchObject({ amount_msats: 1000, rail: "cashu_p2pk",
+      reason: { _source: "provider", text: "Block one" }, display: expect.any(String) });
     expect(seams.pay).toHaveBeenCalledTimes(3);
     expect(seams.pay.mock.calls.every((call) => call[2] === policy)).toBe(true);
     expect(stream.mock.calls.at(-1)?.[1]).toBe(5);
@@ -88,11 +114,15 @@ describe("messages wait", () => {
     const history = [msg(5, "payment-request", { amount_msats: 1000, reason: "Continue" }),
       msg(6, "text", { text: "Still working" }), msg(7, "prompt", { id: "choice", text: "Continue?" })];
     const stream = transport([], "awaiting-input");
-    stream.mockImplementation(async (_job, after) => ({ messages: history.filter((message) => message.seq > after) }));
+    stream.mockImplementation(async (_job, after, _provider, options) => {
+      const batch = history.filter((message) => message.seq > after);
+      for (const message of batch) options?.onMessage?.(message);
+      return { messages: batch };
+    });
     vi.mocked(seams.transport.getMessages).mockResolvedValue(history);
     await messages(jobId, { wait: true, ...(explicit ? { after: "4" } : {}) });
     expect(output().cursor).toBe(4);
-    expect(output().messages.map((message: Message) => message.seq)).toEqual([5, 6, 7]);
+    expect(streamedSeqs()).toEqual([5, 6, 7]);
     expect(output().next_action).toMatchObject({ type: "respond", prompt_id: "choice" });
     expect(seams.pay).not.toHaveBeenCalled();
   });
@@ -127,8 +157,8 @@ describe("messages wait", () => {
     try {
       await messages("http-wait", { wait: true, until: "20s" });
       expect(output().next_action).toMatchObject({ type: "respond", prompt_id: "choice" });
-      expect(output().auto_payments).toHaveLength(3);
-      expect(output().messages.map((m: Message) => m.seq)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+      expect(streamed("payment")).toHaveLength(3);
+      expect(streamedSeqs()).toEqual([1, 2, 3, 4, 5, 6, 7]);
       expect(seams.pay).toHaveBeenCalledTimes(3);
     } finally {
       provider.endpoint = originalEndpoint;
@@ -173,14 +203,13 @@ describe("messages wait", () => {
 
   it("retries a transport timeout and returns a later completion", async () => {
     vi.useFakeTimers();
-    const stream = transport([]);
-    stream.mockRejectedValueOnce(new DvmError("timeout", "Read timed out"))
-      .mockResolvedValueOnce({ messages: [msg(1, "complete", { summary: "Done" })] });
+    const stream = transport([[msg(1, "complete", { summary: "Done" })]]);
+    stream.mockRejectedValueOnce(new DvmError("timeout", "Read timed out"));
     const pending = messages("wait-retry", { wait: true });
     await vi.runAllTimersAsync();
     await pending;
     expect(output().next_action).toBeNull();
-    expect(output().messages).toHaveLength(1);
+    expect(streamedSeqs()).toEqual([1]);
   });
 
   it("returns immediately for a terminal snapshot", async () => {
@@ -202,7 +231,7 @@ describe("messages wait", () => {
     await vi.runAllTimersAsync();
     await pending;
     expect(output().next_action).toBeNull();
-    expect(output().messages.map((m: Message) => m.type)).toEqual(["working", "artifact", "complete"]);
+    expect(streamed("message").map((line) => line.type)).toEqual(["working", "artifact", "complete"]);
     expect(output().cursor).toBe(3);
     expect(stream).toHaveBeenCalledTimes(1);
   });
@@ -217,6 +246,128 @@ describe("messages wait", () => {
     await vi.runAllTimersAsync();
     await pending;
     expect(seams.json).not.toHaveBeenCalled();
+  });
+
+  it("writes each message line as it arrives, before the wait resolves", async () => {
+    vi.useFakeTimers();
+    const stream = transport([]);
+    const still = msg(2, "artifact", { name: "still-1.jpg", mime_type: "image/jpeg", url: "https://dvm.example/still-1.jpg" });
+    stream.mockImplementationOnce(async (_job, _after, _provider, options) => {
+      options.onMessage?.(msg(1, "working"));
+      await new Promise((resolve) => setTimeout(resolve, 60_000));
+      options.onMessage?.(still);
+      await new Promise((resolve) => setTimeout(resolve, 60_000));
+      const prompt = msg(3, "prompt", { id: "more", text: "Keep watching?" });
+      options.onMessage?.(prompt);
+      return { messages: [msg(1, "working"), still, prompt] };
+    });
+    let settled = false;
+    const pending = messages("wait-live", { wait: true }).then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(streamedSeqs()).toEqual([1]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(streamed("message").at(-1)).toMatchObject({ seq: 2, type: "artifact", content: { mime_type: "image/jpeg" } });
+    expect(settled).toBe(false);
+    expect(seams.json).not.toHaveBeenCalled();
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(seams.lines.map((line) => line.event)).toEqual(["message", "message", "message", "result"]);
+    expect(output().next_action).toMatchObject({ type: "respond", prompt_id: "more" });
+  });
+
+  it("puts the job's settlement and wallet report on the result line only", async () => {
+    transport([[msg(1, "complete", { summary: "Done" })]]);
+    const walletRemaining = { display: "$0.45 of what you paid is left over from this job.", hint: "Keep it." };
+    seams.settlement = { wallet_remaining: walletRemaining };
+    await messages("wait-wallet", { wait: true });
+    expect(seams.lines.map((line) => line.event)).toEqual(["message", "result"]);
+    expect(output()).toMatchObject({ event: "result", wallet_remaining: walletRemaining });
+    expect(seams.lines[0]).not.toHaveProperty("wallet_remaining");
+  });
+
+  it.each([["--after 0", { after: "0" }, undefined], ["the stored cursor", {}, 4]] as const)(
+    "writes a recovered credit payment after its ask (%s)", async (_label, flags, messageCursor) => {
+      const jobId = `wait-credit-recovery-${messageCursor ?? "after"}`;
+      const ask = msg(5, "payment-request", { amount_msats: 1000, reason: "Recovered block" });
+      const intent = { request: ask.content, amountMsats: 1000, approval: "auto",
+        authorization: { request_seq: 5, payment_id: `${jobId}-payment`, amount_micro: 1000, currency: "usd" } };
+      saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy,
+        pendingCreditPayment: intent, ...(messageCursor !== undefined ? { messageCursor } : {}) } as never);
+      transport([[ask, msg(6, "prompt", { id: "q", text: "Continue?" })]]);
+      seams.pay.mockImplementationOnce(async () => {
+        bookCreditPayment(jobId, intent as never);
+        return { status: "paid", rail: "credit", amountMsats: 1000 };
+      });
+      await messages(jobId, { wait: true, ...flags });
+      expect(seams.lines.map((line) => line.event === "message" ? line.seq : line.event)).toEqual([5, "payment", 6, "result"]);
+      expect(output().auto_payment_count).toBe(1);
+    });
+
+  it("writes a payment line for an auto-payment confirmed only on a later read", async () => {
+    vi.useFakeTimers();
+    const jobId = "wait-delayed-confirmation";
+    const ask = msg(5, "payment-request", { amount_msats: 1000, reason: "Delayed block", fiat_amount: { amount: 0.01, currency: "usd" } });
+    const paid = { ...msg(6, "payment", { x402_payment: "signed" }), from: "requester" } as Message;
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+    transport([[ask]]);
+    vi.mocked(seams.transport.status).mockResolvedValueOnce({ status: "processing" } as never)
+      .mockResolvedValue({ status: "completed" } as never);
+    vi.mocked(seams.transport.getMessages).mockResolvedValue([ask, paid, msg(7, "complete", { summary: "Done" })]);
+    seams.pay.mockImplementationOnce(async () => {
+      markPaymentRequestInFlight(jobId, 5, { rail: "x402", content: { x402_payment: "signed" },
+        requestAmountMsats: 1000, amountMsats: 1000, btcRate: 100_000, approval: "auto", reason: "Delayed block" });
+      throw new DvmError("payment_unconfirmed", "Reply not confirmed yet");
+    });
+    const pending = messages(jobId, { wait: true });
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(loadJob(jobId)).toMatchObject({ totalPaidMsats: 1000, paymentsHonoured: 1 });
+    expect(seams.lines.map((line) => line.event === "message" ? line.seq : line.event))
+      .toEqual([5, 6, 7, "payment", "result"]);
+    expect(streamed("payment")[0]).toMatchObject({ amount_msats: 1000, rail: "x402",
+      reason: { _source: "provider", text: "Delayed block" }, display: expect.stringContaining("$0.01") });
+    expect(output().auto_payment_count).toBe(1);
+  });
+
+  it("does not repeat written messages after an error exit, but repeats the open ask", async () => {
+    const jobId = "wait-error-resume";
+    const artifact = msg(1, "artifact", { name: "picture.jpg", mime_type: "image/jpeg", url: "https://dvm.example/picture.jpg" });
+    const ask = msg(2, "payment-request", { amount_msats: 1000, reason: "Next block" });
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy, messageCursor: 0 });
+    transport([[artifact, ask]]);
+    seams.pay.mockResolvedValueOnce("payment-cap-exceeded");
+    await expect(messages(jobId, { wait: true })).rejects.toMatchObject({ code: "payment_cap_exceeded" });
+    expect(streamedSeqs()).toEqual([1, 2]);
+    // The cursor stays before the unpaid ask, so the next wait still answers it.
+    expect(loadJob(jobId)?.messageCursor).toBe(0);
+    seams.lines.length = 0;
+    transport([[artifact, ask], [msg(3, "prompt", { id: "q", text: "Continue?" })]]);
+    await messages(jobId, { wait: true });
+    expect(seams.lines.map((line) => line.event === "message" ? line.seq : line.event)).toEqual([2, "payment", 3, "result"]);
+    seams.lines.length = 0;
+    // An explicit --after reads written messages again.
+    transport([[artifact, ask, msg(3, "prompt", { id: "q", text: "Continue?" })]]);
+    await messages(jobId, { wait: true, after: "0" });
+    expect(streamedSeqs()).toEqual([1, 2, 3]);
+  });
+
+  it("ends an error exit with the error line after every payment and message already written", async () => {
+    vi.useFakeTimers();
+    transport([[msg(1, "payment-request", { amount_msats: 1000, reason: "Hour one" })],
+      [msg(2, "payment-request", { amount_msats: 1000, reason: "Hour two" })],
+      [msg(3, "payment-request", { amount_msats: 1000, reason: "Hour three" })]]);
+    seams.pay.mockResolvedValueOnce({ status: "paid", rail: "cashu_p2pk", amountMsats: 1000 })
+      .mockResolvedValueOnce({ status: "paid", rail: "cashu_p2pk", amountMsats: 1000 })
+      .mockResolvedValue("payment-cap-exceeded");
+    const exit = new Error("process exit");
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => { throw exit; });
+    const pending = expect(catchErrors(() => messages("wait-cap-lines", { wait: true }), undefined, { event: "error" })).rejects.toBe(exit);
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(seams.lines.map((line) => line.event === "message" ? line.seq : line.event))
+      .toEqual([1, "payment", 2, "payment", 3, "error"]);
+    expect(seams.lines.at(-1)).toMatchObject({ event: "error", error: { code: "payment_cap_exceeded" } });
   });
 
   it("propagates non-timeout transport failures", async () => {
@@ -292,7 +443,7 @@ describe("payment replay and terminal refund regressions", () => {
     await vi.runAllTimersAsync();
     await pending;
     expect(seams.pay).toHaveBeenCalledTimes(1);
-    expect(output().messages.filter((m: Message) => m.seq === 5)).toHaveLength(1);
+    expect(streamedSeqs()).toEqual([5, 7]);
   });
   it("terminal snapshot with unclaimed refund in tail keeps refund action", async () => {
     vi.useFakeTimers();
@@ -331,7 +482,7 @@ describe("payment replay and terminal refund regressions", () => {
     await vi.runAllTimersAsync();
     await pending;
     expect(output().next_action).toBeNull();
-    expect(output().messages.at(-1).type).toBe("complete");
+    expect(streamed("message").at(-1)?.type).toBe("complete");
   });
 });
 
@@ -610,7 +761,12 @@ it("names the wait limit when --until expires on a running job with nothing in f
   vi.useFakeTimers();
   const jobId = "until-expired";
   saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
-  const stream = transport([[msg(1, "payment-request", { amount_msats: 1000, reason: "Hour two" })]]);
+  const stream = transport([]);
+  const ask = msg(1, "payment-request", { amount_msats: 1000, reason: "Hour two" });
+  stream.mockImplementationOnce(async (_job, _after, _provider, options) => {
+    options.onMessage?.(ask);
+    return { messages: [ask] };
+  });
   // After the payment the stream stays attached, collecting progress until the wait limit cuts it.
   stream.mockImplementationOnce((_job, _after, _provider, options) => new Promise((resolve) => {
     options.signal.addEventListener("abort", () => resolve({ messages: [msg(2, "progress", { percent_complete: 10 })] }));
@@ -618,7 +774,7 @@ it("names the wait limit when --until expires on a running job with nothing in f
   const pending = messages(jobId, { wait: true, until: "30s" });
   await vi.runAllTimersAsync();
   await pending;
-  expect(output().auto_payments).toHaveLength(1);
+  expect(streamed("payment")).toHaveLength(1);
   const action = output().next_action;
   expect(action).toMatchObject({ type: "poll", job_id: jobId });
   expect(action.hint).toContain("wait limit (30s)");
@@ -637,6 +793,8 @@ it("names the budget, the spend so far and the ask when an ask would exceed the 
   transport([[msg(9, "payment-request", { amount_msats: 69_000, reason: "Hour five" })]], "awaiting-input");
   seams.pay.mockResolvedValue("over-budget");
   await messages(jobId, { wait: true, until: "1m" });
+  // The refusal's figures ride the stream's final line, after the ask itself.
+  expect(seams.lines.map((line) => line.event === "message" ? line.seq : line.event)).toEqual([9, "result"]);
   const action = output().next_action;
   expect(action).toMatchObject({ type: "pay", amount_msats: 69_000 });
   const text = `${action.display} ${action.hint}`;
@@ -684,4 +842,112 @@ it("does not claim a job is running when the wait limit passes before any read",
   expect(hint).toContain(`dvm status ${jobId}`);
   expect(hint).not.toContain("still running");
   expect(hint).not.toContain("--until 0s");
+});
+
+describe("wait stream recovery", () => {
+  it("writes a payment confirmed by reconciliation within a second, while the stream stays quiet", async () => {
+    vi.useFakeTimers();
+    const jobId = "wait-quiet-booking";
+    const ask = msg(5, "payment-request", { amount_msats: 1000, reason: "Quiet block" });
+    const paid = { ...msg(6, "payment", { x402_payment: "signed" }), from: "requester" } as Message;
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+    const stream = transport([]);
+    stream.mockImplementationOnce(async (_job, _after, _provider, options) => {
+      options.onMessage?.(ask);
+      return { messages: [ask] };
+    });
+    stream.mockImplementationOnce(async (_job, _after, _provider, options) => {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      const done = msg(7, "complete", { summary: "Done" });
+      for (const message of [ask, paid, done]) options.onMessage?.(message);
+      return { messages: [ask, paid, done] };
+    });
+    vi.mocked(seams.transport.getMessages).mockResolvedValue([ask, paid]);
+    seams.pay.mockImplementationOnce(async () => {
+      markPaymentRequestInFlight(jobId, 5, { rail: "x402", content: { x402_payment: "signed" },
+        requestAmountMsats: 1000, amountMsats: 1000, btcRate: 100_000, approval: "auto" });
+      throw new DvmError("payment_unconfirmed", "Reply not confirmed yet");
+    });
+    const pending = messages(jobId, { wait: true });
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(loadJob(jobId)?.totalPaidMsats).toBe(1000);
+    expect(seams.json).not.toHaveBeenCalled();
+    expect(streamed("payment")).toHaveLength(1);
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(streamed("payment")).toHaveLength(1);
+  });
+
+  it("gives a recovered x402 payment its exact USDC amount, as a sent one has", () => {
+    const jobId = "wait-recovered-usdc";
+    const ask = msg(5, "payment-request", { amount_msats: 1000, reason: "Signed amount" });
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+    appendMessages(jobId, [ask]);
+    const report = vi.fn();
+    transport([]);
+    const paymentLines = createWaitPaymentLines({ jobId, provider, transport: seams.transport, afterSeq: 0, onAutoPayment: report });
+    paymentLines.onMessage(ask);
+    markPaymentRequestInFlight(jobId, 5, { rail: "x402", content: { x402_payment: "signed" },
+      requestAmountMsats: 1000, amountMsats: 1000, amountUsdcMicro: "1000", btcRate: 100_000, approval: "auto" });
+    markPaymentRequestPaid(jobId, 5);
+    expect(report).toHaveBeenCalledTimes(1);
+    paymentLines.finish();
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(report.mock.calls[0][0]).toMatchObject({ amount_usdc_microunits: "1000", display: expect.stringContaining("USDC"),
+      reason: { _source: "provider", text: "Signed amount" } });
+  });
+
+  it("repeats an open ask after an error exit, but not an ask it already paid", async () => {
+    const jobId = "wait-paid-ask-resume";
+    const paidAsk = msg(1, "payment-request", { amount_msats: 1000, reason: "Paid block" });
+    const artifact = msg(2, "artifact", { mime_type: "image/jpeg", url: "https://dvm.example/picture.jpg" });
+    const openAsk = msg(3, "payment-request", { amount_msats: 1000, reason: "Open block" });
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy, messageCursor: 0 });
+    transport([[paidAsk], [artifact, openAsk]]);
+    seams.pay.mockResolvedValueOnce({ status: "paid", rail: "cashu_p2pk", amountMsats: 1000 })
+      .mockResolvedValueOnce("payment-cap-exceeded");
+    await expect(messages(jobId, { wait: true })).rejects.toMatchObject({ code: "payment_cap_exceeded" });
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs).toContain(1);
+    expect(loadJob(jobId)?.waitDeliveredSeq).toBe(3);
+    seams.lines.length = 0;
+    transport([[paidAsk, artifact, openAsk], [msg(4, "prompt", { id: "q", text: "Continue?" })]]);
+    await messages(jobId, { wait: true });
+    expect(streamedSeqs()).toEqual([3, 4]);
+  });
+
+  it.each([false, true])("reads every later message for an explicit --after, whatever was delivered (older record=%s)", async (olderRecord) => {
+    const jobId = `wait-explicit-after-${olderRecord}`;
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy, messageCursor: 0,
+      ...(olderRecord ? {} : { waitDeliveredSeq: 10 }) });
+    transport([[msg(3, "text", { text: "Before after" }), msg(5, "artifact", { mime_type: "image/jpeg", url: "https://dvm.example/picture.jpg" }),
+      msg(6, "prompt", { id: "q", text: "Continue?" })]]);
+    await messages(jobId, { wait: true, after: "4" });
+    expect(streamedSeqs()).toEqual([5, 6]);
+    expect(output().next_action).toMatchObject({ type: "respond", prompt_id: "q" });
+  });
+
+  it.each(["prompt", "payment-request"])("repeats a delivered %s that is still open, and keeps it actionable", async (type) => {
+    const jobId = `wait-open-${type}`;
+    const content = type === "prompt" ? { id: "q", text: "Continue?" } : { amount_msats: 3000, reason: "Open block" };
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy, messageCursor: 0, waitDeliveredSeq: 5 });
+    transport([[msg(5, type, content)]]);
+    await messages(jobId, { wait: true });
+    expect(streamedSeqs()).toEqual([5]);
+    expect(output().next_action.type).toBe(type === "prompt" ? "respond" : "pay");
+  });
+
+  it("keeps what was delivered when an explicit replay exits early, so a picture is not repeated", async () => {
+    const jobId = "wait-replay-watermark";
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy, messageCursor: 0, waitDeliveredSeq: 10 });
+    transport([[msg(1, "text", { text: "Replay" }), msg(2, "payment-request", { amount_msats: 1000, reason: "Old open ask" })]]);
+    seams.pay.mockResolvedValueOnce("payment-cap-exceeded");
+    await expect(messages(jobId, { wait: true, after: "0" })).rejects.toMatchObject({ code: "payment_cap_exceeded" });
+    expect(loadJob(jobId)?.waitDeliveredSeq).toBe(10);
+    seams.lines.length = 0;
+    transport([[msg(5, "artifact", { mime_type: "image/jpeg", url: "https://dvm.example/picture.jpg" }),
+      msg(6, "payment-request", { amount_msats: 1000, reason: "New open ask" })],
+    [msg(7, "prompt", { id: "q", text: "Continue?" })]]);
+    await messages(jobId, { wait: true });
+    expect(streamedSeqs()).toEqual([6, 7]);
+  });
 });

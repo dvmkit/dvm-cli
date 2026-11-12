@@ -9,8 +9,19 @@ import { isTerminalJobStatus, paymentInFlightHint, pollNextAction, type NextActi
 import { formatDurationMs } from "./duration";
 import { guidanceJobArg } from "./provider-output";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "./stream-loop";
+import { createWaitPaymentLines } from "./wait-payment-lines";
 
 export async function waitForJob(opts: StreamLoopOptions, durationMs: number, now: () => number = Date.now): Promise<StreamLoopResult> {
+  if (!opts.onAutoPayment) return waitAttached(opts, durationMs, now);
+  const payments = createWaitPaymentLines(opts);
+  try {
+    return await waitAttached({ ...opts, onMessage: payments.onMessage, onAutoPayment: payments.onAutoPayment }, durationMs, now);
+  } finally {
+    payments.finish();
+  }
+}
+
+async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: () => number): Promise<StreamLoopResult> {
   const deadline = now() + durationMs;
   const result: StreamLoopResult = {
     messages: [], autoPayments: [], refunds: [], cursor: opts.afterSeq,

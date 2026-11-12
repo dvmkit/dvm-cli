@@ -64,10 +64,12 @@ export async function verifyDiscoveryRecovery(packageRoot, expectedSdkVersion) {
         const resumed = await cli(binary, root, args);
         assert.equal(resumed.code, 0);
         assert.equal(resumed.stderr, "");
-        const output = JSON.parse(resumed.stdout);
+        const lines = resumed.stdout.trimEnd().split("\n").map((line) => JSON.parse(line));
+        const output = lines.at(-1);
+        assert.equal(output.event, "result");
         assert.equal(output.jobId, job.id);
         assert.equal(output.next_action, null);
-        const complete = output.messages.find((message) => message.type === "complete");
+        const complete = lines.find((line) => line.event === "message" && line.type === "complete");
         assert.ok(complete, "continuation must deliver the completed result");
         phase = "completion summary";
         assert.equal(complete.content.summary._source, "provider");
