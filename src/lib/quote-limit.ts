@@ -13,6 +13,14 @@ export function quoteWithinDeclaredLimit(
   return native ?? quote.priceMsats <= limitMsats;
 }
 
+export function dollarLimitMicro(declaredLimit: string): bigint | undefined {
+  const amount = /^\$(\d+)(?:\.(\d{1,6}))?$/.exec(declaredLimit.trim());
+  if (!amount) return undefined;
+  const whole = BigInt(amount[1]);
+  const fraction = BigInt((amount[2] || "").padEnd(6, "0"));
+  return whole * 1_000_000n + fraction;
+}
+
 function quoteWithinNativeDollarLimit(
   quote: Quote,
   declaredLimit: string | undefined,
@@ -57,12 +65,4 @@ function upfrontQuoteWithinDollarLimit(
     return undefined;
   }
   return BigInt(amountMicro) <= limitMicro;
-}
-
-function dollarLimitMicro(declaredLimit: string): bigint | undefined {
-  const amount = /^\$(\d+)(?:\.(\d{1,6}))?$/.exec(declaredLimit.trim());
-  if (!amount) return undefined;
-  const whole = BigInt(amount[1]);
-  const fraction = BigInt((amount[2] || "").padEnd(6, "0"));
-  return whole * 1_000_000n + fraction;
 }

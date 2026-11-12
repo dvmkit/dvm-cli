@@ -191,6 +191,15 @@ describe("balance-backed mid-job payments", () => {
     expect(loadJob("job-a")?.pendingCreditPayment).toBeUndefined();
   });
 
+  it("holds a balance payment to a dollar budget in dollars", async () => {
+    await expect(respond({ ...policy, maxTotalUsdMicro: 1_499 } as typeof policy)).resolves.toBe("over-budget");
+    expect(received).toHaveLength(0);
+    // 1,500 msats is past the 1,400-msat conversion, but the ask is exactly the $0.0015 declared.
+    await expect(respond({ ...policy, maxTotalMsats: 1_400, maxTotalUsdMicro: 1_500 } as typeof policy))
+      .resolves.toMatchObject({ rail: "credit" });
+    expect(loadJob("job-a")).toMatchObject({ totalPaidMsats: 1_500, paidUsdMicro: 1_500 });
+  });
+
   it.each(["drop", "malformed", "conflict", "unavailable", "fake-insufficient", "invalid-insufficient"] as const)("keeps the same intent after %s and recovers it without double booking", async (mode) => {
     reply = mode;
     await expect(respond()).rejects.toBeInstanceOf(Error);

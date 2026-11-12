@@ -40,7 +40,8 @@ import {
   withJobTokenRedaction,
 } from "../lib/job-access";
 import { loadMessages } from "../lib/messages";
-import { isTerminalJobStatus } from "../lib/next-action";
+import { isTerminalJobStatus, overBudgetHint } from "../lib/next-action";
+import { describeBudgetOverrun } from "../lib/job-budget";
 import { JOB_READ_TIMEOUT_MS, pendingPaymentRequest, reconcileInFlightPaymentRequest } from "../lib/yield-state";
 import { applyMintPin } from "../lib/mint-pin";
 import { paidConfirmationDisplay } from "../lib/payment-copy";
@@ -181,7 +182,9 @@ async function payWithAccess(
 
   if (result === "over-budget") {
     transport.close();
-    throw new DvmError("over_budget", "Payment would exceed the job's budget.");
+    const refusal = requestSeq === undefined ? undefined : loadJob(jobId)?.budgetRefusals?.[String(requestSeq)];
+    throw new DvmError("over_budget", "Payment would exceed the job's budget.",
+      refusal ? overBudgetHint(jobId, describeBudgetOverrun(refusal, stored.policy)) : undefined);
   }
 
   if (result === "payment-cap-exceeded") {

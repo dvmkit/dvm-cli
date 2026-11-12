@@ -1,4 +1,5 @@
 import { hasPendingAcceptedJobAccess } from "./submission-evidence";
+import { askUsdMicro, budgetVerdict, dollarBoundUsdMicro, usdMicro, type BudgetOverrun, type JobBudgetPolicy } from "./job-budget";
 import { withJobPaymentLock } from "./payment-lock";
 import { loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest, settleRecordedPayments } from "./yield-state";
 import { finishBookedSubmission, midJobSpendLabel } from "./taken-payment";
@@ -9,7 +10,6 @@ import {
   DvmError,
   isPublicRequestId,
   shellQuoteArg,
-  type JobPolicy,
   loadAgentWallet,
   type MppxCredential,
   msatsToUsdc,
@@ -29,6 +29,7 @@ import {
 import { getEncodedToken } from "@cashu/cashu-ts";
 import {
   addPayment,
+  recordBudgetRefusal,
   clearPaymentRequestInFlight,
   loadJob,
   hasUnknownUpfrontCredit,
@@ -83,7 +84,7 @@ export type PaymentResult =
 export async function handlePaymentRequest(
   jobId: string,
   request: PaymentRequestContent,
-  policy: JobPolicy,
+  policy: JobBudgetPolicy,
   transport: Transport,
   provider: ProviderRef,
   // `jobToken` is the anonymous-flow per-job token threaded into
@@ -156,7 +157,7 @@ export async function handlePaymentRequest(
 async function handleLockedPaymentRequest(
   jobId: string,
   request: PaymentRequestContent,
-  policy: JobPolicy,
+  policy: JobBudgetPolicy,
   transport: Transport,
   provider: ProviderRef,
   opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean }
@@ -240,16 +241,26 @@ async function handleLockedPaymentRequest(
 
   // Settling above can book an earlier payment, so the caps read the job now.
   const latest = loadJob(jobId);
-  const spent = latest?.totalPaidMsats ?? 0;
   const paymentsHonoured = latest?.paymentsHonoured ?? 0;
 
   if (policy.maxIncrementMsats > 0 && request.amount_msats > policy.maxIncrementMsats) {
     return "over-budget";
   }
 
-  if (spent + request.amount_msats > policy.maxTotalMsats) {
+  // A dollar budget holds the ask's sats to its dollars at this caller's own
+  // rate; a rail that signs another amount is checked again on that amount.
+  const askUsd = askUsdMicro(request);
+  const budgetAsk = { msats: request.amount_msats, usdMicro: askUsd,
+    rate: policy.maxTotalUsdMicro !== undefined && askUsd !== undefined ? (await tryResolveBtcUsdRate())?.rate : undefined };
+  const budget = budgetVerdict(policy, latest ?? undefined, budgetAsk);
+  // A refused ask keeps the figures it was refused on, for `dvm pay` and the next step.
+  const refuse = (overrun: BudgetOverrun): "over-budget" => {
+    if (matchingEndpoint && opts?.requestSeq !== undefined) recordBudgetRefusal(jobId, opts.requestSeq, overrun);
     return "over-budget";
-  }
+  };
+  if (!budget.fits) return refuse(budget);
+  // Set when a rail's signed amount does not fit; a later rail may still sign one that does.
+  let signedRefusal: BudgetOverrun | undefined;
 
   // Check payment count cap (drip-attack defence)
   if (paymentsHonoured >= policy.maxPayments) {
@@ -334,6 +345,7 @@ async function handleLockedPaymentRequest(
       transport,
       provider,
       btcRate,
+      usdMicro: dollarBoundUsdMicro(budgetAsk),
       pinnedMint,
       maxCashuFeeSats,
       strictPerCall,
@@ -377,6 +389,15 @@ async function handleLockedPaymentRequest(
         if (!(err instanceof DvmError) || err.code !== "x402_build_failed") throw err;
         proof = null;
       }
+      const signedUsd = proof ? usdMicro(Number(proof.amountUsdcMicro), "usd") : undefined;
+      if (proof) {
+        const signed = budgetVerdict(policy, loadJob(jobId) ?? undefined,
+          { msats: proof.amountMsats, usdMicro: signedUsd, rate: proof.btcRate });
+        if (!signed.fits) {
+          signedRefusal = signed;
+          proof = null;
+        }
+      }
       if (proof) {
         // Bind the cross-job ledger ceiling to the amount actually signed,
         // which may be slightly higher than the msat quote at the caller's
@@ -390,6 +411,8 @@ async function handleLockedPaymentRequest(
             content: { x402_payment: proof.paymentHeader, amount_msats: proof.amountMsats },
             requestAmountMsats: request.amount_msats,
             amountMsats: proof.amountMsats,
+            // Book the dollars the signed authorization moves, not the ask's figure.
+            ...usdMicroField(signedUsd),
             btcRate: proof.btcRate,
             amountUsdcMicro: proof.amountUsdcMicro,
             approval: approval?.approval,
@@ -412,7 +435,12 @@ async function handleLockedPaymentRequest(
       // only the basis it was held within a tolerance of — so bind the ledger
       // ceiling and every entry to the signed figure, exactly as the x402
       // branch above does.
-      const paidMsats = usdcToMsats(Number(tempoCredentialAmountMicro(cred)) / 1e6, tempoRate);
+      const signedMicro = Number(tempoCredentialAmountMicro(cred));
+      const paidMsats = usdcToMsats(signedMicro / 1e6, tempoRate);
+      const signedUsd = usdMicro(signedMicro, "usd");
+      const signed = budgetVerdict(policy, loadJob(jobId) ?? undefined,
+        { msats: paidMsats, usdMicro: signedUsd, rate: tempoRate });
+      if (!signed.fits) return refuse(signed);
       await enforceGlobalBudget({ plannedMsats: paidMsats, btcRate: tempoRate });
       return deliverSignedRailPayment({
         jobId, request, transport, provider, jobToken, approval,
@@ -422,6 +450,7 @@ async function handleLockedPaymentRequest(
           content: { tempo_credential: cred, amount_msats: paidMsats },
           requestAmountMsats: request.amount_msats,
           amountMsats: paidMsats,
+          ...usdMicroField(signedUsd),
           btcRate: tempoRate,
           approval: approval?.approval,
           reason: request.reason,
@@ -430,7 +459,7 @@ async function handleLockedPaymentRequest(
     }
   }
 
-  return "needs-approval";
+  return signedRefusal ? refuse(signedRefusal) : "needs-approval";
 }
 
 function unconfirmedPaymentError(jobId: string, message: string, hint = unresendablePaymentHint(jobId)): DvmError {
@@ -514,7 +543,7 @@ async function deliverSignedRailPayment(args: {
     { type: "payment", content: submission.content } as OutboundMessage,
     provider, { jobToken: args.jobToken }, args.requestSeq, submission, args.redelivery);
   if (!sent.tracked) {
-    addPayment(jobId, submission.amountMsats, args.approval);
+    addPayment(jobId, submission.amountMsats, args.approval, submission.usdMicro);
     recordSpend({ msats: submission.amountMsats, btcRate: submission.btcRate, jobId,
       providerEndpoint: provider.endpoint, ...midJobSpendLabel(args.request.reason) });
   } else if (sent.booked) await finishBookedSubmission(jobId, sent.booked, provider.endpoint);
@@ -547,6 +576,8 @@ async function tryAgentWalletMidJobPayment(args: {
   transport: Transport;
   provider: ProviderRef;
   btcRate: number;
+  /** Dollars to book: the ask's, only when its sats were held to them. */
+  usdMicro?: number;
   approval?: { requestSeq: number; approval: PaymentApproval };
   /** Caller-pinned spend mint. Narrows the allowlist to this mint. */
   pinnedMint?: string;
@@ -654,6 +685,7 @@ async function tryAgentWalletMidJobPayment(args: {
       ...(prepared.fromReserve ? { reserve: true as const } : {}),
       requestAmountMsats: request.amount_msats,
       amountMsats: request.amount_msats,
+      ...usdMicroField(args.usdMicro),
       btcRate,
       approval: approval?.approval,
       reason: request.reason,
@@ -724,7 +756,7 @@ async function deliverAgentWalletPayment(args: {
       signed_at_ms: Date.now(),
     },
   });
-  addPayment(jobId, request.amount_msats, approval);
+  addPayment(jobId, request.amount_msats, approval, submission.usdMicro);
   recordSpend({
     msats: request.amount_msats,
     btcRate: submission.btcRate,
@@ -958,4 +990,8 @@ async function tryMppCredential(
     basisMicro: msatsToUsdc(amountMsats, btcRate),
     onError: "null",
   });
+}
+
+function usdMicroField(value: number | undefined): { usdMicro?: number } {
+  return value !== undefined ? { usdMicro: value } : {};
 }
