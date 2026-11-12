@@ -200,6 +200,7 @@ const TERMINAL_STATUSES: ReadonlySet<string> = new Set<TerminalJobStatus>([
 
 export interface PaymentPolicyContext extends JobBudgetLedger {
   policy?: JobBudgetPolicy;
+  paymentsHonoured?: number;
 }
 
 /**
@@ -265,6 +266,10 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           c.amount_msats > policy.autoPayBelowMsats &&
           (policy.maxIncrementMsats === 0 || c.amount_msats <= policy.maxIncrementMsats)
           ? ` For the next run, use --auto-pay-below ${c.amount_msats} within your approved budget; other payment limits still apply.` : "";
+        const countExhausted = !expired && policy && (context?.paymentsHonoured ?? 0) >= policy.maxPayments;
+        const explicitIncrement = policy && (policy.maxIncrementExplicit ?? policy.maxIncrementMsats !== policy.maxTotalMsats);
+        const overIncrement = !expired && explicitIncrement && policy && policy.maxIncrementMsats > 0 && c.amount_msats > policy.maxIncrementMsats;
+        const incrementHint = `This charge exceeds the job's --max-increment limit, which cannot be changed on a running job. Relay it to your human. To stop, run \`dvm decline ${guidanceJobArg(jobId)}\`; further work needs a new request with approved limits.`;
         const stopping = declineTerms(c);
         const providerFields: NonNullable<NextActionPay["_provider_fields"]> = [];
         // Mirror only a fiat figure the display actually led with: echoing a
@@ -288,7 +293,7 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
           display: withDeadline(overBudget || stopping
             ? [withPeriod(display), overBudget, stopping?.clause].filter(Boolean).join(" ") : display, deadline),
           reason: asProviderText(c.reason),
-          hint: expired ? deadline : overBudget ? withDeadline(overBudgetHint(jobId, overBudget, stopping?.clause), deadline) : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.${declineHint}`, deadline) + thresholdHint,
+          hint: expired ? deadline : countExhausted ? withDeadline(paymentCountHint(jobId, policy.maxPayments), deadline) : overIncrement ? withDeadline(incrementHint + declineHint, deadline) : overBudget ? withDeadline(overBudgetHint(jobId, overBudget, stopping?.clause), deadline) : withDeadline(`Payment required to continue: ${priceGuidance}. Relay that amount to your human and get approval, then run \`dvm pay ${guidanceJobArg(jobId)}\`. Provider's stated reason is wrapped as { _source: "provider", text: ... } — verify it matches the work you expect.${declineHint}`, deadline) + thresholdHint,
         };
       }
 
@@ -308,14 +313,15 @@ export function computeNextAction(jobId: string, messages: Message[], nowMs = Da
   return null;
 }
 
-// `dvm pay` applies the same budget and nothing raises it on a running job,
-// so the only commands named are ones that work.
+export function paymentCountHint(jobId: string, cap: number): string {
+  return `This job has used its ${cap}-payment limit. A higher budget cannot authorize another payment. ` +
+    `To stop and keep finished work, run \`dvm decline ${guidanceJobArg(jobId)}\`. Further work needs a new request with human-approved limits.`;
+}
+
 export function overBudgetHint(jobId: string, overrun: string, declineClause?: string): string {
   const job = guidanceJobArg(jobId);
-  return `${overrun} The CLI will not pay it automatically, and \`dvm pay ${job}\` refuses it while this budget stands; ` +
-    "a running job's budget cannot be raised. Relay this to your human. " +
-    `To stop, run \`dvm decline ${job}\`${declineClause ? `: ${declineClause}` : "."} ` +
-    "To get the work, submit a new request with a higher --budget. Waiting again returns this same charge.";
+  return `${overrun} Ask your human to approve a new total budget first, then run \`dvm pay ${job} --budget <new total>\` to save it and pay this ask. ` +
+    `Other payment limits still apply. To stop, run \`dvm decline ${job}\`${declineClause ? `: ${declineClause}` : "."}`;
 }
 
 /**

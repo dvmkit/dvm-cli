@@ -16,6 +16,7 @@ describe("buildPolicy", () => {
       autoPayBelowMsats: 10_000,
       maxIncrementMsats: 50_000,
       maxPayments: 1,
+      maxIncrementExplicit: false,
     });
     expect(parseBudget).toHaveBeenCalledExactlyOnceWith("50000", 100_000);
   });
@@ -27,6 +28,7 @@ describe("buildPolicy", () => {
       autoPayBelowMsats: 5_000,
       maxIncrementMsats: 15_000,
       maxPayments: 5,
+      maxIncrementExplicit: true,
     });
     expect(vi.mocked(parseBudget).mock.calls).toEqual([["50000", 100_000], ["5000", 100_000], ["15000", 100_000]]);
   });
@@ -37,6 +39,7 @@ describe("buildPolicy", () => {
       autoPayBelowMsats: 0,
       maxIncrementMsats: 0,
       maxPayments: 0,
+      maxIncrementExplicit: false,
     });
     expect(parseBudget).not.toHaveBeenCalled();
   });

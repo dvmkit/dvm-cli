@@ -793,7 +793,12 @@ describe("standalone caller contract", () => {
 
     it.each(commands)("%s ends with an unpaid charge and the pay command", async (command) => {
       const result = await readHuman(command, "human-pay");
-      expect(result.stderr.trimEnd().split("\n").at(-1)).toMatch(/^Next: Payment required to continue: \$0\.40.*`dvm pay human-pay`\.$/);
+      const last = result.stderr.trimEnd().split("\n").at(-1);
+      if (command === "request") {
+        expect(last).toMatch(/^Next: Payment required to continue: \$0\.40.*Ask your human to approve the new total first, then run `dvm pay human-pay --budget <new total>`\. To stop instead, run `dvm decline human-pay`\.$/);
+      } else {
+        expect(last).toMatch(/^Next: Payment required to continue: \$0\.40.*`dvm pay human-pay`\.$/);
+      }
     });
 
     it("quotes the job id in the pay command", async () => {

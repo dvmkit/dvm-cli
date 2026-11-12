@@ -703,6 +703,7 @@ export function buildProgram(): Command {
     )
     .option("--endpoint <url>", "Provider URL override (env: DVM_JOB_ENDPOINT)")
     .option("--job-token <hex>", "Job bearer token override (env: DVM_JOB_TOKEN)")
+    .option("--budget <amount>", "Approve a new total job budget and pay the open ask (dollars or millisats)")
     .option("--human", "Human-readable output instead of JSON")
     .option("--timeout <sec>", "Override default timeout for streaming")
     .option(

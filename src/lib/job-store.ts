@@ -216,6 +216,7 @@ export interface JobRecord {
     maxTotalMsats: number;
     autoPayBelowMsats: number;
     maxIncrementMsats: number;
+    maxIncrementExplicit?: boolean;
     maxPayments: number;
     /** The budget as declared in dollars, in micro-dollars. Absent on sat budgets and older records. */
     maxTotalUsdMicro?: number;

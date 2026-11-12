@@ -241,7 +241,7 @@ describe("messages wait", () => {
     transport([[], [msg(1, "payment-request", { amount_msats: 1000, reason: "Next block" })]]);
     seams.pay.mockResolvedValue("payment-cap-exceeded");
     const pending = expect(messages("wait-cap", { wait: true })).rejects.toMatchObject({
-      code: "payment_cap_exceeded", hint: expect.stringContaining("--max-payments 6"),
+      code: "payment_cap_exceeded", hint: expect.stringContaining("dvm decline wait-cap"),
     });
     await vi.runAllTimersAsync();
     await pending;
@@ -802,8 +802,8 @@ it("names the budget, the spend so far and the ask when an ask would exceed the 
   expect(text).toContain("961,000 msats spent so far plus 69,000 msats asked comes to 1,030,000 msats, " +
     "473 msats over the 1,029,527 msats budget.");
   expect(action.hint).toContain(`dvm decline ${jobId}`);
-  // `dvm pay` refuses an ask over the job's budget, so the hint must not send the agent there.
-  expect(action.hint).not.toContain("then run `dvm pay");
+  expect(action.hint).toContain("Ask your human");
+  expect(action.hint).toContain(`dvm pay ${jobId} --budget <new total>`);
 });
 
 // The limit must not bury a held payment: its guidance is what stops a second payment for the same charge.

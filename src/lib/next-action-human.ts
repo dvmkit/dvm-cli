@@ -20,10 +20,13 @@ export function nextActionHuman(action: NextAction): string | null {
       if (action.type === "respond") {
         return `Next: ${display} Provider is waiting for your input. ${command ? `Run \`${command}\`.` : action.hint}`;
       }
+      if (command?.startsWith("dvm decline ")) return `Next: ${display} ${action.hint}`;
       const thresholdHint = action.hint.match(/ For the next run, use --auto-pay-below .+$/)?.[0] ?? "";
-      const decline = action.charged_if_declined_micro !== undefined && command?.startsWith("dvm pay ")
+      const budgetChange = command?.includes(" --budget ");
+      const approval = budgetChange ? "Ask your human to approve the new total first, then run" : "Run";
+      const decline = (action.charged_if_declined_micro !== undefined || budgetChange) && command?.startsWith("dvm pay ")
         ? ` To stop instead, run \`dvm decline ${shellQuoteArg(action.job_id)}\`.` : "";
-      return `Next: Payment required to continue: ${display}${display.endsWith(".") ? "" : "."} Run \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.${decline}${thresholdHint}`;
+      return `Next: Payment required to continue: ${display}${display.endsWith(".") ? "" : "."} ${approval} \`${command ?? `dvm pay ${shellQuoteArg(action.job_id)}`}\`.${decline}${thresholdHint}`;
     }
     case "poll": {
       const hint = typeof action.hint === "string" ? action.hint : action.hint.text;
