@@ -1083,9 +1083,15 @@ describe("standalone caller contract", () => {
       expect(result.stderr).toBe("");
       expect(output.error).toMatchObject({
         code: "credit_funding_unavailable",
-        display: expect.stringContaining("No way to fund"),
-        hint: expect.any(String),
+        display: expect.stringContaining("No money moved"),
+        hint: expect.stringContaining("dvm wallet fund '$0.10' --no-float"),
+        wallet_fund_command: "dvm wallet fund '$0.10' --no-float",
       });
+      const display = String(output.error.display);
+      expect(display).toContain("dvm wallet fund '$0.10' --no-float");
+      expect(display).toContain("any Lightning wallet");
+      expect(display).toContain("dvm wallet connect");
+      expect(display.indexOf("dvm wallet fund")).toBeLessThan(display.indexOf("dvm wallet connect"));
       expect(String(output.error.display)).not.toContain("Funded $");
       expect(creditRequestBodies().filter((body) => body.op === "fund")).toEqual([]);
       expect(existsSync(join(caller.root, "credits.json"))).toBe(false);
