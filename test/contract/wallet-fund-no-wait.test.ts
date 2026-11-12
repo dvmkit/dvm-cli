@@ -1,4 +1,4 @@
-import { deriveKeysetId } from "@cashu/cashu-ts";
+import { createNewMintKeys, serializeMintKeys } from "@cashu/cashu-ts";
 import { WALLET_VERSION } from "@dvmkit/sdk/internal";
 import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -12,8 +12,10 @@ const binary = resolve(import.meta.dirname, "../../dist/dvm.js");
 const root = mkdtempSync(join(tmpdir(), "dvm-fund-handoff-contract-"));
 const execute = promisify(execFile);
 const pubkey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-const keys = Object.fromEntries(Array.from({ length: 11 }, (_, i) => [2 ** i, pubkey]));
-const keyset = { id: deriveKeysetId(keys), unit: "sat", active: true, input_fee_ppk: 0 };
+// cashu-ts rejects a keyset that reuses one public key across denominations.
+const mintKeys = createNewMintKeys(11, new Uint8Array(32).fill(1));
+const keys = serializeMintKeys(mintKeys.pubKeys);
+const keyset = { id: mintKeys.keysetId, unit: "sat", active: true, input_fee_ppk: 0 };
 const requests: string[] = [];
 const expiry = Math.floor(Date.now() / 1000) + 3600;
 let server: Server;
@@ -70,8 +72,16 @@ afterAll(async () => {
 it("exits successfully within five seconds with a durable invoice and warns on a second quote", async () => {
   const args = [binary, "wallet", "fund", "1000", "--sats", "--no-float", "--no-wait", "--qr-image", join(root, "qr.png")];
   const env = { ...process.env, DVM_CONFIG_DIR: root };
+  async function runFundingCommand() {
+    const result = await execute(process.execPath, args, { env, timeout: 5000 }).then(
+      (result) => ({ ...result, code: 0 }),
+      (error) => error as { stdout: string; stderr: string; code: number | undefined }
+    );
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    return result;
+  }
   const started = Date.now();
-  const first = await execute(process.execPath, args, { env, timeout: 5000 });
+  const first = await runFundingCommand();
   expect(Date.now() - started).toBeLessThan(5000);
   expect(first.stderr).toBe("");
   expect(JSON.parse(first.stdout)).toMatchObject({
@@ -84,7 +94,7 @@ it("exits successfully within five seconds with a durable invoice and warns on a
   expect(disk().pending_mints).toMatchObject([{ quote_id: "quote-1", amount_sats: 1000, expires_at: expiry }]);
   expect(readFileSync(join(root, "qr.png")).subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
 
-  const second = await execute(process.execPath, args, { env, timeout: 5000 });
+  const second = await runFundingCommand();
   expect(JSON.parse(second.stdout)).toMatchObject({
     quote_id: "quote-2", warning: expect.stringContaining("An unpaid quote already exists: quote-1"),
   });
