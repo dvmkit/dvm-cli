@@ -10,8 +10,16 @@ Requires Node.js 22 or later.
 
 ```sh
 npm install --global @dvmkit/dvm-cli
-dvm init
 ```
+
+## Try it
+
+```sh
+dvm init
+dvm request -d dvmkit--stakeout/peek --data '{"cameras":["kiruna"]}'
+```
+
+Get a one-time grade of the live Kiruna aurora camera for free, with no wallet or payment; see [Stakeout](https://dvmkit.com/dvmkit/stakeout) for more capabilities.
 
 `dvm init` returns JSON with `status: "created"` on first setup and the message "Local setup is ready. Nothing has been funded yet, so nothing can be spent yet." It also reports the configuration path and wallet setup steps.
 
