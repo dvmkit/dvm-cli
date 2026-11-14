@@ -5,6 +5,7 @@ import {
 import {
   info,
   json,
+  withOutputWarningContext,
 } from "./output";
 
 import { takeCreditNoticeFields } from "./credit-notice";
@@ -30,9 +31,13 @@ import { takeFeedbackNoticeFields } from "./feedback-notice";
 export async function catchErrors(fn: () => void | Promise<void>, human?: boolean, jsonFields?: ErrorJsonFields): Promise<void> {
   const lifetimeHold = setInterval(() => undefined, 60 * 60 * 1000);
   try {
-    await fn();
-  } catch (err) {
-    handleError(err, human, jsonFields);
+    await withOutputWarningContext(async () => {
+      try {
+        await fn();
+      } catch (err) {
+        handleError(err, human, jsonFields);
+      }
+    });
   } finally {
     clearInterval(lifetimeHold);
   }

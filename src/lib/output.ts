@@ -21,8 +21,13 @@ export type OutputWarning = AutoPayWarning | DrawFundingWarning | LocalJobStateW
 
 const warnings = new AsyncLocalStorage<OutputWarning[]>();
 
+/** Keep a command's warnings available through its terminal error handler. */
+export function withOutputWarningContext<T>(run: () => Promise<T>): Promise<T> {
+  return warnings.run([], run);
+}
+
 export function withOutputWarnings<T>(run: () => Promise<T>, human?: boolean): Promise<T> {
-  return warnings.run([], () => withJobPersistence(run, ({ accessPreserved, accessUnpreserved }) => {
+  const collect = () => withJobPersistence(run, ({ accessPreserved, accessUnpreserved }) => {
     const hint = accessUnpreserved
       ? "Job access was not preserved. Supply --endpoint <url> and --job-token <hex>, or DVM_JOB_ENDPOINT and DVM_JOB_TOKEN, to read this job; do not submit or pay again."
       : "Refresh the job with dvm status <job_id> --messages before paying or submitting a replacement.";
@@ -32,7 +37,8 @@ export function withOutputWarnings<T>(run: () => Promise<T>, human?: boolean): P
         (accessUnpreserved ? ` ${hint}` : accessPreserved ? ` Job access is preserved privately. ${hint}` : ""),
       hint,
     }], human);
-  }));
+  });
+  return warnings.getStore() ? collect() : withOutputWarningContext(collect);
 }
 
 function sameWarning(prior: OutputWarning, entry: OutputWarning): boolean {
@@ -116,9 +122,8 @@ export function json(data: unknown): void {
 
 /**
  * Write one event of a JSON-lines stream to stdout, synchronously. Unlike
- * `json`, it adds no warnings or trace_id. The stream's `result` line, written
- * with `json`, carries the warnings; an `error` line is written at the error
- * boundary, outside the command's warning scope, and carries none.
+ * `json`, it adds no warnings or trace_id. The stream's terminal `result` or
+ * `error` line is written with `json` and carries the command's warnings.
  */
 export function jsonEvent(data: Record<string, unknown>): void {
   writeAllSync(1, JSON.stringify(data) + "\n");
