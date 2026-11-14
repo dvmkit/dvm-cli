@@ -2,7 +2,7 @@ import { hasUnsavedJobState } from "../lib/job-persistence";
 import { terminalSettlementReport } from "../lib/job-settlement";
 import { autoPayWarnings } from "../lib/auto-pay-warning";
 import { addOutputWarnings, withOutputWarnings } from "../lib/output";
-import { providerFields, providerJobJson as json } from "../lib/provider-output";
+import { guidanceJobArg, providerFields, providerJobJson as json } from "../lib/provider-output";
 import { buildTempoCredential } from "../lib/payment-rails/tempo-credential";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { parseBudget } from "../lib/currency";
@@ -968,11 +968,16 @@ async function requestWithWarnings(
 
   if (noStream && !isTerminalJobStatus(receipt.status)) {
     transport.close();
+    const nextAction = pollNextAction(receipt.jobId);
+    if (policy.maxPayments > 1) {
+      const job = guidanceJobArg(receipt.jobId);
+      nextAction.hint += ` Later payment asks are paid only while \`dvm messages ${job} --wait\` stays attached within the saved spending policy, or by running \`dvm pay ${job}\` for each ask. An unanswered payment ask ends the job. Neither \`dvm status ${job}\` nor \`dvm messages ${job} --no-stream\` pays later asks.`;
+    }
     if (opts.human) {
       info(`Job published: ${receipt.jobId}`);
       echoTraceIdHuman();
       if (!isTerminalJobStatus(receipt.status)) {
-        printNextActionHuman(pollNextAction(receipt.jobId, "Job submitted, check back for updates"));
+        printNextActionHuman(nextAction);
       }
     } else {
       json({
@@ -993,11 +998,7 @@ async function requestWithWarnings(
         // NOT drain here: nothing may stash a feedback notice before a
         // terminal, so there is nothing to carry.
         ...takeCreditNoticeFields(),
-        next_action: {
-          type: "poll",
-          job_id: receipt.jobId,
-          hint: "Job submitted, check back for updates",
-        },
+        next_action: nextAction,
       });
     }
     return;

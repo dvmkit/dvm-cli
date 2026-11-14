@@ -1,4 +1,5 @@
 import { observedSettlementFields, renderSettlementHuman } from "../lib/receipt-capture";
+import { readUnansweredPaymentRequest } from "../lib/unanswered-payment";
 import { providerCurrency } from "../lib/provider-currency";
 import { isCallerMessage } from "../lib/message-ownership";
 import { providerFields, providerJobJson } from "../lib/provider-output";
@@ -155,10 +156,15 @@ async function messagesWithAccess(
     const currency = access.endpointOverridden
       ? await providerCurrency({ receipt: providerStatus?.receipt, status: providerStatus, messages: msgs, transport, ref }) : undefined;
     const settlement = await observedSettlementFields(jobId, providerStatus, !access.endpointOverridden, currency);
+    const unanswered = await readUnansweredPaymentRequest(jobId, providerStatus?.status ??
+      (access.endpointOverridden ? undefined : loadJob(jobId)?.status), access, transport, {
+      messages: msgs, fullHistory: after === 0, localOnly: isTerminal, timeoutMs: timeout,
+    });
     transport.close();
 
     if (opts.human) {
       renderSettlementHuman(settlement);
+      if (unanswered) info(unanswered.display);
       info(String(content.content_hint));
       if (msgs.length === 0) {
         info("No new messages.");
@@ -174,6 +180,7 @@ async function messagesWithAccess(
         jobId,
         ...content,
         ...settlement,
+        ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
         messages: msgs.map(serialize),
         cursor: newCursor,
         next_action: resolvedAction,
@@ -267,10 +274,19 @@ async function messagesWithAccess(
   const currency = access.endpointOverridden
     ? await providerCurrency({ receipt: observed?.receipt, status: observed, messages: result.messages, transport, ref }) : undefined;
   const settlement = await observedSettlementFields(jobId, observed, !access.endpointOverridden, currency);
+  const unanswered = await readUnansweredPaymentRequest(jobId, observed?.status ??
+    (access.endpointOverridden ? undefined : loadJob(jobId)?.status), access, transport, {
+    messages: result.messages,
+    fullHistory: after === 0 && result.messages.some((message) => message.type === "cancel" || message.type === "complete"),
+    localOnly: isTerminal || (waitDeadline !== undefined && Date.now() >= waitDeadline),
+    timeoutMs: waitDeadline === undefined ? streamOptions.timeoutMs
+      : Math.max(1, Math.min(streamOptions.timeoutMs, waitDeadline - Date.now())),
+  });
   transport.close();
 
   if (opts.human) {
     renderSettlementHuman(settlement);
+    if (unanswered) info(unanswered.display);
     info(String(content.content_hint));
     if (result.messages.length === 0) {
       info("No new messages.");
@@ -288,6 +304,7 @@ async function messagesWithAccess(
       jobId,
       ...content,
       ...settlement,
+      ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
       message_count: messageLines,
       auto_payment_count: paymentLines,
       cursor: result.cursor,
@@ -299,6 +316,7 @@ async function messagesWithAccess(
       jobId,
       ...content,
       ...settlement,
+      ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
       messages: result.messages.map(serialize),
       cursor: result.cursor,
       next_action: resolvedAction,

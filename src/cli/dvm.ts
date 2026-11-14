@@ -353,7 +353,7 @@ export function buildProgram(): Command {
       "Max payments to honour per job (default: 5); 0 = free, 1 = typical, 3+ = multi-turn"
     )
     .option("--output-type <mime>", "Desired output MIME type")
-    .option("--no-stream", "Submit and return immediately without streaming")
+    .option("--no-stream", "Submit and return immediately; later asks need dvm messages <job> --wait or dvm pay <job>")
     .option(
       "--auto-pay",
       "Pay without prompting, bounded by --auto-pay-below (else config autoPayThreshold, else 20% of --budget). Unnecessary when --auto-pay-below is set."
