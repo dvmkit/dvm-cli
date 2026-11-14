@@ -12,6 +12,14 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.19.1](https://github.com/dvmkit/dvm-cli/compare/v0.19.0...v0.19.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **jobs:** explain unattended payment expiry ([db950e7](https://github.com/dvmkit/dvm-cli/commit/db950e7be080aa1bd79ac77f5fd8a98d7a556918))
+* **output:** preserve command warnings on JSON errors ([d3cb9a6](https://github.com/dvmkit/dvm-cli/commit/d3cb9a666e9f556149095b1dcd62b0145091841a))
+
 ## [0.19.0](https://github.com/dvmkit/dvm-cli/compare/v0.18.0...v0.19.0) (2026-11-12)
 
 
