@@ -242,7 +242,7 @@ async function statusWithAccess(
   }
 
   const unanswered = await readUnansweredPaymentRequest(jobId, result.status, access, transport, {
-    messages: msgs, timeoutMs: timeout,
+    messages: msgs, timeoutMs: timeout, localOnly: result.content_available === false,
   });
   transport.close();
 

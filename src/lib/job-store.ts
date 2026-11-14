@@ -15,7 +15,7 @@ import { dirname } from "node:path";
 import lockfile from "proper-lockfile";
 import type { PaymentContent, UpfrontPayment } from "@dvmkit/sdk";
 import { parseUpfrontPayment, parseUpfrontRailPayment, type UpfrontRailPayment } from "./upfront-payment";
-import type { PaymentRequestContent } from "@dvmkit/sdk/internal";
+import type { Message, PaymentRequestContent } from "@dvmkit/sdk/internal";
 import { usdMicro, type BudgetOverrun } from "./job-budget";
 import type { JobCompletion } from "./completion-hints";
 import { ensureConfigDir } from "@dvmkit/sdk/internal";
@@ -139,6 +139,11 @@ export interface JobRecord {
    * absent only on records written before this landed.
    */
   completion?: JobCompletion;
+  /** Expiry evidence stays separate from the message log, which records delivered output. */
+  unansweredPaymentEvidence?: {
+    request: Extract<Message, { type: "payment-request" }>;
+    cancellation: Extract<Message, { type: "cancel" }>;
+  };
   /** Cost in millisatoshis */
   costMsats?: number;
   /** Rail the upfront spend settled on. `credit` — drawn from a prepaid credit. */

@@ -26,7 +26,7 @@ import {
   resolveJobAccess,
   withJobTokenRedaction,
 } from "../lib/job-access";
-import { jobContentFields, observeJobContent } from "../lib/job-content";
+import { jobContentFields, observeJobContent, type ContentStatus } from "../lib/job-content";
 import { appendMessages, loadMessages, maxSeq } from "../lib/messages";
 import { loadJob, updateObservedJob } from "../lib/job-store";
 import { finalizeProgressLine } from "../lib/progress-bar";
@@ -158,7 +158,8 @@ async function messagesWithAccess(
     const settlement = await observedSettlementFields(jobId, providerStatus, !access.endpointOverridden, currency);
     const unanswered = await readUnansweredPaymentRequest(jobId, providerStatus?.status ??
       (access.endpointOverridden ? undefined : loadJob(jobId)?.status), access, transport, {
-      messages: msgs, fullHistory: after === 0, localOnly: isTerminal, timeoutMs: timeout,
+      messages: msgs, fullHistory: after === 0,
+      localOnly: isTerminal || providerStatus?.content_available === false, timeoutMs: timeout,
     });
     transport.close();
 
@@ -270,7 +271,7 @@ async function messagesWithAccess(
   }
   const content = jobContentFields(jobId, providerStatus, opts.human);
   const resolvedAction = await resolveNextAction(result.nextAction, result.messages, providerStatus?.status ?? result.providerStatus?.status);
-  const observed = providerStatus ?? result.providerStatus;
+  const observed: ContentStatus | undefined = providerStatus ?? result.providerStatus;
   const currency = access.endpointOverridden
     ? await providerCurrency({ receipt: observed?.receipt, status: observed, messages: result.messages, transport, ref }) : undefined;
   const settlement = await observedSettlementFields(jobId, observed, !access.endpointOverridden, currency);
@@ -278,7 +279,7 @@ async function messagesWithAccess(
     (access.endpointOverridden ? undefined : loadJob(jobId)?.status), access, transport, {
     messages: result.messages,
     fullHistory: after === 0 && result.messages.some((message) => message.type === "cancel" || message.type === "complete"),
-    localOnly: isTerminal || (waitDeadline !== undefined && Date.now() >= waitDeadline),
+    localOnly: isTerminal || observed?.content_available === false || (waitDeadline !== undefined && Date.now() >= waitDeadline),
     timeoutMs: waitDeadline === undefined ? streamOptions.timeoutMs
       : Math.max(1, Math.min(streamOptions.timeoutMs, waitDeadline - Date.now())),
   });

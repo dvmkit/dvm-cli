@@ -5,7 +5,7 @@ import type { Message } from "@dvmkit/sdk/internal";
 import { status } from "../src/commands/status";
 import { messages } from "../src/commands/messages";
 import { loadJob, saveJob, updateJob } from "../src/lib/job-store";
-import { appendMessages } from "../src/lib/messages";
+import { appendMessages, loadMessages } from "../src/lib/messages";
 
 const wire = vi.hoisted(() => ({ status: vi.fn(), getMessages: vi.fn(), stream: vi.fn(),
   sendMessage: vi.fn(), close: vi.fn(), json: vi.fn(), jsonEvent: vi.fn(), info: vi.fn() }));
@@ -36,7 +36,8 @@ beforeEach(() => {
   rmSync(root, { recursive: true, force: true });
   mkdirSync(root, { recursive: true });
   writeFileSync(join(root, "config.json"), JSON.stringify({ credit: { posture: "off" }, feedback: { posture: "off" } }));
-  saveJob({ id: jobId, endpoint, status: "processing", submittedAt: 1, messageCursor: 0 });
+  saveJob({ id: jobId, endpoint, status: "processing", submittedAt: 1, messageCursor: 0,
+    policy: { maxTotalMsats: 10000, autoPayBelowMsats: 5000, maxIncrementMsats: 5000, maxPayments: 2 } });
   log = [ask, ended];
   wire.getMessages.mockImplementation(async (_id: string, after: number) => log.filter((msg) => msg.seq > after));
   wire.stream.mockImplementation(async () => ({ messages: log, lastSeq: log.at(-1)?.seq }));
@@ -64,6 +65,7 @@ it.each(reads)("$name explains an expired unanswered charge and retains provider
 it("retains cancellation evidence for offline status without consuming messages", async () => {
   await status(jobId, {});
   expect(loadJob(jobId)?.messageCursor).toBe(0);
+  expect(loadMessages(jobId)).toEqual([]);
   wire.status.mockRejectedValue(new Error("Offline"));
   wire.getMessages.mockRejectedValue(new Error("Offline"));
   await status(jobId, {});
@@ -118,6 +120,38 @@ it("finds an expired ask before the current messages cursor", async () => {
   expect(output().messages.map((message: Message) => message.seq)).toEqual([2]);
   expect(output().unanswered_payment_request).toMatchObject({ seq: 1 });
   expect(loadJob(jobId)?.messageCursor).toBe(2);
+  expect(loadMessages(jobId).map((message) => message.seq)).toEqual([2]);
+});
+
+it.each([false, true])("does not fetch unavailable content (retained expiry evidence: %s)", async (retained) => {
+  if (retained) appendMessages(jobId, [ask, ended]);
+  wire.status.mockResolvedValue({ jobId, status: "cancelled", content_available: false, hasArtifacts: false });
+  await status(jobId, {});
+  if (retained) expect(output().unanswered_payment_request).toMatchObject({ seq: 1 });
+  else expect(output()).not.toHaveProperty("unanswered_payment_request");
+  expect(wire.getMessages).not.toHaveBeenCalled();
+});
+
+it("withdraws cached expiry attribution when fresh history shows the ask was paid", async () => {
+  log = [ask, { ...ended, seq: 3 }];
+  await status(jobId, {});
+  expect(output().unanswered_payment_request).toMatchObject({ seq: 1 });
+  log = [ask, { seq: 2, from: "requester", timestamp: 1, type: "payment", content: { amount_msats: 5000 } },
+    { ...ended, seq: 3 }];
+  await status(jobId, { jobToken: "ab".repeat(32) });
+  expect(output()).not.toHaveProperty("unanswered_payment_request");
+  wire.status.mockRejectedValue(new Error("Offline"));
+  wire.getMessages.mockRejectedValue(new Error("Offline"));
+  await status(jobId, {});
+  expect(output()).not.toHaveProperty("unanswered_payment_request");
+});
+
+it("reconciles a stored ask even without a saved spending policy", async () => {
+  updateJob(jobId, { policy: undefined });
+  appendMessages(jobId, [ask]);
+  await status(jobId, {});
+  expect(output().unanswered_payment_request).toMatchObject({ seq: 1 });
+  expect(loadMessages(jobId).map((message) => message.seq)).toEqual([1]);
 });
 
 it("reads the ending when the stream yields at an ask before reporting cancellation", async () => {
