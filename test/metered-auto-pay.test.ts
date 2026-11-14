@@ -98,6 +98,26 @@ function seedCredit(): void {
 }
 
 describe("metered caller guidance", () => {
+  it.each([false, true])("explains who pays later no-stream asks (human=%s)", async (human) => {
+    await request({ endpoint, input: "work", budget: "$1.50", maxPayments: "2", stream: false, human });
+    const hint = human ? seams.stderr.join("") : output().next_action.hint;
+    expect(hint).toContain("dvm messages job-metered --wait");
+    expect(hint).toContain("dvm pay job-metered");
+    expect(hint).toContain("only while");
+    expect(hint).toContain("An unanswered payment ask ends the job");
+    if (!human) expect(output().next_action.type).toBe("poll");
+    expect(seams.getMessages).not.toHaveBeenCalled();
+    expect(seams.sendMessage).not.toHaveBeenCalled();
+    expect(loadJob("job-metered")?.policy?.maxPayments).toBe(2);
+  });
+
+  it("uses the default poll guidance without a multi-payment warning for a single payment", async () => {
+    await request({ endpoint, input: "work", maxPayments: "1", stream: false });
+    expect(output().next_action).toMatchObject({ type: "poll", job_id: "job-metered",
+      hint: "Provider is still working. Keep the job moving unattended with `dvm messages job-metered --wait`." });
+    expect(output().next_action.hint).not.toContain("unanswered");
+  });
+
   it("accepts quote preview flags through the CLI without payment or stored consent", async () => {
     vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
     const before = snapshot();
@@ -276,6 +296,9 @@ describe("credit-only threshold", () => {
       upfrontPayment: { amount_msats: 0, credit_id: "approved-credit", draw_id: envelope.data.draw_id,
         amount_micro: 0, currency: "usd" } }));
     await request({ endpoint, input: "work", budget: "$1.50", autoPayBelow: "$0.90", creditOnly: "approved-credit", requestId: "request-approved", stream: false });
+    expect(output().next_action).toMatchObject({ type: "poll", hint: expect.stringContaining("dvm messages job-metered --wait") });
+    expect(output().next_action.hint).toContain("An unanswered payment ask ends the job");
+    expect(seams.sendMessage).not.toHaveBeenCalled();
     expect(seams.quote).toHaveBeenCalledTimes(1);
     expect(loadJob("job-metered")).toMatchObject({ creditOnly: "approved-credit", policy: { autoPayBelowMsats: 900_000 } });
     await handlePaymentRequest("job-metered", ask, loadJob("job-metered")!.policy!,

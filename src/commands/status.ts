@@ -1,4 +1,5 @@
 import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
+import { readUnansweredPaymentRequest } from "../lib/unanswered-payment";
 import { providerJobJson } from "../lib/provider-output";
 import { jobSpend, renderSpendHuman } from "../lib/job-spend";
 import { terminalSettlementReport } from "../lib/job-settlement";
@@ -128,10 +129,11 @@ async function statusWithAccess(
       markJobTerminal(jobId, terminalStatus, completion);
     }
     await settleCreditAfterRead({ job: stored, capture: receipt, transport, human: opts.human });
+    const unanswered = await readUnansweredPaymentRequest(jobId, terminalStatus, access, transport, { localOnly: true });
     transport.close();
 
     await renderStatus(jobId, stored, terminalStatus, completion, "local", null, opts, {
-      receipt, content,
+      receipt, content, unanswered,
     });
     return;
   }
@@ -239,6 +241,9 @@ async function statusWithAccess(
     if (Object.keys(updates).length > 0) updateObservedJob(jobId, updates);
   }
 
+  const unanswered = await readUnansweredPaymentRequest(jobId, result.status, access, transport, {
+    messages: msgs, timeoutMs: timeout, localOnly: result.content_available === false,
+  });
   transport.close();
 
   await renderStatus(jobId, stored, result.status, completion, "provider", nextAction, opts, {
@@ -247,6 +252,7 @@ async function statusWithAccess(
     receipt,
     content: result,
     currency,
+    unanswered,
   });
 }
 
@@ -287,7 +293,8 @@ async function renderStatus(
   source: "local" | "provider",
   nextAction: NextAction,
   opts: StatusOptions,
-  fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: Partial<ContentStatus>; currency?: string }
+  fetched?: { msgs?: Message[]; cursor?: number; receipt?: ReceiptCapture; content?: Partial<ContentStatus>; currency?: string;
+    unanswered?: Awaited<ReturnType<typeof readUnansweredPaymentRequest>> }
 ): Promise<void> {
   const identifier = stored?.dvmId ? formatIdentifier(stored.dvmId, stored.capability) : undefined;
   const artifacts = terminalCompletionOutput(jobId, jobStatus, completion, {
@@ -309,6 +316,7 @@ async function renderStatus(
       info(`Status: ${jobStatus}${identifier ? ` [${identifier}]` : ""}`);
       if (completion.message) info(`  ${completion.message}`);
     }
+    if (fetched?.unanswered) info(fetched.unanswered.display);
     if (artifacts.hint) info(`📎 ${artifacts.hint}`);
     info(String(content.content_hint));
     if (msgs.length > 0) {
@@ -344,6 +352,7 @@ async function renderStatus(
     ...artifacts.fields,
     ...(artifacts.display ? { display: artifacts.display } : {}),
     ...(completion.message ? { message: completion.message } : {}),
+    ...(fetched?.unanswered ? { unanswered_payment_request: fetched.unanswered } : {}),
     // terminal responses only. On a still-running job "absent" would
     // read as "this DVM doesn't issue receipts" rather than "not yet".
     ...(receipt ? await receiptJsonFields(receipt) : {}),
