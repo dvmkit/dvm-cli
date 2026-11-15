@@ -636,8 +636,6 @@ async function requestWithWarnings(
   }
   const pricing = providerInfo.capabilities?.[capability]?.pricing as { max?: unknown } | undefined;
   const warningLimits = { budget: effectiveBudget, autoPayBelow: effectiveAutoPayBelow };
-  const previewWarnings = autoPayWarnings(previewQuotes, warningLimits, pricing?.max ?? providerInfo.pricing?.max, btcRate);
-  addOutputWarnings(previewWarnings, opts.human);
 
   if (signing) {
     const signer = signing;
@@ -764,6 +762,11 @@ async function requestWithWarnings(
     }
   }
 
+  const previewUpfrontCoveredByCredit = probePlan.mode === "draw";
+  const previewWarnings = autoPayWarnings(previewQuotes, warningLimits, pricing?.max ?? providerInfo.pricing?.max,
+    btcRate, { upfrontCoveredByCredit: previewUpfrontCoveredByCredit });
+  addOutputWarnings(previewWarnings, opts.human);
+
   let envelope: JobEnvelope = { ...envelopeBase, data };
 
   // The ID the submitted job is recorded and reported under: the caller's own,
@@ -881,7 +884,9 @@ async function requestWithWarnings(
       transport.close();
       throw new DvmError("credit_only_unavailable", "The selected prepaid credit did not cover this submission; no fresh payment was attempted.");
     }
-    if (!previewWarnings.length) addOutputWarnings(autoPayWarnings(quotes, warningLimits, undefined, btcRate), opts.human);
+    if (!previewWarnings.length || previewUpfrontCoveredByCredit) {
+      addOutputWarnings(autoPayWarnings(quotes, warningLimits, undefined, btcRate), opts.human);
+    }
     if (autoPayConsent && quotes.length > 0) {
       const pay = () =>
         handleAutoPayQuotes(
