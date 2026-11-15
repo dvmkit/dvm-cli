@@ -372,7 +372,7 @@ describe("human-paid funding without waiting", () => {
     });
     expect(sdk.loadAgentWallet()?.pending_mints).toHaveLength(1);
 
-    fixture.wallet.checkMintQuoteBolt11.mockResolvedValue({ quote: "quote-1", state: "SETTLING" as never });
+    fixture.wallet.checkMintQuoteBolt11.mockResolvedValue({ quote: "quote-1", request: "lnbc1", expiry: null, state: "SETTLING" as never });
     await expect(walletForgetQuote("quote-1", { yes: true })).rejects.toMatchObject({
       code: "mint_quote_unchecked", data: { cause: "unexpected", retryable: false },
     });
