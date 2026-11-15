@@ -2,7 +2,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+// The first dynamic import of the SDK and `tempo-wallet` transforms their
+// whole module graph. That cold cost is unbounded under machine load, so it is
+// paid once here with its own budget instead of inside whichever test runs
+// first; the transform cache survives `vi.resetModules()`, so each test keeps
+// the default 5 s for its own assertions.
+const COLD_IMPORT_TIMEOUT_MS = 60_000;
 
 // Sandbox `config.json` to a fresh dir per test by redirecting
 // `DVM_CONFIG_DIR` and re-importing the modules that resolve it at module-eval
@@ -14,6 +21,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 describe("tempo-wallet", () => {
   let originalConfigDir: string | undefined;
   let tmpConfigDir: string;
+
+  beforeAll(async () => {
+    await import("@dvmkit/sdk/internal");
+    await import("../tempo-wallet");
+  }, COLD_IMPORT_TIMEOUT_MS);
 
   beforeEach(() => {
     originalConfigDir = process.env.DVM_CONFIG_DIR;
