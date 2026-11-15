@@ -98,6 +98,53 @@ function seedCredit(): void {
 }
 
 describe("metered caller guidance", () => {
+  it.each([false, true])("omits credit-covered upfront warnings (credit-only=%s)", async (creditOnly) => {
+    seedCredit();
+    seams.quote.mockResolvedValue([{ ...metered, upfront: { amount: 0.55, currency: "usd" }, priceMsats: 550_000,
+      rate: { per_unit: { amount: 0.05, currency: "usd" }, unit: "hour", max_units: 1 } }]);
+    seams.submit.mockImplementation(async (_ref, envelope) => ({ jobId: "job-metered", status: "processing",
+      upfrontPayment: { amount_msats: 550_000, credit_id: "approved-credit", draw_id: envelope.data.draw_id,
+        amount_micro: 550_000, currency: "usd" } }));
+    await request({ endpoint, input: "work", budget: "$0.60", maxPayments: "2", maxIncrement: "$0.55",
+      ...(creditOnly ? { creditOnly: "approved-credit", requestId: "request-covered" } : {}), stream: false });
+    expect(seams.submit.mock.calls[0][1].data).toMatchObject({ credit_id: "approved-credit", draw_id: expect.any(String) });
+    expect(output()).toMatchObject({ jobId: "job-metered", next_action: { type: "poll" } });
+    expect(output()).not.toHaveProperty("warnings");
+    expect(loadJob("job-metered")?.policy?.autoPayBelowMsats).toBe(120_000);
+    expect(seams.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("warns about a bounded rate above the threshold when credit covers upfront", async () => {
+    seedCredit();
+    seams.quote.mockResolvedValue([{ ...metered, upfront: { amount: 0.55, currency: "usd" }, priceMsats: 550_000,
+      rate: { per_unit: { amount: 0.15, currency: "usd" }, unit: "hour", max_units: 1 } }]);
+    await request({ endpoint, input: "work", budget: "$0.60", creditOnly: "approved-credit",
+      requestId: "request-rate", stream: false });
+    expect(output().warnings).toMatchObject([{ code: "auto_pay_bound_exceeded", auto_pay_below: "150000",
+      maximum: "$0.15 USD (150000 msats)" }]);
+    expect(seams.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("retains upfront warnings for wallet quotes (refused draw=%s)", async (refusedDraw) => {
+    const quotes = [{ ...metered, upfront: { amount: 0.55, currency: "usd" }, priceMsats: 550_000,
+      rate: { per_unit: { amount: 0.15, currency: "usd" }, unit: "hour", max_units: 1 } }];
+    if (refusedDraw) {
+      seedCredit();
+      const { DvmError } = await import("@dvmkit/sdk/internal");
+      seams.submit.mockRejectedValueOnce(new DvmError("credit_not_found", "Credit not found"));
+    }
+    seams.quote.mockResolvedValue(quotes);
+    seams.submit.mockResolvedValue({ jobId: "", status: "payment-required", quotes });
+    await request({ endpoint, input: "work", budget: "$0.60", stream: false });
+    expect(output().warnings).toEqual(expect.arrayContaining([expect.objectContaining({
+      code: "auto_pay_bound_exceeded", auto_pay_below: "550000",
+    })]));
+    expect(output().status).toBe("quotes-collected");
+    expect(seams.submit).toHaveBeenCalledTimes(refusedDraw ? 2 : 1);
+    if (refusedDraw) expect(seams.submit.mock.calls[1][1].data).not.toHaveProperty("credit_id");
+    expect(seams.sendMessage).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("explains who pays later no-stream asks (human=%s)", async (human) => {
     await request({ endpoint, input: "work", budget: "$1.50", maxPayments: "2", stream: false, human });
     const hint = human ? seams.stderr.join("") : output().next_action.hint;

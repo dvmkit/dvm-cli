@@ -23,7 +23,8 @@ export function autoPayWarnings(
   quotes: Quote[],
   limits: Limits,
   ceiling?: unknown,
-  btcRate = getLastKnownBtcRate()?.rate ?? 0
+  btcRate = getLastKnownBtcRate()?.rate ?? 0,
+  { upfrontCoveredByCredit = false }: { upfrontCoveredByCredit?: boolean } = {}
 ): AutoPayWarning[] {
   if (!limits.budget && !limits.autoPayBelow) return [];
   if (!positive(btcRate)) {
@@ -33,8 +34,12 @@ export function autoPayWarnings(
       ? quoted.upfront.amount * 100_000_000_000 / quoted.priceMsats : 0);
   }
   const amounts: number[] = [];
+  let excludedUpfront = false;
   for (const quote of quotes) {
-    if (quote.upfront?.currency === "usd" && positive(quote.upfront.amount)) amounts.push(quote.upfront.amount);
+    if (quote.upfront?.currency === "usd" && positive(quote.upfront.amount)) {
+      if (upfrontCoveredByCredit) excludedUpfront = true;
+      else amounts.push(quote.upfront.amount);
+    }
     const rate = quote.rate;
     if (rate?.per_unit?.currency === "usd" && positive(rate.per_unit.amount) && positive(rate.max_units)) {
       const maximum = Number((rate.per_unit.amount * rate.max_units).toPrecision(15));
@@ -42,7 +47,8 @@ export function autoPayWarnings(
     }
   }
   let source: AutoPayWarning["source"] = "quote";
-  if (!amounts.length && ceiling && typeof ceiling === "object") {
+  // A known charge paid by credit must not reappear as an advertised ceiling.
+  if (!amounts.length && !excludedUpfront && ceiling && typeof ceiling === "object") {
     const max = ceiling as { amount?: unknown; currency?: unknown };
     if (max.currency === "usd" && positive(max.amount)) {
       amounts.push(max.amount);

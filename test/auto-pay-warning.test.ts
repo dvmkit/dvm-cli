@@ -8,6 +8,23 @@ const metered = (amount = 0.09, units: number | undefined = 10): Quote => ({
 });
 
 describe("auto-pay quote warnings", () => {
+  it("excludes only the credit-covered upfront amount", () => {
+    const quote = { ...metered(0.05, 1), upfront: { amount: 0.55, currency: "usd" }, priceMsats: 550_000 };
+    const limits = { budget: "$0.60" };
+    const covered = { upfrontCoveredByCredit: true };
+    expect(autoPayWarnings([quote], limits, undefined, 100_000, covered)).toEqual([]);
+    expect(autoPayWarnings([quote], limits, undefined, 100_000)[0])
+      .toMatchObject({ maximum: "$0.55 USD (550000 msats)", auto_pay_below: "550000" });
+    expect(autoPayWarnings([{ ...quote, rate: metered(0.15, 1).rate }], limits, undefined, 100_000, covered)[0])
+      .toMatchObject({ maximum: "$0.15 USD (150000 msats)", auto_pay_below: "150000" });
+  });
+
+  it("does not replace an excluded upfront charge with the advertised ceiling", () => {
+    const quote = { ...metered(), rate: undefined, upfront: { amount: 0.55, currency: "usd" }, priceMsats: 550_000 };
+    expect(autoPayWarnings([quote], { budget: "$0.60" }, { amount: 0.55, currency: "usd" },
+      100_000, { upfrontCoveredByCredit: true })).toEqual([]);
+  });
+
   it("computes the rate cap against the unchanged 20% default", () => {
     expect(autoPayWarnings([metered()], { budget: "$1.50" }, undefined, 100_000)).toMatchObject([
       { bound: "300000 msats", maximum: "$0.9 USD (900000 msats)", auto_pay_below: "900000", source: "quote" },
