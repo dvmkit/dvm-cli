@@ -366,7 +366,9 @@ describe("pending-mint reconcile against a mint that won't answer", () => {
       status: "ok",
       pending_mints: [],
       sweep: {
-        expired: [{ quote_id: "expired-quote", mint: MINT, amount_sats: 1_200 }],
+        expired: [
+          { quote_id: "expired-quote", mint: MINT, amount_sats: 1_200, reason: "grace_elapsed" },
+        ],
         dropped: ["expired-quote", "issued-quote"],
       },
     });
@@ -383,6 +385,7 @@ describe("pending-mint reconcile against a mint that won't answer", () => {
     expect(expired).toContain("1200 sats");
     expect(expired).toContain(MINT);
     expect(expired).toContain("quote ID expired-quote");
+    expect(expired).toContain("24 hours after it expired");
     expect(expired).toContain("local recovery entry removed");
     expect(lines.join("\n")).not.toContain("issued-quote");
   });
@@ -417,6 +420,8 @@ function prepareExpiredQuotes(): void {
       ...pendingMint("expired-quote"),
       amount_sats: 1_200,
       requested_at: new Date(0).toISOString(),
+      // Two days past expiry: beyond the grace period an unpaid quote is kept for.
+      expires_at: Math.floor(Date.now() / 1000) - 48 * 60 * 60,
     },
     { ...pendingMint("issued-quote"), amount_sats: 300 },
   ]);

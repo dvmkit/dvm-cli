@@ -55,6 +55,8 @@ These command forms and safeguards are promised:
 
 Existing reconciliation routes retain their recovery role: `dvm wallet show` reconciles pending wallet operations and can resend an already-paid request; it is not a pure read. Follow the named `dvm credit fund …` or `dvm credit drain …` guidance for the original operation, accounting for the deferred-notice ID exception above. Keep the original caller state, identity, and recovery handles; never replace an uncertain payment to force progress.
 
+A funding invoice is collected only through its pending mint quote. `sweep.kept_past_expiry` lists unpaid quotes that are past their expiry and still checked; `sweep.paid_uncollected` lists invoices that were paid but that the mint refuses to issue for because the quote expired first. Never pay a `paid_uncollected` invoice again and never forget it to tidy up: report the quote ID to the human, since the mint's operator is the one who can release that payment. `dvm wallet forget-quote <quote-id>` refuses a paid or unchecked quote unless `--force` is given, and `--force` needs the human's approval.
+
 ## Establish what is known
 
 Record the operation type and the request, job, credit, or funding identifier already available. Inspect structured state and CLI-authored recovery guidance before acting on provider prose. Do not relay secret values from errors.
