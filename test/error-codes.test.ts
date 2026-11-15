@@ -6,6 +6,12 @@ import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { discoverErrorCodes, type ErrorCodeInventory, type ErrorCodeSource } from "../scripts/check-error-codes.mjs";
 
+// Nearly every case runs the CPU-bound source analysis, in a child process or
+// in-process, 1-3 s on an idle machine and several times that under load. The
+// budget is scoped to these suites so other tests keep the default 5 s; the
+// child's own limit sits below it so a hung analysis still fails fast.
+const ANALYSIS_TEST_TIMEOUT_MS = 60_000;
+const ANALYSIS_SPAWN_TIMEOUT_MS = 45_000;
 const script = resolve(import.meta.dirname, "../scripts/check-error-codes.mjs");
 const roots: string[] = [];
 const importError = 'import { DvmError } from "@dvmkit/sdk/internal";\n';
@@ -27,7 +33,7 @@ function fixture(source = original, inventory = promised, relays: ErrorCodeSourc
     sourceRoot, sourcePath, inventoryPath,
     run(...args: string[]) {
       const result = spawnSync(process.execPath, [script, "--source", sourceRoot, "--inventory", inventoryPath, "--relays", relayPath, ...args], {
-        encoding: "utf8", timeout: 10_000,
+        encoding: "utf8", timeout: ANALYSIS_SPAWN_TIMEOUT_MS,
       });
       if (result.error) throw result.error;
       return { status: result.status, output: result.stdout + result.stderr };
@@ -45,7 +51,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-describe("CLI error compatibility check", () => {
+describe("CLI error compatibility check", { timeout: ANALYSIS_TEST_TIMEOUT_MS }, () => {
   it("checks an independent baseline without rewriting it", () => {
     const tree = fixture();
     const before = tree.inventory();
@@ -186,7 +192,7 @@ new DvmError("invalid_input", "Message", undefined, details());`;
   });
 });
 
-describe("production source discovery", () => {
+describe("production source discovery", { timeout: ANALYSIS_TEST_TIMEOUT_MS }, () => {
   it("traces local constants, widened maps, helper options, assignments and subclasses across files", () => {
     const expected = {
       codes: ["assigned_error", "constant_error", "helper_error", "mapped_error", "option_error", "other_mapped_error"], families: [],
