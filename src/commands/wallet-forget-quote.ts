@@ -98,7 +98,9 @@ async function quoteStanding(entry: PendingMint): Promise<QuoteStanding> {
     if (quote.state === MintQuoteState.PAID) return { state: "paid" };
     if (quote.state === MintQuoteState.ISSUED) return { state: "issued" };
     if (quote.state === MintQuoteState.UNPAID) return { state: "unpaid" };
-    return { state: "gone" };
+    if ((quote.state as string) === "EXPIRED") return { state: "gone" };
+    // A state this CLI cannot read is not an answer that the quote is dead.
+    return { state: "unchecked", cause: "unexpected" };
   } catch (err) {
     if (mintQuoteRefusal(err) !== undefined) return { state: "gone" };
     return { state: "unchecked", cause: classifyMintError(err) };

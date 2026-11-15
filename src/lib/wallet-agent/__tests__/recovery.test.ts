@@ -491,8 +491,9 @@ describe("sweepPendingMints", () => {
       },
       {
         err: Object.assign(new Error("mint quote does not exist"), {
-          name: "HttpResponseError",
-          status: 404,
+          name: "MintOperationError",
+          status: 400,
+          code: 10000,
         }),
         reason: "mint_unknown",
       },
@@ -535,6 +536,20 @@ describe("sweepPendingMints", () => {
       }),
       // What a mint API answers for a route it does not serve at all.
       Object.assign(new Error("Not Found"), { name: "HttpResponseError", status: 404 }),
+      // A proxy or web server page: its text names the quote only by echoing
+      // the request path, and the mint itself said nothing.
+      Object.assign(
+        new Error("The requested URL /v1/mint/quote/bolt11/refused-check was not found on this server."),
+        { name: "HttpResponseError", status: 404 }
+      ),
+      Object.assign(new Error("GET /v1/mint/quote/bolt11/refused-check: session expired"), {
+        name: "HttpResponseError",
+        status: 403,
+      }),
+      Object.assign(new Error("mint quote does not exist"), {
+        name: "HttpResponseError",
+        status: 404,
+      }),
       // The same words from a mint that failed rather than answered.
       Object.assign(new Error("quote not found"), { name: "HttpResponseError", status: 503 }),
     ];
@@ -556,6 +571,56 @@ describe("sweepPendingMints", () => {
       expect(result.outcomes[0].kind).toBe("error");
       expect(saveAgentWallet).not.toHaveBeenCalled();
     }
+  });
+
+  it("restores from saved outputs before acting on the mint's answer that a quote is gone", async () => {
+    const seenPaid = {
+      ...pending("seen-paid", FRESH),
+      minting: { keyset_id: "k1", outputs: persistedOutputs() },
+    };
+    const gone = Object.assign(new Error("quote not found"), {
+      name: "MintOperationError",
+      status: 400,
+      code: 0,
+    });
+
+    vi.mocked(loadAgentWallet).mockReturnValue({ ...baseWallet, pending_mints: [seenPaid] });
+    const cashu = makeMockWallet("UNPAID");
+    cashu.checkMintQuoteBolt11.mockRejectedValue(gone);
+    cashu.mint.restore.mockResolvedValue({
+      outputs: [
+        { amount: 64, B_: "02BB64", id: "k1" },
+        { amount: 32, B_: "02BB32", id: "k1" },
+        { amount: 4, B_: "02BB04", id: "k1" },
+      ],
+      signatures: [
+        { id: "k1", amount: 64, C_: "02CC64" },
+        { id: "k1", amount: 32, C_: "02CC32" },
+        { id: "k1", amount: 4, C_: "02CC04" },
+      ],
+    });
+
+    const restored = await sweepPendingMints({
+      now: () => NOW,
+      getWalletForMint: vi.fn().mockResolvedValue(cashu),
+    });
+
+    expect(restored.outcomes[0].kind).toBe("restored");
+    const saved = vi.mocked(saveAgentWallet).mock.calls[0][0];
+    expect(saved.pending_mints).toHaveLength(0);
+    expect(saved.proofs.map((p) => p.amount).sort((a, b) => a - b)).toEqual([4, 32, 64]);
+
+    // Nothing to restore: the entry is the only record of the payment.
+    vi.mocked(saveAgentWallet).mockClear();
+    cashu.mint.restore.mockResolvedValue({ outputs: [], signatures: [] });
+    const kept = await sweepPendingMints({
+      now: () => NOW,
+      getWalletForMint: vi.fn().mockResolvedValue(cashu),
+    });
+
+    expect(kept.outcomes[0].kind).toBe("error");
+    expect(kept.errors.map((e) => e.quote_id)).toEqual(["seen-paid"]);
+    expect(saveAgentWallet).not.toHaveBeenCalled();
   });
 
   it("PAID but the mint refuses to issue after expiry → entry kept and reported as refused", async () => {

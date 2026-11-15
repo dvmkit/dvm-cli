@@ -165,11 +165,9 @@ async function processEntry(
   } catch (err) {
     const refusal = mintQuoteRefusal(err);
     if (refusal !== undefined) {
-      return {
-        kind: "expired",
-        entry,
-        reason: refusal === "unknown" ? "mint_unknown" : "mint_expired",
-      };
+      return finalAnswer(wallet, entry, refusal === "unknown" ? "mint_unknown" : "mint_expired", () =>
+        getWalletForMint(entry.mint)
+      );
     }
     return { kind: "error", entry, error: errorMessage(err) };
   }
@@ -250,7 +248,7 @@ async function processEntry(
 
   // Not a NUT-04 state, but a mint that names one has given its final answer.
   if ((state as string) === "EXPIRED") {
-    return { kind: "expired", entry, reason: "mint_expired" };
+    return finalAnswer(wallet, entry, "mint_expired", async () => cashuWallet);
   }
 
   // UNPAID. The quote ID is the only handle that can mint a late payment, so
@@ -267,7 +265,7 @@ async function processEntry(
   }
   const dropAfterMs = expiredAtMs + expiryGraceMs;
   if (nowMs > dropAfterMs) {
-    return { kind: "expired", entry, reason: "grace_elapsed" };
+    return finalAnswer(wallet, entry, "grace_elapsed", async () => cashuWallet);
   }
   return {
     kind: "still_pending",
@@ -276,21 +274,55 @@ async function processEntry(
   };
 }
 
+/**
+ * Acts on the mint's answer that a quote is finished. Saved outputs mean an
+ * earlier sweep saw the quote paid and may have crashed mid-mint, so that
+ * entry is restored from them, and kept when nothing comes back: it is the
+ * only record of a payment the mint took.
+ */
+async function finalAnswer(
+  wallet: AgentWallet,
+  entry: PendingMint,
+  reason: MintQuoteDropReason,
+  getCashuWallet: () => Promise<Wallet>
+): Promise<SweepEntryOutcome> {
+  if (!entry.minting) return { kind: "expired", entry, reason };
+  try {
+    const restored = await restoreFromMintingState(
+      await getCashuWallet(),
+      entry.minting,
+      wallet.lock_pubkey,
+      entry.mint
+    );
+    if (restored.length > 0) return { kind: "restored", entry, proofs: restored };
+  } catch (err) {
+    return { kind: "error", entry, error: errorMessage(err) };
+  }
+  if (reason === "mint_expired") return { kind: "paid_refused", entry, reason: "quote_expired" };
+  return {
+    kind: "error",
+    entry,
+    error:
+      reason === "mint_unknown"
+        ? "The mint reported this quote paid earlier and no longer knows it; nothing could be restored, so the quote is kept."
+        : "The mint reported this quote paid earlier and now reports it unpaid; nothing could be restored, so the quote is kept.",
+  };
+}
+
 /** NUT error code a mint returns for a quote past its expiry. */
 const MINT_QUOTE_EXPIRED_CODE = 20007;
-// Both name the quote: a bare "Not Found" is also what a moved or
-// misconfigured mint API answers for every route, and that must not read as
-// the mint disowning a quote.
 const QUOTE_UNKNOWN_TEXT =
   /\bquote\b[^.]*\b(not found|unknown|does not exist)\b|\b(unknown|no such) quote\b/i;
 const QUOTE_EXPIRED_TEXT = /\bquote\b[^.]*\bexpired\b|\bexpired quote\b/i;
 
 /**
  * A mint's definite answer that a quote is gone, as opposed to a mint that
- * could not answer. Only a 4xx reply counts, so an outage, a rate limit or a
- * failure inside this CLI never reads as the quote being lost. Duck-typed on
- * cashu-ts's `name` and `status`: the bundle can carry more than one copy of
- * the error classes.
+ * could not answer. Only the mint's structured protocol error counts (HTTP 400
+ * carrying a numeric `code` and a `detail`, which cashu-ts raises as
+ * `MintOperationError`). Any other reply's message can be a proxy or web
+ * server page, whose text echoes the request path and so names the quote
+ * without the mint having said anything about it. Duck-typed on cashu-ts's
+ * `name`: the bundle can carry more than one copy of the error classes.
  */
 export function mintQuoteRefusal(err: unknown): "unknown" | "expired" | undefined {
   if (typeof err !== "object" || err === null) return undefined;
@@ -300,9 +332,7 @@ export function mintQuoteRefusal(err: unknown): "unknown" | "expired" | undefine
     code?: unknown;
     message?: unknown;
   };
-  const answered =
-    name === "MintOperationError" ||
-    (typeof status === "number" && status >= 400 && status < 500 && status !== 429);
+  const answered = name === "MintOperationError" && status === 400 && typeof code === "number";
   if (!answered) return undefined;
   const text = typeof message === "string" ? message : "";
   if (code === MINT_QUOTE_EXPIRED_CODE || QUOTE_EXPIRED_TEXT.test(text)) return "expired";
