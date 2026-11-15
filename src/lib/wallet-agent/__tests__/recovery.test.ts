@@ -336,7 +336,7 @@ describe("sweepPendingMints", () => {
     expect(saveAgentWallet).not.toHaveBeenCalled();
   });
 
-  it("UNPAID + live quote expiry → survives past the fund-timeout fallback", async () => {
+  it("UNPAID + live quote expiry → stays pending however old the request is", async () => {
     vi.mocked(loadAgentWallet).mockReturnValue({
       ...baseWallet,
       pending_mints: [
@@ -349,69 +349,309 @@ describe("sweepPendingMints", () => {
     const cashu = makeMockWallet("UNPAID");
     const result = await sweepPendingMints({
       now: () => NOW,
-      expirationMs: 10 * 60 * 1000,
       getWalletForMint: vi.fn().mockResolvedValue(cashu),
     });
 
-    expect(result.outcomes[0].kind).toBe("still_pending");
+    expect(result.outcomes[0]).toEqual({ kind: "still_pending", entry: expect.anything() });
     expect(result.still_pending.map((entry) => entry.quote_id)).toEqual(["live-quote"]);
     expect(saveAgentWallet).not.toHaveBeenCalled();
   });
 
-  it("UNPAID + elapsed quote expiry → drops entry even within the fund timeout", async () => {
+  it("UNPAID + elapsed quote expiry → kept through the grace period, then collected once paid", async () => {
+    const expiresAt = Math.floor(NOW / 1000) - 1;
+    vi.mocked(loadAgentWallet).mockReturnValue({
+      ...baseWallet,
+      pending_mints: [{ ...pending("elapsed-quote", FRESH), expires_at: expiresAt }],
+    });
+    const cashu = makeMockWallet("UNPAID");
+    const getWalletForMint = vi.fn().mockResolvedValue(cashu);
+
+    const kept = await sweepPendingMints({ now: () => NOW, getWalletForMint });
+
+    expect(kept.outcomes[0]).toMatchObject({
+      kind: "still_pending",
+      past_expiry: {
+        expired_at_ms: expiresAt * 1000,
+        drop_after_ms: expiresAt * 1000 + 24 * 60 * 60 * 1000,
+      },
+    });
+    expect(kept.still_pending.map((entry) => entry.quote_id)).toEqual(["elapsed-quote"]);
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+
+    // The payment lands 23 hours after the quote expired.
+    cashu.checkMintQuoteBolt11.mockResolvedValue({
+      quote: "elapsed-quote",
+      state: "PAID",
+      request: "lnbc1",
+    });
+    const paid = await sweepPendingMints({
+      now: () => NOW + 23 * 60 * 60 * 1000,
+      getWalletForMint,
+    });
+
+    expect(paid.outcomes[0].kind).toBe("minted");
+    expect(paid.recovered_proofs.map((p) => p.amount)).toEqual([64, 32, 4]);
+    const saved = vi.mocked(saveAgentWallet).mock.calls.at(-1)![0];
+    expect(saved.pending_mints).toHaveLength(0);
+    expect(saved.proofs).toHaveLength(3);
+  });
+
+  it("UNPAID a full grace period past expiry → drops entry on the mint's answer", async () => {
     vi.mocked(loadAgentWallet).mockReturnValue({
       ...baseWallet,
       pending_mints: [
         {
-          ...pending("elapsed-quote", FRESH),
-          expires_at: Math.floor(NOW / 1000) - 1,
+          ...pending("long-expired", STALE),
+          expires_at: Math.floor(NOW / 1000) - 24 * 60 * 60 - 1,
         },
       ],
     });
     const cashu = makeMockWallet("UNPAID");
     const result = await sweepPendingMints({
       now: () => NOW,
-      expirationMs: 10 * 60 * 1000,
       getWalletForMint: vi.fn().mockResolvedValue(cashu),
     });
 
-    expect(result.outcomes[0].kind).toBe("expired");
+    expect(result.outcomes[0]).toMatchObject({ kind: "expired", reason: "grace_elapsed" });
+    expect(cashu.checkMintQuoteBolt11).toHaveBeenCalledTimes(1);
     const saved = vi.mocked(saveAgentWallet).mock.calls[0][0];
     expect(saved.pending_mints).toHaveLength(0);
   });
 
-  it("UNPAID legacy entry past the fallback → drops entry", async () => {
+  it("a mint that cannot answer never drops a quote, even a full grace period past expiry", async () => {
     vi.mocked(loadAgentWallet).mockReturnValue({
       ...baseWallet,
-      pending_mints: [pending("q3", STALE)],
+      pending_mints: [
+        {
+          ...pending("unreachable", STALE),
+          expires_at: Math.floor(NOW / 1000) - 48 * 60 * 60,
+        },
+      ],
     });
     const cashu = makeMockWallet("UNPAID");
+    cashu.checkMintQuoteBolt11.mockRejectedValue(
+      Object.assign(new Error("mint failed"), { name: "HttpResponseError", status: 503 })
+    );
+
     const result = await sweepPendingMints({
       now: () => NOW,
-      expirationMs: 10 * 60 * 1000,
+      quoteRetryTimeoutMs: 0,
       getWalletForMint: vi.fn().mockResolvedValue(cashu),
     });
 
-    expect(result.outcomes[0].kind).toBe("expired");
-    const saved = vi.mocked(saveAgentWallet).mock.calls[0][0];
-    expect(saved.pending_mints).toHaveLength(0);
-  });
-
-  it("UNPAID legacy entry within the fallback → leaves entry pending", async () => {
-    vi.mocked(loadAgentWallet).mockReturnValue({
-      ...baseWallet,
-      pending_mints: [pending("q4", FRESH)],
-    });
-    const cashu = makeMockWallet("UNPAID");
-    const result = await sweepPendingMints({
-      now: () => NOW,
-      expirationMs: 10 * 60 * 1000,
-      getWalletForMint: vi.fn().mockResolvedValue(cashu),
-    });
-
-    expect(result.outcomes[0].kind).toBe("still_pending");
-    expect(result.still_pending).toHaveLength(1);
+    expect(result.outcomes[0].kind).toBe("error");
     expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it("UNPAID with no quote expiry → never dropped locally, and collected when paid late", async () => {
+    // The request is 11 minutes old: past the 10-minute fund timeout that used
+    // to drop a quote whose mint named no expiry.
+    const requestedAt = new Date(NOW - 11 * 60 * 1000).toISOString();
+    vi.mocked(loadAgentWallet).mockReturnValue({
+      ...baseWallet,
+      pending_mints: [pending("no-expiry", requestedAt)],
+    });
+    const cashu = makeMockWallet("UNPAID");
+    const getWalletForMint = vi.fn().mockResolvedValue(cashu);
+
+    const unpaid = await sweepPendingMints({ now: () => NOW, getWalletForMint });
+
+    expect(unpaid.outcomes[0]).toEqual({ kind: "still_pending", entry: expect.anything() });
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+
+    const muchLater = await sweepPendingMints({
+      now: () => NOW + 30 * 24 * 60 * 60 * 1000,
+      getWalletForMint,
+    });
+    expect(muchLater.outcomes[0].kind).toBe("still_pending");
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+
+    cashu.checkMintQuoteBolt11.mockResolvedValue({
+      quote: "no-expiry",
+      state: "PAID",
+      request: "lnbc1",
+    });
+    const paid = await sweepPendingMints({ now: () => NOW, getWalletForMint });
+
+    expect(paid.outcomes[0].kind).toBe("minted");
+    const saved = vi.mocked(saveAgentWallet).mock.calls.at(-1)![0];
+    expect(saved.pending_mints).toHaveLength(0);
+    expect(saved.proofs.map((p) => p.amount)).toEqual([64, 32, 4]);
+  });
+
+  it("drops an unpaid quote the mint reports as unknown or expired", async () => {
+    const answers = [
+      {
+        err: Object.assign(new Error("quote not found"), {
+          name: "MintOperationError",
+          status: 400,
+          code: 0,
+        }),
+        reason: "mint_unknown",
+      },
+      {
+        err: Object.assign(new Error("mint quote does not exist"), {
+          name: "MintOperationError",
+          status: 400,
+          code: 10000,
+        }),
+        reason: "mint_unknown",
+      },
+      {
+        err: Object.assign(new Error("mint quote is no longer valid"), {
+          name: "MintOperationError",
+          status: 400,
+          code: 20007,
+        }),
+        reason: "mint_expired",
+      },
+    ];
+
+    for (const { err, reason } of answers) {
+      vi.mocked(saveAgentWallet).mockClear();
+      vi.mocked(loadAgentWallet).mockReturnValue({
+        ...baseWallet,
+        pending_mints: [pending("gone", FRESH)],
+      });
+      const cashu = makeMockWallet("UNPAID");
+      cashu.checkMintQuoteBolt11.mockRejectedValue(err);
+
+      const result = await sweepPendingMints({
+        now: () => NOW,
+        getWalletForMint: vi.fn().mockResolvedValue(cashu),
+      });
+
+      expect(result.outcomes[0]).toMatchObject({ kind: "expired", reason });
+      expect(result.errors).toEqual([]);
+      expect(vi.mocked(saveAgentWallet).mock.calls[0][0].pending_mints).toHaveLength(0);
+    }
+  });
+
+  it("keeps a quote when the mint refuses the status check for any other reason", async () => {
+    const refusals = [
+      Object.assign(new Error("signature verification failed"), {
+        name: "MintOperationError",
+        status: 400,
+        code: 20008,
+      }),
+      // What a mint API answers for a route it does not serve at all.
+      Object.assign(new Error("Not Found"), { name: "HttpResponseError", status: 404 }),
+      // A proxy or web server page: its text names the quote only by echoing
+      // the request path, and the mint itself said nothing.
+      Object.assign(
+        new Error("The requested URL /v1/mint/quote/bolt11/refused-check was not found on this server."),
+        { name: "HttpResponseError", status: 404 }
+      ),
+      Object.assign(new Error("GET /v1/mint/quote/bolt11/refused-check: session expired"), {
+        name: "HttpResponseError",
+        status: 403,
+      }),
+      Object.assign(new Error("mint quote does not exist"), {
+        name: "HttpResponseError",
+        status: 404,
+      }),
+      // The same words from a mint that failed rather than answered.
+      Object.assign(new Error("quote not found"), { name: "HttpResponseError", status: 503 }),
+    ];
+
+    for (const err of refusals) {
+      vi.mocked(loadAgentWallet).mockReturnValue({
+        ...baseWallet,
+        pending_mints: [pending("refused-check", FRESH)],
+      });
+      const cashu = makeMockWallet("UNPAID");
+      cashu.checkMintQuoteBolt11.mockRejectedValue(err);
+
+      const result = await sweepPendingMints({
+        now: () => NOW,
+        quoteRetryTimeoutMs: 0,
+        getWalletForMint: vi.fn().mockResolvedValue(cashu),
+      });
+
+      expect(result.outcomes[0].kind).toBe("error");
+      expect(saveAgentWallet).not.toHaveBeenCalled();
+    }
+  });
+
+  it("restores from saved outputs before acting on the mint's answer that a quote is gone", async () => {
+    const seenPaid = {
+      ...pending("seen-paid", FRESH),
+      minting: { keyset_id: "k1", outputs: persistedOutputs() },
+    };
+    const gone = Object.assign(new Error("quote not found"), {
+      name: "MintOperationError",
+      status: 400,
+      code: 0,
+    });
+
+    vi.mocked(loadAgentWallet).mockReturnValue({ ...baseWallet, pending_mints: [seenPaid] });
+    const cashu = makeMockWallet("UNPAID");
+    cashu.checkMintQuoteBolt11.mockRejectedValue(gone);
+    cashu.mint.restore.mockResolvedValue({
+      outputs: [
+        { amount: 64, B_: "02BB64", id: "k1" },
+        { amount: 32, B_: "02BB32", id: "k1" },
+        { amount: 4, B_: "02BB04", id: "k1" },
+      ],
+      signatures: [
+        { id: "k1", amount: 64, C_: "02CC64" },
+        { id: "k1", amount: 32, C_: "02CC32" },
+        { id: "k1", amount: 4, C_: "02CC04" },
+      ],
+    });
+
+    const restored = await sweepPendingMints({
+      now: () => NOW,
+      getWalletForMint: vi.fn().mockResolvedValue(cashu),
+    });
+
+    expect(restored.outcomes[0].kind).toBe("restored");
+    const saved = vi.mocked(saveAgentWallet).mock.calls[0][0];
+    expect(saved.pending_mints).toHaveLength(0);
+    expect(saved.proofs.map((p) => p.amount).sort((a, b) => a - b)).toEqual([4, 32, 64]);
+
+    // Nothing to restore: the entry is the only record of the payment.
+    vi.mocked(saveAgentWallet).mockClear();
+    cashu.mint.restore.mockResolvedValue({ outputs: [], signatures: [] });
+    const kept = await sweepPendingMints({
+      now: () => NOW,
+      getWalletForMint: vi.fn().mockResolvedValue(cashu),
+    });
+
+    expect(kept.outcomes[0].kind).toBe("error");
+    expect(kept.errors.map((e) => e.quote_id)).toEqual(["seen-paid"]);
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it("PAID but the mint refuses to issue after expiry → entry kept and reported as refused", async () => {
+    vi.mocked(loadAgentWallet).mockReturnValue({
+      ...baseWallet,
+      pending_mints: [
+        { ...pending("paid-late", STALE), expires_at: Math.floor(NOW / 1000) - 60 },
+      ],
+    });
+    const cashu = makeMockWallet("PAID");
+    cashu.completeMint.mockRejectedValue(
+      Object.assign(new Error("quote is expired"), {
+        name: "MintOperationError",
+        status: 400,
+        code: 20007,
+      })
+    );
+
+    const result = await sweepPendingMints({
+      now: () => NOW,
+      getWalletForMint: vi.fn().mockResolvedValue(cashu),
+    });
+
+    expect(result.outcomes[0]).toMatchObject({ kind: "paid_refused", reason: "quote_expired" });
+    expect(result.refused.map((entry) => entry.quote_id)).toEqual(["paid-late"]);
+    expect(result.errors).toEqual([]);
+    expect(result.recovered_proofs).toEqual([]);
+    // Every write so far kept the entry: it is the only record of the payment.
+    for (const [saved] of vi.mocked(saveAgentWallet).mock.calls) {
+      expect(saved.pending_mints.map((p) => p.quote_id)).toEqual(["paid-late"]);
+    }
   });
 
   it("network error → keeps entry, surfaces error in result", async () => {

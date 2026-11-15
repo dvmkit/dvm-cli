@@ -22,6 +22,7 @@ import {
   resolveTempoNetwork,
   resolveX402Asset,
   saveAgentWallet,
+  shellQuoteArg,
   type TempoAccount,
   withWalletLock,
   withX402ChannelLock,
@@ -93,6 +94,10 @@ import {
   type UncheckedMint,
   uncheckedPendingNote,
 } from "../lib/wallet-agent/mint-sweep";
+import {
+  MINT_QUOTE_EXPIRY_GRACE_MS,
+  type MintQuoteDropReason,
+} from "../lib/wallet-agent/recovery";
 import {
   describePendingSubmissions,
   describeReclaimedSubmissions,
@@ -344,6 +349,7 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
         info(`Quote ID: ${quote.quote}`);
         if (expiresAt) info(`Invoice expires: ${expiresAt}`);
         info("After payment, run `dvm wallet show` to collect the sats and check the new balance.");
+        info(`  ↳ ${collectDeadlineHint(expiresAt)}`);
       } else {
         info(
           "Polling for payment every 2s; press Ctrl-C to bail (the quote will be recoverable on next run)."
@@ -368,6 +374,7 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
         qr_image_path: qrImagePath,
         relay: { copy_text: invoice, standalone: true },
         expires_at: expiresAt,
+        ...(opts.wait === false ? { collect_before: expiresAt } : {}),
         lock_pubkey: wallet.lock_pubkey,
         display: `Pay ${sats} sats to the Lightning invoice to fund ${amountPhrase} into the agent wallet at ${mintUrl} (${selectionPhrase}). Scannable QR at ${qrImagePath}.`,
         ...(opts.wait === false ? {
@@ -377,7 +384,7 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
           melt_sweep: summarizeMeltSweep(meltSweep),
         } : {}),
         hint: opts.wait === false
-          ? "Forward the QR PNG (or raw invoice) to a human. After payment, run `dvm wallet show` to collect the sats and check the new balance. Funding is still pending."
+          ? `Forward the QR PNG (or raw invoice) to a human. After payment, run \`dvm wallet show\` to collect the sats and check the new balance. ${collectDeadlineHint(expiresAt)} Funding is still pending.`
           : "Forward the QR PNG (or raw invoice) to a human; the CLI will mint P2PK-locked Cashu proofs into ~/.dvm/wallet.json once paid.",
       });
     }
@@ -564,7 +571,8 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
   await loadConfiguredMints();
 
   const sweep = await reconcilePendingMints();
-  const expiredMints = describeExpiredMints(sweep);
+  const sweepSummary = summarizeSweep(sweep);
+  const expiredMints = sweepSummary.expired;
   // reconcile cash-outs the mint never confirmed before the in-flight
   // sweep runs — the melt sweep is the authority on those proofs, and letting
   // the generic timeout sweep reach them first would offer the wallet proofs a
@@ -605,6 +613,11 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
   // paid nor unpaid as far as the wallet knows, so its row must not claim
   // either — keyed by quote so both branches can name the reason inline.
   const unchecked = new Map(sweep.unchecked.map((u) => [u.quote_id, u]));
+  const pendingNotes = new Map<string, string>([
+    ...sweepSummary.pending.map((p) => [p.quote_id, p.display] as const),
+    ...sweepSummary.kept_past_expiry.map((p) => [p.quote_id, p.display] as const),
+    ...sweepSummary.paid_uncollected.map((p) => [p.quote_id, p.display] as const),
+  ]);
   const inventory = buildDisplayMintInventory(post);
   const mintsToProbe = inventory.map((e) => e.url);
   const sources = new Map<string, MintSource>(inventory.map((e) => [e.url, e.source]));
@@ -649,13 +662,17 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
       const recovered = sweep.recovered_proofs.reduce((sum, p) => sum + p.amount, 0);
       info(`Recovered ${recovered} sats from ${sweep.recovered_proofs.length} pending mint(s).`);
     }
-    for (const collected of summarizeSweep(sweep).collected) {
+    for (const collected of sweepSummary.collected) {
       info(`${collected.display} Added ${collected.sats_collected} sats at ${collected.mint}.`);
     }
     for (const expired of expiredMints) {
       info(
-        `Unpaid mint quote expired: ${expired.amount_sats} sats at ${expired.mint} (quote ID ${expired.quote_id}) — local recovery entry removed.`
+        `Unpaid mint quote expired: ${expired.amount_sats} sats at ${expired.mint} (quote ID ${expired.quote_id}) — ${describeDropReason(expired.reason)}; local recovery entry removed.`
       );
+    }
+    for (const refused of sweepSummary.paid_uncollected) {
+      info(refused.display);
+      info(`  ↳ ${refused.hint}`);
     }
     reportUncheckedMints(sweep.unchecked);
     reportUncheckedMints(meltSweep.unchecked);
@@ -736,7 +753,7 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
       info("");
       info(`Pending mints: ${post.pending_mints.length}`);
       for (const p of post.pending_mints) {
-        info(`  ${formatPending(p, unchecked.get(p.quote_id))}`);
+        info(`  ${formatPending(p, unchecked.get(p.quote_id), pendingNotes.get(p.quote_id))}`);
       }
     }
     if (pendingMelts.length > 0) {
@@ -820,6 +837,17 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
       sweep.unchecked.length > 0
         ? `${sweep.unchecked.length} pending mint(s) could not be checked against their mint on this call — see sweep.unchecked for the cause and how long to wait. They keep their pending state; don't fund the same invoice again.`
         : null;
+    // Paid money the mint will not issue for is the one pending-mint state
+    // that needs a person, so it leads; a quote kept past its expiry follows
+    // because a payment for it can still be collected, but not for long.
+    const refusedHint =
+      sweepSummary.paid_uncollected.length > 0
+        ? `${sweepSummary.paid_uncollected.length} paid invoice(s) could not be collected because the mint refuses to issue after the quote expired — see sweep.paid_uncollected. Don't pay them again.`
+        : null;
+    const keptHint =
+      sweepSummary.kept_past_expiry.length > 0
+        ? `${sweepSummary.kept_past_expiry.length} unpaid invoice(s) are past their expiry and still checked for a late payment — see sweep.kept_past_expiry for when each is removed.`
+        : null;
     const stuckReclaims = skippedReclaimViews.filter((v) => !v.terminal);
     const deadReclaims = skippedReclaimViews.filter((v) => v.terminal);
     const unresolvedHint =
@@ -871,13 +899,15 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
       // paid calls the provider accepted without a settled job identity,
       // detected on this call or missing their evidence record.
       accepted_unresolved: unresolvedViews,
-      sweep: summarizeSweep(sweep),
+      sweep: sweepSummary,
       melt_sweep: summarizeMeltSweep(meltSweep),
       display:
         railsSnapshot.length === 0
           ? "Agent wallet is empty."
           : `${railsSnapshot.map((r) => r.json.display).join(" — ")} (~$${totalUsd.toFixed(2)} total)`,
-      hint: [uncheckedHint, unresolvedHint, resumedHint, baseHint].filter(Boolean).join(" "),
+      hint: [refusedHint, uncheckedHint, keptHint, unresolvedHint, resumedHint, baseHint]
+        .filter(Boolean)
+        .join(" "),
     });
   }
 }
@@ -1291,13 +1321,34 @@ function formatFeePpk(fee: number | null): string {
   return `${fee} ppk`;
 }
 
-function formatPending(p: PendingMint, unchecked?: UncheckedMint): string {
+function formatPending(p: PendingMint, unchecked?: UncheckedMint, note?: string): string {
   const row = `${p.amount_sats} sats at ${p.mint} (quote ${p.quote_id}, requested ${p.requested_at})`;
   // Without this the row reads as awaiting payment, which is the one thing the
   // mint just declined to confirm.
-  return unchecked
-    ? `${row}\n    ↳ ${uncheckedPendingNote(unchecked)}`
-    : `${row} — not paid yet; awaiting payment`;
+  if (unchecked) return `${row}\n    ↳ ${uncheckedPendingNote(unchecked)}`;
+  return note ? `${row}\n    ↳ ${note}` : `${row} — not paid yet; awaiting payment`;
+}
+
+/**
+ * When a human-paid invoice has to be collected by. A mint may refuse to issue
+ * for a quote past its expiry even when the invoice was paid in time, so the
+ * handoff names the time instead of leaving collection open-ended.
+ */
+function collectDeadlineHint(expiresAt: string | null): string {
+  return expiresAt
+    ? `Collect before ${expiresAt}: a mint can refuse to issue for a paid invoice once its quote has expired.`
+    : "The mint named no expiry for this invoice; collect soon after payment.";
+}
+
+function describeDropReason(reason: MintQuoteDropReason): string {
+  switch (reason) {
+    case "mint_unknown":
+      return "the mint no longer knows this quote";
+    case "mint_expired":
+      return "the mint reports it expired";
+    case "grace_elapsed":
+      return `the mint still reported it unpaid ${GRACE_HOURS} hours after it expired`;
+  }
 }
 
 function reportUncheckedMints(unchecked: UncheckedMint[]): void {
@@ -1369,13 +1420,53 @@ function summarizeMeltSweep(sweep: MeltReconcileResult) {
  * `unchecked` carries classified causes and retry waits, never the mint's
  * unbounded third-party prose.
  */
-function summarizeSweep(sweep: ReconcileResult) {
+function summarizeSweep(sweep: ReconcileResult, nowMs: number = Date.now()) {
+  const waiting = sweep.outcomes.filter((o) => o.kind === "still_pending");
   return {
-    pending: sweep.still_pending.map((entry) => ({
+    pending: waiting
+      .filter((o) => o.past_expiry === undefined)
+      .map(({ entry }) => {
+        const requestedAtMs = Date.parse(entry.requested_at);
+        const forget = `dvm wallet forget-quote ${shellQuoteArg(entry.quote_id)}`;
+        return {
+          quote_id: entry.quote_id,
+          mint: entry.mint,
+          amount_sats: entry.amount_sats,
+          requested_at: entry.requested_at,
+          age_seconds: Number.isFinite(requestedAtMs)
+            ? Math.max(0, Math.floor((nowMs - requestedAtMs) / 1000))
+            : null,
+          expires_at:
+            entry.expires_at === undefined ? null : new Date(entry.expires_at * 1000).toISOString(),
+          display:
+            entry.expires_at === undefined
+              ? `Mint quote ${entry.quote_id} is not paid yet. The mint named no expiry, so it stays pending until it is paid or you forget it with \`${forget}\`.`
+              : `Mint quote ${entry.quote_id} is not paid yet.`,
+        };
+      }),
+    // Unpaid quotes past their expiry. A late payment is still collected while
+    // they are listed here.
+    kept_past_expiry: waiting.flatMap(({ entry, past_expiry }) => {
+      if (past_expiry === undefined) return [];
+      const dropAfter = new Date(past_expiry.drop_after_ms).toISOString();
+      return [{
+        quote_id: entry.quote_id,
+        mint: entry.mint,
+        amount_sats: entry.amount_sats,
+        expired_at: new Date(past_expiry.expired_at_ms).toISOString(),
+        drop_after: dropAfter,
+        display: `Mint quote ${entry.quote_id} expired unpaid. It is kept and checked for a late payment until ${dropAfter}.`,
+        hint: `A payment that arrives late is collected by \`dvm wallet show\` if the mint credits it. Ask for a new invoice instead of paying this one; to stop tracking it now, run \`dvm wallet forget-quote ${shellQuoteArg(entry.quote_id)}\`.`,
+      }];
+    }),
+    // Paid, but the mint will not issue ecash for it. Never dropped by a sweep.
+    paid_uncollected: sweep.refused.map((entry) => ({
       quote_id: entry.quote_id,
       mint: entry.mint,
       amount_sats: entry.amount_sats,
-      display: `Mint quote ${entry.quote_id} is not paid yet.`,
+      reason: "quote_expired" as const,
+      display: `Mint quote ${entry.quote_id} was paid (${entry.amount_sats} sats at ${entry.mint}), but the mint refuses to issue the sats because the quote expired before they were collected.`,
+      hint: `The payment is recorded and \`dvm wallet show\` asks the mint again on every run. Don't pay it again. If the mint keeps refusing, its operator is the one who can release the payment: give them the quote ID. To stop tracking it, run \`dvm wallet forget-quote ${shellQuoteArg(entry.quote_id)} --force --yes\`.`,
     })),
     collected: sweep.outcomes.flatMap((outcome) =>
       outcome.kind === "minted" || outcome.kind === "restored"
@@ -1399,15 +1490,21 @@ function summarizeSweep(sweep: ReconcileResult) {
   };
 }
 
-/** Expired unpaid quotes removed from local recovery state by this sweep. */
+const GRACE_HOURS = MINT_QUOTE_EXPIRY_GRACE_MS / 3_600_000;
+
+/** Unpaid quotes this sweep removed, each on the mint's own answer. */
 function describeExpiredMints(sweep: ReconcileResult) {
-  return sweep.outcomes
-    .filter((outcome) => outcome.kind === "expired")
-    .map(({ entry }) => ({
-      quote_id: entry.quote_id,
-      mint: entry.mint,
-      amount_sats: entry.amount_sats,
-    }));
+  return sweep.outcomes.flatMap((outcome) =>
+    outcome.kind === "expired"
+      ? [{
+          quote_id: outcome.entry.quote_id,
+          mint: outcome.entry.mint,
+          amount_sats: outcome.entry.amount_sats,
+          reason: outcome.reason,
+          display: `Unpaid mint quote ${outcome.entry.quote_id} was removed: ${describeDropReason(outcome.reason)}. A payment made to it now cannot be collected.`,
+        }]
+      : []
+  );
 }
 
 /**

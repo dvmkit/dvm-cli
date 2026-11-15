@@ -75,8 +75,8 @@ export interface UncheckedMint {
  */
 export interface ReconcileOptions {
   now?: () => number;
-  /** Override the age at which an unpaid invoice is abandoned. */
-  expirationMs?: number;
+  /** How long an unpaid invoice is kept, and still checked, after its expiry. */
+  expiryGraceMs?: number;
   getWalletForMint?: (mintUrl: string) => Promise<Wallet>;
   /** Maximum time spent retrying a quote read. Defaults to the SDK's bounded 10-second window. */
   quoteRetryTimeoutMs?: number;

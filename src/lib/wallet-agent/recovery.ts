@@ -9,7 +9,6 @@ import { MintQuoteState } from "@cashu/cashu-ts";
 
 import { getWallet } from "@dvmkit/sdk/internal";
 import { computeSmartDenominations } from "@dvmkit/sdk/internal";
-import { fundTimeoutMs } from "./fund";
 import { maxKeysetDenomination, prepareP2PKMint } from "@dvmkit/sdk/internal";
 import { retryMintQuoteOperation } from "@dvmkit/sdk/internal";
 import { restoreProofsFromOutputs, serializeOutputData } from "@dvmkit/sdk/internal";
@@ -28,21 +27,37 @@ export type SweepEntryOutcome =
   | { kind: "minted"; entry: PendingMint; proofs: AgentProof[] }
   | { kind: "restored"; entry: PendingMint; proofs: AgentProof[] }
   | { kind: "already_issued"; entry: PendingMint }
-  | { kind: "expired"; entry: PendingMint }
-  | { kind: "still_pending"; entry: PendingMint }
+  | { kind: "expired"; entry: PendingMint; reason: MintQuoteDropReason }
+  | { kind: "still_pending"; entry: PendingMint; past_expiry?: PastExpiry }
+  | { kind: "paid_refused"; entry: PendingMint; reason: "quote_expired" }
   | { kind: "error"; entry: PendingMint; error: string };
+
+/**
+ * Why an unpaid quote left the pending list. Each needs the mint's own answer:
+ * `grace_elapsed` is a mint that still said UNPAID a full grace period after
+ * the quote expired, not a local timer alone.
+ */
+export type MintQuoteDropReason = "mint_unknown" | "mint_expired" | "grace_elapsed";
+
+/** An unpaid quote kept after its expiry, in unix milliseconds. */
+export interface PastExpiry {
+  expired_at_ms: number;
+  drop_after_ms: number;
+}
 
 export interface SweepResult {
   outcomes: SweepEntryOutcome[];
   recovered_proofs: AgentProof[];
   still_pending: PendingMint[];
+  /** Paid quotes the mint refuses to issue for. Kept, and retried on every sweep. */
+  refused: PendingMint[];
   errors: { quote_id: string; error: string }[];
 }
 
 export interface SweepOptions {
   now?: () => number;
-  /** Override the bounded fallback for legacy entries without a quote expiry. */
-  expirationMs?: number;
+  /** How long an unpaid quote is kept, and still checked, after its expiry. Default 24 hours. */
+  expiryGraceMs?: number;
   getWalletForMint?: (mintUrl: string) => Promise<Wallet>;
   /** Maximum time spent retrying one transient quote-status read. Default 10 seconds. */
   quoteRetryTimeoutMs?: number;
@@ -50,6 +65,12 @@ export interface SweepOptions {
 }
 
 const DEFAULT_SWEEP_QUOTE_RETRY_TIMEOUT_MS = 10_000;
+
+/**
+ * A payment can land after the quote's expiry, and NUT-04 lets a mint credit
+ * it, so an expired quote is still checked for this long before it is dropped.
+ */
+export const MINT_QUOTE_EXPIRY_GRACE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Reconcile every entry in `wallet.pending_mints[]` against its mint and
@@ -60,18 +81,18 @@ const DEFAULT_SWEEP_QUOTE_RETRY_TIMEOUT_MS = 10_000;
 export async function sweepPendingMints(opts: SweepOptions = {}): Promise<SweepResult> {
   const wallet = loadAgentWallet();
   if (!wallet || wallet.pending_mints.length === 0) {
-    return { outcomes: [], recovered_proofs: [], still_pending: [], errors: [] };
+    return { outcomes: [], recovered_proofs: [], still_pending: [], refused: [], errors: [] };
   }
 
   const now = opts.now ?? (() => Date.now());
-  const expirationMs = opts.expirationMs ?? fundTimeoutMs();
+  const expiryGraceMs = opts.expiryGraceMs ?? MINT_QUOTE_EXPIRY_GRACE_MS;
   const getWalletForMint = opts.getWalletForMint ?? getWallet;
   const quoteRetryTimeoutMs =
     opts.quoteRetryTimeoutMs ?? DEFAULT_SWEEP_QUOTE_RETRY_TIMEOUT_MS;
 
   const outcomes: SweepEntryOutcome[] = [];
   for (const entry of wallet.pending_mints) {
-    const outcome = await processEntry(wallet, entry, now(), expirationMs, getWalletForMint, {
+    const outcome = await processEntry(wallet, entry, now(), expiryGraceMs, getWalletForMint, {
       now,
       sleep: opts.sleep,
       timeoutMs: quoteRetryTimeoutMs,
@@ -106,6 +127,7 @@ export async function sweepPendingMints(opts: SweepOptions = {}): Promise<SweepR
           o.kind === "still_pending"
       )
       .map((o) => o.entry),
+    refused: outcomes.filter((o) => o.kind === "paid_refused").map((o) => o.entry),
     errors: outcomes
       .filter((o): o is Extract<SweepEntryOutcome, { kind: "error" }> => o.kind === "error")
       .map((o) => ({ quote_id: o.entry.quote_id, error: o.error })),
@@ -116,7 +138,7 @@ async function processEntry(
   wallet: AgentWallet,
   entry: PendingMint,
   nowMs: number,
-  expirationMs: number,
+  expiryGraceMs: number,
   getWalletForMint: (mintUrl: string) => Promise<Wallet>,
   retry: {
     now: () => number;
@@ -141,6 +163,12 @@ async function processEntry(
       }
     ));
   } catch (err) {
+    const refusal = mintQuoteRefusal(err);
+    if (refusal !== undefined) {
+      return finalAnswer(wallet, entry, refusal === "unknown" ? "mint_unknown" : "mint_expired", () =>
+        getWalletForMint(entry.mint)
+      );
+    }
     return { kind: "error", entry, error: errorMessage(err) };
   }
 
@@ -209,27 +237,107 @@ async function processEntry(
       const agentProofs = proofs.map((p) => toAgentProof(p, entry.mint, wallet.lock_pubkey));
       return { kind: "minted", entry, proofs: agentProofs };
     } catch (err) {
+      // The mint took the payment and will not issue for it. Keeping the entry
+      // is the only record of that money, and a later sweep asks again.
+      if (mintQuoteRefusal(err) === "expired") {
+        return { kind: "paid_refused", entry, reason: "quote_expired" };
+      }
       return { kind: "error", entry, error: errorMessage(err) };
     }
   }
 
-  // UNPAID: the quote's own expiry is authoritative when recorded. Wallets
-  // predating schema v9 (and mints that return no expiry) retain the bounded
-  // fund-timeout fallback so an unreachable quote cannot live forever.
-  const quoteExpiry = entry.expires_at;
-  if (quoteExpiry !== undefined && Number.isFinite(quoteExpiry)) {
-    if (nowMs > quoteExpiry * 1000) {
-      return { kind: "expired", entry };
-    }
-    return { kind: "still_pending", entry };
+  // Not a NUT-04 state, but a mint that names one has given its final answer.
+  if ((state as string) === "EXPIRED") {
+    return finalAnswer(wallet, entry, "mint_expired", async () => cashuWallet);
   }
 
-  const requestedAtMs = Date.parse(entry.requested_at);
-  const ageMs = Number.isFinite(requestedAtMs) ? nowMs - requestedAtMs : Infinity;
-  if (ageMs > expirationMs) {
-    return { kind: "expired", entry };
+  // UNPAID. The quote ID is the only handle that can mint a late payment, so
+  // no local timer drops it: a quote without an expiry stays until the mint
+  // gives a final answer or the caller forgets it, and an expired one is kept
+  // through the grace period while the mint keeps being asked.
+  const quoteExpiry = entry.expires_at;
+  if (quoteExpiry === undefined || !Number.isFinite(quoteExpiry)) {
+    return { kind: "still_pending", entry };
   }
-  return { kind: "still_pending", entry };
+  const expiredAtMs = quoteExpiry * 1000;
+  if (nowMs <= expiredAtMs) {
+    return { kind: "still_pending", entry };
+  }
+  const dropAfterMs = expiredAtMs + expiryGraceMs;
+  if (nowMs > dropAfterMs) {
+    return finalAnswer(wallet, entry, "grace_elapsed", async () => cashuWallet);
+  }
+  return {
+    kind: "still_pending",
+    entry,
+    past_expiry: { expired_at_ms: expiredAtMs, drop_after_ms: dropAfterMs },
+  };
+}
+
+/**
+ * Acts on the mint's answer that a quote is finished. Saved outputs mean an
+ * earlier sweep saw the quote paid and may have crashed mid-mint, so that
+ * entry is restored from them, and kept when nothing comes back: it is the
+ * only record of a payment the mint took.
+ */
+async function finalAnswer(
+  wallet: AgentWallet,
+  entry: PendingMint,
+  reason: MintQuoteDropReason,
+  getCashuWallet: () => Promise<Wallet>
+): Promise<SweepEntryOutcome> {
+  if (!entry.minting) return { kind: "expired", entry, reason };
+  try {
+    const restored = await restoreFromMintingState(
+      await getCashuWallet(),
+      entry.minting,
+      wallet.lock_pubkey,
+      entry.mint
+    );
+    if (restored.length > 0) return { kind: "restored", entry, proofs: restored };
+  } catch (err) {
+    return { kind: "error", entry, error: errorMessage(err) };
+  }
+  if (reason === "mint_expired") return { kind: "paid_refused", entry, reason: "quote_expired" };
+  return {
+    kind: "error",
+    entry,
+    error:
+      reason === "mint_unknown"
+        ? "The mint reported this quote paid earlier and no longer knows it; nothing could be restored, so the quote is kept."
+        : "The mint reported this quote paid earlier and now reports it unpaid; nothing could be restored, so the quote is kept.",
+  };
+}
+
+/** NUT error code a mint returns for a quote past its expiry. */
+const MINT_QUOTE_EXPIRED_CODE = 20007;
+const QUOTE_UNKNOWN_TEXT =
+  /\bquote\b[^.]*\b(not found|unknown|does not exist)\b|\b(unknown|no such) quote\b/i;
+const QUOTE_EXPIRED_TEXT = /\bquote\b[^.]*\bexpired\b|\bexpired quote\b/i;
+
+/**
+ * A mint's definite answer that a quote is gone, as opposed to a mint that
+ * could not answer. Only the mint's structured protocol error counts (HTTP 400
+ * carrying a numeric `code` and a `detail`, which cashu-ts raises as
+ * `MintOperationError`). Any other reply's message can be a proxy or web
+ * server page, whose text echoes the request path and so names the quote
+ * without the mint having said anything about it. Duck-typed on cashu-ts's
+ * `name`: the bundle can carry more than one copy of the error classes.
+ */
+export function mintQuoteRefusal(err: unknown): "unknown" | "expired" | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const { name, status, code, message } = err as {
+    name?: unknown;
+    status?: unknown;
+    code?: unknown;
+    message?: unknown;
+  };
+  const answered = name === "MintOperationError" && status === 400 && typeof code === "number";
+  if (!answered) return undefined;
+  const text = typeof message === "string" ? message : "";
+  if (code === MINT_QUOTE_EXPIRED_CODE || QUOTE_EXPIRED_TEXT.test(text)) return "expired";
+  if (QUOTE_UNKNOWN_TEXT.test(text)) return "unknown";
+  return undefined;
 }
 
 async function restoreFromMintingState(
@@ -243,7 +351,11 @@ async function restoreFromMintingState(
 }
 
 function applyOutcome(wallet: AgentWallet, outcome: SweepEntryOutcome): AgentWallet {
-  if (outcome.kind === "still_pending" || outcome.kind === "error") {
+  if (
+    outcome.kind === "still_pending" ||
+    outcome.kind === "paid_refused" ||
+    outcome.kind === "error"
+  ) {
     return wallet;
   }
   const next: AgentWallet = {

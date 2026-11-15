@@ -132,6 +132,8 @@ import {
 import type { WalletRecoverSubmissionOptions } from "../commands/wallet-recover-submission";
 import { walletRecoverSubmission } from "../commands/wallet-recover-submission";
 import { walletSetDefaultRail } from "../commands/wallet-set-default-rail";
+import type { WalletForgetQuoteOptions } from "../commands/wallet-forget-quote";
+import { walletForgetQuote } from "../commands/wallet-forget-quote";
 import type { WalletSubmissionsOptions } from "../commands/wallet-submissions";
 import { walletSubmissions } from "../commands/wallet-submissions";
 import {
@@ -1129,6 +1131,21 @@ Docs:
     .option("--human", "Human-readable output instead of JSON")
     .action((opts: WalletSubmissionsOptions) => {
       return catchErrors(() => walletSubmissions(opts), opts.human);
+    });
+
+  wallet
+    .command("forget-quote <quote-id>")
+    .description(
+      "Stop tracking one pending funding invoice, named by its mint quote ID. Asks the mint first and refuses while the invoice is paid or its state is unknown. A payment made after forgetting cannot be collected"
+    )
+    .option("--yes", "Skip the confirmation prompt (required to forget non-interactively)")
+    .option(
+      "--force",
+      "Forget a quote the mint reports as paid, or whose state could not be checked. This gives up the only record that can collect that payment"
+    )
+    .option("--human", "Human-readable output instead of JSON")
+    .action((quoteId: string, opts: WalletForgetQuoteOptions) => {
+      return catchErrors(() => walletForgetQuote(quoteId, opts), opts.human);
     });
 
   wallet

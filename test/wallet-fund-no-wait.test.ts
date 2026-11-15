@@ -27,6 +27,7 @@ let root: string;
 let sdk: typeof import("@dvmkit/sdk/internal");
 let walletFund: typeof import("../src/commands/wallet-agent-fund")["walletFund"];
 let walletShow: typeof import("../src/commands/wallet-agent-fund")["walletShow"];
+let walletForgetQuote: typeof import("../src/commands/wallet-forget-quote")["walletForgetQuote"];
 let buildProgram: typeof import("../src/cli/dvm")["buildProgram"];
 let originalConfigRoot: string | undefined;
 
@@ -63,6 +64,24 @@ function lastEvent() {
   return seams.json.mock.calls.at(-1)?.[0] as Record<string, unknown>;
 }
 
+const HOUR_SEC = 3600;
+
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
+
+/** Rewrite the stored quote, as time passing since the handoff would have. */
+function agePendingQuote(patch: Record<string, unknown>) {
+  const path = join(root, "wallet.json");
+  const disk = JSON.parse(readFileSync(path, "utf8")) as { pending_mints: Record<string, unknown>[] };
+  disk.pending_mints = disk.pending_mints.map((entry) => ({ ...entry, ...patch }));
+  writeFileSync(path, JSON.stringify(disk));
+}
+
+function mintError(detail: string, code: number) {
+  return Object.assign(new Error(detail), { name: "MintOperationError", status: 400, code });
+}
+
 function fundArgs(...extra: string[]) {
   return ["wallet", "fund", "1000", "--sats", "--no-float", "--no-wait", "--qr-image", join(root, "invoice.png"), ...extra];
 }
@@ -75,6 +94,7 @@ describe("human-paid funding without waiting", () => {
     vi.resetModules();
     sdk = await import("@dvmkit/sdk/internal");
     ({ walletFund, walletShow } = await import("../src/commands/wallet-agent-fund"));
+    ({ walletForgetQuote } = await import("../src/commands/wallet-forget-quote"));
     ({ buildProgram } = await import("../src/cli/dvm"));
   });
 
@@ -132,11 +152,14 @@ describe("human-paid funding without waiting", () => {
       const text = seams.info.mock.calls.flat().join("\n");
       expect(text).toContain("Quote ID: quote-1");
       expect(text).toContain("dvm wallet show");
+      expect(text).toContain(`Collect before ${new Date(fixture.expiry! * 1000).toISOString()}`);
       expect(text).not.toContain("Polling");
     } else {
       expect(lastEvent()).toMatchObject({
         status: "awaiting_payment", invoice: "lnbc10u1fakea", quote_id: "quote-1", next_step: "dvm wallet show",
         expires_at: new Date(fixture.expiry! * 1000).toISOString(),
+        collect_before: new Date(fixture.expiry! * 1000).toISOString(),
+        hint: expect.stringContaining(`Collect before ${new Date(fixture.expiry! * 1000).toISOString()}`),
         relay: { copy_text: "lnbc10u1fakea", standalone: true },
       });
     }
@@ -147,7 +170,7 @@ describe("human-paid funding without waiting", () => {
   it("emits null expiry for a mint that supplies none", async () => {
     mint(null);
     await runFund();
-    expect(lastEvent()).toMatchObject({ expires_at: null, quote_id: "quote-1" });
+    expect(lastEvent()).toMatchObject({ expires_at: null, collect_before: null, quote_id: "quote-1" });
     expect(sdk.loadAgentWallet()?.pending_mints[0]).not.toHaveProperty("expires_at");
   });
 
@@ -207,16 +230,157 @@ describe("human-paid funding without waiting", () => {
     expect(text).toMatch(/Cashu agent wallet:.*1000 sats/);
   });
 
-  it("reports an expired unpaid quote and removes it without collecting", async () => {
-    const fixture = mint(Math.floor(Date.now() / 1000) - 1);
+  it("keeps an unpaid quote past its expiry, lists it, and collects a late payment", async () => {
+    const fixture = mint(nowSec() - 1);
     await runFund();
+    await walletShow({});
+    const expiredAt = new Date(fixture.expiry! * 1000).toISOString();
+    expect(lastEvent()).toMatchObject({
+      total_sats: 0,
+      pending_mints: [{ quote_id: "quote-1" }],
+      sweep: {
+        pending: [], collected: [], expired: [], dropped: [],
+        kept_past_expiry: [{
+          quote_id: "quote-1", mint: MINT, amount_sats: 1000, expired_at: expiredAt,
+          drop_after: new Date((fixture.expiry! + 24 * HOUR_SEC) * 1000).toISOString(),
+          hint: expect.stringContaining("dvm wallet forget-quote quote-1"),
+        }],
+      },
+      hint: expect.stringContaining("sweep.kept_past_expiry"),
+    });
+    expect(sdk.loadAgentWallet()?.pending_mints).toHaveLength(1);
+
+    fixture.states.set("quote-1", "PAID");
+    await walletShow({});
+    expect(lastEvent()).toMatchObject({
+      total_sats: 1000, pending_mints: [],
+      sweep: { kept_past_expiry: [], collected: [{ quote_id: "quote-1", sats_collected: 1000 }] },
+    });
+    expect(sdk.loadAgentWallet()?.proofs.map((proof) => proof.amount)).toEqual([1000]);
+  });
+
+  it("says in human mode that a quote past its expiry is still checked", async () => {
+    mint(nowSec() - 1);
+    await runFund();
+    seams.info.mockClear();
+    await walletShow({ human: true });
+    const text = seams.info.mock.calls.flat().join("\n");
+    expect(text).toMatch(/quote quote-1[^\n]*\n[^\n]*expired unpaid[^\n]*checked for a late payment/);
+    expect(text).not.toContain("awaiting payment");
+  });
+
+  it("removes an unpaid quote the mint still reports unpaid a day after it expired", async () => {
+    const fixture = mint();
+    await runFund();
+    agePendingQuote({ expires_at: nowSec() - 24 * HOUR_SEC - 60 });
     await walletShow({});
     expect(lastEvent()).toMatchObject({
       total_sats: 0, pending_mints: [],
-      sweep: { pending: [], collected: [], expired: [{ quote_id: "quote-1", amount_sats: 1000, mint: MINT }] },
+      sweep: {
+        pending: [], collected: [], kept_past_expiry: [], dropped: ["quote-1"],
+        expired: [{ quote_id: "quote-1", amount_sats: 1000, mint: MINT, reason: "grace_elapsed" }],
+      },
     });
     expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
+    expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledExactlyOnceWith("quote-1");
     expect(fixture.wallet.completeMint).not.toHaveBeenCalled();
+  });
+
+  it("removes an unpaid quote the mint no longer knows", async () => {
+    const fixture = mint();
+    await runFund();
+    fixture.wallet.checkMintQuoteBolt11.mockRejectedValue(mintError("quote not found", 0));
+    await walletShow({});
+    expect(lastEvent()).toMatchObject({
+      pending_mints: [],
+      sweep: { expired: [{ quote_id: "quote-1", reason: "mint_unknown" }], unchecked: [] },
+    });
+    expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
+  });
+
+  it("collects a quote with no expiry that is paid 11 minutes after the request", async () => {
+    const fixture = mint(null);
+    await runFund();
+    agePendingQuote({ requested_at: new Date(Date.now() - 11 * 60 * 1000).toISOString() });
+
+    await walletShow({});
+    const [pending] = (lastEvent().sweep as { pending: Record<string, unknown>[] }).pending;
+    expect(pending).toMatchObject({
+      quote_id: "quote-1", expires_at: null,
+      display: expect.stringContaining("dvm wallet forget-quote quote-1"),
+    });
+    expect(pending.age_seconds).toBeGreaterThanOrEqual(660);
+    expect(sdk.loadAgentWallet()?.pending_mints).toHaveLength(1);
+
+    fixture.states.set("quote-1", "PAID");
+    await walletShow({});
+    expect(lastEvent()).toMatchObject({
+      total_sats: 1000, pending_mints: [],
+      sweep: { collected: [{ quote_id: "quote-1", sats_collected: 1000 }] },
+    });
+  });
+
+  it("reports a paid quote the mint refuses to issue after expiry, and keeps it", async () => {
+    const fixture = mint(nowSec() - 60);
+    await runFund();
+    fixture.states.set("quote-1", "PAID");
+    fixture.wallet.completeMint.mockRejectedValue(mintError("quote is expired", 20007));
+
+    await walletShow({});
+    expect(lastEvent()).toMatchObject({
+      total_sats: 0,
+      pending_mints: [{ quote_id: "quote-1" }],
+      sweep: {
+        collected: [], expired: [], unchecked: [], kept_past_expiry: [],
+        paid_uncollected: [{
+          quote_id: "quote-1", mint: MINT, amount_sats: 1000, reason: "quote_expired",
+          display: expect.stringContaining("was paid"),
+        }],
+      },
+      hint: expect.stringContaining("sweep.paid_uncollected"),
+    });
+    expect(sdk.loadAgentWallet()?.pending_mints.map((entry) => entry.quote_id)).toEqual(["quote-1"]);
+  });
+
+  it("forgets an unpaid quote on request, and only then", async () => {
+    mint(null);
+    await runFund();
+
+    await expect(walletForgetQuote("quote-1", {})).rejects.toMatchObject({ code: "confirmation_required" });
+    await expect(walletForgetQuote("no-such-quote", { yes: true })).rejects.toMatchObject({ code: "mint_quote_not_found" });
+    expect(sdk.loadAgentWallet()?.pending_mints).toHaveLength(1);
+
+    await expect(
+      buildProgram().parseAsync(["wallet", "forget-quote", "quote-1", "--yes"], { from: "user" })
+    ).rejects.toMatchObject({ code: 0 });
+    expect(lastEvent()).toMatchObject({ status: "forgotten", quote_id: "quote-1", mint_state: "unpaid", amount_sats: 1000 });
+    expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
+  });
+
+  it("refuses to forget a paid or unchecked quote without --force", async () => {
+    const fixture = mint();
+    await runFund();
+
+    fixture.states.set("quote-1", "PAID");
+    await expect(walletForgetQuote("quote-1", { yes: true })).rejects.toMatchObject({ code: "mint_quote_collectable" });
+
+    fixture.wallet.checkMintQuoteBolt11.mockRejectedValue(
+      Object.assign(new Error("mint failed"), { name: "HttpResponseError", status: 503 })
+    );
+    await expect(walletForgetQuote("quote-1", { yes: true })).rejects.toMatchObject({
+      code: "mint_quote_unchecked", data: { cause: "mint_server_error", retryable: true },
+    });
+    expect(sdk.loadAgentWallet()?.pending_mints).toHaveLength(1);
+
+    fixture.wallet.checkMintQuoteBolt11.mockResolvedValue({ quote: "quote-1", request: "lnbc1", expiry: null, state: "SETTLING" as never });
+    await expect(walletForgetQuote("quote-1", { yes: true })).rejects.toMatchObject({
+      code: "mint_quote_unchecked", data: { cause: "unexpected", retryable: false },
+    });
+    expect(sdk.loadAgentWallet()?.pending_mints).toHaveLength(1);
+
+    await walletForgetQuote("quote-1", { yes: true, force: true });
+    expect(lastEvent()).toMatchObject({ status: "forgotten", mint_state: "unchecked" });
+    expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
   });
 
   it.each([
