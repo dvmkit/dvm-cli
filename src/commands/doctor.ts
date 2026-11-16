@@ -72,6 +72,7 @@ import { NWC_FUNDING_FLOAT_ROLE } from "../lib/float";
 
 import { checkBuildFreshness } from "../lib/build-freshness";
 import {
+  describeMissingSetup,
   detectSetupState,
   type FileCheckRow,
   findQuarantinedCreditStores,
@@ -312,12 +313,13 @@ function buildFileChecks(): DoctorCheck[] {
   try {
     const state = detectSetupState();
     if (isPartialSetup(state)) {
+      const missing = describeMissingSetup(state);
       checks.push({
         name: "partial_setup_state",
         group: "files",
         status: "warn",
-        display: "Caller history (jobs / messages) is present but core setup files are missing.",
-        hint: "Run 'dvm init' to recreate the missing config, identity, and wallet without touching existing history.",
+        display: `Caller history (jobs / messages) is present. Missing setup: ${missing}.`,
+        hint: `Run 'dvm init' to recreate ${missing} without touching existing history.`,
         details: { existingState: state.existingState, missing: state.missing },
       });
     }
