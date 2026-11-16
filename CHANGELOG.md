@@ -9,6 +9,7 @@
 
 ### Bug Fixes
 
+* Failed Cashu spend preparation replaces raw dependency errors with bounded explanations and redacts mint URLs in attempt entries and summaries. Error and reason codes remain unchanged; consumers parsing failure prose should use those codes and follow recovery hints instead. Summaries are limited to 4,096 characters, while every ordered attempt remains available.
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 

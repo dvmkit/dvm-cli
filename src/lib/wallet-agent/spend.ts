@@ -116,6 +116,7 @@ export interface SpendMintAttempt {
     | "insufficient_balance"
     | "no_eligible_mint"
     | "swap_rejected";
+  /** CLI-authored explanation; branch on `reason`, not this prose. */
   message: string;
 }
 
@@ -442,26 +443,22 @@ export async function prepareAgentSpend(args: {
     try {
       candidateWallet = await getWalletForMint(mint);
       rememberKeysetFees(mint, candidateWallet);
-    } catch (err) {
-      attempts.push({ mint, reason: "unreachable", message: errorText(err) });
+    } catch {
+      attempts.push(spendMintAttempt(mint, "unreachable"));
       continue;
     }
     let reserveSats: SwapSendReserve;
     try {
       reserveSats = swapSendReserve(candidateWallet, args.amountSats);
-    } catch (err) {
-      attempts.push({ mint, reason: "keys_unavailable", message: errorText(err) });
+    } catch {
+      attempts.push(spendMintAttempt(mint, "keys_unavailable"));
       continue;
     }
     // A mint in melt-only recovery advertises swaps switched off. Asking
     // costs nothing here — the mint info is already loaded — and skipping
     // saves a round-trip that can only fail.
     if (!swapEnabled(candidateWallet)) {
-      attempts.push({
-        mint,
-        reason: "swap_disabled",
-        message: "Mint advertises swaps switched off (NUT-3 disabled).",
-      });
+      attempts.push(spendMintAttempt(mint, "swap_disabled"));
       continue;
     }
 
@@ -501,7 +498,7 @@ export async function prepareAgentSpend(args: {
         return {
           error: {
             code: "cashu_fee_cap_exceeded",
-            message: `Cashu fees at ${mint} would be ${selectedFeeSats} sats, over the ${args.maxCashuFeeSats}-sat --max-cashu-fee-sats limit.`,
+            message: `Cashu fees at ${spendDiagnosticMint(mint)} would be ${selectedFeeSats} sats, over the ${args.maxCashuFeeSats}-sat --max-cashu-fee-sats limit.`,
             hint: "Raise --max-cashu-fee-sats only after approval, or fund an accepted mint with a lower swap fee.",
           },
         };
@@ -557,7 +554,7 @@ export async function prepareAgentSpend(args: {
       if (lock2.error.code === "no_agent_wallet") return lock2;
       if (lock2.error.code === "cashu_fee_cap_exceeded") {
         lastFeeCapError = lock2.error;
-        attempts.push({ mint, reason: "fee_cap_exceeded", message: lock2.error.message });
+        attempts.push(spendMintAttempt(mint, "fee_cap_exceeded", lock2.error.message));
         continue;
       }
       const selectError = lock2.error as SelectError;
@@ -565,7 +562,7 @@ export async function prepareAgentSpend(args: {
       // Carry the selection's own code: proofs that covered under Lock 1 can be
       // gone entirely by Lock 2 (a concurrent call spent them), and calling that
       // "insufficient_balance" tells an operator a mint is short when it's empty.
-      attempts.push({ mint, reason: selectError.code, message: selectError.message });
+      attempts.push(spendMintAttempt(mint, selectError.code, selectError.message));
       continue;
     }
 
@@ -587,8 +584,8 @@ export async function prepareAgentSpend(args: {
     let preview: SwapPreview;
     try {
       preview = await swapBuilder.prepare();
-    } catch (err) {
-      attempts.push({ mint, reason: "swap_rejected", message: errorText(err) });
+    } catch {
+      attempts.push(spendMintAttempt(mint, "swap_rejected"));
       await rollbackAttempt(requestId, lock2.selectedKeys);
       if (hasNextCandidate) continue;
       break;
@@ -656,8 +653,8 @@ export async function prepareAgentSpend(args: {
       keepProofs = result.keep;
       break;
     } catch (err) {
-      attempts.push({ mint, reason: "swap_rejected", message: errorText(err) });
       if (err instanceof MintOperationError) {
+        attempts.push(spendMintAttempt(mint, "swap_rejected"));
         // A protocol-level 4xx says the mint did not commit the swap, so these
         // inputs are safe to return and another mint may be tried.
         await rollbackAttempt(requestId, lock2.selectedKeys);
@@ -668,6 +665,7 @@ export async function prepareAgentSpend(args: {
       // even though the response never arrived. Never fail over or age these
       // inputs back into circulation. The persisted preview lets the next
       // sweep restore signed outputs or prove the inputs remained UNSPENT.
+      attempts.push(spendMintAttempt(mint, "swap_rejected", "Mint swap outcome is unknown; recovery is required."));
       inputsLeftInFlight = true;
       break;
     }
@@ -735,28 +733,38 @@ export async function prepareAgentSpend(args: {
   };
 }
 
+const SPEND_ATTEMPT_MESSAGES: Record<SpendMintAttempt["reason"], string> = {
+  unreachable: "Mint could not be loaded.",
+  keys_unavailable: "Mint did not provide an active keyset.",
+  swap_disabled: "Mint advertises swaps switched off (NUT-3 disabled).",
+  fee_cap_exceeded: "Mint swap fee exceeds the approved limit.",
+  insufficient_balance: "Mint balance cannot cover the price and swap fee.",
+  no_eligible_mint: "Mint no longer has eligible proofs for this payment.",
+  swap_rejected: "Mint swap could not be prepared or was definitely refused.",
+};
+
+function spendDiagnosticMint(mint: string): string {
+  try {
+    const url = new URL(mint);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return "[invalid mint URL]";
+    return redactUrl(mint).replace(/\/$/u, "").slice(0, 2048);
+  } catch {
+    return "[invalid mint URL]";
+  }
+}
+
+// Dependency errors may echo proof secrets, tokens or authorization headers.
+// Only owned explanations and selection/fee arithmetic belong in diagnostics.
+function spendMintAttempt(
+  mint: string,
+  reason: SpendMintAttempt["reason"],
+  message = SPEND_ATTEMPT_MESSAGES[reason]
+): SpendMintAttempt {
+  return { mint: spendDiagnosticMint(mint), reason, message };
+}
+
 function successfulSpendAttempts(attempts: SpendMintAttempt[]): SpendMintAttempt[] {
-  // Dependency messages may echo proofs, tokens or authorization headers. Only
-  // publish CLI-authored explanations on the additive success surface.
-  const messages: Record<SpendMintAttempt["reason"], string> = {
-    unreachable: "Mint could not be loaded.",
-    keys_unavailable: "Mint did not provide an active keyset.",
-    swap_disabled: "Mint advertises swaps switched off (NUT-3 disabled).",
-    fee_cap_exceeded: "Mint swap fee exceeds the approved limit.",
-    insufficient_balance: "Mint balance cannot cover the price and swap fee.",
-    no_eligible_mint: "Mint no longer has eligible proofs for this payment.",
-    swap_rejected: "Mint swap could not be prepared or was definitely refused.",
-  };
-  return attempts.map(({ mint, reason }) => {
-    let safeMint: string;
-    try {
-      new URL(mint);
-      safeMint = redactUrl(mint).replace(/\/$/u, "").slice(0, 2048);
-    } catch {
-      safeMint = "[invalid mint URL]";
-    }
-    return { mint: safeMint, reason, message: messages[reason] };
-  });
+  return attempts.map((attempt) => ({ ...attempt, message: SPEND_ATTEMPT_MESSAGES[attempt.reason] }));
 }
 
 function principalCapFailure(
@@ -1098,7 +1106,7 @@ function exhaustedError(
     if (attempts.length === 1) return { ...lastSelectError, attempts };
     return {
       code: lastSelectError.code,
-      message: `Agent wallet can't cover the price plus the per-call swap fee at any of the DVM's mints: ${describeAttempts(attempts)}.`,
+      message: boundedSpendMessage(`Agent wallet can't cover the price plus the per-call swap fee at any of the DVM's mints: ${describeAttempts(attempts)}.`),
       hint: lastSelectError.hint,
       attempts,
     };
@@ -1113,7 +1121,7 @@ function exhaustedError(
     if (attempts.length === 1) return { ...lastFeeCapError, attempts };
     return {
       ...lastFeeCapError,
-      message: `Every accepted mint that can cover this payment exceeds --max-cashu-fee-sats: ${describeAttempts(attempts)}.`,
+      message: boundedSpendMessage(`Every accepted mint that can cover this payment exceeds --max-cashu-fee-sats: ${describeAttempts(attempts)}.`),
       attempts,
     };
   }
@@ -1124,7 +1132,7 @@ function exhaustedError(
       : `Every mint the DVM accepts failed for this payment: ${describeAttempts(attempts)}.`;
   return {
     code: "swap_failed",
-    message,
+    message: boundedSpendMessage(message),
     hint: inputsLeftInFlight
       ? "The swap outcome is being recovered from the mint. Run `dvm wallet show` to restore signed outputs or return inputs once the mint confirms they stayed unspent."
       : "Nothing was spent and the balance is untouched. Retry now — a mint that's down now is tried again on the next call.",
@@ -1138,6 +1146,11 @@ function isSelectionReason(reason: SpendMintAttempt["reason"]): boolean {
 
 function describeAttempts(attempts: SpendMintAttempt[]): string {
   return attempts.map((a) => `${a.mint} — ${a.reason} (${a.message})`).join("; ");
+}
+
+function boundedSpendMessage(message: string): string {
+  // Keep all ordered entries in `attempts` even when their summary is shortened.
+  return message.length <= 4096 ? message : `${message.slice(0, 4095)}…`;
 }
 
 /**
@@ -1161,10 +1174,6 @@ function swapEnabled(cashuWallet: Wallet): boolean {
   }
   if (typeof nuts !== "object" || nuts === null) return true;
   return canSwap(nuts as Record<string, unknown>);
-}
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 /**

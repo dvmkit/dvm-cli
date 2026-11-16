@@ -98,7 +98,11 @@ afterEach(() => {
 
 // Mint transport and keyset metadata are external inputs. Selection, fee
 // arithmetic, journaling, token encoding, commit and request rendering stay real.
-function mintWallet(failure?: "keys" | "disabled" | "refused", fee = 100): Wallet {
+function mintWallet(
+  failure?: "keys" | "disabled" | "prepare" | "refused" | "ambiguous",
+  fee = 100,
+  diagnostic?: string
+): Wallet {
   let inputs: Proof[] = [];
   const send: Proof[] = [{ id: keysetId, amount: Amount.from(5), secret: "output-secret", C }];
   const keep: Proof[] = [{ id: keysetId, amount: Amount.from(1), secret: "change-secret", C }];
@@ -109,18 +113,20 @@ function mintWallet(failure?: "keys" | "disabled" | "refused", fee = 100): Walle
   const builder = {
     asP2PK: vi.fn().mockReturnThis(), keepAsP2PK: vi.fn().mockReturnThis(),
     privkey: vi.fn().mockReturnThis(), includeFees: vi.fn().mockReturnThis(),
-    prepare: vi.fn(async () => ({
-      keysetId, inputs, sendOutputs: outputData(send), keepOutputs: outputData(keep), unselectedProofs: [],
-    })),
+    prepare: vi.fn(async () => {
+      if (failure === "prepare") throw new Error(diagnostic);
+      return { keysetId, inputs, sendOutputs: outputData(send), keepOutputs: outputData(keep), unselectedProofs: [] };
+    }),
   };
   return {
     ops: { send: vi.fn((_amount, selected: Proof[]) => { inputs = selected; return builder; }) },
     completeSwap: vi.fn(async () => {
-      if (failure === "refused") throw new MintOperationError(11000, "Authorization: Bearer credential-secret");
+      if (failure === "refused") throw new MintOperationError(11000, diagnostic ?? "Authorization: Bearer credential-secret");
+      if (failure === "ambiguous") throw new Error(diagnostic);
       return { send, keep };
     }),
     getKeyset: vi.fn(() => {
-      if (failure === "keys") throw new Error("cashuBtoken-secret");
+      if (failure === "keys") throw new Error(diagnostic ?? "cashuBtoken-secret");
       return { id: keysetId, fee, keys: Object.fromEntries(
         Array.from({ length: 11 }, (_, i) => [2 ** i, C])
       ) };
@@ -287,6 +293,81 @@ describe("accepted job payment refusal recovery", () => {
     expect(seams.sendMessage).not.toHaveBeenCalled();
     expect(seams.submit).toHaveBeenCalledTimes(1);
     expect(seams.requestResult).not.toHaveBeenCalled();
+  });
+});
+
+describe.each(["upfront", "mid-job"])("failed %s Cashu diagnostics", (phase) => {
+  const hostileError = "input-secret-0 proof-secret cashuBtoken-secret Authorization: Bearer credential-secret " + "x".repeat(20_000);
+
+  beforeEach(() => {
+    if (phase === "mid-job") {
+      seams.submit.mockResolvedValue({ jobId: "job", status: "processing" });
+      seams.stream.mockResolvedValue({ messages: [{ seq: 1, type: "payment-request", from: "provider", timestamp: 1,
+        content: { amount_msats: 5_000, reason: "More work", mints, lock_pubkey: lockPubkey } }], lastSeq: 1 });
+    }
+  });
+
+  function renderFailure(error: unknown): Record<string, unknown> {
+    expect(error).toBeInstanceOf(DvmError);
+    const exit = new Error("exit");
+    vi.spyOn(process, "exit").mockImplementation(() => { throw exit; });
+    expect(() => handleError(error)).toThrow(exit);
+    assertSecretFree();
+    expect(() => handleError(error, true)).toThrow(exit);
+    const human = seams.info.mock.calls.flat().join("\n");
+    for (const secret of ["input-secret", "proof-secret", "cashuBtoken-secret", "Authorization", "credential-secret", "x".repeat(100)]) {
+      expect(human).not.toContain(secret);
+    }
+    return terminal().error as Record<string, unknown>;
+  }
+
+  it("shapes all failed candidates in order and permits immediate retry after definite refusals", async () => {
+    const wallets = [mintWallet("keys", 100, hostileError), mintWallet("disabled"),
+      mintWallet("prepare", 100, hostileError), mintWallet("refused", 100, hostileError)];
+    seams.getWallet.mockImplementation(async (mint: string) => {
+      const index = mints.indexOf(mint);
+      if (index === 0) throw new Error(hostileError);
+      return wallets[index - 1];
+    });
+
+    const rendered = renderFailure(await paidRequest().catch((error: unknown) => error));
+
+    expect(rendered).toMatchObject({ code: "swap_failed", hint: expect.stringContaining("Retry now"), mint_attempts: [
+      { mint: mints[0], reason: "unreachable", message: "Mint could not be loaded." },
+      { mint: mints[1], reason: "keys_unavailable", message: "Mint did not provide an active keyset." },
+      { mint: mints[2], reason: "swap_disabled", message: "Mint advertises swaps switched off (NUT-3 disabled)." },
+      { mint: mints[3], reason: "swap_rejected", message: "Mint swap could not be prepared or was definitely refused." },
+      { mint: mints[4], reason: "swap_rejected", message: "Mint swap could not be prepared or was definitely refused." },
+    ] });
+    expect(seams.getWallet.mock.calls.map(([mint]) => mint)).toEqual(mints);
+    expect(wallets[2].completeSwap).not.toHaveBeenCalled();
+    expect(wallets[3].completeSwap).toHaveBeenCalledOnce();
+    const wallet = loadAgentWallet()!;
+    expect(wallet.proofs.every((proof) => proof.status === "valid")).toBe(true);
+    expect(wallet.pending_submissions).toEqual([]);
+    expect(wallet.recent_spends).toEqual([]);
+    expect(seams.sendMessage).not.toHaveBeenCalled();
+    expect(seams.submit).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an ambiguous swap protected, stops failover, and gives recovery guidance", async () => {
+    const ambiguous = mintWallet("ambiguous", 100, hostileError);
+    seams.getWallet.mockResolvedValue(ambiguous);
+
+    const rendered = renderFailure(await paidRequest().catch((error: unknown) => error));
+
+    expect(rendered).toMatchObject({ code: "swap_failed", hint: expect.stringContaining("dvm wallet show"), mint_attempts: [
+      { mint: mints[0], reason: "swap_rejected", message: "Mint swap outcome is unknown; recovery is required." },
+    ] });
+    expect(seams.getWallet.mock.calls).toEqual([[mints[0]]]);
+    const wallet = loadAgentWallet()!;
+    expect(wallet.pending_submissions).toHaveLength(1);
+    expect(wallet.pending_submissions[0].swapping).toBeDefined();
+    expect(wallet.proofs.find((proof) => proof.mint === mints[0])?.status).toBe("in_flight");
+    expect(wallet.proofs.filter((proof) => proof.mint !== mints[0]).every((proof) => proof.status === "valid")).toBe(true);
+    expect(wallet.recent_spends).toEqual([]);
+    expect(seams.sendMessage).not.toHaveBeenCalled();
+    expect(seams.submit).toHaveBeenCalledOnce();
   });
 });
 

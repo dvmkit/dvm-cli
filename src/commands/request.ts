@@ -2870,8 +2870,8 @@ function requestOutcomeUnknown(requestId: string, cause: unknown): DvmError {
  *     (surfaced via `fellThroughCode` so the caller can explain the mismatch)
  *
  * Hard failures (throw + exit non-zero):
- *   - mint `/v1/swap` rejected the swap (`swap_failed` — inputs are
- *     left `in_flight` and recovered after the in-flight timeout)
+ *   - mint failure (`swap_failed` — definite refusals restore inputs;
+ *     ambiguous swaps keep inputs protected for mint reconciliation)
  *   - DVM advertised a `lock_pubkey` that doesn't match the wallet
  *   - DVM responded with payment_invalid / payment_insufficient on
  *     submit (proofs are reverted to spendable)
