@@ -1,6 +1,7 @@
 import { DvmError, formatUsd, shellQuoteArg, type CreditOpResult } from "@dvmkit/sdk/internal";
 import type { CreditFundOutcome, FundCreditArgs } from "../credit-fund";
 import type { CardFundDeps } from "./fund";
+import { cardMinimumMicro, STRIPE_CARD_FLOOR_MICRO } from "./minimum";
 import {
   clearPendingCardFunding,
   checkoutRetiredSince,
@@ -53,7 +54,7 @@ export async function fundOverCheckout(
     const error = new DvmError("invalid_argument", "Card top-ups must be whole USD cents.");
     return { creditId: args.creditId, fundId, rail: "stripe", status: "refused", error, display: error.message };
   }
-  const minimum = Math.max(args.menu?.stripe?.min_micro ?? 500_000, args.menu?.min_micro ?? 0);
+  const minimum = cardMinimumMicro(args.menu);
   const amountMicro = prior?.amountMicro ?? Math.max(args.amountMicro, minimum);
   const startedAt = args.cardInvocationStartedAt ?? Date.now();
   const reserved = await withCardFundingLock({ endpoint: args.ref.endpoint, callerPubkey: args.signing.pubkey }, () => {
@@ -85,8 +86,9 @@ export async function fundOverCheckout(
       display: `A card top-up for this DVM completed while this command was starting. Check the balance with ${balance}. Re-run this command to start another top-up.` };
   }
   const { entry } = reserved;
+  const minimumSource = minimum === STRIPE_CARD_FLOOR_MICRO ? "Stripe's card charge floor" : "this DVM's card minimum";
   const raised = reserved.created && entry.amountMicro > args.amountMicro
-    ? `Raised the requested $${formatUsd(args.amountMicro / 1_000_000)} to this DVM's card minimum of $${formatUsd(entry.amountMicro / 1_000_000)}.`
+    ? `Raised the requested $${formatUsd(args.amountMicro / 1_000_000)} to ${minimumSource} of $${formatUsd(entry.amountMicro / 1_000_000)}.`
     : undefined;
   const base = { creditId: entry.creditId, fundId: entry.fundId, rail: "stripe" as const };
   const body = {

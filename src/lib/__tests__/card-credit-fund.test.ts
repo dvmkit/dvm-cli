@@ -16,7 +16,7 @@ vi.mock("../btc-rate", () => ({ tryResolveBtcUsdRate: vi.fn(async () => undefine
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Challenge, Credential } from "mppx";
-import { DvmError, usdToMsats } from "@dvmkit/sdk/internal";
+import { DvmError, usdToMsats, type CreditMenu } from "@dvmkit/sdk/internal";
 
 import { recordSpendOnce } from "../budget-ledger";
 import { fundOverStripe, type CardFundDeps } from "../card-credit/fund";
@@ -33,6 +33,10 @@ const ENDPOINT = "https://card.example.test";
 const PUBKEY = "ab".repeat(32);
 const CREDIT = "11111111-1111-4111-8111-111111111111";
 const SPT = "spt_test_0123456789abcdef01234567";
+const CARD_MENU: CreditMenu = {
+  funding: ["stripe"], currency: "usd", min_micro: 100_000,
+  max_micro: 50_000_000, ttl_ms: 86_400_000,
+};
 
 afterEach(() => {
   rmSync(join(stateRoot, "card-fundings"), { recursive: true, force: true });
@@ -154,6 +158,69 @@ describe("re-run after a card top-up's challenge has expired", () => {
 });
 
 describe("card top-up limits and records", () => {
+  describe.each([undefined, SPT])("minimum checks with approval token %s", (cardSpt) => {
+    it.each([
+      { name: "advertised card minimum", terms: { network_id: "example", currency: "usd" as const, min_micro: 5_000_000 },
+        menuMin: 100_000, amount: 1_000_000, minimum: 5_000_000, label: "$5.00", source: "DVM" },
+      { name: "missing card terms", terms: undefined,
+        menuMin: 100_000, amount: 400_000, minimum: 500_000, label: "$0.50", source: "Stripe's" },
+      { name: "advertised minimum below Stripe's floor", terms: { network_id: "example", currency: "usd" as const, min_micro: 100_000 },
+        menuMin: 100_000, amount: 400_000, minimum: 500_000, label: "$0.50", source: "Stripe's" },
+      { name: "general minimum above card terms", terms: { network_id: "example", currency: "usd" as const, min_micro: 500_000 },
+        menuMin: 1_000_000, amount: 500_000, minimum: 1_000_000, label: "$1.00", source: "DVM" },
+    ])("refuses below $name before asking the DVM", async ({ terms, menuMin, amount, minimum, label, source }) => {
+      const post = vi.fn<CardFundDeps["post"]>();
+      const outcome = await fundOverStripe(args({
+        amountMicro: amount, cardApprovalSteps: true, cardSpt,
+        menu: { ...CARD_MENU, min_micro: menuMin, ...(terms ? { stripe: terms } : {}) },
+      }), "fund-new", deps(post));
+
+      expect(outcome.status).toBe("refused");
+      expect(outcome.error?.code).toBe("below_rail_minimum");
+      expect(outcome.error?.data).toMatchObject({ rail: "stripe", min_micro: minimum });
+      expect(outcome.error?.message).toContain(source);
+      expect(outcome.display).toContain(label);
+      expect(outcome.display).toContain("Nothing was charged");
+      expect(outcome.hint).toContain(label);
+      expect(post).not.toHaveBeenCalled();
+      expect(loadPendingCardFunding(ENDPOINT, PUBKEY, CREDIT)).toBeUndefined();
+    });
+  });
+
+  it("still refuses fractional cents above the advertised minimum", async () => {
+    const post = vi.fn<CardFundDeps["post"]>();
+    const outcome = await fundOverStripe(args({
+      amountMicro: 5_000_001, cardApprovalSteps: true,
+      menu: { ...CARD_MENU, stripe: { network_id: "example", currency: "usd", min_micro: 5_000_000 } },
+    }), "fund-new", deps(post));
+
+    expect(outcome.error?.code).toBe("invalid_argument");
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [5_000_000, 100_000, 1_000_000, 5_000_000, "$5.00"],
+    [100_000, 100_000, 400_000, 500_000, "$0.50"],
+    [500_000, 1_000_000, 500_000, 1_000_000, "$1.00"],
+  ])("checkout respects card terms %i and menu floor %i before payment", async (cardMin, menuMin, amountMicro, minimum, label) => {
+    const post = vi.fn<CardFundDeps["post"]>().mockResolvedValue({
+      op: "fund", status: "pending", credit_id: CREDIT,
+      checkout: { url: "https://checkout.stripe.com/c/pay/example", expires_at: Math.floor(Date.now() / 1_000) + 3600 },
+    } as Awaited<ReturnType<CardFundDeps["post"]>>);
+    const outcome = await fundOverStripe(args({
+      amountMicro, cardApprovalSteps: true, cardWait: false,
+      menu: { ...CARD_MENU, min_micro: menuMin,
+        stripe: { network_id: "example", currency: "usd", min_micro: cardMin, checkout: true } },
+    }), "fund-new", deps(post));
+
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]?.[0]).toMatchObject({ fund: { via: "checkout", amount_micro: minimum } });
+    expect(outcome.status).toBe("checkout_pending");
+    expect(outcome.checkoutHandoff).toMatchObject({ amount_micro: minimum });
+    expect(outcome.display).toContain("Raised the requested");
+    expect(outcome.display).toContain(label);
+  });
+
   it("refuses a top-up above Link's $500 approval limit before asking the DVM", async () => {
     const post = vi.fn<CardFundDeps["post"]>();
 
