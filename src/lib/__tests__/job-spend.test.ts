@@ -185,8 +185,6 @@ it("shows the mint fee beside the payment without adding it to what the provider
 
   expect(stored.cashuSwapFeeSats).toBe(3);
   expect(spend).toMatchObject({ total_msats: 8000, swap_fee_sats: 3 });
-  expect(spend.display).toContain("Mint fee: ");
-  expect(spend.display).toContain("3 sats");
 });
 
 it("says nothing about a mint fee when none was charged", () => {

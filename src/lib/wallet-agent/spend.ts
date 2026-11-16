@@ -91,9 +91,11 @@ export interface PreparedAgentSpend {
   /** Total spend in sats (exactly the requested amount; the swap fee comes off inputs). */
   totalSats: number;
   /**
-   * The mint's swap fee in sats, measured as proofs spent minus proofs returned
-   * (token plus change) rather than estimated beforehand. It left the wallet on
-   * top of `totalSats`. Zero when existing reserve proofs shipped without a swap.
+   * Mint fees in sats beyond `totalSats`: the swap's own input fee plus the
+   * redemption fee folded into the token by `includeFees(true)`. Measured as
+   * proofs spent minus change minus the price, not estimated beforehand, so
+   * `totalSats + swapFeeSats` is the wallet's actual drop. Zero when existing
+   * reserve proofs shipped without a swap.
    */
   swapFeeSats: number;
   endpoint: string;
@@ -672,10 +674,12 @@ export async function prepareAgentSpend(args: {
       inner = { ...lock2, submission: preparedSubmission };
       sendProofs = result.send;
       keepProofs = result.keep;
-      // The mint keeps whatever the inputs held beyond the token and the change.
+      // Everything the wallet gave up beyond the price: this swap's input fee
+      // plus the redemption fee `.includeFees(true)` folds into the token, so
+      // price + fee is exactly the drop in the wallet's balance.
       swapFeeSats = Math.max(
         0,
-        sumAmounts(preview.inputs) - sumAmounts(sendProofs) - sumAmounts(keepProofs)
+        sumAmounts(preview.inputs) - sumAmounts(keepProofs) - lock2.submission.amount_sats
       );
       break;
     } catch (err) {

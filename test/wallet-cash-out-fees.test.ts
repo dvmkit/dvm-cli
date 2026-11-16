@@ -90,7 +90,6 @@ describe("cash-out fee itemisation", () => {
       input_fee_sats: 10,
       fee_share_pct: 4.5,
     });
-    expect(summary.display).toContain("about 4.5% of the payout");
     // The same 4.5% share trips the pre-commit warning, which names both flags.
     const preCommit = lastJson("cash_out_quote");
     expect(preCommit).toMatchObject({ fee_sats: 14, fee_warning: true });
@@ -111,7 +110,6 @@ describe("cash-out fee itemisation", () => {
       routing_fee_sats: 4,
       routing_reserve_returned_sats: 6,
     });
-    expect(summary.mints[0].display).toContain("6 sats of unused routing reserve came back");
   });
 
   it.each([

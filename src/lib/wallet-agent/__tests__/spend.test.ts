@@ -263,7 +263,7 @@ describe("prepareAgentSpend per-call swap", () => {
     });
   });
 
-  it("reports the mint fee measured from proofs in versus proofs out, so paid plus fee equals the wallet's drop", async () => {
+  it("counts the redemption fee in the token as a mint fee, so paid plus fee equals the wallet's drop", async () => {
     const { privkey, pubkey } = generateAgentKeypair();
     const dvmPubkey = "02" + "ee".repeat(32);
     vi.mocked(loadAgentWallet).mockImplementation(() => {
@@ -272,14 +272,13 @@ describe("prepareAgentSpend per-call swap", () => {
         ? calls[calls.length - 1][0]
         : baseWallet(privkey, pubkey, [proof("big", 10)]);
     });
-    // The mint swaps one 10-sat input into 5 for the DVM and 4 of change. At
-    // input_fee_ppk 100 it keeps the remaining 1 sat.
+    // includeFees(true) sizes the token at price + the DVM's redemption fee:
+    // a 10-sat input becomes a 6-sat token (price 5 + redemption 1) and 3 of
+    // change, and the mint keeps 1 sat as the swap's own input fee.
     const mockWallet = makeMockWallet(
       {
-        send: [{ id: "k1", amount: 5, secret: "to-dvm", C: "02SEND" }],
-        keep: [
-          { id: "k1", amount: 4, secret: "change-a", C: "02KEEPA" },
-        ],
+        send: [{ id: "k1", amount: 6, secret: "to-dvm", C: "02SEND" }],
+        keep: [{ id: "k1", amount: 3, secret: "change-a", C: "02KEEPA" }],
       },
       100
     );
@@ -300,9 +299,9 @@ describe("prepareAgentSpend per-call swap", () => {
       .proofs.filter((p) => p.status === "valid")
       .reduce((sum, p) => sum + p.amount, 0);
     expect(result.totalSats).toBe(5);
-    expect(result.swapFeeSats).toBe(1);
+    expect(result.swapFeeSats).toBe(2);
     expect(10 - spendableAfter).toBe(result.totalSats + result.swapFeeSats);
-    expect(lastSavedWallet().pending_submissions[0]).toMatchObject({ swap_fee_sats: 1 });
+    expect(lastSavedWallet().pending_submissions[0]).toMatchObject({ swap_fee_sats: 2 });
   });
 
   it("persists the submit context so a resume can re-POST the original call", async () => {
