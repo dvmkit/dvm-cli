@@ -16,7 +16,12 @@ import {
 import { DEFAULT_CREDIT_POSTURE } from "../lib/credit-policy";
 import { createInterface } from "node:readline";
 
-import { describeExisting, detectSetupState, isPartialSetup } from "../lib/caller-state";
+import {
+  describeExisting,
+  describeMissingSetup,
+  detectSetupState,
+  isPartialSetup,
+} from "../lib/caller-state";
 import { DEFAULT_FEEDBACK_POSTURE } from "../lib/feedback-nudges";
 import { ensureDefaultIdentity } from "./identity";
 
@@ -92,11 +97,11 @@ export async function init(opts: InitOptions): Promise<void> {
   const feedbackPosture = existing.feedback?.posture ?? DEFAULT_FEEDBACK_POSTURE;
 
   if (opts.human) {
-    if (created && isPartialSetup(setupState)) {
+    if (isPartialSetup(setupState)) {
       info(
-        `Found existing ${describeExisting(setupState)} in ${CONFIG_DIR}, but no config, identity, or wallet.`
+        `Found existing ${describeExisting(setupState)} in ${CONFIG_DIR}. Missing setup: ${describeMissingSetup(setupState)}.`
       );
-      info("Creating the missing setup files and preserving existing history.");
+      info("Preserved existing history.");
     }
     info(created ? `Config written to ${CONFIG_FILE}` : `Config already exists at ${CONFIG_FILE}`);
     if (!created) info("Nothing already configured was changed.");

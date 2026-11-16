@@ -67,13 +67,20 @@ export function detectSetupState(): SetupState {
 
 /**
  * True when some caller history exists (jobs or messages) but at least one
- * core setup file (config / identity / wallet) is missing — the
- * partial-state case worth surfacing to a fresh re-init on a shared box.
+ * core setup file (config / identity) is missing. Wallet setup is a separate
+ * step that `dvm init` does not perform.
  */
 export function isPartialSetup(state: SetupState): boolean {
   const hasExisting = state.existingState.jobs || state.existingState.messages;
-  const hasMissing = state.missing.config || state.missing.identity || state.missing.wallet;
+  const hasMissing = state.missing.config || state.missing.identity;
   return hasExisting && hasMissing;
+}
+
+export function describeMissingSetup(state: SetupState): string {
+  const files: string[] = [];
+  if (state.missing.config) files.push("config.json");
+  if (state.missing.identity) files.push("identities.json");
+  return files.join(" and ");
 }
 
 export function describeExisting(state: SetupState): string {
