@@ -144,10 +144,10 @@ function cashuOptions(mints: string[] | undefined, hasLightningBackend: boolean)
   const receiveTokenOption: FundingOption = {
     method: "cashu-receive-token",
     display: "Receive an existing Cashu token",
-    command: "dvm wallet receive-token <cashu-token>",
+    command: "dvm wallet receive-token",
     description:
       "Claim a pre-minted Cashu token (e.g. from a friend or a faucet) into the agent wallet. The token is re-locked to your wallet's key so it's spendable.",
-    hint: "Tokens are single-use; a token locked to a third party can't be claimed.",
+    hint: "Pipe the token into stdin or redirect a token file; do not pass it as a command argument. Tokens are single-use; a token locked to a third party can't be claimed.",
     ...(hasMints ? { mints } : {}),
   };
 

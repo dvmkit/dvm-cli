@@ -118,7 +118,8 @@ describe("getFundingGuidance", () => {
       cashuMints: [],
     });
     const receive = result.fundingOptions.find((o) => o.method === "cashu-receive-token");
-    expect(receive?.command).toBe("dvm wallet receive-token <cashu-token>");
+    expect(receive?.command).toBe("dvm wallet receive-token");
+    expect(receive?.hint).toContain("stdin");
     expect(receive?.description).toContain("into the agent wallet");
   });
 
