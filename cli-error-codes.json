@@ -154,6 +154,7 @@
     "job_payment_state_required",
     "job_terminal",
     "job_token_required",
+    "lightning_invoice_changed",
     "lightning_invoice_expired",
     "lightning_unreachable",
     "local_correlation_id_exists",

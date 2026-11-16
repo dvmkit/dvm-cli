@@ -15,6 +15,7 @@ import {
   emitFloatBudgetWarning,
   floatBudgetJson,
   floatPaymentJson,
+  lookupFloatInvoice,
   parseStatedBudget,
   payViaFloat,
   probeFloat,
@@ -467,5 +468,46 @@ describe("payViaFloat", () => {
     expect(err).toBeInstanceOf(DvmError);
     expect((err as DvmError).code).toBe("float_quota_exceeded");
     expect((err as DvmError).data?.display).toContain("spending limit");
+  });
+});
+
+describe("lookupFloatInvoice", () => {
+  it("proves an invoice the wallet paid", async () => {
+    const { stub, float } = await connect();
+    await payViaFloat({ bolt11: "lnbc100n1pjlookup", amountMsats: 10_000, float, timeoutMs: 4000 });
+
+    await expect(
+      lookupFloatInvoice({ float, paymentHash: stub.payments[0].paymentHash, timeoutMs: 4000 })
+    ).resolves.toBe("paid");
+  });
+
+  it("proves an invoice the wallet never attempted unpaid from its NOT_FOUND answer", async () => {
+    const { float } = await connect();
+
+    await expect(
+      lookupFloatInvoice({ float, paymentHash: "cd".repeat(32), timeoutMs: 4000 })
+    ).resolves.toBe("unpaid");
+  });
+
+  it("proves nothing when the wallet does not advertise lookup_invoice, and does not ask", async () => {
+    const { stub, float } = await connect();
+
+    await expect(
+      lookupFloatInvoice({
+        float: { ...float, methods: ["pay_invoice", "get_info"] },
+        paymentHash: "cd".repeat(32),
+        timeoutMs: 4000,
+      })
+    ).resolves.toBe("unknown");
+    expect(stub.requests.filter((request) => request.method === "lookup_invoice")).toHaveLength(0);
+  });
+
+  it("proves nothing when the wallet does not answer", async () => {
+    const { stub, float } = await connect();
+    stub.setFault({ mode: "offline" });
+
+    await expect(
+      lookupFloatInvoice({ float, paymentHash: "cd".repeat(32), timeoutMs: 300 })
+    ).resolves.toBe("unknown");
   });
 });

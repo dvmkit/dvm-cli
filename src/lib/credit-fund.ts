@@ -47,6 +47,7 @@ import {
   floatPaymentDisplay,
   fundViaFloat,
   loadFloat,
+  lookupFloatInvoice,
 } from "./float";
 import {
   loadConfig,
@@ -712,9 +713,14 @@ export async function pollPendingCreditFundings(args: {
       const offer = lightningOffer(err);
       if (offer) {
         if (isInvoiceFunding(funding) && funding.bolt11 && funding.bolt11 !== offer.invoice) continue;
+        // A replacement invoice is never adopted over an unproven original: the retry reports it.
+        const verdict = await replacementInvoiceVerdict(funding, offer, undefined);
+        if (verdict === "refuse") continue;
         // Still pending at the DVM: the intent stays, expired or not, until the DVM settles or
         // definitively refuses it.
-        recordPendingFunding(withLightningOffer(funding, offer));
+        recordPendingFunding(
+          verdict === "paid" ? withReconciledPayment(funding) : withLightningOffer(funding, offer)
+        );
       } else if (lightningFundingTerminal(err, funding)) {
         clearPending(funding);
       }
@@ -3530,10 +3536,23 @@ async function fundOverLightning(
       return lightningRefusal(base, err);
     }
     offer = parsed;
+    if (recorded) {
+      // The wallet already paid this intent: only the DVM's confirmation is outstanding.
+      recordPendingFunding(withLightningOffer(pending, offer));
+      return paidAwaitingSettlement(base, recorded, lightningSpendDisplay(recorded));
+    }
+    const verdict = await replacementInvoiceVerdict(pending, offer, args.float);
+    if (verdict === "refuse") return replacementInvoiceRefusal(base, pending);
+    if (verdict === "paid") {
+      pending = withReconciledPayment(pending);
+      recordPendingFunding(pending);
+      const reconciled = lightningSpendFromPending(pending);
+      if (reconciled) {
+        return paidAwaitingSettlement(base, reconciled, lightningSpendDisplay(reconciled));
+      }
+    }
     pending = withLightningOffer(pending, offer);
     recordPendingFunding(pending);
-    // The wallet already paid this intent: only the DVM's confirmation is outstanding.
-    if (recorded) return paidAwaitingSettlement(base, recorded, lightningSpendDisplay(recorded));
   }
 
   if (pendingFundingExpired(pending)) return expiredUnresolvedFunding(base);
@@ -4121,6 +4140,65 @@ function withLightningOffer(pending: PendingFunding, offer: LightningFundingOffe
     paymentHash: offer.payment_hash,
     amountMsats: offer.amount_msats,
     expiresAtMs: offer.expires_at_ms,
+  };
+}
+
+type ReplacementInvoiceVerdict = "same" | "paid" | "unpaid" | "refuse";
+
+/**
+ * Whether the invoice the DVM now offers may replace the saved one. Only the wallet can say the
+ * original was not paid: the journal lacking a payment record proves nothing, since a payment can
+ * land before it is written. Anything the wallet cannot prove is a refusal.
+ */
+async function replacementInvoiceVerdict(
+  pending: PendingFunding,
+  offer: LightningFundingOffer,
+  float: Float | null | undefined
+): Promise<ReplacementInvoiceVerdict> {
+  if (pending.paymentOutcome !== undefined || !pending.bolt11 || pending.bolt11 === offer.invoice) {
+    return "same";
+  }
+  if (!pending.paymentHash) return "refuse";
+  let wallet: Float | null;
+  try {
+    wallet = float === undefined ? loadFloat() : float;
+  } catch {
+    return "refuse";
+  }
+  if (!wallet) return "refuse";
+  const state = await lookupFloatInvoice({ float: wallet, paymentHash: pending.paymentHash });
+  return state === "unknown" ? "refuse" : state;
+}
+
+/** Record the wallet's proof that the saved invoice was paid; the original invoice stays saved. */
+function withReconciledPayment(pending: PendingFunding): PendingFunding {
+  return {
+    ...pending,
+    principalMsats: pending.amountMsats ?? 0,
+    routingFeeMsats: null,
+    totalWalletFeeMsats: null,
+    unitemizedWalletFeeMsats: null,
+    walletDebitMsats: null,
+    paymentOutcome: "reconciled",
+  };
+}
+
+function replacementInvoiceRefusal(
+  base: { creditId: string; fundId: string; rail: "lightning" },
+  pending: PendingFunding
+): CreditFundOutcome {
+  const error = new DvmError(
+    "lightning_invoice_changed",
+    "The DVM offered a different invoice for a funding whose first invoice may already be paid.",
+    `Do not pay another invoice or fund again. Check the wallet's history for the original invoice, or quote funding id ${pending.fundId} to the DVM operator.`,
+    { credit_id: pending.creditId, fund_id: pending.fundId }
+  );
+  return {
+    ...base,
+    status: "refused",
+    error,
+    display: `The DVM replaced the Lightning invoice for saved funding ${pending.fundId}, and the wallet could not show that the original went unpaid. Nothing was paid on this attempt; the original invoice and funding id are kept.`,
+    hint: error.hint,
   };
 }
 
