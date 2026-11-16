@@ -678,7 +678,8 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
 /**
  * Reconciles existing durable fundings independently, tolerating an entry's network failure. It
  * may complete session management or re-sign an expired Tempo charge under the existing fund id;
- * it does not create a new funding intent.
+ * it does not create a new funding intent. Paid Lightning refusals are returned for the caller
+ * to report before clearing their journal entries.
  */
 export async function pollPendingCreditFundings(args: {
   transport: Transport;
@@ -686,7 +687,8 @@ export async function pollPendingCreditFundings(args: {
   signing: { privkey: string; pubkey: string };
   /** Test seam for the request-signing dependency (avoids a hard cycle). */
   signBody?: (privkey: string, body: Record<string, unknown>) => Record<string, unknown>;
-}): Promise<void> {
+}): Promise<CreditFundOutcome[]> {
+  const refused: CreditFundOutcome[] = [];
   const pending = listPendingFundings({
     endpoint: args.ref.endpoint,
     callerPubkey: args.signing.pubkey,
@@ -722,7 +724,12 @@ export async function pollPendingCreditFundings(args: {
           verdict === "paid" ? withReconciledPayment(funding) : withLightningOffer(funding, offer)
         );
       } else if (lightningFundingTerminal(err, funding)) {
-        clearPending(funding);
+        const spend = lightningSpendFromPending(funding);
+        if (spend) {
+          refused.push(paidButRefused(fundArgs, base, spend, lightningSpendDisplay(spend), err as DvmError));
+        } else {
+          clearPending(funding);
+        }
       }
     }
   }
@@ -781,7 +788,7 @@ export async function pollPendingCreditFundings(args: {
   // settle. Nothing to do without a wallet — the header is journalled, but the
   // resume still resolves the flavour off the connected chain.
   const exactWallet = loadX402Wallet();
-  if (!exactWallet) return;
+  if (!exactWallet) return refused;
   for (const funding of listResumableX402ExactFundings({
     endpoint: args.ref.endpoint,
     callerPubkey: args.signing.pubkey,
@@ -801,6 +808,7 @@ export async function pollPendingCreditFundings(args: {
       funding
     ).catch(() => undefined);
   }
+  return refused;
 }
 
 /**

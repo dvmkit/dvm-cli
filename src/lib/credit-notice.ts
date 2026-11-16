@@ -380,8 +380,8 @@ export interface CreditRailPinConflict {
 /**
  * The deferred credit fields for one terminal JSON emission.
  *
- * The two funding fields are **lists**, in the order the purchases happened,
- * and the other notices are single blocks. The split is what each field
+ * Funding fields are lists in purchase order; refused fundings are a list in sweep order.
+ * The other notices are single blocks. The split is what each field
  * describes: a suggestion, a funding skip, a refill diagnosis, a draw skip, a sibling balance
  * and a rail-pin conflict each describe the state the command left behind, so a
  * second one supersedes the first. A funding describes a *spend*, and one
@@ -394,6 +394,7 @@ export interface CreditRailPinConflict {
  * what lets every terminal emission spread the sink in blind.
  */
 export interface CreditNoticeFields {
+  refused_fundings?: ReturnType<typeof refusedFundingReport>[];
   credit_suggestion?: CreditSuggestion;
   credit_funding?: CreditFundingReport[];
   credit_funding_incomplete?: CreditFundingIncomplete[];
@@ -402,6 +403,32 @@ export interface CreditNoticeFields {
   credit_draw_skipped?: CreditDrawSkipped;
   credit_sibling?: SiblingCreditAvailable;
   credit_rail_pin_conflict?: CreditRailPinConflict;
+}
+
+function refusedFundingReport(endpoint: string, outcome: CreditFundOutcome) {
+  return {
+    endpoint,
+    status: outcome.status,
+    credit_id: outcome.creditId,
+    fund_id: outcome.fundId,
+    rail: outcome.rail,
+    ...(outcome.spentSats !== undefined ? { spent_sats: outcome.spentSats } : {}),
+    ...(outcome.principalSats !== undefined ? { principal_sats: outcome.principalSats } : {}),
+    ...(outcome.routingFeeSats !== undefined ? { routing_fee_sats: outcome.routingFeeSats } : {}),
+    ...(outcome.totalWalletFeeSats !== undefined ? { total_wallet_fee_sats: outcome.totalWalletFeeSats } : {}),
+    ...(outcome.unitemizedWalletFeeSats !== undefined ? { unitemized_wallet_fee_sats: outcome.unitemizedWalletFeeSats } : {}),
+    ...(outcome.walletDebitSats !== undefined ? { wallet_debit_sats: outcome.walletDebitSats } : {}),
+    ...(outcome.paymentOutcome ? { payment_outcome: outcome.paymentOutcome } : {}),
+    ...(outcome.error ? { error_code: outcome.error.code } : {}),
+    display: outcome.display,
+    hint: outcome.hint,
+  };
+}
+
+export function noteRefusedCreditFunding(endpoint: string, outcome: CreditFundOutcome, human?: boolean): void {
+  // The error boundary drains this sink too, so a later failed balance read cannot lose the notice.
+  if (human) info([outcome.display, outcome.hint].filter(Boolean).join(" "));
+  else (pending.refused_fundings ??= []).push(refusedFundingReport(endpoint, outcome));
 }
 
 export function buildCreditFundingSkipped(args: {

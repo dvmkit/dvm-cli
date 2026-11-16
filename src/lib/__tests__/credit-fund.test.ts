@@ -2828,6 +2828,34 @@ describe("fundCredit over Lightning", () => {
       );
     });
 
+    it.each(["credit_funding_unrecorded", "lightning_invoice_expired", "payment_invalid"])(
+      "hands back a paid %s refusal before retiring its evidence",
+      async (code) => {
+        vi.mocked(listPendingFundings).mockReturnValue([expiredPaid()]);
+        mockCreditOp.mockRejectedValueOnce(new DvmError(code, "Funding refused.", undefined, {
+          retryable: false,
+          display: "Nothing was charged.",
+        }));
+
+        const outcomes = await sweep();
+
+        expect(outcomes).toEqual([expect.objectContaining({
+          status: "refused", creditId: "credit-1", fundId: "fund-original", rail: "lightning",
+          principalSats: 100, routingFeeSats: 5, totalWalletFeeSats: 5,
+          unitemizedWalletFeeSats: 0, walletDebitSats: 105, spentSats: 105,
+          paymentOutcome: "paid", error: expect.objectContaining({ code }),
+          display: expect.stringContaining("The Lightning payment went out"),
+          hint: expect.stringContaining("quote funding id fund-original"),
+        })]);
+        expect(outcomes[0].display).not.toContain("Nothing was charged");
+        expect(mockCreditOp).toHaveBeenCalledTimes(1);
+        expectOriginalIdsOnly();
+        expect(clearPendingFunding).not.toHaveBeenCalled();
+        expect(recordFundResponse).not.toHaveBeenCalled();
+        expect(fundViaFloat).not.toHaveBeenCalled();
+      }
+    );
+
     it.each([
       ["a transport timeout", () => new DvmError("timeout", "The DVM did not answer in time.")],
       ["an unreachable DVM receive wallet", () => new DvmError("lightning_unavailable", "Receive wallet offline.")],
@@ -2836,7 +2864,7 @@ describe("fundCredit over Lightning", () => {
       vi.mocked(listPendingFundings).mockReturnValue([expiredPaid()]);
       mockCreditOp.mockRejectedValueOnce(failure());
 
-      await sweep();
+      expect(await sweep()).toEqual([]);
 
       expectOriginalIdsOnly();
       expect(clearPendingFunding).not.toHaveBeenCalled();
@@ -2851,7 +2879,7 @@ describe("fundCredit over Lightning", () => {
       vi.mocked(listPendingFundings).mockReturnValue([expiredUnpaid()]);
       mockCreditOp.mockRejectedValueOnce(dvmExpired());
 
-      await sweep();
+      expect(await sweep()).toEqual([]);
 
       expect(mockCreditOp).toHaveBeenCalledTimes(1);
       expectOriginalIdsOnly();
