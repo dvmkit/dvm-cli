@@ -57,7 +57,8 @@ describe("human next actions", () => {
     printNextActionHuman(refundNextAction("recover", [claim]), { refunds: [claim], terminal });
     const output = vi.mocked(info).mock.calls.map(([text]) => text).join("");
     expect(output.match(/could not be auto-claimed/g)).toHaveLength(1);
-    expect(output).toContain("dvm wallet receive-token recoverable-token");
+    expect(output).toContain("dvm wallet receive-token via stdin");
+    expect(output).not.toContain(claim.cashu_token);
     expect(output.includes("Next:")).toBe(!terminal);
   });
 

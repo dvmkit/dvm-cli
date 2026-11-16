@@ -132,7 +132,7 @@ export function refundNextAction(jobId: string, claims: RefundClaim[]): NextActi
       reason: claim.reason,
       claimed: false,
       cashu_token: claim.cashu_token,
-      hint: `The provider sent a ${noun} but the auto-claim into your wallet failed (the mint may be unreachable). Claim it manually with 'dvm wallet receive-token <cashu_token>' — the token is in this action's 'cashu_token' field, don't lose it. Or retry the auto-claim with 'dvm messages ${guidanceJobArg(jobId)} --no-stream' (re-running plain 'dvm messages' won't retry — its cursor has already advanced past this message).`,
+      hint: `The provider sent a ${noun} but the auto-claim into your wallet failed (the mint may be unreachable). Pipe this action's 'cashu_token' field into 'dvm wallet receive-token' via stdin; do not put the token in command arguments. Or retry the auto-claim with 'dvm messages ${guidanceJobArg(jobId)} --no-stream' (re-running plain 'dvm messages' won't retry — its cursor has already advanced past this message).`,
     }, ["amount_msats", "reason", "cashu_token"]);
   }
 
@@ -181,7 +181,7 @@ export function refundSummaryHuman(
   if (claim.claimed) {
     return `Claimed ${noun} of ${formatAmountBestEffort(claim.amount_msats)} into your wallet.`;
   }
-  return `${cap(noun)} of ${formatAmountBestEffort(claim.amount_msats)} could not be auto-claimed (the mint may be down). Recover with: dvm wallet receive-token ${claim.cashu_token}`;
+  return `${cap(noun)} of ${formatAmountBestEffort(claim.amount_msats)} could not be auto-claimed (the mint may be down). Pipe the cashu_token field from JSON messages output into dvm wallet receive-token via stdin; do not put the token in command arguments. Use dvm messages <job-id> --no-stream to retry the auto-claim or recover the token.`;
 }
 
 export function printRefundSummaryHuman(claims: RefundClaim[]): void {

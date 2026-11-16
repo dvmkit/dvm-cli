@@ -1088,10 +1088,10 @@ Docs:
     });
 
   wallet
-    .command("receive-token <token>")
-    .description("Claim an external Cashu token into the agent wallet as spendable balance")
+    .command("receive-token [token]")
+    .description("Claim an external Cashu token into the agent wallet. Omit token or use - to read stdin (recommended); positional tokens expose funds in shell history and process listings")
     .option("--human", "Human-readable output instead of JSON")
-    .action((token: string, opts: WalletReceiveTokenOptions) => {
+    .action((token: string | undefined, opts: WalletReceiveTokenOptions) => {
       return catchErrors(() => walletReceiveToken(token, opts), opts.human);
     });
 

@@ -71,6 +71,7 @@ import {
   stablecoinFundingHandoffJson,
 } from "../lib/funding-handoff";
 import { dvmFetch } from "../lib/http";
+import { drainStdin, StdinTimeoutError } from "../lib/byte-source";
 import { defaultQrImagePath, renderQrPng, renderQrTerminal } from "../lib/qr";
 import { getSpotRate } from "../lib/spot-rate";
 import { fundTempoFromFaucet } from "../lib/tempo-faucet";
@@ -528,9 +529,28 @@ export interface WalletReceiveTokenOptions {
  * party with `cashu_not_claimable` (no silent loss).
  */
 export async function walletReceiveToken(
-  token: string,
+  token: string | undefined,
   opts: WalletReceiveTokenOptions
 ): Promise<void> {
+  const stdinHint = "Pipe the Cashu token into `dvm wallet receive-token` or redirect a token file into stdin. Do not put the token in command arguments.";
+  if (token === undefined || token === "-") {
+    if (process.stdin.isTTY) {
+      throw new DvmError("no_input", "No Cashu token provided.", stdinHint);
+    }
+    try {
+      token = (await drainStdin()).trim();
+    } catch (err) {
+      if (err instanceof StdinTimeoutError) {
+        throw new DvmError("no_input", "No Cashu token provided (stdin timed out).", stdinHint);
+      }
+      throw err;
+    }
+  } else {
+    info("WARNING: passing a Cashu token on the command line exposes it in shell history and process listings, where anyone who reads it can spend it first. Pipe it into `dvm wallet receive-token` instead.");
+  }
+  if (!token) {
+    throw new DvmError("no_input", "No Cashu token provided.", stdinHint);
+  }
   const result = await receiveToAgentWallet(token);
 
   if (opts.human) {

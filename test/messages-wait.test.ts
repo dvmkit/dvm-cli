@@ -633,7 +633,8 @@ it.each([true, false])("keeps terminal human refund output actionable only when 
     expect(text).not.toContain("Next:");
   } else {
     expect(text).toContain("Next: Change");
-    expect(text).toContain("dvm wallet receive-token tok");
+    expect(text).toContain("dvm wallet receive-token via stdin");
+    expect(text).not.toContain("receive-token tok");
   }
 });
 
