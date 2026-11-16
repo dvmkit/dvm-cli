@@ -5,6 +5,7 @@ import {
   addPayment, loadAllJobs, loadJob, recordUpfrontCreditPayment, saveJob, saveSubmittedJob,
 } from "../job-store";
 import { handlePaymentRequest } from "../payment-responder";
+import { checkUpfrontPayment, receiptUpfrontFault, upfrontReceiptFields } from "../upfront-payment";
 import { HttpsTransport } from "../transport/https";
 
 const endpoint = "https://provider.example";
@@ -92,4 +93,90 @@ it.each([200, 202])("parses the accepted debit on HTTP %i submit and recovery re
     expect(loadJob("job")).toMatchObject({ totalPaidMsats: 7000, paymentsHonoured: 2, upfrontPayment: upfront });
     expect(fetch).toHaveBeenCalledTimes(2);
   } finally { vi.unstubAllGlobals(); }
+});
+
+// Card credit draws arrive with rail "stripe"; every rail the SDK can put on an upfront_payment must book.
+it.each(["cashu", "x402", "tempo", "lightning", "stripe"] as const)(
+  "books a %s-funded draw and then enforces the budget on it", async (rail) => {
+    recordUpfrontCreditPayment("job", { ...upfront, rail });
+    expect(loadJob("job")).toMatchObject({ totalPaidMsats: 6000, paymentsHonoured: 1, upfrontCreditBooked: true,
+      upfrontPayment: { rail } });
+    expect(loadJob("job")?.upfrontCreditConflict).toBeUndefined();
+    await expect(handlePaymentRequest("job", { amount_msats: 5000, reason: "More work" }, policy,
+      {} as Transport, { endpoint })).resolves.toBe("over-budget");
+  });
+
+it("refuses an unknown rail with the reason instead of dropping the debit silently", () => {
+  expect(checkUpfrontPayment({ ...upfront, rail: "paypal" })).toEqual({
+    reason: expect.stringContaining("rail \"paypal\" is not a known funding rail") });
+});
+
+it("records why an unusable upfront_payment left the credit job unbooked", async () => {
+  const bad = { ...upfront, rail: "paypal" };
+  const fields = upfrontReceiptFields(bad);
+  expect(fields.upfrontPayment).toBeUndefined();
+  recordUpfrontCreditPayment("job", fields.upfrontPayment, false, receiptUpfrontFault(fields));
+  expect(loadJob("job")).toMatchObject({ upfrontCreditConflict: true,
+    upfrontCreditConflictReason: expect.stringContaining("paypal") });
+  await expect(handlePaymentRequest("job", { amount_msats: 1000, reason: "More work" }, policy,
+    {} as Transport, { endpoint })).rejects.toMatchObject({
+    code: "upfront_credit_unknown", message: expect.stringContaining("paypal"),
+    data: { reason: expect.stringContaining("paypal") } });
+});
+
+it("recovers from an unusable body when a later valid matching debit arrives, then pays", async () => {
+  const bad = upfrontReceiptFields({ ...upfront, rail: "paypal" });
+  recordUpfrontCreditPayment("job", bad.upfrontPayment, false, receiptUpfrontFault(bad));
+  expect(loadJob("job")?.upfrontCreditConflict).toBe(true);
+  recordUpfrontCreditPayment("job", { ...upfront, rail: "stripe" });
+  const job = loadJob("job");
+  expect(job).toMatchObject({ totalPaidMsats: 6000, paymentsHonoured: 1, upfrontCreditBooked: true });
+  expect(job?.upfrontCreditConflict).toBeUndefined();
+  expect(job?.upfrontCreditConflictReason).toBeUndefined();
+  const sendMessage = vi.fn();
+  await expect(handlePaymentRequest("job", { amount_msats: 1000, reason: "More work" }, policy,
+    { sendMessage } as unknown as Transport, { endpoint })).resolves.not.toBe("over-budget");
+  await expect(handlePaymentRequest("job", { amount_msats: 5000, reason: "Too much" }, policy,
+    {} as Transport, { endpoint })).resolves.toBe("over-budget");
+});
+
+it("keeps a real mismatch sticky even when a valid debit follows", async () => {
+  recordUpfrontCreditPayment("job", { ...upfront, draw_id: "other-draw" });
+  expect(loadJob("job")).toMatchObject({ upfrontCreditConflict: true });
+  recordUpfrontCreditPayment("job", upfront);
+  expect(loadJob("job")?.upfrontCreditConflict).toBe(true);
+  await expect(handlePaymentRequest("job", { amount_msats: 1000, reason: "More work" }, policy,
+    {} as Transport, { endpoint })).rejects.toMatchObject({ code: "upfront_credit_unknown" });
+});
+
+it("does not let a later unusable body downgrade a real mismatch to recoverable", () => {
+  recordUpfrontCreditPayment("job", { ...upfront, draw_id: "other-draw" });
+  recordUpfrontCreditPayment("job", undefined, false, "garbled");
+  recordUpfrontCreditPayment("job", upfront);
+  expect(loadJob("job")?.upfrontCreditConflict).toBe(true);
+});
+
+it("leaves an absent upfront_payment unknown rather than a sticky conflict", () => {
+  recordUpfrontCreditPayment("job", undefined, false, upfrontReceiptFields(undefined).upfrontPaymentFault);
+  expect(loadJob("job")?.upfrontCreditConflict).toBeUndefined();
+});
+
+it("does not flag a conflict on a job whose debit is already booked", () => {
+  recordUpfrontCreditPayment("job", upfront);
+  recordUpfrontCreditPayment("job", undefined, false, "garbled replay");
+  expect(loadJob("job")?.upfrontCreditConflict).toBeUndefined();
+});
+
+it("names a request-result command that can work, or says none can", async () => {
+  const refuse = () => handlePaymentRequest("job", { amount_msats: 1000, reason: "More work" }, policy,
+    {} as Transport, { endpoint });
+  await expect(refuse()).rejects.toMatchObject({ hint: expect.stringContaining("no stored request id") });
+  const { updateJob } = await import("../job-store");
+  updateJob("job", { requestId: "req-1" });
+  await expect(refuse()).rejects.toMatchObject({ hint: expect.stringContaining("no stored intent"),
+    data: { request_id: "req-1" } });
+  const { saveRequestIntent } = await import("../request-intent-store");
+  saveRequestIntent({ v: 2, requestId: "req-1", endpoint, capability: "echo", body: {}, callerPubkey: "01".repeat(32),
+    policy, authAudience: { dvm_id: "d", builder_pubkey: "ab".repeat(32) }, createdAt: 1 } as never);
+  await expect(refuse()).rejects.toMatchObject({ hint: expect.stringContaining("`dvm request-result req-1`") });
 });

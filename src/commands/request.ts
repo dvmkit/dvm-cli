@@ -168,7 +168,7 @@ import { progressNotice } from "../lib/progress-notice";
 import { quoteWithinDeclaredLimit } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
-import { upfrontRailPayment, type UpfrontRailPayment } from "../lib/upfront-payment";
+import { receiptUpfrontFault, upfrontRailPayment, type UpfrontRailPayment } from "../lib/upfront-payment";
 import { dollarBoundUsdMicro, usdMicro } from "../lib/job-budget";
 import { clearRequestRefusal, recordRequestRefusal } from "../lib/request-refusal-store";
 import { createArtifactSaveSession } from "../lib/save-artifact";
@@ -969,7 +969,7 @@ async function requestWithWarnings(
     ...receiptTrustFields(providerInfo),
     ...localCorrelationJobFields(localCorrelationId),
   });
-  recordUpfrontCreditPayment(receipt.jobId, receipt.upfrontPayment);
+  recordUpfrontCreditPayment(receipt.jobId, receipt.upfrontPayment, false, receiptUpfrontFault(receipt));
 
   if (noStream && !isTerminalJobStatus(receipt.status)) {
     transport.close();

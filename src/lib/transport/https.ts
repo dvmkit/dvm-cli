@@ -2,7 +2,7 @@ import { sameEndpoint } from "../provider-endpoint";
 import { callerMessageRecognizer, rememberCallerMessage } from "../message-ownership";
 import { loadJob } from "../job-store";
 import { providerFields } from "../provider-output";
-import { parseUpfrontPayment } from "../upfront-payment";
+import { upfrontReceiptFields } from "../upfront-payment";
 import { unknownUpfrontPrice } from "../quote-upfront";
 import {
   type CancelOptions,
@@ -437,7 +437,7 @@ export class HttpsTransport implements Transport {
         ...(tempoTransactionHash ? { transactionHash: tempoTransactionHash } : {}),
         ...(feedbackClaim ? { feedbackClaim } : {}),
         ...parseFundingResponse(data),
-        upfrontPayment: parseUpfrontPayment(data.upfront_payment),
+        ...upfrontReceiptFields(data.upfront_payment),
       };
     }
 
@@ -454,7 +454,7 @@ export class HttpsTransport implements Transport {
       ...(feedbackClaim ? { feedbackClaim } : {}),
       ...parseSignedReceipt(data.receipt),
       ...parseFundingResponse(data),
-      upfrontPayment: parseUpfrontPayment(data.upfront_payment),
+      ...upfrontReceiptFields(data.upfront_payment),
     };
   }
 
@@ -1126,7 +1126,7 @@ function parseRequestResultResponse(
     ...(typeof data.job_token === "string" ? { jobToken: data.job_token } : {}),
     ...(receipt ? { receipt } : {}),
     ...parseFundingResponse(data),
-    upfrontPayment: parseUpfrontPayment(data.upfront_payment),
+    ...upfrontReceiptFields(data.upfront_payment),
   };
 }
 

@@ -34,7 +34,7 @@ import {
 } from "../lib/job-store";
 
 import { sameEndpoint } from "../lib/job-access";
-import { parseUpfrontPayment, parseUpfrontRailPayment } from "../lib/upfront-payment";
+import { parseUpfrontPayment, parseUpfrontRailPayment, receiptUpfrontFault } from "../lib/upfront-payment";
 import { isIdentityFailure, type ProviderIdentityError, withRequestResultRecovery } from "../lib/job-identity";
 import { loadRequestIntent, type RequestIntent } from "../lib/request-intent-store";
 import { loadRequestRefusal } from "../lib/request-refusal-store";
@@ -57,7 +57,14 @@ export async function requestResult(
   return withOutputWarnings(() => requestResultWithWarnings(requestId, opts), opts.human);
 }
 
-async function requestResultWithWarnings(requestId: string, opts: RequestResultOptions): Promise<void> {
+/** A job id names its stored request id; a request id with a stored intent always wins. */
+function resolveRequestId(arg: string): string {
+  if (isPublicRequestId(arg) && loadRequestIntent(arg)) return arg;
+  return loadJob(arg)?.requestId ?? arg;
+}
+
+async function requestResultWithWarnings(argument: string, opts: RequestResultOptions): Promise<void> {
+  const requestId = resolveRequestId(argument);
   if (!isPublicRequestId(requestId)) {
     throw new DvmError(
       "invalid_request_id",
@@ -190,7 +197,7 @@ async function requestResultWithWarnings(requestId: string, opts: RequestResultO
     recordUpfrontRailPayment(receipt.jobId, localPayment ?? (free ? "free" : accepted && method
       ? { method, amountMsats: accepted.amount_msats } : undefined));
   }
-  recordUpfrontCreditPayment(receipt.jobId, receipt.upfrontPayment, originalData?.fund !== undefined);
+  recordUpfrontCreditPayment(receipt.jobId, receipt.upfrontPayment, originalData?.fund !== undefined, receiptUpfrontFault(receipt));
 
   if (
     receipt.status === "completed" ||

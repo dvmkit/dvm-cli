@@ -683,6 +683,24 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     expect(budget.loadLedger()).toEqual(before);
   });
 
+  // Card-funded credit reports rail "stripe"; its later hourly ask must still be paid from the same credit.
+  it("pays a later ask from a card-funded draw after a --no-stream submit", async () => {
+    writeConfig("auto");
+    seedCredit(40_000);
+    provider.draw = (post, accepted) => answer(202, { job_id: accepted, status: "processing", job_token: provider.token,
+      upfront_payment: { amount_msats: 6000, amount_micro: 6000, currency: "usd",
+        credit_id: post.body.credit_id, draw_id: post.body.draw_id, rail: "stripe" } }, { [FIELD]: accepted });
+    await paidRequest({ budget: "10000", maxPayments: "3", stream: false });
+    expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 6000, paymentsHonoured: 1,
+      upfrontCreditBooked: true, upfrontPayment: { rail: "stripe" } });
+    const { handlePaymentRequest } = await import("../src/lib/payment-responder");
+    const { HttpsTransport } = await import("../src/lib/transport/https");
+    const ask = { amount_msats: 3000, reason: "Additional work", credit: { amount_micro: 3000, currency: "usd" } };
+    await expect(handlePaymentRequest("job-a", ask, jobs.loadJob("job-a")!.policy!, new HttpsTransport(),
+      { endpoint: provider.endpoint }, { requestSeq: 4 })).resolves.toMatchObject({ rail: "credit", amountMsats: 3000 });
+    expect(provider.balancePayments).toHaveLength(1);
+  });
+
   it("counts a recovered draw toward max-payments without drawing again", async () => {
     writeConfig("auto");
     seedCredit(40_000);

@@ -4,6 +4,7 @@ import { withJobPaymentLock } from "./payment-lock";
 import { loadAnsweredYieldSeqs, reconcileInFlightPaymentRequest, settleRecordedPayments } from "./yield-state";
 import { finishBookedSubmission, midJobSpendLabel } from "./taken-payment";
 import { sameEndpoint } from "./job-access";
+import { unknownUpfrontCreditError } from "./upfront-credit-error";
 import { bookedCreditPayment, sendCreditPayment, tryCreditPayment } from "./credit-payment";
 import { buildTempoCredential } from "./payment-rails/tempo-credential";
 import {
@@ -257,8 +258,7 @@ async function handleLockedPaymentRequest(
     throw new DvmError("upfront_rail_unknown", "The original upfront rail charge is unknown or conflicting.",
       "Recover the original job price before authorizing more payments.");
   if (job && hasUnknownUpfrontCredit(job))
-    throw new DvmError("upfront_credit_unknown", "The original upfront credit debit is unknown or conflicting.",
-      "Recover the accepted upfront amount with 'dvm request-result' before authorizing more payments.");
+    throw unknownUpfrontCreditError(job, "The original upfront credit debit is unknown or conflicting.");
 
   // Caller-pinned spend mint, persisted at request time or by
   // `dvm pay --mint`. Honoured on every spend leg below — no fallback.
