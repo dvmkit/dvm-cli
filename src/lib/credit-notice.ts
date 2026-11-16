@@ -151,9 +151,9 @@ export interface CreditFundingReport {
  * - `credit_funding_reconciled` — the balance landed, on a credit this caller
  *   never named, because the provider's operator repaired a blocked invoice
  *   onto one of their choosing. {@link credit_id} is that credit.
- * - `credit_funding_deferred` — the funding never went out, because a signature
- *   the DVM can still submit is outstanding: an x402 voucher, an
- *   exact authorization, or a Tempo charge. Usually the
+ * - `credit_funding_deferred` — no new payment was made because an external
+ *   Lightning invoice or a signature the DVM can still submit is outstanding:
+ *   an x402 voucher, an exact authorization, or a Tempo charge. Usually the
  *   one this credit signed itself, and then {@link fund_id} is that intent's —
  *   the key the retry re-presents it under, and what an operator traces it by.
  *   The exception is an x402 voucher this attempt cannot replay: a sibling

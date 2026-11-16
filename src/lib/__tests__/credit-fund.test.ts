@@ -2293,7 +2293,7 @@ describe("fundCredit with a human-paid Lightning invoice", () => {
     mockCreditOp.mockRejectedValueOnce(pendingInvoice()).mockResolvedValueOnce(fundedResponse());
 
     const outcome = await fundExhaustingSettlementPoll(() => fundCredit(args({
-      rail: "lightning", invoice: true, invoiceProgress: progress, float: null,
+      rail: "lightning", invoice: true, invoiceWait: true, invoiceProgress: progress, float: null,
     })));
 
     expect(outcome).toMatchObject({ status: "funded", creditId: "credit-1", fundId: "fund-1" });
@@ -2331,7 +2331,7 @@ describe("fundCredit with a human-paid Lightning invoice", () => {
     vi.mocked(loadPendingFunding).mockReturnValueOnce(pending);
     mockCreditOp.mockRejectedValueOnce(pendingInvoice(pending.bolt11)).mockResolvedValueOnce(fundedResponse());
     const progress = vi.fn();
-    const outcome = await fundExhaustingSettlementPoll(() => fundCredit(args({ amountMicro: 900_000, invoiceProgress: progress })));
+    const outcome = await fundExhaustingSettlementPoll(() => fundCredit(args({ amountMicro: 900_000, invoiceWait: true, invoiceProgress: progress })));
     expect(outcome).toMatchObject({ status: "funded", fundId: "fund-original" });
     expect(progress).toHaveBeenCalledTimes(1);
     for (const call of mockCreditOp.mock.calls) {
@@ -2392,7 +2392,7 @@ describe("fundCredit with a human-paid Lightning invoice", () => {
   it.each(["timeout", "lightning_unavailable"])("keeps a relayed invoice after %s and never falls back to another rail", async (code) => {
     mockCreditOp.mockRejectedValueOnce(pendingInvoice()).mockRejectedValueOnce(new DvmError(code, "No confirmation.", undefined,
       code === "lightning_unavailable" ? { retryable: false } : undefined));
-    const outcome = await fundExhaustingSettlementPoll(() => fundCredit(args({ rail: "lightning", invoice: true, invoiceProgress: vi.fn() })));
+    const outcome = await fundExhaustingSettlementPoll(() => fundCredit(args({ rail: "lightning", invoice: true, invoiceWait: true, invoiceProgress: vi.fn() })));
     expect(outcome).toMatchObject({ status: "refused", error: { code } });
     expect(outcome.display).toContain("unresolved");
     expect(clearPendingFunding).not.toHaveBeenCalled();

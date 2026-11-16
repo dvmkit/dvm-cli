@@ -408,6 +408,7 @@ export interface FundCreditArgs {
   float?: Float | null;
   /** Relay a Lightning invoice for external payment; never invoke the connected wallet. */
   invoice?: boolean;
+  /** Only an explicit funding command may wait for human payment. */
   invoiceWait?: boolean;
   invoiceIdentity?: string;
   invoiceProgress?: (handoff: Record<string, unknown>) => void | Promise<void>;

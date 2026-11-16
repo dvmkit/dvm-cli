@@ -111,15 +111,19 @@ export async function fundOverInvoice(
         return { ...base, status: "refused", error: expired, display: expired.message, hint: expired.hint };
       }
       if (pending.paymentOutcome !== undefined) {
-        if (args.invoiceWait === false) {
+        if (args.invoiceWait !== true) {
           return { ...base, status: "settlement_pending",
             display: "The connected wallet's payment is already recorded, but the DVM has not confirmed the credit yet.",
             hint: "Do not pay this invoice again. Re-run this funding or check 'dvm credit balance' to reconcile it." };
         }
       } else {
         const output = handoff(payable, args.invoiceIdentity);
-        if (args.invoiceWait === false) {
-          return { ...base, status: "invoice_pending", invoiceHandoff: output, display: String(output.display) };
+        if (args.invoiceWait !== true) {
+          return { ...base, status: "invoice_pending", invoiceHandoff: output,
+            display: args.invoiceWait === false
+              ? String(output.display)
+              : "The original Lightning funding is still pending. Its invoice and funding id are saved; no new payment was made.",
+            hint: "Re-run the original 'dvm credit fund --invoice' command to finish this funding before starting another payment." };
         }
         if (!announced) {
           await args.invoiceProgress?.(output);
