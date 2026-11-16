@@ -112,7 +112,7 @@ export type CashOutMintOutcome =
       quote?: CashOutQuote;
     };
 
-export type CashOutFailureReason = "quote_already_exists" | "quote_already_in_progress";
+export type CashOutFailureReason = "quote_already_exists" | "quote_already_in_progress" | "quote_state_unknown";
 
 export interface CashOutMintOptions {
   /** Mint to melt at. Only proofs issued here are considered. */

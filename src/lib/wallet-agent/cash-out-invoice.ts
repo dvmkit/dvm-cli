@@ -1,4 +1,4 @@
-import { Amount, type Wallet } from "@cashu/cashu-ts";
+import { Amount, HttpResponseError, MintOperationError, type Wallet } from "@cashu/cashu-ts";
 import {
   fetchMeltQuote,
   getInputFeesForProofs,
@@ -20,6 +20,16 @@ function isDuplicateQuoteRefusal(err: unknown): boolean {
 }
 
 /**
+ * Whether the mint itself answered and rejected the request, as opposed to a
+ * timeout, a dropped connection, or a server fault that says nothing about it.
+ */
+function isMintRejection(err: unknown): boolean {
+  if (err instanceof MintOperationError) return true;
+  return err instanceof HttpResponseError && err.status >= 400 && err.status < 500
+    && err.status !== 408 && err.status !== 429;
+}
+
+/**
  * The melt quote for a fixed invoice. Some mints issue one quote per invoice
  * and refuse a second, so a quote an earlier run left unpaid is reused rather
  * than requested again. Only the mint's own answer makes a stored quote usable:
@@ -36,15 +46,28 @@ async function resolveInvoiceQuote(
     let current;
     try {
       current = await cashuWallet.checkMeltQuoteBolt11(held.quote_id);
-    } catch {
-      // The mint may have dropped the quote; if it is merely unreachable the
-      // request below fails the same way and reports it.
+    } catch (err) {
+      // Only the mint's own answer means the quote is gone. Anything else
+      // leaves its state unknown, and an unknown quote may be paid or pending.
+      if (!isMintRejection(err)) {
+        return {
+          kind: "failed", mint, settlement: "reverted", reason: "quote_state_unknown",
+          message: `Could not check this wallet's saved melt quote for the invoice at ${mint}: ${err instanceof Error ? err.message : String(err)}. No money moved and the quote is still saved. Run \`dvm wallet mint-health\`, then retry \`dvm wallet cash-out <invoice>\`; do not pay this invoice from another mint until the quote's state is known.`,
+        };
+      }
+      forgetStored(mint, invoice, held.quote_id);
       current = undefined;
     }
-    if (current && (current.state === "PENDING" || current.state === "PAID")) {
+    if (current && current.state === "PAID") {
       return {
         kind: "failed", mint, settlement: "reverted", reason: "quote_already_in_progress",
-        message: `${mint} reports this invoice's melt quote as ${current.state === "PAID" ? "already paid" : "being paid"}. No money moved in this run. Run \`dvm wallet show\` to reconcile it; do not pay this invoice again.`,
+        message: `${mint} reports this invoice as already paid with this wallet's saved quote. No money moved in this run and nothing is left to pay; do not pay this invoice again. \`dvm wallet show\` shows the current balance.`,
+      };
+    }
+    if (current && current.state === "PENDING") {
+      return {
+        kind: "failed", mint, settlement: "reverted", reason: "quote_already_in_progress",
+        message: `${mint} reports this invoice's melt quote as being paid. No money moved in this run. Run \`dvm wallet show\` to reconcile it; do not pay this invoice again.`,
       };
     }
     const sameInvoice = current !== undefined

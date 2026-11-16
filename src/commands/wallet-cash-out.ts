@@ -201,6 +201,7 @@ export async function walletCashOut(
     cappedCount,
     dryRun: opts.dryRun,
     savedQuote,
+    invoiceOutcomes: bolt11 ? outcomes : undefined,
   });
 
   if (human) {
@@ -405,6 +406,8 @@ function buildHint(args: {
   dryRun?: boolean;
   /** The quote a dry run of a fixed invoice left saved for the real run. */
   savedQuote?: CashOutQuote;
+  /** Per-mint outcomes of a fixed-invoice run; absent for an address. */
+  invoiceOutcomes?: CashOutMintOutcome[];
 }): string {
   if (args.unresolvedCount > 0) {
     return "At least one melt's outcome is unknown — those sats stay committed until `dvm wallet show` reconciles them against the mint. Don't retry that mint until it does.";
@@ -417,6 +420,7 @@ function buildHint(args: {
           : " while the mint still holds it unpaid";
       return `Re-run without --dry-run to send. This quote is saved and the real run pays with it${until}, at the fees shown.`;
     }
+    if (args.invoiceOutcomes) return unquotedInvoiceHint(args.invoiceOutcomes);
     return "Re-run without --dry-run to send. Quotes expire, so the fee is re-quoted at that point.";
   }
   // A capped leg is the one case where money still owed is left behind on a run
@@ -429,6 +433,27 @@ function buildHint(args: {
     return "The wallet's mints couldn't cover the full amount — `dvm wallet show` breaks the balance down per mint.";
   }
   return "Confirm the remaining balance with `dvm wallet show`.";
+}
+
+/**
+ * A fixed invoice's dry run that quoted nothing. A re-run does not re-quote
+ * it: the mint's quote is saved, refused, or already in play.
+ */
+function unquotedInvoiceHint(outcomes: CashOutMintOutcome[]): string {
+  const reason = outcomes.find((o) => o.kind === "failed" && o.reason !== undefined);
+  if (reason?.kind === "failed" && reason.reason === "quote_already_in_progress") {
+    return "Do not re-run to send: the mint reports this invoice's quote as paid or being paid. `dvm wallet show` reconciles any payment still in flight.";
+  }
+  if (reason?.kind === "failed" && reason.reason === "quote_already_exists") {
+    return "Re-running will not send this invoice from that mint: it will not issue another quote. Ask for a new invoice, or pass --mint to pay from a different mint.";
+  }
+  if (reason?.kind === "failed" && reason.reason === "quote_state_unknown") {
+    return "Nothing was quoted because the saved quote could not be checked. It is still saved: retry once `dvm wallet mint-health` shows the mint reachable.";
+  }
+  if (outcomes.some((o) => o.kind === "skipped" && o.reason === "fee_cap_exceeded")) {
+    return "Nothing would be sent at this fee cap. The quote is saved, so a re-run meets the same fees: raise --max-fee to accept them.";
+  }
+  return "Nothing would be sent: see the per-mint reasons above.";
 }
 
 function parseMaxFee(raw: string | undefined): number | undefined {
