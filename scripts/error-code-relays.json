@@ -862,5 +862,25 @@
       "name": "settled"
     },
     "reason": "Checkout uses the same local settled result callback as token card funding."
+  },
+  {
+    "file": "lib/credit-invoice.ts",
+    "owner": "fundOverInvoice",
+    "expression": "deps.settled(result, pending)",
+    "path": ["error", "code"],
+    "alsoPaths": [["error", "data", "code"]],
+    "local": {
+      "file": "lib/credit-fund.ts",
+      "name": "settleAndClear"
+    },
+    "reason": "Manual Lightning confirmation uses the same local credit settlement callback as automatic Lightning funding."
+  },
+  {
+    "file": "lib/credit-invoice.ts",
+    "owner": "fundOverInvoice",
+    "expression": "err",
+    "path": ["code"],
+    "alsoPaths": [["data", "code"]],
+    "reason": "DVM transport errors are relayed without changing their codes; local fallback errors are scanned separately."
   }
 ]

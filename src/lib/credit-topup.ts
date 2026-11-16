@@ -696,6 +696,10 @@ function reportFunding(
       );
       return;
     }
+    case "invoice_pending":
+      info(`${what} at ${args.ref.endpoint} deferred — ${outcome.display}${hint}`);
+      incomplete("credit_funding_deferred");
+      return;
     case "settlement_pending":
       // The money left the wallet and is recorded; crediting is pull-based, so
       // the next request to this DVM settles it. Both halves are the caller's
