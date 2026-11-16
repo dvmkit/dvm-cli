@@ -3520,12 +3520,8 @@ async function fundOverLightning(
       if (recorded) {
         return terminal
           ? paidButRefused(args, base, recorded, lightningSpendDisplay(recorded), err as DvmError)
-          : paidAwaitingSettlement(
-              base,
-              recorded,
-              lightningSpendDisplay(recorded),
-              err instanceof DvmError ? err : undefined
-            );
+          : // Inconclusive: the error is surfaced as a failure so the caller retries the same ids.
+            { ...unresolvedFunding(base, err), ...recorded };
       }
       // An issued invoice may have been paid by an attempt that died before recording it, so an
       // inconclusive answer keeps the intent and must not cascade to another rail.
@@ -4143,7 +4139,9 @@ function clearPending(pending: PendingFunding): void {
 function lightningFundingTerminal(err: unknown, pending: PendingFunding): boolean {
   if (!(err instanceof DvmError)) return false;
   if (err.code === "lightning_invoice_expired") return true;
-  if (err.code === "lightning_unavailable") return !pending.bolt11;
+  if (err.code === "lightning_unavailable") {
+    return !pending.bolt11 && pending.paymentOutcome === undefined;
+  }
   return isPermanentRefusal(err);
 }
 

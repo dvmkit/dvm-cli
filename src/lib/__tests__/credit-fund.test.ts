@@ -2737,12 +2737,14 @@ describe("fundCredit over Lightning", () => {
 
       const outcome = await fundCredit(args({ fundId: "fund-fresh", rail: "cashu" }));
 
+      // A failure, not a pending success: the CLI exits non-zero and the caller retries.
       expect(outcome).toMatchObject({
-        status: "settlement_pending",
+        status: "refused",
         rail: "lightning",
         fundId: "fund-original",
         walletDebitSats: 105,
       });
+      expect(outcome.error).toBeInstanceOf(DvmError);
       expect(mockCreditOp).toHaveBeenCalledTimes(1);
       expectOriginalIdsOnly();
       expect(prepareAgentSpend).not.toHaveBeenCalled();
