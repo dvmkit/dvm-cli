@@ -29,6 +29,7 @@ import {
 } from "@dvmkit/sdk/internal";
 import { getEncodedToken } from "@cashu/cashu-ts";
 import {
+  addCashuSwapFee,
   addPayment,
   updateJob,
   recordBudgetRefusal,
@@ -56,6 +57,7 @@ import {
   prepareAgentSpend,
   type PreparedAgentSpend,
 } from "./wallet-agent/spend";
+import { submissionSwapFeeSats } from "./mint-fee";
 import { sweepPendingSubmissions } from "./wallet-agent/recovery-submissions";
 import { enforceGlobalBudget, recordSpend } from "./budget-ledger";
 import { buildPolicy } from "./policy";
@@ -613,6 +615,7 @@ async function redeliverUnconfirmedPayment(args: {
       requestId: held.request_id,
       mint: held.mint,
       totalSats: held.amount_sats,
+      swapFeeSats: submissionSwapFeeSats(held),
       endpoint: held.endpoint,
       intendedLockPubkey: held.intended_lock_pubkey,
     },
@@ -847,10 +850,12 @@ async function deliverAgentWalletPayment(args: {
       dvm_endpoint: provider.endpoint,
       mint: prepared.mint,
       amount_sats: prepared.totalSats,
+      ...(prepared.swapFeeSats > 0 ? { fee_sats: prepared.swapFeeSats } : {}),
       signed_at_ms: Date.now(),
     },
   });
   addPayment(jobId, request.amount_msats, approval, submission.usdMicro);
+  addCashuSwapFee(jobId, prepared.swapFeeSats);
   recordSpend({
     msats: request.amount_msats,
     btcRate: submission.btcRate,

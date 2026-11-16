@@ -6,6 +6,7 @@
  * recovered transparently before the user sees stale state.
  */
 
+import { MINT_FEE_EXPLAINER } from "../lib/mint-fee";
 import {
   amountBoundsVerdict,
   chainIdFromCaip2,
@@ -830,6 +831,7 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
       for (const spend of recentSpends) {
         info(`  ${formatRecentSpend(spend)}`);
       }
+      if (recentSpends.some((spend) => (spend as { fee_sats?: number }).fee_sats)) info(MINT_FEE_EXPLAINER);
     }
   } else {
     const totalUsd = railsSnapshot.reduce((sum, r) => sum + (r.json.balance_usd ?? 0), 0);
@@ -1383,11 +1385,13 @@ function formatRecentSpend(spend: {
   dvm_endpoint: string;
   mint: string;
   amount_sats: number;
+  fee_sats?: number;
   signed_at_ms: number;
 }): string {
   const when = new Date(spend.signed_at_ms).toISOString();
   const reqShort = `${spend.request_id.slice(0, 8)}…${spend.request_id.slice(-4)}`;
-  return `${when}  ${spend.amount_sats} sats  ${spend.dvm_endpoint}  (req ${reqShort})`;
+  const fee = spend.fee_sats !== undefined && spend.fee_sats > 0 ? ` + ${spend.fee_sats} sats mint fee` : "";
+  return `${when}  ${spend.amount_sats} sats${fee}  ${spend.dvm_endpoint}  (req ${reqShort})`;
 }
 
 function formatMintSourceTag(source: MintSource): string {

@@ -1,5 +1,6 @@
 import { rememberKeysetFees } from "../wallet-keyset-fees";
 import {
+  Amount,
   getEncodedToken,
   MintOperationError,
   type Proof,
@@ -16,6 +17,7 @@ import { getWallet } from "@dvmkit/sdk/internal";
 import { readAgentMnemonic } from "@dvmkit/sdk/internal";
 import { redactUrl } from "@dvmkit/sdk/internal";
 import { reservedForMarker } from "./builder-handle";
+import { submissionSwapFeeSats } from "../mint-fee";
 import {
   inFlightTimeoutSeconds,
   markProofsInFlight,
@@ -51,6 +53,17 @@ import { bindCashuTokenToSubmissionContext } from "@dvmkit/sdk/internal";
 
 export type AgentSpendMode = "standard" | "strict_per_call";
 
+/**
+ * A recent spend with the mint fee that left the wallet on top of
+ * `amount_sats`. The SDK wallet file keeps unknown keys on `recent_spends`
+ * and `pending_submissions`, so these fields persist without an SDK change.
+ */
+export type RecentSpendWithFee = AgentRecentSpend & { fee_sats?: number };
+
+function sumAmounts(proofs: readonly Proof[]): number {
+  return proofs.reduce((sum, proof) => sum + Amount.from(proof.amount).toNumber(), 0);
+}
+
 export interface CashuP2pkOffer {
   mints: string[];
   /** The DVM's current `cashu.lock_pubkeys[0]` to lock per-call outputs to. */
@@ -77,6 +90,14 @@ export interface PreparedAgentSpend {
   mint: string;
   /** Total spend in sats (exactly the requested amount; the swap fee comes off inputs). */
   totalSats: number;
+  /**
+   * Mint fees in sats beyond `totalSats`: the swap's own input fee plus the
+   * redemption fee folded into the token by `includeFees(true)`. Measured as
+   * proofs spent minus change minus the price, not estimated beforehand, so
+   * `totalSats + swapFeeSats` is the wallet's actual drop. Zero when existing
+   * reserve proofs shipped without a swap.
+   */
+  swapFeeSats: number;
   endpoint: string;
   /** The DVM lock pubkey the outputs are locked to. Used by the retry-with-refetch path. */
   intendedLockPubkey: string;
@@ -410,6 +431,7 @@ export async function prepareAgentSpend(args: {
       requestId: inner.requestId,
       mint: inner.mint,
       totalSats: inner.submission.amount_sats,
+      swapFeeSats: 0,
       endpoint: args.endpoint,
       intendedLockPubkey: args.cashuP2pk.lock_pubkey,
       fromReserve: true,
@@ -432,6 +454,7 @@ export async function prepareAgentSpend(args: {
   let inner: PreparedInner | undefined;
   let sendProofs: Proof[] = [];
   let keepProofs: Proof[] = [];
+  let swapFeeSats = 0;
 
   for (const [index, mint] of lock1.candidateMints.entries()) {
     const hasNextCandidate = index < lock1.candidateMints.length - 1;
@@ -651,6 +674,13 @@ export async function prepareAgentSpend(args: {
       inner = { ...lock2, submission: preparedSubmission };
       sendProofs = result.send;
       keepProofs = result.keep;
+      // Everything the wallet gave up beyond the price: this swap's input fee
+      // plus the redemption fee `.includeFees(true)` folds into the token, so
+      // price + fee is exactly the drop in the wallet's balance.
+      swapFeeSats = Math.max(
+        0,
+        sumAmounts(preview.inputs) - sumAmounts(keepProofs) - lock2.submission.amount_sats
+      );
       break;
     } catch (err) {
       if (err instanceof MintOperationError) {
@@ -699,6 +729,7 @@ export async function prepareAgentSpend(args: {
               ...s,
               output_proofs: agentOutputs,
               swapping: undefined,
+              swap_fee_sats: swapFeeSats,
               cashu_token: cashuToken,
               ...(boundContext ? { context: boundContext } : {}),
               // What a later reclaim needs. Only the swap path
@@ -724,6 +755,7 @@ export async function prepareAgentSpend(args: {
     requestId: inner.requestId,
     mint: inner.mint,
     totalSats: inner.submission.amount_sats,
+    swapFeeSats,
     endpoint: args.endpoint,
     intendedLockPubkey: args.cashuP2pk.lock_pubkey,
     ...(attempts.length > 0 ? { attempts: successfulSpendAttempts(attempts) } : {}),
@@ -840,7 +872,7 @@ function strictSpendFailure(message: string): PrepareAgentSpendFailure {
  */
 export async function commitAgentSpend(args: {
   requestId: string;
-  recentSpend: AgentRecentSpend;
+  recentSpend: RecentSpendWithFee;
 }): Promise<void> {
   await withWalletLock(() => {
     const wallet = loadAgentWallet();
@@ -876,8 +908,9 @@ export async function commitHeldSubmission(requestId: string, now: () => number 
         dvm_endpoint: submission.endpoint,
         mint: submission.mint,
         amount_sats: submission.amount_sats,
+        ...(submissionSwapFeeSats(submission) > 0 ? { fee_sats: submissionSwapFeeSats(submission) } : {}),
         signed_at_ms: now(),
-      }].slice(-RECENT_SPENDS_CAP),
+      } satisfies RecentSpendWithFee].slice(-RECENT_SPENDS_CAP),
     });
   });
 }

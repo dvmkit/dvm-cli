@@ -38,6 +38,7 @@ function generateAgentKeypair() {
 import {
   abandonPendingSubmission,
   commitAgentSpend,
+  commitHeldSubmission,
   correctPendingFundAmount,
   prepareAgentSpend,
 } from "../spend";
@@ -260,6 +261,47 @@ describe("prepareAgentSpend per-call swap", () => {
       s: "dleq-s",
       r: "blind-r",
     });
+  });
+
+  it("counts the redemption fee in the token as a mint fee, so paid plus fee equals the wallet's drop", async () => {
+    const { privkey, pubkey } = generateAgentKeypair();
+    const dvmPubkey = "02" + "ee".repeat(32);
+    vi.mocked(loadAgentWallet).mockImplementation(() => {
+      const calls = vi.mocked(saveAgentWallet).mock.calls;
+      return calls.length > 0
+        ? calls[calls.length - 1][0]
+        : baseWallet(privkey, pubkey, [proof("big", 10)]);
+    });
+    // includeFees(true) sizes the token at price + the DVM's redemption fee:
+    // a 10-sat input becomes a 6-sat token (price 5 + redemption 1) and 3 of
+    // change, and the mint keeps 1 sat as the swap's own input fee.
+    const mockWallet = makeMockWallet(
+      {
+        send: [{ id: "k1", amount: 6, secret: "to-dvm", C: "02SEND" }],
+        keep: [{ id: "k1", amount: 3, secret: "change-a", C: "02KEEPA" }],
+      },
+      100
+    );
+
+    const result = await prepareAgentSpend({
+      amountSats: 5,
+      endpoint: ENDPOINT,
+      cashuP2pk: { mints: ["https://mint.example"], lock_pubkey: dvmPubkey },
+      now: () => FIXED_NOW,
+      uuid: () => FIXED_UUID,
+      inFlightTimeoutSec: 60,
+      getWalletForMint: () => Promise.resolve(mockWallet),
+    });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+
+    const spendableAfter = lastSavedWallet()
+      .proofs.filter((p) => p.status === "valid")
+      .reduce((sum, p) => sum + p.amount, 0);
+    expect(result.totalSats).toBe(5);
+    expect(result.swapFeeSats).toBe(2);
+    expect(10 - spendableAfter).toBe(result.totalSats + result.swapFeeSats);
+    expect(lastSavedWallet().pending_submissions[0]).toMatchObject({ swap_fee_sats: 2 });
   });
 
   it("persists the submit context so a resume can re-POST the original call", async () => {
@@ -704,6 +746,7 @@ describe("prepareAgentSpend reserve-direct path", () => {
     if ("error" in result) return;
 
     expect(result.totalSats).toBeGreaterThanOrEqual(4);
+    expect(result.swapFeeSats).toBe(0);
     expect(result).not.toHaveProperty("attempts");
     expect(result.mint).toBe("https://mint.example");
     const sendSpy = vi.mocked(mockWallet.ops.send);
@@ -928,6 +971,45 @@ describe("commitAgentSpend", () => {
     expect(saved.pending_submissions).toHaveLength(0);
     expect(saved.recent_spends).toHaveLength(1);
     expect(saved.recent_spends[0].request_id).toBe(FIXED_UUID);
+  });
+
+  it("keeps the mint fee on the recent spend, and a resumed commit carries the persisted fee", async () => {
+    const { privkey, pubkey } = generateAgentKeypair();
+    const entry = {
+      endpoint: ENDPOINT,
+      request_id: FIXED_UUID,
+      intended_lock_pubkey: "02" + "ee".repeat(32),
+      mint: "https://mint.example",
+      amount_sats: 8,
+      swap_fee_sats: 2,
+      output_proofs: [{ ...proof("o", 8), locked_to_pubkey: "02" + "ee".repeat(32) }],
+      created_at: "2026-05-09T00:00:00.000Z",
+    };
+    vi.mocked(loadAgentWallet).mockReturnValue({
+      ...baseWallet(privkey, pubkey, []),
+      pending_submissions: [entry],
+    });
+    await commitHeldSubmission(FIXED_UUID, () => FIXED_NOW);
+    expect(lastSavedWallet().recent_spends).toEqual([
+      expect.objectContaining({ request_id: FIXED_UUID, amount_sats: 8, fee_sats: 2 }),
+    ]);
+
+    vi.mocked(loadAgentWallet).mockReturnValue({
+      ...baseWallet(privkey, pubkey, []),
+      pending_submissions: [entry],
+    });
+    await commitAgentSpend({
+      requestId: FIXED_UUID,
+      recentSpend: {
+        request_id: FIXED_UUID,
+        dvm_endpoint: ENDPOINT,
+        mint: "https://mint.example",
+        amount_sats: 8,
+        fee_sats: 2,
+        signed_at_ms: FIXED_NOW,
+      },
+    });
+    expect(lastSavedWallet().recent_spends[0]).toMatchObject({ amount_sats: 8, fee_sats: 2 });
   });
 
   it("is a no-op when the wallet is missing", async () => {

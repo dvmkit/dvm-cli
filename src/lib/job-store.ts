@@ -214,6 +214,11 @@ export interface JobRecord {
   paidUsdMicro?: number;
   /** The millisats of the payments {@link paidUsdMicro} covers; short of {@link totalPaidMsats} when any payment had no exact dollars. */
   paidUsdMsats?: number;
+  /**
+   * Mint swap fees in sats the wallet paid on top of the Cashu payments this job
+   * made. Not part of {@link totalPaidMsats}: the provider never received it.
+   */
+  cashuSwapFeeSats?: number;
   /** Number of payments honoured for this job (auto + manual). */
   paymentsHonoured?: number;
   /** Approval of mid-job asks, keyed by provider request sequence. Absent on older records. */
@@ -390,6 +395,15 @@ export function recordUpfrontRailPayment(jobId: string, value: unknown, freshSub
     job.paymentMethod = payment.method;
     job.upfrontRailPayment = payment;
   }, true);
+}
+
+/** Add the mint fee a Cashu payment cost this job. No-op for zero or an unknown job. */
+export function addCashuSwapFee(jobId: string, sats: number): void {
+  if (!Number.isSafeInteger(sats) || sats <= 0) return;
+  mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === jobId);
+    if (job) job.cashuSwapFeeSats = (job.cashuSwapFeeSats ?? 0) + sats;
+  });
 }
 
 export function hasUnknownUpfrontRail(job: JobRecord): boolean {

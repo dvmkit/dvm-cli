@@ -4,6 +4,7 @@ import { hasUnknownUpfrontCredit, type JobRecord } from "./job-store";
 import { loadMessages } from "./messages";
 import { isTerminalJobStatus } from "./next-action";
 import { jobSettlement } from "./job-settlement";
+import { MINT_FEE_EXPLAINER } from "./mint-fee";
 
 export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   const settlement = jobSettlement(job, receipt);
@@ -106,6 +107,11 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
   // Rounded labels can match while the msat totals differ, so fall back to exact msats.
   const [receiptLabel, localLabel] = receiptTotalDisplay === totalDisplay
     ? [`${receipt!.paid.msats} msats`, `${total} msats`] : [receiptTotalDisplay, totalDisplay];
+  const swapFeeSats = job.cashuSwapFeeSats ?? 0;
+  const swapFeeDisplay = swapFeeSats > 0
+    ? `Mint fee: ${formatPaymentAmount(swapFeeSats * 1000, undefined, { anchor: false })} left your wallet on top of the payments above. ${MINT_FEE_EXPLAINER}`
+    : undefined;
+  if (swapFeeDisplay) display += ` ${swapFeeDisplay}`;
   if (receiptMismatch) display += ` Receipt total ${receiptLabel} differs from local total ${localLabel}; mint fees, returned change, or a payment not recorded locally can explain the difference.`;
   return { charges, refunds, total_msats: total, total_display: totalDisplay, settlement,
     ...(upfront > 0 && (job.paymentMethod !== "credit" || knownCredit) ? {
@@ -114,6 +120,7 @@ export function jobSpend(job: JobRecord, receipt?: JobReceipt) {
       { anchor: false }),
     } : {}),
     ...(budgetDisplay ? { budget_display: budgetDisplay } : {}),
+    ...(swapFeeDisplay ? { swap_fee_sats: swapFeeSats, swap_fee_display: swapFeeDisplay } : {}),
     payments, max_payments: job.policy?.maxPayments ?? null, log_mismatch: logMismatch,
     ...(receipt ? { receipt_total_display: receiptTotalDisplay,
       ...(receiptMismatch !== undefined ? { receipt_mismatch: receiptMismatch } : {}) } : {}), display };

@@ -300,6 +300,7 @@ function preparedSpend() {
       requestId: "44444444-4444-4444-8444-444444444444",
       mint: "https://mint.example",
       totalSats: 100,
+      swapFeeSats: 0,
       endpoint: ENDPOINT,
       intendedLockPubkey: "02" + "cd".repeat(32),
     };
