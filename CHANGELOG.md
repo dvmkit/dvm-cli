@@ -12,6 +12,14 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.19.2](https://github.com/dvmkit/dvm-cli/compare/v0.19.1...v0.19.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* **credit:** book card-funded credit draws and explain unusable upfront debits ([acd824f](https://github.com/dvmkit/dvm-cli/commit/acd824f6a8493cb7549066e7671ee1bcc2248a34))
+* **wallet:** receive Cashu tokens through stdin ([430c1d8](https://github.com/dvmkit/dvm-cli/commit/430c1d8756e3b6f39a2b0e56c0e63bb0378d9bb8))
+
 ## [0.19.1](https://github.com/dvmkit/dvm-cli/compare/v0.19.0...v0.19.1) (2026-11-15)
 
 
