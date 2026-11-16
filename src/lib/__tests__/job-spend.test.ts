@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { jobSpend } from "../job-spend";
-import { addPayment, loadJob, markJobTerminal, recordUpfrontCreditPayment, saveJob } from "../job-store";
+import { addCashuSwapFee, addPayment, loadJob, markJobTerminal, recordUpfrontCreditPayment, saveJob } from "../job-store";
 import { appendMessages } from "../messages";
 import { attestedDvm } from "./fixtures/receipt-fixture";
 
@@ -170,4 +170,28 @@ it("keeps legacy credit consumption unknown even with a zero recorded total", ()
   expect(spend.display).toContain("upfront amount is not recorded locally");
   expect(spend.display).not.toContain("free");
   expect(spend).not.toHaveProperty("upfront_display");
+});
+
+it("shows the mint fee beside the payment without adding it to what the provider was paid", () => {
+  const id = "mint-fee-spend";
+  saveJob({ id, endpoint: "https://provider.example", submittedAt: 1, status: "completed",
+    totalPaidMsats: 8000, paymentsHonoured: 1, paymentMethod: "cashu" });
+  addCashuSwapFee(id, 2);
+  addCashuSwapFee(id, 1);
+  addCashuSwapFee(id, 0);
+
+  const stored = loadJob(id)!;
+  const spend = jobSpend(stored);
+
+  expect(stored.cashuSwapFeeSats).toBe(3);
+  expect(spend).toMatchObject({ total_msats: 8000, swap_fee_sats: 3 });
+  expect(spend.display).toContain("Mint fee: ");
+  expect(spend.display).toContain("3 sats");
+});
+
+it("says nothing about a mint fee when none was charged", () => {
+  const spend = jobSpend({ id: "no-mint-fee", endpoint: "https://provider.example", submittedAt: 1,
+    status: "completed", totalPaidMsats: 8000, paymentsHonoured: 1, paymentMethod: "cashu" });
+  expect(spend).not.toHaveProperty("swap_fee_sats");
+  expect(spend.display).not.toContain("Mint fee");
 });

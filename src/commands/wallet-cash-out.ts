@@ -30,6 +30,14 @@ import {
   type CashOutQuote,
   spendableAt,
 } from "../lib/wallet-agent/cash-out";
+import {
+  feeSharePercent,
+  isLargeFeeShare,
+  LARGE_FEE_ADVICE,
+  settledFeeBreakdown,
+} from "../lib/wallet-agent/cash-out-fees";
+import { formatAmountBestEffort } from "../lib/currency";
+import { MINT_FEE_EXPLAINER } from "../lib/mint-fee";
 import { assertInvoiceNotPending, invoiceAmountSats, invoiceDestination } from "../lib/wallet-agent/invoice";
 import { loadConfiguredMints } from "../lib/wallet-agent/mint-inventory";
 import { sweepPendingMelts } from "../lib/wallet-agent/recovery-melt";
@@ -173,6 +181,20 @@ export async function walletCashOut(
   // `debit - amount` would report a fee several times the real one, and this is
   // the number an agent relays.
   const feeSats = outcomes.reduce((sum, o) => sum + (o.kind === "sent" ? netFeeSats(o) : 0), 0);
+  const sentBreakdowns = outcomes.flatMap((o) =>
+    o.kind === "sent" ? [settledFeeBreakdown(o.quote, o.change_sats)] : []
+  );
+  const inputFeeSats = sentBreakdowns.reduce((sum, b) => sum + b.inputFeeSats, 0);
+  const routingFeeSats = sentBreakdowns.reduce((sum, b) => sum + b.routingFeeSats, 0);
+  const routingReserveReturnedSats = sentBreakdowns.reduce(
+    (sum, b) => sum + b.routingReserveReturnedSats,
+    0
+  );
+  // A dry run has no settled fee: the most it can cost is the quoted reserve plus input fees.
+  const quotedFeeSats = outcomes.reduce(
+    (sum, o) => sum + (o.kind === "quoted" ? quotedFeeCeiling(o.quote) : 0),
+    0
+  );
   const changeSats = outcomes.reduce((sum, o) => sum + (o.kind === "sent" ? o.change_sats : 0), 0);
   const quotedSats = outcomes.reduce(
     (sum, o) => sum + (o.kind === "quoted" ? o.quote.amount_sats : 0),
@@ -188,10 +210,15 @@ export async function walletCashOut(
   const rows = outcomes.map((o) => toRow(o, moreToSend));
 
   const status = opts.dryRun ? "quoted" : sentSats > 0 ? "cashed_out" : "nothing_sent";
+  const headlineFeeSats = opts.dryRun ? quotedFeeSats : feeSats;
+  const headlinePayoutSats = opts.dryRun ? quotedSats : sentSats;
+  const feeSharePct = feeSharePercent(headlineFeeSats, headlinePayoutSats);
+  const feeWarning = rows.some((r) => r.fee_warning) || isLargeFeeShare(headlineFeeSats, headlinePayoutSats);
+  const anyInputFee = rows.some((r) => (r.input_fee_sats ?? 0) > 0);
   const display = opts.dryRun
-    ? `Quoted ${quotedSats} sats to ${destination}${bolt11 ? " from one mint" : ` across ${rows.length} mint(s)`}. Nothing was paid.`
+    ? `Quoted ${quotedSats} sats to ${destination}${bolt11 ? " from one mint" : ` across ${rows.length} mint(s)`}${quotedFeeSats > 0 ? `, with fees of up to ${feeAmount(quotedFeeSats)}${shareClause(feeSharePct)}` : ""}. Nothing was paid.${feeWarning ? ` ${LARGE_FEE_ADVICE}` : ""}${anyInputFee ? ` ${MINT_FEE_EXPLAINER}` : ""}`
     : sentSats > 0
-      ? `Sent ${sentSats} sats to ${destination}${feeSats > 0 ? `, plus ${feeSats} sats in fees` : ""}${shortfall > 0 ? ` — ${shortfall} sats short of what you asked for` : ""}.`
+      ? `Sent ${sentSats} sats to ${destination}${feeSats > 0 ? `, plus ${feeAmount(feeSats)} in fees (${inputFeeSats} mint input fee + ${routingFeeSats} routing${shareClause(feeSharePct, true)}${routingReserveReturnedSats > 0 ? `; ${routingReserveReturnedSats} sats of unused routing reserve came back` : ""})` : ""}${shortfall > 0 ? ` — ${shortfall} sats short of what you asked for` : ""}.${feeSats > 0 && inputFeeSats > 0 ? ` ${MINT_FEE_EXPLAINER}` : ""}`
       : `Nothing was sent to ${destination}.`;
   const cappedCount = moreToSend ? rows.filter((r) => r.mint_max_sats !== undefined).length : 0;
   const savedQuote = bolt11 ? outcomes.find((o) => o.kind === "quoted")?.quote : undefined;
@@ -220,6 +247,12 @@ export async function walletCashOut(
       requested_sats: requested?.sats ?? invoiceSats ?? null,
       sats_sent: sentSats,
       fee_sats: feeSats,
+      input_fee_sats: inputFeeSats,
+      routing_fee_sats: routingFeeSats,
+      routing_reserve_returned_sats: routingReserveReturnedSats,
+      quoted_fee_sats: quotedFeeSats,
+      fee_share_pct: feeSharePct,
+      fee_warning: feeWarning,
       change_sats: changeSats,
       shortfall_sats: shortfall,
       mints: rows,
@@ -254,6 +287,16 @@ interface CashOutRow {
   input_fee_sats: number | null;
   debit_sats: number | null;
   change_sats: number | null;
+  /** Total fee: settled for `sent`, the quoted ceiling (reserve + input fee) for `quoted`. */
+  fee_sats: number | null;
+  /** Routing the payment really used; `sent` only. */
+  routing_fee_sats: number | null;
+  /** Reserved routing buffer the payment did not use; `sent` only. */
+  routing_reserve_returned_sats: number | null;
+  /** Fee as a percentage of the payout, one decimal. */
+  fee_share_pct: number | null;
+  /** True when fees pass the large-share threshold. */
+  fee_warning: boolean;
   preimage: string | null;
   /** Present on `failed`: whether the committed proofs came back or are still in play. */
   settlement?: "reverted" | "unresolved";
@@ -276,6 +319,20 @@ interface CashOutRow {
  * wallet. This is the headline number an agent relays; both the per-mint row
  * and the summary read it from here so they can't drift apart.
  */
+function quotedFeeCeiling(quote: CashOutQuote): number {
+  return quote.fee_reserve_sats + quote.input_fee_sats;
+}
+
+function shareClause(share: number | null, inline = false): string {
+  if (share === null) return "";
+  return inline ? `, about ${share}% of the payout` : ` (about ${share}% of the payout)`;
+}
+
+/** Sats with a fiat figure beside them once a rate is known. */
+function feeAmount(sats: number): string {
+  return formatAmountBestEffort(sats * 1000, { anchor: false });
+}
+
 function netFeeSats(outcome: Extract<CashOutMintOutcome, { kind: "sent" }>): number {
   return outcome.quote.debit_sats - outcome.quote.amount_sats - outcome.change_sats;
 }
@@ -307,14 +364,26 @@ function toRow(outcome: CashOutMintOutcome, moreToSend: boolean): CashOutRow {
     input_fee_sats: null as number | null,
     debit_sats: null as number | null,
     change_sats: null as number | null,
+    fee_sats: null as number | null,
+    routing_fee_sats: null as number | null,
+    routing_reserve_returned_sats: null as number | null,
+    fee_share_pct: null as number | null,
+    fee_warning: false,
     preimage: null as string | null,
     error: null as string | null,
   };
 
   switch (outcome.kind) {
-    case "sent":
+    case "sent": {
+      const breakdown = settledFeeBreakdown(outcome.quote, outcome.change_sats);
+      const share = feeSharePercent(breakdown.feeSats, outcome.quote.amount_sats);
       return {
         ...base,
+        fee_sats: breakdown.feeSats,
+        routing_fee_sats: breakdown.routingFeeSats,
+        routing_reserve_returned_sats: breakdown.routingReserveReturnedSats,
+        fee_share_pct: share,
+        fee_warning: isLargeFeeShare(breakdown.feeSats, outcome.quote.amount_sats),
         sats_sent: outcome.quote.amount_sats,
         fee_reserve_sats: outcome.quote.fee_reserve_sats,
         input_fee_sats: outcome.quote.input_fee_sats,
@@ -322,11 +391,18 @@ function toRow(outcome: CashOutMintOutcome, moreToSend: boolean): CashOutRow {
         change_sats: outcome.change_sats,
         preimage: outcome.preimage,
         ...(outcome.mint_max_sats !== undefined ? { mint_max_sats: outcome.mint_max_sats } : {}),
-        display: `${outcome.mint}: sent ${outcome.quote.amount_sats} sats (${netFeeSats(outcome)} sats in fees).${capNote(outcome.mint_max_sats, moreToSend)}`,
+        display: `${outcome.mint}: sent ${outcome.quote.amount_sats} sats. Fees ${breakdown.feeSats} sats${shareClause(share, true)}: ${breakdown.inputFeeSats} mint input fee + ${breakdown.routingFeeSats} routing${breakdown.routingReserveReturnedSats > 0 ? `; ${breakdown.routingReserveReturnedSats} sats of unused routing reserve came back` : ""}.${capNote(outcome.mint_max_sats, moreToSend)}`,
       };
-    case "quoted":
+    }
+    case "quoted": {
+      const ceiling = quotedFeeCeiling(outcome.quote);
+      const share = feeSharePercent(ceiling, outcome.quote.amount_sats);
+      const large = isLargeFeeShare(ceiling, outcome.quote.amount_sats);
       return {
         ...base,
+        fee_sats: ceiling,
+        fee_share_pct: share,
+        fee_warning: large,
         fee_reserve_sats: outcome.quote.fee_reserve_sats,
         input_fee_sats: outcome.quote.input_fee_sats,
         debit_sats: outcome.quote.debit_sats,
@@ -334,8 +410,9 @@ function toRow(outcome: CashOutMintOutcome, moreToSend: boolean): CashOutRow {
         // A dry run sent nothing, so "run it again" would be the wrong advice
         // whatever the mode — the cap is reported as fact and the summary hint
         // already says to re-run without --dry-run.
-        display: `${outcome.mint}: would send ${outcome.quote.amount_sats} sats for up to ${outcome.quote.fee_reserve_sats + outcome.quote.input_fee_sats} sats in fees.${capNote(outcome.mint_max_sats, false)}`,
+        display: `${outcome.mint}: would send ${outcome.quote.amount_sats} sats for up to ${ceiling} sats in fees (${outcome.quote.fee_reserve_sats} routing reserve + ${outcome.quote.input_fee_sats} mint input fee${shareClause(share, true)}).${large ? ` ${LARGE_FEE_ADVICE}` : ""}${capNote(outcome.mint_max_sats, false)}`,
       };
+    }
     case "skipped":
       return {
         ...base,
@@ -361,8 +438,10 @@ function toRow(outcome: CashOutMintOutcome, moreToSend: boolean): CashOutRow {
  * the balance afterwards.
  */
 function emitQuote(quote: CashOutQuote, destination: string, human: boolean): void {
-  const fees = quote.fee_reserve_sats + quote.input_fee_sats;
-  const display = `${quote.mint}: sending ${quote.amount_sats} sats to ${destination} costs up to ${fees} sats in fees (${quote.fee_reserve_sats} routing reserve + ${quote.input_fee_sats} mint input fee), debiting up to ${quote.debit_sats} sats. Unused routing reserve comes back.`;
+  const fees = quotedFeeCeiling(quote);
+  const share = feeSharePercent(fees, quote.amount_sats);
+  const large = isLargeFeeShare(fees, quote.amount_sats);
+  const display = `${quote.mint}: sending ${quote.amount_sats} sats to ${destination} costs up to ${fees} sats in fees (${quote.fee_reserve_sats} routing reserve + ${quote.input_fee_sats} mint input fee${shareClause(share, true)}), debiting up to ${quote.debit_sats} sats. Unused routing reserve comes back.${large ? ` ${LARGE_FEE_ADVICE}` : ""}`;
   if (human) {
     info(display);
   } else {
@@ -374,6 +453,9 @@ function emitQuote(quote: CashOutQuote, destination: string, human: boolean): vo
       amount_sats: quote.amount_sats,
       fee_reserve_sats: quote.fee_reserve_sats,
       input_fee_sats: quote.input_fee_sats,
+      fee_sats: fees,
+      fee_share_pct: share,
+      fee_warning: large,
       debit_sats: quote.debit_sats,
       expires_at: quote.expires_at,
       display,

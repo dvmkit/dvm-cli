@@ -57,6 +57,7 @@ import {
   type X402Wallet,
 } from "@dvmkit/sdk/internal";
 import {
+  addCashuSwapFee,
   recordUpfrontRailPayment,
   loadJob,
   markJobTerminal,
@@ -120,6 +121,7 @@ import {
   planProbeDraw,
 } from "../lib/credit-policy";
 import { enforceGlobalBudget, recordSpend, recordSpendOnce } from "../lib/budget-ledger";
+import { cashuPaymentFeeFields, describeCashuPayment } from "../lib/mint-fee";
 import { loadFloat } from "../lib/float";
 import { resolveBtcUsdRate, tryResolveBtcUsdRate } from "../lib/btc-rate";
 import { createHash, randomUUID } from "crypto";
@@ -3525,6 +3527,7 @@ async function payWithAgentWallet(
   await collectCashuChange(effectiveJobId, receipt.cashuChange);
 
   recordUpfrontRailPayment(effectiveJobId, cashuUpfrontPayment(chosen, btcRate), true);
+  addCashuSwapFee(effectiveJobId, prepared.swapFeeSats);
   // Spend successful — clear the pending_submission and record the spend
   // in the recent-spends ring buffer.
   if (!hasUnsavedJobState()) await commitAgentSpend({
@@ -3534,6 +3537,7 @@ async function payWithAgentWallet(
       dvm_endpoint: ref.endpoint,
       mint: prepared.mint,
       amount_sats: prepared.totalSats,
+      ...(prepared.swapFeeSats > 0 ? { fee_sats: prepared.swapFeeSats } : {}),
       signed_at_ms: Date.now(),
     },
   });
@@ -3587,6 +3591,8 @@ async function payWithAgentWallet(
     transport.close?.();
     if (opts.human) {
       console.log(receipt.summary);
+      const feeLine = describeCashuPayment(prepared.totalSats, prepared.swapFeeSats);
+      if (feeLine) info(feeLine);
       const hint = nextStepHint(effectiveJobId, receipt.payloadIn, receipt.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
       await renderReceiptHuman(captured, effectiveJobId);
@@ -3601,6 +3607,7 @@ async function payWithAgentWallet(
         paidWith: "cashu_p2pk",
         mint: prepared.mint,
         amountSats: prepared.totalSats,
+        ...cashuPaymentFeeFields(prepared.totalSats, prepared.swapFeeSats),
         requestId: prepared.requestId,
         ...(prepared.attempts?.length ? { mint_attempts: prepared.attempts } : {}),
         ...(prepared.submissionBindingFingerprint
@@ -3630,6 +3637,7 @@ async function payWithAgentWallet(
       paidWith: "cashu_p2pk",
       mint: prepared.mint,
       amountSats: prepared.totalSats,
+      ...cashuPaymentFeeFields(prepared.totalSats, prepared.swapFeeSats),
       requestId: prepared.requestId,
       ...(prepared.attempts?.length ? { mint_attempts: prepared.attempts } : {}),
       ...(prepared.submissionBindingFingerprint

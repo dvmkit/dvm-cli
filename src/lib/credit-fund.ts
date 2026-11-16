@@ -2433,6 +2433,7 @@ async function fundOverCashu(args: FundCreditArgs, fundId: string): Promise<Cred
         dvm_endpoint: args.ref.endpoint,
         mint: prepared.mint,
         amount_sats: prepared.totalSats,
+        ...(prepared.swapFeeSats > 0 ? { fee_sats: prepared.swapFeeSats } : {}),
         signed_at_ms: Date.now(),
       },
     });
