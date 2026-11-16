@@ -397,7 +397,7 @@ export function buildProgram(): Command {
 
   program
     .command("request-result <request-id>")
-    .description("Read the exact accepted job for a caller-generated request id without mutation")
+    .description("Read the exact accepted job for a caller-generated request id (or a local job id) without mutation")
     .option("--human", "Human-readable output instead of JSON")
     .action((requestId: string, opts: RequestResultOptions) => {
       return catchErrors(() => requestResult(requestId, opts), opts.human);

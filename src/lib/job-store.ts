@@ -104,6 +104,8 @@ export interface JobRecord {
   upfrontCreditConflict?: true;
   /** Why the credit job's accepted debit could not be booked, when the provider sent an unusable one. */
   upfrontCreditConflictReason?: string;
+  /** The conflict came only from an unusable body, so a later valid matching debit clears it. */
+  upfrontCreditConflictRecoverable?: true;
   /** Absent on legacy jobs: their existing draw must never be guessed. */
   creditBinding?: { creditId: string; drawId: string; callerPubkey: string } | { unbound: true; callerPubkey: string };
   pendingCreditPayment?: CreditPaymentIntent;
@@ -292,9 +294,20 @@ export function saveSubmittedJob(job: JobRecord): void {
   }, true, job);
 }
 
-function markUpfrontCreditConflict(job: JobRecord, reason: string): void {
+/**
+ * A conflict from an unusable body (`recoverable`) is cleared by a later valid matching debit.
+ * Any real mismatch makes the conflict permanent and replaces a recoverable reason.
+ */
+function markUpfrontCreditConflict(job: JobRecord, reason: string, recoverable = false): void {
+  const wasRecoverable = job.upfrontCreditConflictRecoverable === true;
+  if (job.upfrontCreditConflict && !(wasRecoverable && !recoverable)) {
+    job.upfrontCreditConflictReason ??= reason;
+    return;
+  }
   job.upfrontCreditConflict = true;
-  job.upfrontCreditConflictReason ??= reason;
+  job.upfrontCreditConflictReason = reason;
+  if (recoverable) job.upfrontCreditConflictRecoverable = true;
+  else delete job.upfrontCreditConflictRecoverable;
 }
 
 /**
@@ -309,7 +322,7 @@ export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOn
     if (!job) return;
     if (!payment) {
       if (unusable && !paidOnRail && job.paymentMethod === "credit" && !job.upfrontCreditBooked) {
-        markUpfrontCreditConflict(job, `the provider's upfront_payment was unusable: ${unusable}`);
+        markUpfrontCreditConflict(job, `the provider's upfront_payment was unusable: ${unusable}`, true);
       }
       return;
     }
@@ -330,6 +343,11 @@ export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOn
     if (job.upfrontPayment && JSON.stringify(job.upfrontPayment) !== JSON.stringify(payment)) {
       markUpfrontCreditConflict(job, "the provider reported a different accepted debit than the one recorded");
       return;
+    }
+    if (job.upfrontCreditConflictRecoverable) {
+      delete job.upfrontCreditConflict;
+      delete job.upfrontCreditConflictReason;
+      delete job.upfrontCreditConflictRecoverable;
     }
     job.upfrontPayment = payment;
     job.paymentMethod = "credit";
