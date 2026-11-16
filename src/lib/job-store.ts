@@ -14,7 +14,7 @@ import { JOBS_FILE } from "@dvmkit/sdk/internal";
 import { dirname } from "node:path";
 import lockfile from "proper-lockfile";
 import type { PaymentContent, UpfrontPayment } from "@dvmkit/sdk";
-import { parseUpfrontPayment, parseUpfrontRailPayment, type UpfrontRailPayment } from "./upfront-payment";
+import { parseUpfrontPayment, parseUpfrontRailPayment, upfrontPaymentFault, type UpfrontRailPayment } from "./upfront-payment";
 import type { Message, PaymentRequestContent } from "@dvmkit/sdk/internal";
 import { usdMicro, type BudgetOverrun } from "./job-budget";
 import type { JobCompletion } from "./completion-hints";
@@ -102,6 +102,8 @@ export interface JobRecord {
   upfrontPayment?: UpfrontPayment;
   upfrontCreditBooked?: true;
   upfrontCreditConflict?: true;
+  /** Why the credit job's accepted debit could not be booked, when the provider sent an unusable one. */
+  upfrontCreditConflictReason?: string;
   /** Absent on legacy jobs: their existing draw must never be guessed. */
   creditBinding?: { creditId: string; drawId: string; callerPubkey: string } | { unbound: true; callerPubkey: string };
   pendingCreditPayment?: CreditPaymentIntent;
@@ -290,27 +292,43 @@ export function saveSubmittedJob(job: JobRecord): void {
   }, true, job);
 }
 
-export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOnRail = false): void {
+function markUpfrontCreditConflict(job: JobRecord, reason: string): void {
+  job.upfrontCreditConflict = true;
+  job.upfrontCreditConflictReason ??= reason;
+}
+
+/**
+ * `fault` is why a present `upfront_payment` was unusable. A credit job records it as a
+ * conflict so the refusal names a cause; an absent body stays merely unknown.
+ */
+export function recordUpfrontCreditPayment(jobId: string, value: unknown, paidOnRail = false, fault?: string): void {
   const payment = parseUpfrontPayment(value);
+  const unusable = fault ?? upfrontPaymentFault(value);
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
-    if (!job || !payment) return;
+    if (!job) return;
+    if (!payment) {
+      if (unusable && !paidOnRail && job.paymentMethod === "credit" && !job.upfrontCreditBooked) {
+        markUpfrontCreditConflict(job, `the provider's upfront_payment was unusable: ${unusable}`);
+      }
+      return;
+    }
     // Fund-and-draw submissions already book their attached rail payment.
     if (paidOnRail || (job.paymentMethod && job.paymentMethod !== "credit")) {
       job.upfrontPayment ??= payment;
       return;
     }
     if (!payment.credit_id || !payment.draw_id) {
-      if (job.paymentMethod === "credit") job.upfrontCreditConflict = true;
+      if (job.paymentMethod === "credit") markUpfrontCreditConflict(job, "the accepted debit names no credit draw");
       return;
     }
     const binding = job.creditBinding;
     if (!binding || "unbound" in binding || binding.creditId !== payment.credit_id || binding.drawId !== payment.draw_id) {
-      job.upfrontCreditConflict = true;
+      markUpfrontCreditConflict(job, "the accepted debit does not match this job's credit draw");
       return;
     }
     if (job.upfrontPayment && JSON.stringify(job.upfrontPayment) !== JSON.stringify(payment)) {
-      job.upfrontCreditConflict = true;
+      markUpfrontCreditConflict(job, "the provider reported a different accepted debit than the one recorded");
       return;
     }
     job.upfrontPayment = payment;

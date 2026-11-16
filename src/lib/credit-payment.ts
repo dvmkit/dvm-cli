@@ -15,6 +15,7 @@ import {
   type Transport,
 } from "@dvmkit/sdk/internal";
 import { dvmFetch } from "./http";
+import { unknownUpfrontCreditError } from "./upfront-credit-error";
 import { budgetVerdict, usdMicro, type JobBudgetPolicy } from "./job-budget";
 import { tryResolveBtcUsdRate } from "./btc-rate";
 import { findSigningIdentityByPubkey } from "./cli-identity-resolve";
@@ -134,7 +135,7 @@ export async function tryCreditPayment(args: {
     throw new DvmError("upfront_rail_unknown", "Recover the original upfront rail charge before another balance payment.");
   const ask = request.credit;
   if (job && hasUnknownUpfrontCredit(job))
-    throw new DvmError("upfront_credit_unknown", "The original upfront credit debit must be recovered before another balance payment.");
+    throw unknownUpfrontCreditError(job, "The original upfront credit debit must be recovered before another balance payment.");
   if (!job?.creditBinding || !ask || !Number.isSafeInteger(requestSeq) || requestSeq! < 0 ||
       !Number.isSafeInteger(ask.amount_micro) || ask.amount_micro <= 0 || !/^[a-z]{3}$/.test(ask.currency)) return false;
   const signer = findSigningIdentityByPubkey(job.creditBinding.callerPubkey);
