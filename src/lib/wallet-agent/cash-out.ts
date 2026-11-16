@@ -10,6 +10,7 @@ import { getWallet } from "@dvmkit/sdk/internal";
 import { DvmError } from "@dvmkit/sdk/internal";
 import { assertInvoiceNotPending, invoiceAmountSats } from "./invoice";
 import { prepareCashOut } from "./cash-out-prepare";
+import { forgetMeltQuote } from "./melt-quotes";
 import {
   markProofsInFlight,
   meltInFlightTimeoutSeconds,
@@ -102,8 +103,16 @@ export type CashOutMintOutcome =
        * settles it on a later run. Never claim the first without asking the mint.
        */
       settlement: "reverted" | "unresolved";
+      /**
+       * Set when the mint's existing quote for a fixed invoice blocks this run.
+       * Not a transient refusal: that quote may still be payable or already
+       * paid, so the invoice must not be routed to another mint.
+       */
+      reason?: CashOutFailureReason;
       quote?: CashOutQuote;
     };
+
+export type CashOutFailureReason = "quote_already_exists" | "quote_already_in_progress" | "quote_state_unknown";
 
 export interface CashOutMintOptions {
   /** Mint to melt at. Only proofs issued here are considered. */
@@ -190,7 +199,7 @@ export async function cashOutFromMint(opts: CashOutMintOptions): Promise<CashOut
       kind: "skipped",
       mint: mintUrl,
       reason: "fee_cap_exceeded",
-      message: `Fees at ${mintUrl} would be up to ${totalFees} sats, over the ${opts.maxFeeSats} sat cap.${opts.bolt11 ? " No money moved. Run `dvm wallet cash-out <invoice> --max-fee <sats>` with a sufficient cap if you accept these fees." : ""}`,
+      message: `Fees at ${mintUrl} would be up to ${totalFees} sats, over the ${opts.maxFeeSats} sat cap.${opts.bolt11 ? " No money moved. The quote is saved: run `dvm wallet cash-out <invoice> --max-fee <sats>` with a sufficient cap to pay with it if you accept these fees." : ""}`,
       quote: quoteView,
     };
   }
@@ -297,6 +306,12 @@ export async function cashOutFromMint(opts: CashOutMintOptions): Promise<CashOut
       pending_melts: fresh.pending_melts.filter((m) => m.quote_id !== entry.quote_id),
     });
   });
+
+  if (opts.bolt11) {
+    // The payment already landed; a leftover record is rechecked at the mint
+    // before any reuse, so failing to drop it must not fail the cash-out.
+    try { forgetMeltQuote(mintUrl, opts.bolt11, entry.quote_id); } catch { /* see above */ }
+  }
 
   return {
     kind: "sent",

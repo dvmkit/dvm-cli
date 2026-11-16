@@ -21,6 +21,10 @@ import { sweepPendingMelts } from "../recovery-melt";
 import { info } from "../../output";
 import { json } from "../../output";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { HttpResponseError, MintOperationError, NetworkError } from "@cashu/cashu-ts";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { JOBS_FILE } from "@dvmkit/sdk/internal";
 
 vi.mock("@cashu/cashu-ts", async (importOriginal) => ({ ...(await importOriginal<typeof import("@cashu/cashu-ts")>()), ...(() => ({
   Amount: {
@@ -131,8 +135,11 @@ function stubQuotes(inputFee: number, quotes: { amount: number; feeReserve: numb
   });
 }
 
+const quoteStore = () => join(dirname(JOBS_FILE), "melt-quotes.json");
+
 beforeEach(() => {
   vi.clearAllMocks();
+  rmSync(quoteStore(), { force: true });
 });
 
 describe("cashOutFromMint", () => {
@@ -787,4 +794,231 @@ describe("invoice cash-out", () => {
     expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
   });
 
+});
+
+/**
+ * A mint that, like the one observed in production, issues one melt quote per
+ * invoice and refuses a second while the first is unexpired.
+ */
+function oneQuotePerInvoiceMint(feeReserve = 2) {
+  interface Issued { quote: string; amount: number; fee_reserve: number; expiry: number; state: string; request: string; mint: string }
+  const issued: Issued[] = [];
+  const createQuote = async (mint: string, request: string) => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (issued.some((q) => q.mint === mint && q.request === request && q.expiry > nowSec)) {
+      throw new DvmError(
+        "cashu_melt_quote_failed",
+        `Failed to create melt quote at ${mint}: This invoice already has a melt quote; request a new invoice`,
+        "The mint may be down or the invoice is invalid."
+      );
+    }
+    const quote: Issued = { quote: `mq${issued.length + 1}`, amount: 60, fee_reserve: feeReserve, expiry: nowSec + 600, state: "UNPAID", request, mint };
+    issued.push(quote);
+    return { amountSats: quote.amount, feeReserveSats: quote.fee_reserve, rawQuote: quote as never };
+  };
+  const checkQuote = async (id: string) => {
+    const quote = issued.find((q) => q.quote === id);
+    if (!quote) throw new Error("quote not found");
+    return { ...quote };
+  };
+  return { issued, createQuote, checkQuote };
+}
+
+describe("invoice cash-out at a mint that issues one quote per invoice", () => {
+  const invoice = CASH_OUT_INVOICE;
+  const START = Date.parse("2026-11-12T12:00:00Z");
+  let cashuWallet: ReturnType<typeof makeCashuWallet>;
+  let mint: ReturnType<typeof oneQuotePerInvoiceMint>;
+  const meltedQuoteIds = () => cashuWallet.ops.meltBolt11.mock.calls.map((call) => (call[0] as { quote: string }).quote);
+  const lastReport = () => vi.mocked(json).mock.calls.at(-1)![0] as { hint: string; mints: Record<string, unknown>[] };
+
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(START);
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 64)]));
+    vi.mocked(getInputFeesForProofs).mockResolvedValue(2);
+    mint = oneQuotePerInvoiceMint();
+    vi.mocked(fetchMeltQuote).mockImplementation(mint.createQuote);
+    cashuWallet = makeCashuWallet();
+    cashuWallet.checkMeltQuoteBolt11.mockImplementation(mint.checkQuote as never);
+    vi.mocked(getWallet).mockResolvedValue(cashuWallet as never);
+  });
+
+  it("pays once with the dry run's quote on a single-mint wallet", async () => {
+    await walletCashOut(invoice, { dryRun: true });
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(lastReport().hint).toContain("saved");
+    expect(lastReport().hint).not.toContain("re-quoted");
+
+    await walletCashOut(invoice, {});
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+    expect(meltedQuoteIds()).toEqual(["mq1"]);
+    expect(vi.mocked(saveAgentWallet).mock.calls[0][0].pending_melts[0]).toMatchObject({ quote_id: "mq1", bolt11: invoice });
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ status: "cashed_out", sats_sent: 60 }));
+    expect(JSON.parse(readFileSync(quoteStore(), "utf8"))).toEqual([]);
+  });
+
+  it("repeats a dry run without asking the mint for a second quote", async () => {
+    await walletCashOut(invoice, { dryRun: true });
+    await walletCashOut(invoice, { dryRun: true });
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ status: "quoted", mints: [expect.objectContaining({ status: "quoted", fee_reserve_sats: 2 })] }));
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+  });
+
+  it("pays on the same mint when a fee-cap refusal is retried with a higher cap", async () => {
+    await expect(walletCashOut(invoice, { maxFee: "3" })).rejects.toThrow("over the 3 sat cap");
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+
+    await walletCashOut(invoice, { maxFee: "4" });
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(meltedQuoteIds()).toEqual(["mq1"]);
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+  });
+
+  it("finds the dry run's quote again after a restart", async () => {
+    await walletCashOut(invoice, { dryRun: true });
+    expect(existsSync(quoteStore())).toBe(true);
+
+    // Fresh module instances: nothing the first run held in memory survives.
+    vi.resetModules();
+    vi.mocked(fetchMeltQuote).mockClear();
+    const restarted = await import("../../../commands/wallet-cash-out");
+
+    await restarted.walletCashOut(invoice, {});
+    expect(mint.issued).toHaveLength(1);
+    expect(fetchMeltQuote).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+    expect(meltedQuoteIds()).toEqual(["mq1"]);
+  });
+
+  it("replaces an expired stored quote instead of reusing it", async () => {
+    await walletCashOut(invoice, { dryRun: true });
+    vi.mocked(Date.now).mockReturnValue(START + 601_000);
+
+    await walletCashOut(invoice, {});
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(2);
+    expect(meltedQuoteIds()).toEqual(["mq2"]);
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+  });
+
+  it("replaces a stored quote the mint reports expired before the local clock does", async () => {
+    await walletCashOut(invoice, { dryRun: true });
+    mint.issued[0].expiry = Math.floor(START / 1000) - 1;
+
+    await walletCashOut(invoice, {});
+    expect(meltedQuoteIds()).toEqual(["mq2"]);
+  });
+
+  it.each(["PAID", "PENDING"])("never requests a new quote or another mint once the stored quote is %s", async (state) => {
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 128), proof("b", 64, { mint: OTHER_MINT })]));
+    await walletCashOut(invoice, { dryRun: true });
+    mint.issued[0].state = state;
+
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("do not pay this invoice again");
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(lastReport().mints).toEqual([expect.objectContaining({ mint: MINT, status: "failed", reason: "quote_already_in_progress" })]);
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a duplicate-quote refusal it holds no record for, without routing to another mint", async () => {
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 128), proof("b", 64, { mint: OTHER_MINT })]));
+    await mint.createQuote(MINT, invoice);
+    vi.mocked(fetchMeltQuote).mockClear();
+
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("already holds a melt quote for this invoice");
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(fetchMeltQuote).toHaveBeenCalledWith(MINT, invoice);
+    expect(lastReport().mints).toEqual([expect.objectContaining({ mint: MINT, status: "failed", settlement: "reverted", reason: "quote_already_exists" })]);
+    expect(saveAgentWallet).not.toHaveBeenCalled();
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+  });
+
+  it("stops without a new quote when the stored quote's state cannot be read, then pays with it on retry", async () => {
+    vi.mocked(loadAgentWallet).mockReturnValue(walletWith([proof("a", 128), proof("b", 64, { mint: OTHER_MINT })]));
+    await walletCashOut(invoice, { dryRun: true });
+    cashuWallet.checkMeltQuoteBolt11.mockRejectedValueOnce(new NetworkError("socket hang up"));
+
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("the quote is still saved");
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(lastReport().mints).toEqual([expect.objectContaining({ mint: MINT, status: "failed", settlement: "reverted", reason: "quote_state_unknown" })]);
+    expect(cashuWallet.completeMelt).not.toHaveBeenCalled();
+
+    await walletCashOut(invoice, {});
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(meltedQuoteIds()).toEqual(["mq1"]);
+  });
+
+  it("treats a server fault on the stored quote's lookup as unknown, not as a dropped quote", async () => {
+    await walletCashOut(invoice, { dryRun: true });
+    cashuWallet.checkMeltQuoteBolt11.mockRejectedValueOnce(new HttpResponseError("bad gateway", 502));
+
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("the quote is still saved");
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+  });
+
+  it("requests a new quote when the mint itself answers that the stored quote is gone", async () => {
+    await walletCashOut(invoice, { dryRun: true });
+    mint.issued.length = 0;
+    cashuWallet.checkMeltQuoteBolt11.mockRejectedValueOnce(new MintOperationError(20005, "quote not found"));
+
+    await walletCashOut(invoice, {});
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(2);
+    expect(cashuWallet.completeMelt).toHaveBeenCalledTimes(1);
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ status: "cashed_out", sats_sent: 60 }));
+  });
+
+  describe("dry-run hint when nothing was quoted", () => {
+    const hintAfter = async (opts: Parameters<typeof walletCashOut>[1]) => {
+      await walletCashOut(invoice, { ...opts, dryRun: true });
+      return lastReport().hint;
+    };
+
+    it("says the saved quote meets the same fees after a fee-cap refusal", async () => {
+      const hint = await hintAfter({ maxFee: "3" });
+      expect(hint).toContain("raise --max-fee");
+      expect(hint).not.toContain("re-quoted");
+    });
+
+    it("does not offer a re-run after a duplicate-quote refusal", async () => {
+      await mint.createQuote(MINT, invoice);
+      const hint = await hintAfter({});
+      expect(hint).toContain("new invoice");
+      expect(hint).not.toContain("re-quoted");
+    });
+
+    it("says not to re-run once the stored quote is paid", async () => {
+      await walletCashOut(invoice, { dryRun: true });
+      mint.issued[0].state = "PAID";
+      const hint = await hintAfter({});
+      expect(hint).toContain("Do not re-run");
+      expect(hint).not.toContain("re-quoted");
+    });
+
+    it("says to retry when the stored quote could not be checked", async () => {
+      await walletCashOut(invoice, { dryRun: true });
+      cashuWallet.checkMeltQuoteBolt11.mockRejectedValueOnce(new NetworkError("socket hang up"));
+      const hint = await hintAfter({});
+      expect(hint).toContain("still saved");
+      expect(hint).not.toContain("re-quoted");
+    });
+  });
+
+  it("keeps the quote for a retry after a melt the mint confirms unpaid", async () => {
+    cashuWallet.completeMelt.mockRejectedValueOnce(new Error("connection lost"));
+    await expect(walletCashOut(invoice, {})).rejects.toThrow("mint confirms the invoice is unpaid");
+
+    await walletCashOut(invoice, {});
+    expect(fetchMeltQuote).toHaveBeenCalledTimes(1);
+    expect(meltedQuoteIds()).toEqual(["mq1", "mq1"]);
+    expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ status: "cashed_out", sats_sent: 60 }));
+  });
+
+  it("still tells an address cash-out that its fee is re-quoted", async () => {
+    vi.mocked(fetchLnurlPayInvoice).mockResolvedValue("lnbc600n1resolved");
+    await walletCashOut(DEST, { amount: "60", sats: true, dryRun: true });
+    expect(lastReport().hint).toContain("re-quoted");
+    expect(existsSync(quoteStore())).toBe(false);
+  });
 });
