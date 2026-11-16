@@ -1,18 +1,98 @@
+import { Amount, type Wallet } from "@cashu/cashu-ts";
 import {
   fetchMeltQuote,
   getInputFeesForProofs,
   toCashuProofs,
   type AgentProof,
+  type MeltQuoteInfo,
   type MintAmountBounds,
 } from "@dvmkit/sdk/internal";
 import type { CashOutMintOptions, CashOutMintOutcome } from "./cash-out";
-import { invoiceAmountSats } from "./invoice";
+import { invoiceAmountSats, invoiceDestination } from "./invoice";
 import type { PreparedCashOut } from "./cash-out-prepare";
+import { forgetMeltQuote, rememberMeltQuote, storedMeltQuote } from "./melt-quotes";
+
+type QuoteLookup = Pick<Wallet, "checkMeltQuoteBolt11">;
+
+/** How a mint words its refusal to quote an invoice it has already quoted. */
+function isDuplicateQuoteRefusal(err: unknown): boolean {
+  return /already has a (melt )?quote/i.test(err instanceof Error ? err.message : String(err));
+}
+
+/**
+ * The melt quote for a fixed invoice. Some mints issue one quote per invoice
+ * and refuse a second, so a quote an earlier run left unpaid is reused rather
+ * than requested again. Only the mint's own answer makes a stored quote usable:
+ * `UNPAID` and unexpired. A `PENDING` or `PAID` quote never leads to a new one.
+ */
+async function resolveInvoiceQuote(
+  mint: string,
+  invoice: string,
+  nowMs: number,
+  cashuWallet: QuoteLookup
+): Promise<MeltQuoteInfo | CashOutMintOutcome> {
+  const held = storedMeltQuote(mint, invoice, nowMs);
+  if (held) {
+    let current;
+    try {
+      current = await cashuWallet.checkMeltQuoteBolt11(held.quote_id);
+    } catch {
+      // The mint may have dropped the quote; if it is merely unreachable the
+      // request below fails the same way and reports it.
+      current = undefined;
+    }
+    if (current && (current.state === "PENDING" || current.state === "PAID")) {
+      return {
+        kind: "failed", mint, settlement: "reverted", reason: "quote_already_in_progress",
+        message: `${mint} reports this invoice's melt quote as ${current.state === "PAID" ? "already paid" : "being paid"}. No money moved in this run. Run \`dvm wallet show\` to reconcile it; do not pay this invoice again.`,
+      };
+    }
+    const sameInvoice = current !== undefined
+      && (typeof current.request !== "string" || invoiceDestination(current.request) === invoiceDestination(invoice));
+    const live = current !== undefined && current.state === "UNPAID" && sameInvoice
+      && !(typeof current.expiry === "number" && current.expiry * 1000 <= nowMs);
+    if (current && live) {
+      return {
+        amountSats: Amount.from(current.amount).toNumber(),
+        feeReserveSats: Amount.from(current.fee_reserve).toNumber(),
+        rawQuote: current,
+      };
+    }
+    if (current) forgetStored(mint, invoice, held.quote_id);
+  }
+
+  let quote: MeltQuoteInfo;
+  try {
+    quote = await fetchMeltQuote(mint, invoice);
+  } catch (err) {
+    if (!isDuplicateQuoteRefusal(err)) throw err;
+    return {
+      kind: "failed", mint, settlement: "reverted", reason: "quote_already_exists",
+      message: `${mint} already holds a melt quote for this invoice and will not issue another, and this wallet has no usable record of that quote. No money moved. Ask for a new invoice, or run \`dvm wallet cash-out <invoice> --mint <url>\` to pay this one from a different mint.`,
+    };
+  }
+  // Recorded before any fee, balance, or dry-run decision, so every way of
+  // stopping short of the melt leaves the quote findable. Best effort: losing
+  // the record costs a retry at such a mint, never money.
+  try {
+    rememberMeltQuote({
+      mint, bolt11: invoice, quote_id: quote.rawQuote.quote,
+      amount_sats: quote.amountSats, fee_reserve_sats: quote.feeReserveSats,
+      expires_at: typeof quote.rawQuote.expiry === "number" ? quote.rawQuote.expiry : null,
+    }, nowMs);
+  } catch { /* see above */ }
+  return quote;
+}
+
+function forgetStored(mint: string, invoice: string, quoteId: string): void {
+  try { forgetMeltQuote(mint, invoice, quoteId); } catch { /* a stale record is rechecked at the mint before any reuse */ }
+}
 
 export async function prepareInvoice(
   opts: CashOutMintOptions,
   candidates: AgentProof[],
-  bounds: MintAmountBounds
+  bounds: MintAmountBounds,
+  cashuWallet: QuoteLookup
 ): Promise<PreparedCashOut | CashOutMintOutcome> {
   const mint = opts.mintUrl;
   const refuse = (reason: "quote_amount_mismatch" | "quote_expired", message: string): CashOutMintOutcome => ({
@@ -23,7 +103,8 @@ export async function prepareInvoice(
   const amount = invoiceAmountSats(invoice, (opts.now ?? Date.now)());
   try {
     // Compare the mint's sat quote with the locally decoded payment amount.
-    const quote = await fetchMeltQuote(mint, invoice);
+    const quote = await resolveInvoiceQuote(mint, invoice, (opts.now ?? Date.now)(), cashuWallet);
+    if ("kind" in quote) return quote;
     if (quote.amountSats !== amount) {
       return refuse("quote_amount_mismatch", `The mint quoted ${quote.amountSats} sats for a ${amount} sat invoice.`);
     }

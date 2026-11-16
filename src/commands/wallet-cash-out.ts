@@ -154,7 +154,10 @@ export async function walletCashOut(
     outcomes.push(outcome);
     // A fixed invoice is one payment. Never retry elsewhere after a melt attempt,
     // even after rollback: only pre-commit refusals are safe to route onward.
-    if (bolt11 && (outcome.kind !== "skipped" && !(outcome.kind === "failed" && !outcome.quote))) break;
+    // A mint that already holds a quote for the invoice is not one of those.
+    const routable =
+      outcome.kind === "skipped" || (outcome.kind === "failed" && !outcome.quote && !outcome.reason);
+    if (bolt11 && !routable) break;
     if (requested && (outcome.kind === "sent" || outcome.kind === "quoted")) {
       remaining -= outcome.quote.amount_sats;
     }
@@ -191,11 +194,13 @@ export async function walletCashOut(
       ? `Sent ${sentSats} sats to ${destination}${feeSats > 0 ? `, plus ${feeSats} sats in fees` : ""}${shortfall > 0 ? ` — ${shortfall} sats short of what you asked for` : ""}.`
       : `Nothing was sent to ${destination}.`;
   const cappedCount = moreToSend ? rows.filter((r) => r.mint_max_sats !== undefined).length : 0;
+  const savedQuote = bolt11 ? outcomes.find((o) => o.kind === "quoted")?.quote : undefined;
   const hint = buildHint({
     unresolvedCount: unresolved.length,
     shortfall,
     cappedCount,
     dryRun: opts.dryRun,
+    savedQuote,
   });
 
   if (human) {
@@ -342,6 +347,7 @@ function toRow(outcome: CashOutMintOutcome, moreToSend: boolean): CashOutRow {
       return {
         ...base,
         settlement: outcome.settlement,
+        ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}),
         error: outcome.message,
         display: `${outcome.mint}: failed — ${outcome.message}`,
       };
@@ -397,11 +403,20 @@ function buildHint(args: {
   shortfall: number;
   cappedCount: number;
   dryRun?: boolean;
+  /** The quote a dry run of a fixed invoice left saved for the real run. */
+  savedQuote?: CashOutQuote;
 }): string {
   if (args.unresolvedCount > 0) {
     return "At least one melt's outcome is unknown — those sats stay committed until `dvm wallet show` reconciles them against the mint. Don't retry that mint until it does.";
   }
   if (args.dryRun) {
+    if (args.savedQuote) {
+      const until =
+        args.savedQuote.expires_at !== null
+          ? ` until it expires at ${new Date(args.savedQuote.expires_at * 1000).toISOString()}`
+          : " while the mint still holds it unpaid";
+      return `Re-run without --dry-run to send. This quote is saved and the real run pays with it${until}, at the fees shown.`;
+    }
     return "Re-run without --dry-run to send. Quotes expire, so the fee is re-quoted at that point.";
   }
   // A capped leg is the one case where money still owed is left behind on a run

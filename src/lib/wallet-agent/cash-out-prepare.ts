@@ -16,7 +16,7 @@ export interface PreparedCashOut {
 export async function prepareCashOut(opts: CashOutMintOptions, candidates: AgentProof[], cashuWallet: Wallet): Promise<PreparedCashOut | CashOutMintOutcome> {
   const mintUrl = opts.mintUrl;
   const fetchInvoice = opts.fetchInvoice ?? fetchLnurlPayInvoice;
-  if (opts.bolt11 !== undefined) return prepareInvoice(opts, candidates, meltBoundsOf(cashuWallet));
+  if (opts.bolt11 !== undefined) return prepareInvoice(opts, candidates, meltBoundsOf(cashuWallet), cashuWallet);
   // Cost has three components and only two of them come back in the quote:
   // the invoice `amount`, the mint's Lightning `fee_reserve`, and the NUT-12
   // per-input fee, which is never surfaced by NUT-05 and has to be computed
