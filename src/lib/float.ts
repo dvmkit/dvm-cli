@@ -345,6 +345,34 @@ export async function payViaFloat(params: {
   }
 }
 
+/** What the connected wallet can prove about one invoice it may have been asked to pay. */
+export type FloatInvoiceState = "paid" | "unpaid" | "unknown";
+
+/**
+ * Ask the wallet whether it paid the invoice with this payment hash. `unpaid` is only the wallet's
+ * own "never attempted" answer (NIP-47 NOT_FOUND). A record that is not settled may still be in
+ * flight, and a wallet without `lookup_invoice`, a timeout or any other failure proves nothing, so
+ * those are `unknown`. Never throws.
+ */
+export async function lookupFloatInvoice(params: {
+  float: Float;
+  paymentHash: string;
+  timeoutMs?: number;
+}): Promise<FloatInvoiceState> {
+  const { methods } = params.float;
+  if (methods && !supportsMethod(methods, "lookup_invoice")) return "unknown";
+  try {
+    const status = await withNwcPool(
+      params.float.conn,
+      (opts) => backendFor(params.float, opts).lookupInvoice(params.paymentHash),
+      params.timeoutMs
+    );
+    return status.settled ? "paid" : "unknown";
+  } catch (err) {
+    return err instanceof NwcError && err.code.toUpperCase() === "NOT_FOUND" ? "unpaid" : "unknown";
+  }
+}
+
 const FLOAT_TRANSACTION_LIMIT = 100;
 const FLOAT_HISTORY_LOOKBACK_SECONDS = 300;
 

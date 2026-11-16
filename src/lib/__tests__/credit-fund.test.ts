@@ -72,6 +72,7 @@ vi.mock("../btc-rate", () => ({
 
 vi.mock("../float", () => ({
   loadFloat: vi.fn(() => ({ conn: {}, connectedAt: "" })),
+  lookupFloatInvoice: vi.fn(() => Promise.resolve("unknown")),
   assertFloatBudget: vi.fn(() => Promise.resolve(100_000)),
   emitFloatBudgetWarning: vi.fn(),
   floatPaymentDisplay: vi.fn(
@@ -138,6 +139,7 @@ import {
   emitFloatBudgetWarning,
   fundViaFloat,
   loadFloat,
+  lookupFloatInvoice,
 } from "../float";
 import {
   clearPendingTempoChargeFunding,
@@ -320,6 +322,7 @@ beforeEach(async () => {
   vi.mocked(loadPendingFunding).mockReturnValue(undefined);
   vi.mocked(listPendingFundings).mockReturnValue([]);
   vi.mocked(loadFloat).mockReturnValue({ conn: {}, connectedAt: "" } as never);
+  vi.mocked(lookupFloatInvoice).mockResolvedValue("unknown");
   vi.mocked(assertFloatBudget).mockResolvedValue(100_000);
   vi.mocked(fundViaFloat).mockImplementation((params) =>
     Promise.resolve({
@@ -2777,7 +2780,9 @@ describe("fundCredit over Lightning", () => {
     it("keeps an expired funding with no payment record while the DVM still reports it pending", async () => {
       const expiresAtMs = Date.now() - 1;
       vi.mocked(loadPendingFunding).mockReturnValue(pendingFunding({ expiresAtMs }));
-      mockCreditOp.mockRejectedValueOnce(stillPending(expiresAtMs));
+      const offer = stillPending(expiresAtMs);
+      (offer.data!.lightning as { invoice: string }).invoice = "lnbcrt1000n1original";
+      mockCreditOp.mockRejectedValueOnce(offer);
 
       const outcome = await fundCredit(args({ fundId: "fund-fresh" }));
 
@@ -2856,6 +2861,155 @@ describe("fundCredit over Lightning", () => {
         "credit-1",
         "fund-original"
       );
+    });
+  });
+
+  describe("when the DVM answers a saved, unrecorded funding with a different invoice", () => {
+    const ORIGINAL = "lnbcrt1000n1original";
+    const REPLACEMENT = "lnbcrt1000n1replacement";
+    const changedInvoice = () => pendingInvoice(REPLACEMENT);
+    const sweep = () =>
+      pollPendingCreditFundings({
+        transport,
+        ref: { endpoint: ENDPOINT },
+        signing: SIGNING,
+        signBody: (_privkey, body) => body,
+      });
+    const recordedInvoices = () =>
+      vi.mocked(recordPendingFunding).mock.calls.map(([recorded]) => recorded.bolt11);
+    const expectNoReplacementRecorded = () => {
+      for (const bolt11 of recordedInvoices()) expect(bolt11).toBe(ORIGINAL);
+    };
+
+    it.each([
+      ["a wallet that cannot look the invoice up", "unknown" as const, true],
+      ["no connected wallet", "paid" as const, false],
+    ])("retry refuses with %s and keeps the original funding", async (_name, state, connected) => {
+      vi.mocked(prepareAgentSpend).mockImplementation(preparedSpend() as never);
+      vi.mocked(loadPendingFunding).mockReturnValue(pendingFunding());
+      vi.mocked(lookupFloatInvoice).mockResolvedValue(state);
+      if (!connected) vi.mocked(loadFloat).mockReturnValue(null);
+      mockCreditOp.mockRejectedValueOnce(changedInvoice());
+
+      const outcome = await fundCredit(args({ fundId: "fund-fresh", rail: "cashu" }));
+
+      expect(outcome).toMatchObject({
+        status: "refused",
+        rail: "lightning",
+        creditId: "credit-1",
+        fundId: "fund-original",
+        error: {
+          code: "lightning_invoice_changed",
+          data: { credit_id: "credit-1", fund_id: "fund-original" },
+        },
+      });
+      expect(outcome.display).toContain("fund-original");
+      expect(outcome.hint).toContain("Do not pay another invoice");
+      expect(fundViaFloat).not.toHaveBeenCalled();
+      expect(prepareAgentSpend).not.toHaveBeenCalled();
+      expect(clearPendingFunding).not.toHaveBeenCalled();
+      expectNoReplacementRecorded();
+    });
+
+    it("retry refuses an entry saved without a payment hash it could look up", async () => {
+      vi.mocked(loadPendingFunding).mockReturnValue(pendingFunding({ paymentHash: undefined }));
+      vi.mocked(lookupFloatInvoice).mockResolvedValue("unpaid");
+      mockCreditOp.mockRejectedValueOnce(changedInvoice());
+
+      const outcome = await fundCredit(args({ fundId: "fund-fresh" }));
+
+      expect(outcome.error?.code).toBe("lightning_invoice_changed");
+      expect(lookupFloatInvoice).not.toHaveBeenCalled();
+      expect(fundViaFloat).not.toHaveBeenCalled();
+    });
+
+    it("retry pays the replacement once the wallet proves the original unpaid", async () => {
+      vi.mocked(loadPendingFunding).mockReturnValue(pendingFunding());
+      vi.mocked(lookupFloatInvoice).mockResolvedValue("unpaid");
+      mockCreditOp.mockRejectedValueOnce(changedInvoice()).mockResolvedValueOnce(fundedResponse());
+
+      const outcome = await fundCredit(args({ fundId: "fund-fresh" }));
+
+      expect(outcome).toMatchObject({ status: "funded", fundId: "fund-original" });
+      expect(lookupFloatInvoice).toHaveBeenCalledWith(
+        expect.objectContaining({ paymentHash: "ab".repeat(32) })
+      );
+      expect(fundViaFloat).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(fundViaFloat).mock.calls[0][0].bolt11).toBe(REPLACEMENT);
+    });
+
+    it("retry records a paid original as evidence and pays nothing new", async () => {
+      vi.mocked(loadPendingFunding).mockReturnValue(pendingFunding());
+      vi.mocked(lookupFloatInvoice).mockResolvedValue("paid");
+      mockCreditOp.mockRejectedValueOnce(changedInvoice());
+
+      const outcome = await fundCredit(args({ fundId: "fund-fresh", rail: "cashu" }));
+
+      expect(outcome).toMatchObject({
+        status: "settlement_pending",
+        fundId: "fund-original",
+        paymentOutcome: "reconciled",
+        principalSats: 100,
+      });
+      expect(fundViaFloat).not.toHaveBeenCalled();
+      expect(prepareAgentSpend).not.toHaveBeenCalled();
+      expect(clearPendingFunding).not.toHaveBeenCalled();
+      expect(vi.mocked(recordPendingFunding).mock.calls.at(-1)?.[0]).toMatchObject({
+        bolt11: ORIGINAL,
+        paymentOutcome: "reconciled",
+        principalMsats: 100_000,
+      });
+      expectNoReplacementRecorded();
+    });
+
+    it("sweep keeps the original invoice when the wallet cannot prove it unpaid", async () => {
+      vi.mocked(listPendingFundings).mockReturnValue([pendingFunding()]);
+      mockCreditOp.mockRejectedValueOnce(changedInvoice());
+
+      await sweep();
+
+      expect(recordPendingFunding).not.toHaveBeenCalled();
+      expect(clearPendingFunding).not.toHaveBeenCalled();
+      expect(fundViaFloat).not.toHaveBeenCalled();
+    });
+
+    it("sweep adopts the replacement only once the wallet proves the original unpaid", async () => {
+      vi.mocked(listPendingFundings).mockReturnValue([pendingFunding()]);
+      vi.mocked(lookupFloatInvoice).mockResolvedValue("unpaid");
+      mockCreditOp.mockRejectedValueOnce(changedInvoice());
+
+      await sweep();
+
+      expect(recordedInvoices()).toEqual([REPLACEMENT]);
+      expect(fundViaFloat).not.toHaveBeenCalled();
+    });
+
+    it("sweep records a paid original as evidence instead of adopting the replacement", async () => {
+      vi.mocked(listPendingFundings).mockReturnValue([pendingFunding()]);
+      vi.mocked(lookupFloatInvoice).mockResolvedValue("paid");
+      mockCreditOp.mockRejectedValueOnce(changedInvoice());
+
+      await sweep();
+
+      expect(vi.mocked(recordPendingFunding).mock.calls).toHaveLength(1);
+      expect(vi.mocked(recordPendingFunding).mock.calls[0][0]).toMatchObject({
+        bolt11: ORIGINAL,
+        paymentOutcome: "reconciled",
+      });
+      expect(fundViaFloat).not.toHaveBeenCalled();
+    });
+
+    it("never consults the wallet when the DVM re-offers the saved invoice", async () => {
+      vi.mocked(loadPendingFunding).mockReturnValue(pendingFunding());
+      mockCreditOp
+        .mockRejectedValueOnce(pendingInvoice(ORIGINAL))
+        .mockResolvedValueOnce(fundedResponse());
+
+      const outcome = await fundCredit(args({ fundId: "fund-fresh" }));
+
+      expect(outcome.status).toBe("funded");
+      expect(lookupFloatInvoice).not.toHaveBeenCalled();
+      expect(vi.mocked(fundViaFloat).mock.calls[0][0].bolt11).toBe(ORIGINAL);
     });
   });
 
@@ -3285,7 +3439,7 @@ describe("the receive floor", () => {
 
     const pending = pendingFunding({ amountMicro: 30_000, menu: FLOOR_MENU });
     vi.mocked(loadPendingFunding).mockReturnValue(pending);
-    mockCreditOp.mockRejectedValueOnce(pendingInvoice());
+    mockCreditOp.mockRejectedValueOnce(pendingInvoice("lnbcrt1000n1original"));
     vi.mocked(fundViaFloat).mockRejectedValueOnce(
       new DvmError(
         "float_payment_failed",
