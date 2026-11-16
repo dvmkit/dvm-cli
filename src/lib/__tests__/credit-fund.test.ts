@@ -2282,6 +2282,172 @@ async function fundExhaustingSettlementPoll(
   }
 }
 
+describe("fundCredit with a human-paid Lightning invoice", () => {
+  it("persists before relaying, confirms the same funding, and never invokes the connected wallet", async () => {
+    const progress = vi.fn(() => {
+      expect(recordPendingFunding).toHaveBeenLastCalledWith(expect.objectContaining({
+        creditId: "credit-1", fundId: "fund-1", bolt11: "lnbcrt1000n1stub", lightningPaymentMode: "invoice",
+      }));
+      expect(recordFundResponse).not.toHaveBeenCalled();
+    });
+    mockCreditOp.mockRejectedValueOnce(pendingInvoice()).mockResolvedValueOnce(fundedResponse());
+
+    const outcome = await fundExhaustingSettlementPoll(() => fundCredit(args({
+      rail: "lightning", invoice: true, invoiceProgress: progress, float: null,
+    })));
+
+    expect(outcome).toMatchObject({ status: "funded", creditId: "credit-1", fundId: "fund-1" });
+    expect(progress).toHaveBeenCalledTimes(1);
+    expect(progress).toHaveBeenCalledWith(expect.objectContaining({
+      status: "awaiting_payment", bolt11: "lnbcrt1000n1stub", amount_msats: 100_000,
+      amount_micro: 100_000, expires_at_ms: expect.any(Number),
+    }));
+    expect(vi.mocked(recordPendingFunding).mock.invocationCallOrder[0]).toBeLessThan(mockCreditOp.mock.invocationCallOrder[0]);
+    expect(mockCreditOp.mock.calls[0][1]).toEqual(mockCreditOp.mock.calls[1][1]);
+    expect(recordFundResponse).toHaveBeenCalledWith(expect.objectContaining({ rail: "lightning", credit: expect.objectContaining({ credit_id: "credit-1" }) }));
+    expect(fundViaFloat).not.toHaveBeenCalled();
+    expect(assertFloatBudget).not.toHaveBeenCalled();
+    expect(outcome.spentSats).toBeUndefined();
+    expect(outcome.walletDebitSats).toBeUndefined();
+  });
+
+  it("returns a durable no-wait handoff with an identity-preserving resume command", async () => {
+    mockCreditOp.mockRejectedValueOnce(pendingInvoice());
+    const outcome = await fundCredit(args({ rail: "lightning", invoice: true, invoiceWait: false, invoiceIdentity: "work" }));
+    expect(outcome).toMatchObject({ status: "invoice_pending", invoiceHandoff: {
+      fund_id: "fund-1", credit_id: "credit-1", bolt11: "lnbcrt1000n1stub", amount_sats: 100,
+      next_step: expect.stringContaining("--as work"),
+    } });
+    expect(outcome.invoiceHandoff?.next_step).toContain("--invoice");
+    expect(outcome.invoiceHandoff?.next_step).toContain("--credit-id credit-1");
+    expect(recordFundResponse).not.toHaveBeenCalled();
+    expect(clearPendingFunding).not.toHaveBeenCalled();
+    expect(mockCreditOp).toHaveBeenCalledTimes(1);
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+
+  it("resumes a journalled invoice without the flag even when a wallet is connected", async () => {
+    const pending = { ...pendingFunding(), lightningPaymentMode: "invoice" as const };
+    vi.mocked(loadPendingFunding).mockReturnValueOnce(pending);
+    mockCreditOp.mockRejectedValueOnce(pendingInvoice(pending.bolt11)).mockResolvedValueOnce(fundedResponse());
+    const progress = vi.fn();
+    const outcome = await fundExhaustingSettlementPoll(() => fundCredit(args({ amountMicro: 900_000, invoiceProgress: progress })));
+    expect(outcome).toMatchObject({ status: "funded", fundId: "fund-original" });
+    expect(progress).toHaveBeenCalledTimes(1);
+    for (const call of mockCreditOp.mock.calls) {
+      expect(call[1]).toMatchObject({ credit_id: "credit-1", fund: { fund_id: "fund-original", amount_micro: 100_000 } });
+    }
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an externally paid invoice after its local expiry", async () => {
+    vi.mocked(loadPendingFunding).mockReturnValueOnce({ ...pendingFunding({ expiresAtMs: Date.now() - 1 }), lightningPaymentMode: "invoice" } as PendingFunding);
+    mockCreditOp.mockResolvedValueOnce(fundedResponse());
+    const outcome = await fundCredit(args());
+    expect(outcome).toMatchObject({ status: "funded", fundId: "fund-original" });
+    expect(mockCreditOp.mock.calls[0][1]).toMatchObject({ fund: { fund_id: "fund-original" } });
+    expect(recordFundResponse).toHaveBeenCalledTimes(1);
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+
+  it("does not ask a human to repay an invoice that the connected wallet already paid", async () => {
+    vi.mocked(loadPendingFunding).mockReturnValueOnce(pendingFunding({
+      paymentOutcome: "paid", principalMsats: 100_000, walletDebitMsats: 105_000,
+      routingFeeMsats: 5000, totalWalletFeeMsats: 5000, unitemizedWalletFeeMsats: 0,
+    }));
+    mockCreditOp.mockRejectedValueOnce(pendingInvoice("lnbcrt1000n1original"));
+    const progress = vi.fn();
+    const outcome = await fundCredit(args({ invoice: true, invoiceWait: false, invoiceProgress: progress }));
+    expect(outcome).toMatchObject({ status: "settlement_pending", principalSats: 100, walletDebitSats: 105, routingFeeSats: 5 });
+    expect(outcome.invoiceHandoff).toBeUndefined();
+    expect(progress).not.toHaveBeenCalled();
+    expect(clearPendingFunding).not.toHaveBeenCalled();
+    expect(recordFundResponse).not.toHaveBeenCalled();
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+
+  it("returns a terminal expiry error without recording credit or issuing another invoice", async () => {
+    vi.mocked(loadPendingFunding).mockReturnValueOnce({ ...pendingFunding({ expiresAtMs: Date.now() - 1 }), lightningPaymentMode: "invoice" } as PendingFunding);
+    mockCreditOp.mockRejectedValueOnce(new DvmError("lightning_invoice_expired", "Invoice expired without payment."));
+    const outcome = await fundCredit(args());
+    expect(outcome).toMatchObject({ status: "refused", fundId: "fund-original", error: { code: "lightning_invoice_expired" } });
+    expect(mockCreditOp).toHaveBeenCalledTimes(1);
+    expect(recordFundResponse).not.toHaveBeenCalled();
+    expect(clearPendingFunding).toHaveBeenCalledWith(ENDPOINT, SIGNING.pubkey, "credit-1", "fund-original");
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+
+  it("does not relay or retire an expired invoice while the server still reports it pending", async () => {
+    const offer = pendingInvoice();
+    (offer.data!.lightning as { expires_at_ms: number }).expires_at_ms = Date.now() - 1;
+    mockCreditOp.mockRejectedValueOnce(offer);
+    const progress = vi.fn();
+    const outcome = await fundCredit(args({ rail: "lightning", invoice: true, invoiceProgress: progress }));
+    expect(outcome).toMatchObject({ status: "refused", error: { code: "lightning_invoice_expired" } });
+    expect(progress).not.toHaveBeenCalled();
+    expect(clearPendingFunding).not.toHaveBeenCalled();
+    expect(recordFundResponse).not.toHaveBeenCalled();
+  });
+
+  it.each(["timeout", "lightning_unavailable"])("keeps a relayed invoice after %s and never falls back to another rail", async (code) => {
+    mockCreditOp.mockRejectedValueOnce(pendingInvoice()).mockRejectedValueOnce(new DvmError(code, "No confirmation.", undefined,
+      code === "lightning_unavailable" ? { retryable: false } : undefined));
+    const outcome = await fundExhaustingSettlementPoll(() => fundCredit(args({ rail: "lightning", invoice: true, invoiceProgress: vi.fn() })));
+    expect(outcome).toMatchObject({ status: "refused", error: { code } });
+    expect(outcome.display).toContain("unresolved");
+    expect(clearPendingFunding).not.toHaveBeenCalled();
+    expect(recordFundResponse).not.toHaveBeenCalled();
+    expect(prepareAgentSpend).not.toHaveBeenCalled();
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an expired manual intent during the balance sweep", async () => {
+    vi.mocked(listPendingFundings).mockReturnValueOnce([{ ...pendingFunding({ expiresAtMs: Date.now() - 1 }), lightningPaymentMode: "invoice" } as PendingFunding]);
+    mockCreditOp.mockResolvedValueOnce(fundedResponse());
+    await pollPendingCreditFundings({ transport, ref: { endpoint: ENDPOINT }, signing: SIGNING, signBody: (_key, body) => body });
+    expect(mockCreditOp.mock.calls[0][1]).toMatchObject({ fund: { fund_id: "fund-original" } });
+    expect(recordFundResponse).toHaveBeenCalledTimes(1);
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+
+  it("retains an expired manual intent when the balance sweep still sees it pending", async () => {
+    const expiresAtMs = Date.now() - 1;
+    const pending = { ...pendingFunding({ expiresAtMs }), lightningPaymentMode: "invoice" };
+    vi.mocked(listPendingFundings).mockReturnValueOnce([pending]);
+    const offer = pendingInvoice(pending.bolt11);
+    (offer.data!.lightning as { expires_at_ms: number }).expires_at_ms = expiresAtMs;
+    mockCreditOp.mockRejectedValueOnce(offer);
+    await pollPendingCreditFundings({ transport, ref: { endpoint: ENDPOINT }, signing: SIGNING, signBody: (_key, body) => body });
+    expect(mockCreditOp).toHaveBeenCalledTimes(1);
+    expect(recordPendingFunding).toHaveBeenLastCalledWith(expect.objectContaining({ fundId: "fund-original", lightningPaymentMode: "invoice" }));
+    expect(clearPendingFunding).not.toHaveBeenCalled();
+    expect(recordFundResponse).not.toHaveBeenCalled();
+  });
+
+  it("does not report funding or discard the intent when the response contains no confirmed credit", async () => {
+    mockCreditOp.mockResolvedValueOnce({ op: "fund" });
+    await expect(fundCredit(args({ invoice: true }))).rejects.toMatchObject({ code: "provider_error" });
+    expect(recordFundResponse).not.toHaveBeenCalled();
+    expect(clearPendingFunding).not.toHaveBeenCalled();
+  });
+
+  it("still enforces the advertised Lightning minimum before journalling or requesting an invoice", async () => {
+    const outcome = await fundCredit(args({ rail: "lightning", invoice: true, menu: { ...MENU, lightning_min_micro: 200_000 } }));
+    expect(outcome.error?.code).toBe("below_rail_minimum");
+    expect(mockCreditOp).not.toHaveBeenCalled();
+    expect(recordPendingFunding).not.toHaveBeenCalled();
+  });
+
+  it("refuses to replace a payable invoice already shown to a human", async () => {
+    vi.mocked(loadPendingFunding).mockReturnValueOnce({ ...pendingFunding(), lightningPaymentMode: "invoice" } as PendingFunding);
+    mockCreditOp.mockRejectedValueOnce(pendingInvoice("lnbcrt1000n1replacement"));
+    await expect(fundCredit(args({ invoice: true }))).rejects.toMatchObject({ code: "provider_error" });
+    expect(clearPendingFunding).not.toHaveBeenCalled();
+    expect(recordFundResponse).not.toHaveBeenCalled();
+    expect(fundViaFloat).not.toHaveBeenCalled();
+  });
+});
+
 describe("fundCredit over Lightning", () => {
   it("pays the DVM's invoice through fundViaFloat and re-posts to settle it", async () => {
     vi.mocked(fundViaFloat).mockResolvedValueOnce({
@@ -2696,6 +2862,9 @@ describe("fundCredit rail selection", () => {
 
     expect(outcome.status).toBe("unavailable");
     expect(outcome.walletFundCommand).toBe(command);
+    expect(outcome.hint).toContain(amountMicro === 1_000_000
+      ? "--rail lightning --invoice --amount '$1.00'"
+      : "--rail lightning --invoice --amount '$1.234567'");
     for (const prose of [outcome.hint ?? "", outcome.display]) {
       expect(prose).toContain(command);
       expect(prose).toContain("any Lightning wallet");

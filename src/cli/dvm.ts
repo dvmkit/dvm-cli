@@ -589,6 +589,7 @@ export function buildProgram(): Command {
       "Fund past the trust-tier cap deliberately — required for an amount above what receipts here have earned, on every rail except card (stripe), which the cap never applies to"
     )
     .option("--rail <rail>", `Force a funding rail: ${creditFundRails}`)
+    .option("--invoice", "Print a Lightning funding invoice for payment from any wallet; implies --rail lightning")
     .option("--cashu-mint <mint>", "Pin Cashu funding to one DVM-accepted mint")
     .option(
       "--max-cashu-principal-sats <sats>",
@@ -603,7 +604,7 @@ export function buildProgram(): Command {
       "--spt <token>",
       "Pay by card: the shared payment token (spt_…) your human approved in Stripe Link, or '-' to read it from stdin. Implies --rail stripe; without it, --rail stripe offers a card checkout link when supported, otherwise the link-cli approval steps"
     )
-    .option("--no-wait", "Print the card checkout link and exit; re-run to resume and confirm payment")
+    .option("--no-wait", "Print the card checkout link or Lightning --invoice and exit; re-run to resume and confirm payment")
     .option("--credit-id <id>", "Fund a specific credit id instead of the tracked one")
     .option("--as <name>", "Caller signing identity to sign the funding as")
     .option("--human", "Human-readable output instead of JSON")

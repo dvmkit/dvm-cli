@@ -39,6 +39,7 @@ export interface CreditDeselectOptions {
 
 export interface CreditFundOptions {
   wait?: boolean;
+  invoice?: boolean;
   human?: boolean;
   /** Caller signing identity ( resolution ladder when unset). */
   as?: string;

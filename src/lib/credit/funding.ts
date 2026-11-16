@@ -78,6 +78,7 @@ import type { CreditFundOptions } from "./options";
 import { listPendingCardFundings } from "../card-credit/journal";
 import { readSecretStdin } from "../secret-input";
 import { info, json } from "../output";
+import { renderQrTerminal } from "../qr";
 
 /**
  * Load a prepaid balance at one DVM, deliberately.
@@ -107,8 +108,13 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
     );
   }
   const fundingMode = parseFundingMode(opts.fundingMode);
-  const cardSpt = await resolveCardSpt(opts.spt);
   const namedRail = parseFundRail(opts.rail);
+  if (opts.invoice && ((namedRail && namedRail !== "lightning") || opts.spt !== undefined || fundingMode ||
+    opts.cashuMint !== undefined || opts.maxCashuPrincipalSats !== undefined || opts.maxCashuFeeSats !== undefined)) {
+    throw new DvmError("invalid_argument", "--invoice only applies to Lightning credit funding.",
+      "Use --rail lightning --invoice without card, stablecoin, or Cashu funding options.");
+  }
+  const cardSpt = await resolveCardSpt(opts.spt);
   if (cardSpt !== undefined && namedRail && namedRail !== "stripe") {
     throw new DvmError(
       "invalid_argument",
@@ -120,7 +126,7 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
     );
   }
   // A token can only ever pay by card, so passing one names the rail.
-  const flagRail = cardSpt !== undefined ? "stripe" : namedRail;
+  const flagRail = opts.invoice ? "lightning" : cardSpt !== undefined ? "stripe" : namedRail;
   // Both Bitcoin rails pay once and have no reusable form, so naming one
   // alongside a mode is a contradiction rather than a preference to resolve —
   // and it is knowable here, before `/v1/info` is even asked. A
@@ -197,6 +203,10 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
     stored,
     journalled: pending,
   });
+  if (opts.invoice && ((pending && pending.rail !== "lightning") || signedPending)) {
+    throw new DvmError("invalid_argument", "Another funding for this credit is unresolved on a different rail.",
+      "Resume that funding without --invoice before starting a Lightning funding.");
+  }
   // Topping up an existing credit has no rail choice to make: `/v1/credit`
   // binds a credit to the rail it was opened on. An already-persisted intent
   // wins over fresh flags: resolving it first is what prevents a re-invocation
@@ -312,6 +322,17 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
         (canRefillStoredCredit(stored) ? stored.creditId : randomUUID()),
       amountMicro: fundMicro,
       human: opts.human,
+      invoice: opts.invoice,
+      invoiceWait: opts.wait !== false,
+      ...(signer.source.kind !== "env" ? { invoiceIdentity: signer.source.name } : {}),
+      invoiceProgress: async (handoff) => {
+        if (opts.human) {
+          info(String(handoff.display));
+          info(String(handoff.bolt11));
+          info(await renderQrTerminal(String(handoff.bolt11).toUpperCase()));
+          info(`Resume with: ${String(handoff.next_step)}`);
+        } else json({ op: "fund", endpoint, ...handoff });
+      },
       providerInfo,
       ...(menu ? { menu } : {}),
       ...(stored ? { targetMicro: Math.max(stored.targetMicro, fundMicro) } : {}),
@@ -426,6 +447,11 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
         : undefined,
       modeSentence,
       outcome.hint,
+      ...(outcome.invoiceHandoff && opts.human ? [
+        String(outcome.invoiceHandoff.bolt11),
+        await renderQrTerminal(String(outcome.invoiceHandoff.bolt11).toUpperCase()),
+        `Resume with: ${String(outcome.invoiceHandoff.next_step)}`,
+      ] : []),
     ].filter((line): line is string => line !== undefined);
     renderCreditFunding({
       human: opts.human === true,
@@ -435,6 +461,7 @@ export async function runCreditFund(dvm: string, opts: CreditFundOptions): Promi
         endpoint,
         status: outcome.status,
         ...(outcome.checkoutHandoff ?? {}),
+        ...(outcome.invoiceHandoff ?? {}),
         credit_id: outcome.creditId,
         fund_id: outcome.fundId,
         ...(resumedNote ? { resumed: resumedNote } : {}),

@@ -90,6 +90,14 @@ describe("first-contact trust cap by rail", () => {
     expect(fund).not.toHaveBeenCalled();
   });
 
+  it("keeps the trust cap when --invoice implies Lightning without a connected wallet", async () => {
+    fund.mockClear();
+    lightningMenu();
+    await expect(runCreditFund("https://provider.example", { amount: "$5", invoice: true }))
+      .rejects.toMatchObject({ code: "amount_exceeds_trust_tier" });
+    expect(fund).not.toHaveBeenCalled();
+  });
+
   it("explains an unreachable Lightning minimum and offers the wallet invoice before over-trust", async () => {
     lightningMenu(850_000);
     const err = await refusal({ amount: "$1.234567", rail: "lightning" });

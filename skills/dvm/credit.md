@@ -18,6 +18,14 @@ After funding or an automatic refill, inspect every funding result, not just the
 
 When `credit_funding_skipped` reports unavailable BTC/USD pricing, relay its `display` and `hint`. Automatic funding remains enabled, and this request follows the ordinary per-call payment path; the notice does not report a prepaid purchase or authorize another one.
 
+## Lightning invoices from any wallet
+
+When a human wants to pay from a phone or other Lightning wallet without connecting it, run `dvm credit fund <dvm> --rail lightning --invoice --amount '$X'`. The DVM must offer Lightning credit funding, and its minimum and the trust-tier cap still apply; `--over-trust` requires the user's approval as usual. This pays the DVM directly, without funding the agent's Cashu wallet first. Reclaims still use ecash, not Lightning.
+
+The command prints a JSON line with `status: "awaiting_payment"`, `bolt11`, `amount_msats`, `amount_sats`, `amount_micro`, expiry, `credit_id`, `fund_id`, and `next_step`, then polls for confirmation. Relay the raw invoice standalone. `--human` prints a terminal QR. With `--no-wait`, the command returns the same handoff immediately; after payment, run `next_step`. Invoice mode never pays from a connected wallet.
+
+If interrupted, run `next_step` or repeat the original command with the same signing identity. The journal resumes the original invoice and funding ID, including a payment made just before expiry. Do not start a separate credit or ask for another invoice while settlement is unresolved. Only a final `funded` result or a confirmed credit balance proves the funding succeeded. An expired invoice returns `lightning_invoice_expired`; do not pay it. External wallet fees and debit totals are unknown to the CLI.
+
 ## Card top-ups (Stripe Link)
 
 Link connects agents only in some regions (the US and Canada as of November 2026). If Link says your region isn't supported, fund over another rail with `--rail`.

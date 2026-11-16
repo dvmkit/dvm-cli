@@ -16,6 +16,7 @@ import {
 
 import { randomUUID } from "crypto";
 import { walletInvoiceFundingAdvice } from "./credit-wallet-funding";
+import { creditInvoiceCommand, fundOverInvoice, isInvoiceFunding, type InvoicePendingFunding } from "./credit-invoice";
 import { sha256hex, shellQuoteArg } from "@dvmkit/sdk/internal";
 import { Challenge, Credential } from "mppx";
 import { privateKeyToAccount } from "viem/accounts";
@@ -264,6 +265,7 @@ export type CreditFundStatus =
   | "funded"
   /** A durable hosted card session awaits payment or confirmation. */
   | "checkout_pending"
+  | "invoice_pending"
   /**
    * The money left the Lightning wallet and is recorded, but the DVM hadn't
    * observed settlement by the time we stopped asking. Crediting is
@@ -278,6 +280,7 @@ export type CreditFundStatus =
 export interface CreditFundOutcome {
   status: CreditFundStatus;
   checkoutHandoff?: Record<string, unknown>;
+  invoiceHandoff?: Record<string, unknown>;
   /** The rail actually used, when one was. */
   rail?: CreditFundRail;
   creditId: string;
@@ -403,6 +406,11 @@ export interface FundCreditArgs {
   signBody?: (privkey: string, body: Record<string, unknown>) => Record<string, unknown>;
   /** Test seam — defaults to the configured float. */
   float?: Float | null;
+  /** Relay a Lightning invoice for external payment; never invoke the connected wallet. */
+  invoice?: boolean;
+  invoiceWait?: boolean;
+  invoiceIdentity?: string;
+  invoiceProgress?: (handoff: Record<string, unknown>) => void | Promise<void>;
   /** Select prose rather than structured progress for pre-payment warnings. */
   human?: boolean;
   /** Test seam — defaults to the configured Tempo account. */
@@ -476,6 +484,12 @@ const SETTLEMENT_POLL_DELAY_MS = 1_500;
  * loading errors may still escape.
  */
 export async function fundCredit(args: FundCreditArgs): Promise<CreditFundOutcome> {
+  if (args.invoice) {
+    if ((args.rail && args.rail !== "lightning") || args.fundingMode) {
+      throw new DvmError("invalid_argument", "--invoice only applies to Lightning credit funding.");
+    }
+    args = { ...args, rail: "lightning" };
+  }
   // One place to stamp the customer-level reading of the instrument that ran,
   // so every exit below — a resumed journal as much as a fresh funding — says
   // whether the money went out as a one-shot payment or as reusable collateral.
@@ -534,7 +548,7 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
 
   const pending = loadPendingFunding(args.ref.endpoint, args.signing.pubkey, args.creditId);
   if (pending) {
-    if (!pendingFundingExpired(pending)) {
+    if (isInvoiceFunding(pending) || (args.invoice && pending.rail === "lightning") || !pendingFundingExpired(pending)) {
       const resumed = argsFromPending(args, pending);
       return pending.rail === "tempo"
         ? fundOverMpp(resumed, pending.fundId, pending)
@@ -674,7 +688,7 @@ export async function pollPendingCreditFundings(args: {
     callerPubkey: args.signing.pubkey,
   });
   for (const funding of pending) {
-    if (pendingFundingExpired(funding)) {
+    if (pendingFundingExpired(funding) && !isInvoiceFunding(funding)) {
       clearPending(funding);
       continue;
     }
@@ -695,10 +709,11 @@ export async function pollPendingCreditFundings(args: {
     } catch (err) {
       const offer = lightningOffer(err);
       if (offer) {
+        if (isInvoiceFunding(funding) && funding.bolt11 && funding.bolt11 !== offer.invoice) continue;
         const enriched = withLightningOffer(funding, offer);
         recordPendingFunding(enriched);
-        if (pendingFundingExpired(enriched)) clearPending(enriched);
-      } else if (shouldClearPending(err)) {
+        if (pendingFundingExpired(enriched) && !isInvoiceFunding(enriched)) clearPending(enriched);
+      } else if (isInvoiceFunding(funding) ? manualFundingTerminal(err, funding) : shouldClearPending(err)) {
         clearPending(funding);
       }
     }
@@ -789,6 +804,7 @@ export function availableRails(args: {
   menu?: CreditMenu;
   providerInfo?: ProviderInfo;
   float?: Float | null;
+  invoice?: boolean;
   tempoAccount?: TempoAccount | null;
   /**
    * A card top-up needs a human's approval each time, so the card is a
@@ -804,8 +820,8 @@ export function availableRails(args: {
   if (offers("cashu") && cashu && cashu.lock_pubkeys.length > 0 && cashu.mints.length > 0) {
     rails.push("cashu");
   }
-  const float = args.float === undefined ? loadFloat() : args.float;
-  if (offers("lightning") && float) rails.push("lightning");
+  const float = args.invoice ? null : args.float === undefined ? loadFloat() : args.float;
+  if (offers("lightning") && (float || args.invoice)) rails.push("lightning");
   // A connected wallet plus `funding: ["x402"]` is not enough: the menu's
   // scheme list has to name a flavour this caller can build on this wallet's
   // own chain. Both flavours qualify — a batch-settlement channel or
@@ -3428,29 +3444,32 @@ async function fundOverLightning(
     // `null` means "explicitly no float" — the same distinction
     // `availableRails` draws, and `??` would erase it by falling through to the
     // configured one.
-    const float = args.float === undefined ? loadFloat() : args.float;
-    if (!float) {
+    const float = args.invoice ? null : args.float === undefined ? loadFloat() : args.float;
+    if (!float && !args.invoice) {
       return {
         ...base,
         status: "unavailable",
         display: "No Lightning wallet is connected, so the credit can't be funded that way.",
-        ...(args.menu?.stripe?.checkout ? { hint: cardCheckoutAlternative(args) + walletInvoiceFundingAdvice(args.amountMicro).text } : {}),
+        hint: `Run ${creditInvoiceCommand({ endpoint: args.ref.endpoint, amountMicro: args.amountMicro, creditId: args.creditId, identity: args.invoiceIdentity })} to pay from any Lightning wallet. ` +
+          cardCheckoutAlternative(args) + walletInvoiceFundingAdvice(args.amountMicro).text,
       };
     }
 
-    const rate = (await tryResolveBtcUsdRate())?.rate ?? 0;
-    if (rate <= 0) {
-      return {
-        ...base,
-        status: "unavailable",
-        display:
-          "The bitcoin exchange rate couldn't be read, so the funding amount can't be sized.",
-      };
-    }
-    try {
-      await assertFloatBudget(microToSats(args.amountMicro, rate) * 1000);
-    } catch (err) {
-      return budgetRefusal(base, err);
+    if (!args.invoice) {
+      const rate = (await tryResolveBtcUsdRate())?.rate ?? 0;
+      if (rate <= 0) {
+        return {
+          ...base,
+          status: "unavailable",
+          display:
+            "The bitcoin exchange rate couldn't be read, so the funding amount can't be sized.",
+        };
+      }
+      try {
+        await assertFloatBudget(microToSats(args.amountMicro, rate) * 1000);
+      } catch (err) {
+        return budgetRefusal(base, err);
+      }
     }
 
     // This write precedes the invoice request. A process death anywhere after
@@ -3466,11 +3485,24 @@ async function fundOverLightning(
       targetMicro: args.targetMicro ?? args.amountMicro,
       ...(args.menu ? { menu: args.menu } : {}),
       requestedAt: Date.now(),
+      ...(args.invoice ? { lightningPaymentMode: "invoice" as const } : {}),
     };
     recordPendingFunding(pending);
   }
 
   const creditBody = lightningCreditBody(pending);
+
+  if (args.invoice || isInvoiceFunding(pending)) {
+    const manual: InvoicePendingFunding = { ...pending, lightningPaymentMode: "invoice" };
+    recordPendingFunding(manual);
+    const outcome = await fundOverInvoice(args, manual, {
+      post: () => postCredit(args, creditBody),
+      settled: (result, entry) => settleAndClear(args, base, result, lightningSpendFromPending(entry), entry),
+      terminal: manualFundingTerminal,
+      clear: clearPending,
+    });
+    return { ...outcome, ...(lightningSpendFromPending(manual) ?? {}) };
+  }
 
   let offer: LightningFundingOffer;
   try {
@@ -3500,7 +3532,7 @@ async function fundOverLightning(
       status: "unavailable",
       display:
         "The original Lightning invoice is still pending, but no wallet is connected to pay or reconcile it.",
-      hint: "Reconnect the Lightning wallet, then re-run this funding. The same invoice and funding id will be reused.",
+      hint: `Run ${creditInvoiceCommand({ endpoint: pending.endpoint, amountMicro: pending.amountMicro, creditId: pending.creditId, identity: args.invoiceIdentity })} to pay the original invoice from any Lightning wallet, or reconnect the Lightning wallet and re-run this funding. The same invoice and funding id will be reused.`,
     };
   }
 
@@ -3883,6 +3915,10 @@ function argsFromPending(
     | "signing"
     | "signBody"
     | "float"
+    | "invoice"
+    | "invoiceWait"
+    | "invoiceIdentity"
+    | "invoiceProgress"
     | "tempoAccount"
     | "tempoGetClient"
     | "tempoFetch"
@@ -3902,6 +3938,10 @@ function argsFromPending(
     ...(pending.menu ? { menu: pending.menu } : {}),
     ...(args.signBody ? { signBody: args.signBody } : {}),
     ...("float" in args ? { float: args.float } : {}),
+    ...(args.invoice ? { invoice: true } : {}),
+    ...(args.invoiceWait !== undefined ? { invoiceWait: args.invoiceWait } : {}),
+    ...(args.invoiceIdentity ? { invoiceIdentity: args.invoiceIdentity } : {}),
+    ...(args.invoiceProgress ? { invoiceProgress: args.invoiceProgress } : {}),
     ...("tempoAccount" in args ? { tempoAccount: args.tempoAccount } : {}),
     ...(args.tempoGetClient ? { tempoGetClient: args.tempoGetClient } : {}),
     ...(args.tempoFetch ? { tempoFetch: args.tempoFetch } : {}),
@@ -4109,6 +4149,13 @@ function shouldClearPending(err: unknown): boolean {
   );
 }
 
+function manualFundingTerminal(err: unknown, pending: PendingFunding): boolean {
+  if (!(err instanceof DvmError)) return false;
+  if (err.code === "lightning_invoice_expired") return true;
+  if (err.code === "lightning_unavailable") return !pending.bolt11;
+  return isPermanentRefusal(err);
+}
+
 /** Local expiry outcome for an invoice we deliberately did not put on the wire. */
 function expiredFunding(base: {
   creditId: string;
@@ -4307,7 +4354,8 @@ function forcedRailHint(args: FundCreditArgs, rail: CreditFundRail): string {
     return `This DVM advertises credit funding over ${advertised.join(", ") || "no rail at all"}, not ${rail}. ${release.text}`;
   }
   if (rail === "lightning") {
-    const connect = `No Lightning wallet is connected here, so direct Lightning credit funding cannot proceed. No money moved. ${walletInvoiceFundingAdvice(args.amountMicro).text} Or connect a wallet that supports it with 'dvm wallet connect', piping the connection string in`;
+    const invoice = creditInvoiceCommand({ endpoint: args.ref.endpoint, amountMicro: args.amountMicro, creditId: args.creditId, identity: args.invoiceIdentity });
+    const connect = `No Lightning wallet is connected here. No money moved. Run ${invoice} to fund this credit by paying an invoice from any Lightning wallet. ${walletInvoiceFundingAdvice(args.amountMicro).text} Or connect a wallet that supports it with 'dvm wallet connect', piping the connection string in`;
     // Only an instruction can be offered as the alternative half of "do this,
     // or that". A binding is a statement of fact, and splicing it after "or"
     // reads as nonsense — it gets its own sentence.
