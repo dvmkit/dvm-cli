@@ -16,9 +16,11 @@
  */
 
 import { fundOverCheckout } from "./checkout";
+import { cardMinimumMicro, STRIPE_CARD_FLOOR_MICRO } from "./minimum";
 import { Challenge, Credential } from "mppx";
 import {
   type CreditOpResult,
+  type CreditMenu,
   DvmError,
   formatUsd,
   type Payment,
@@ -41,8 +43,6 @@ import {
   sha256Hex,
 } from "./journal";
 
-/** Stripe's smallest card charge, and the DVM's advertised floor for card credit. */
-export const CARD_MIN_MICRO = 500_000;
 const MICRO_PER_CENT = 10_000;
 /** Resends of one credential inside a run, for answers that say the charge may yet book. */
 const PRESENT_ATTEMPTS = 3;
@@ -132,7 +132,7 @@ export async function fundOverStripe(
       hint: `This DVM funds credit over ${args.menu.funding.join(", ") || "no rail at all"}. Fund over one of those with --rail <rail>, or drop --rail and --spt to let dvm pick.`,
     };
   }
-  const local = localAmountRefusal(base, args.amountMicro);
+  const local = localAmountRefusal(base, args.amountMicro, args.menu);
   if (local) return local;
 
   const spt = args.cardSpt;
@@ -509,18 +509,20 @@ function approvalNeededOutcome(args: FundCreditArgs, base: CardFundBase): Credit
   };
 }
 
-function localAmountRefusal(base: CardFundBase, amountMicro: number): CreditFundOutcome | undefined {
-  if (amountMicro < CARD_MIN_MICRO) {
+function localAmountRefusal(base: CardFundBase, amountMicro: number, menu: CreditMenu | undefined): CreditFundOutcome | undefined {
+  const minimum = cardMinimumMicro(menu);
+  if (amountMicro < minimum) {
+    const source = minimum === STRIPE_CARD_FLOOR_MICRO ? "Stripe's minimum card charge" : "this DVM's card top-up minimum";
     return refused(
       base,
       new DvmError(
         "below_rail_minimum",
-        `A card top-up must be at least $${usd(CARD_MIN_MICRO)}; $${usd(amountMicro)} is below Stripe's minimum card charge.`,
-        `Fund at least $${usd(CARD_MIN_MICRO)} by card, or use another rail for smaller amounts.`,
-        { rail: "stripe", min_micro: CARD_MIN_MICRO }
+        `A card top-up must be at least $${usd(minimum)}; $${usd(amountMicro)} is below ${source}.`,
+        `Fund at least $${usd(minimum)} by card, or use another rail for smaller amounts.`,
+        { rail: "stripe", min_micro: minimum }
       ),
-      `Card top-ups start at $${usd(CARD_MIN_MICRO)}, so $${usd(amountMicro)} can't be paid by card. Nothing was charged.`,
-      `Fund at least $${usd(CARD_MIN_MICRO)} by card.`
+      `Card top-ups start at $${usd(minimum)} (${source}), so $${usd(amountMicro)} can't be paid by card. Nothing was charged.`,
+      `Fund at least $${usd(minimum)} by card.`
     );
   }
   if (amountMicro % MICRO_PER_CENT !== 0) {

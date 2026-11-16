@@ -37,7 +37,7 @@ import {
   trustOverrideCapMicro,
 } from "./credit-policy";
 import { pickCreditFundRail } from "./credit-fund";
-import { CARD_MIN_MICRO } from "./card-credit/fund";
+import { cardMinimumMicro } from "./card-credit/minimum";
 
 import type { CreditRefillUnavailable } from "./credit-notice";
 
@@ -428,7 +428,7 @@ function railMinimums(menu: CreditMenu | undefined): RailMinimum[] {
     minimums.push({ rail: "lightning", minMicro: menu.lightning_min_micro });
   }
   if (menu?.funding.includes("stripe")) {
-    minimums.push({ rail: "stripe", minMicro: CARD_MIN_MICRO });
+    minimums.push({ rail: "stripe", minMicro: cardMinimumMicro(menu) });
   }
   return minimums;
 }

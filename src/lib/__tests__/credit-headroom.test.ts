@@ -68,6 +68,41 @@ describe("card funding headroom", () => {
     });
   });
 
+  it.each([
+    [5_000_000, 100_000, 1_000_000, 5_000_000, "$5.00"],
+    [100_000, 100_000, 400_000, 500_000, "$0.50"],
+    [500_000, 1_000_000, 500_000, 1_000_000, "$1.00"],
+  ])("uses card terms %i and menu floor %i throughout headroom", (cardMin, menuMin, amountMicro, minimum, label) => {
+    const result = headroom({
+      menu: {
+        min_micro: menuMin,
+        stripe: { network_id: "example", currency: "usd", min_micro: cardMin },
+      },
+      amountMicro,
+    });
+
+    expect(result.rail_minimums).toContainEqual({ rail: "stripe", min_micro: minimum });
+    expect(result.route_compatibility).toContainEqual({
+      rail: "stripe", status: "blocked_by_rail_minimum", min_micro: minimum,
+      available_locally: false,
+    });
+    expect(result.display).toContain(`Funding over stripe needs at least ${label}`);
+    expect(result.display).toContain(`replace $X with a whole-cent amount of at least ${label}`);
+  });
+
+  it("allows the advertised card minimum despite the separate first-caller trust cap", () => {
+    const result = headroom({
+      menu: { stripe: { network_id: "example", currency: "usd", min_micro: 5_000_000 } },
+      amountMicro: 5_000_000,
+    });
+
+    expect(result.effective_cap_micro).toBe(500_000);
+    expect(result.route_compatibility).toContainEqual({
+      rail: "stripe", status: "unavailable_locally", min_micro: 5_000_000,
+      available_locally: false,
+    });
+  });
+
   it("offers a human-approved card command when no automatic route is available", () => {
     const result = headroom();
 
@@ -75,6 +110,7 @@ describe("card funding headroom", () => {
     expect(result.human_funding_required).toBe(true);
     expect(result.display).toContain(`dvm credit fund ${ENDPOINT} --rail stripe --amount '$X'`);
     expect(result.display).toContain("Stripe Link");
+    expect(result.display).toContain("whole-cent amount of at least $0.50");
   });
 
   it("offers a separate card credit when the held credit is bound to another rail", () => {
