@@ -400,6 +400,21 @@
   },
   {
     "file": "lib/credit-fund.ts",
+    "owner": "pollPendingCreditFundings",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "The DVM's permanent Lightning refusal is returned with recorded payment evidence; local construction sites are scanned separately.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
+  },
+  {
+    "file": "lib/credit-fund.ts",
     "owner": "fundOverLightning",
     "expression": "err",
     "path": [

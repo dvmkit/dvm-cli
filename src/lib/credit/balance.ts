@@ -8,6 +8,7 @@ import {
   type CreditWire,
   type StoredImplicitCredit,
   DvmError,
+  clearPendingFunding,
   listCredits,
   listImplicitCredits,
   listPendingFundings,
@@ -25,6 +26,7 @@ import {
   resolveSigningIdentity,
 } from "../cli-identity-resolve";
 import { pollPendingCreditFundings } from "../credit-fund";
+import { noteRefusedCreditFunding, takeCreditNoticeFields } from "../credit-notice";
 import {
   repeatUseCreditHint,
 } from "../credit-guidance";
@@ -118,6 +120,18 @@ export async function runCreditBalance(
   try {
     for (const endpoint of endpoints) {
       try {
+        // Queue paid refusals for both success and error output before retiring their evidence.
+        if (!opts.observeOnly && !opts.selectionOnly) {
+          const refused = await pollPendingCreditFundings({
+            transport,
+            ref: { endpoint },
+            signing: signer,
+          }).catch(() => []);
+          for (const outcome of refused) {
+            noteRefusedCreditFunding(endpoint, outcome, opts.human);
+            clearPendingFunding(endpoint, signer.pubkey, outcome.creditId, outcome.fundId);
+          }
+        }
         reads.push(
           await balanceAt(
             transport,
@@ -126,8 +140,7 @@ export async function runCreditBalance(
             headroomOf,
             advisoryRate,
             opts.creditId,
-            opts.observeOnly,
-            opts.selectionOnly
+            opts.observeOnly
           )
         );
       } catch (err) {
@@ -190,6 +203,7 @@ export async function runCreditBalance(
       display,
       hint: "Balances come from signed server reads or countersigned job receipts. `drawable: true` identifies value job draws can use; every untracked prepaid sibling carries the exact `drain_command` that reclaims it, while `kind: implicit` rows have no drain path. Each entry in `dvms` says what may be funded at that machine now. Expired prepaid credit remains reclaimable; a lost implicit balance does not.",
       ...(creditHint ? { credit_hint: creditHint } : {}),
+      ...takeCreditNoticeFields(),
     },
   });
 }
@@ -210,20 +224,8 @@ async function balanceAt(
   headroomOf: HeadroomReader,
   advisoryRate: () => Promise<number | undefined>,
   creditId?: string,
-  observeOnly = false,
-  selectionOnly = false
+  observeOnly = false
 ): Promise<EndpointBalance> {
-  // Poll the exact persisted `(credit_id, fund_id)` before the generic balance
-  // read. A paid invoice then yields its fund response, updates the projection,
-  // and retires the pending record without asking the wallet to pay again.
-  if (!observeOnly && !selectionOnly) {
-    await pollPendingCreditFundings({
-      transport,
-      ref: { endpoint },
-      signing: signer,
-    }).catch(() => undefined);
-  }
-
   const providerInfo = await transport.describe({ endpoint }).catch(() => undefined);
   const identity = providerDvmIdentity(providerInfo);
   const postureOff = effectiveCreditPosture(loadConfig()?.credit, endpoint, identity).posture === "off";
