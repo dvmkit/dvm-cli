@@ -14,7 +14,7 @@ For planned repeat work, use the provider's offer and a workload-sized target su
 
 Use only a funding route offered by the provider and supported by the wallet. Lightning may fund prepaid credit directly when its advertised floor is met. Stablecoin funding can use a reusable channel or an explicitly admitted one-payment instrument; these have different reclaim paths. Read the [credit funding contract](https://dvmkit.com/docs/credits.md) before choosing an instrument. Do not silently switch the rail or instrument of an existing balance.
 
-After funding or an automatic refill, inspect every funding result, not just the first. One command may produce more than one purchase. Report the actual completed spend and anything incomplete separately. An unknown or pending settlement must go through [recovery](recovery.md), not another funding command.
+After funding or an automatic refill, inspect every funding result, not just the first. One command may produce more than one purchase. Report the actual completed spend and anything incomplete separately. An unknown or pending settlement must go through [recovery](recovery.md), not another funding command. A Lightning funding paid from the connected wallet stays saved past its invoice's expiry until the DVM credits it or confirms it expired unpaid; repeating the funding or running `dvm credit balance <dvm>` checks the original funding ID and never pays again.
 
 When `credit_funding_skipped` reports unavailable BTC/USD pricing, relay its `display` and `hint`. Automatic funding remains enabled, and this request follows the ordinary per-call payment path; the notice does not report a prepaid purchase or authorize another one.
 

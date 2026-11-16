@@ -549,7 +549,9 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
 
   const pending = loadPendingFunding(args.ref.endpoint, args.signing.pubkey, args.creditId);
   if (pending) {
-    if (isInvoiceFunding(pending) || (args.invoice && pending.rail === "lightning") || !pendingFundingExpired(pending)) {
+    // A Lightning invoice's local expiry does not prove it went unpaid, so that intent resumes
+    // until the DVM resolves it.
+    if (pending.rail === "lightning" || !pendingFundingExpired(pending)) {
       const resumed = argsFromPending(args, pending);
       return pending.rail === "tempo"
         ? fundOverMpp(resumed, pending.fundId, pending)
@@ -689,13 +691,12 @@ export async function pollPendingCreditFundings(args: {
     callerPubkey: args.signing.pubkey,
   });
   for (const funding of pending) {
-    if (pendingFundingExpired(funding) && !isInvoiceFunding(funding)) {
-      clearPending(funding);
-      continue;
-    }
-
     const fundArgs = argsFromPending(args, funding);
     if (funding.rail === "tempo") {
+      if (pendingFundingExpired(funding)) {
+        clearPending(funding);
+        continue;
+      }
       await fundOverMpp(fundArgs, funding.fundId, funding).catch(() => undefined);
       continue;
     }
@@ -711,10 +712,10 @@ export async function pollPendingCreditFundings(args: {
       const offer = lightningOffer(err);
       if (offer) {
         if (isInvoiceFunding(funding) && funding.bolt11 && funding.bolt11 !== offer.invoice) continue;
-        const enriched = withLightningOffer(funding, offer);
-        recordPendingFunding(enriched);
-        if (pendingFundingExpired(enriched) && !isInvoiceFunding(enriched)) clearPending(enriched);
-      } else if (isInvoiceFunding(funding) ? manualFundingTerminal(err, funding) : shouldClearPending(err)) {
+        // Still pending at the DVM: the intent stays, expired or not, until the DVM settles or
+        // definitively refuses it.
+        recordPendingFunding(withLightningOffer(funding, offer));
+      } else if (lightningFundingTerminal(err, funding)) {
         clearPending(funding);
       }
     }
@@ -3499,7 +3500,7 @@ async function fundOverLightning(
     const outcome = await fundOverInvoice(args, manual, {
       post: () => postCredit(args, creditBody),
       settled: (result, entry) => settleAndClear(args, base, result, lightningSpendFromPending(entry), entry),
-      terminal: manualFundingTerminal,
+      terminal: lightningFundingTerminal,
       clear: clearPending,
     });
     return { ...outcome, ...(lightningSpendFromPending(manual) ?? {}) };
@@ -3512,19 +3513,29 @@ async function fundOverLightning(
     return settleAndClear(args, base, replay, lightningSpendFromPending(pending), pending);
   } catch (err) {
     const parsed = lightningOffer(err);
+    const recorded = lightningSpendFromPending(pending);
     if (!parsed) {
-      if (shouldClearPending(err)) clearPending(pending);
+      const terminal = lightningFundingTerminal(err, pending);
+      if (terminal) clearPending(pending);
+      if (recorded) {
+        return terminal
+          ? paidButRefused(args, base, recorded, lightningSpendDisplay(recorded), err as DvmError)
+          : // Inconclusive: the error is surfaced as a failure so the caller retries the same ids.
+            { ...unresolvedFunding(base, err), ...recorded };
+      }
+      // An issued invoice may have been paid by an attempt that died before recording it, so an
+      // inconclusive answer keeps the intent and must not cascade to another rail.
+      if (!terminal && pending.bolt11) return unresolvedFunding(base, err);
       return lightningRefusal(base, err);
     }
     offer = parsed;
     pending = withLightningOffer(pending, offer);
     recordPendingFunding(pending);
+    // The wallet already paid this intent: only the DVM's confirmation is outstanding.
+    if (recorded) return paidAwaitingSettlement(base, recorded, lightningSpendDisplay(recorded));
   }
 
-  if (pendingFundingExpired(pending)) {
-    clearPending(pending);
-    return expiredFunding(base);
-  }
+  if (pendingFundingExpired(pending)) return expiredUnresolvedFunding(base);
 
   const float = args.float === undefined ? loadFloat() : args.float;
   if (!float) {
@@ -3612,22 +3623,8 @@ async function fundOverLightning(
       };
     } catch (err) {
       if (isPermanentRefusal(err)) {
-        const mapped = err as DvmError;
         clearPending(pending);
-        // Composed, never the server's own `display`: that copy is written for
-        // a caller who hasn't paid, so `lightning_invoice_expired` relays as
-        // "Nothing was charged" — the one sentence that must not reach someone
-        // whose sats have left. "Won't be crediting it" covers both shapes the
-        // DVM answers with here: a refusal, and `credit_funding_unrecorded`,
-        // which took the payment and lost the row.
-        return {
-          ...base,
-          ...paid,
-          status: "refused",
-          error: mapped,
-          display: `The Lightning payment went out, but the DVM won't be crediting it (${mapped.code}). ${mapped.message} ${floatPaymentDisplay(payment)}`,
-          hint: `Don't fund again — a fresh funding id issues a second invoice. The payment is on record ('dvm wallet history'); quote funding id ${fundId} to the operator of ${args.ref.endpoint}.`,
-        };
+        return paidButRefused(args, base, paid, floatPaymentDisplay(payment), err as DvmError);
       }
       // Keep the last non-pending failure: "we couldn't reach the DVM" and
       // "the DVM says it hasn't landed yet" are different stories to relay.
@@ -3640,18 +3637,7 @@ async function fundOverLightning(
   // `settlement_pending` is the process boundary where money is known to have
   // moved while the server's confirmation is not yet in hand.
   recordPendingFunding(pending);
-  return {
-    ...base,
-    ...paid,
-    status: "settlement_pending",
-    ...(unconfirmed ? { error: unconfirmed } : {}),
-    display: unconfirmed
-      ? `The Lightning payment went out and is recorded, but the DVM couldn't be reached to confirm it (${unconfirmed.code}). It credits the balance the next time it hears from you — nothing is lost. ${floatPaymentDisplay(payment)}`
-      : `The Lightning payment went out and is recorded, but the DVM hasn't seen it land yet. It credits the balance on your next call — nothing is lost. ${floatPaymentDisplay(payment)}`,
-    // Both verbs poll the durable `(credit_id, fund_id)`: neither can mint a
-    // second invoice while this intent remains in flight.
-    hint: "Re-run this funding or check with 'dvm credit balance' — both re-poll the original funding id, and any next request makes the DVM look for settlement.",
-  };
+  return paidAwaitingSettlement(base, paid, floatPaymentDisplay(payment), unconfirmed);
 }
 
 async function postCredit(
@@ -4126,6 +4112,8 @@ function otherCreditPendingX402(args: FundCreditArgs): PendingX402Funding | unde
 }
 
 function withLightningOffer(pending: PendingFunding, offer: LightningFundingOffer): PendingFunding {
+  // A recorded payment names the invoice it paid; a later offer must not overwrite that evidence.
+  if (pending.paymentOutcome !== undefined && pending.bolt11) return pending;
   return {
     ...pending,
     bolt11: offer.invoice,
@@ -4143,38 +4131,104 @@ function clearPending(pending: PendingFunding): void {
   clearPendingFunding(pending.endpoint, pending.callerPubkey, pending.creditId, pending.fundId);
 }
 
-/** Terminal pre-payment answers that prove no useful retry remains. */
-function shouldClearPending(err: unknown): boolean {
-  return (
-    isPermanentRefusal(err) || (err instanceof DvmError && err.code === "lightning_unavailable")
-  );
-}
-
-function manualFundingTerminal(err: unknown, pending: PendingFunding): boolean {
+/**
+ * DVM answers that definitively resolve a Lightning funding intent. `lightning_unavailable` only
+ * counts before an invoice exists: once one was issued it may have been paid, and the DVM's
+ * receive wallet being unreachable says nothing about that.
+ */
+function lightningFundingTerminal(err: unknown, pending: PendingFunding): boolean {
   if (!(err instanceof DvmError)) return false;
   if (err.code === "lightning_invoice_expired") return true;
-  if (err.code === "lightning_unavailable") return !pending.bolt11;
+  if (err.code === "lightning_unavailable") {
+    return !pending.bolt11 && pending.paymentOutcome === undefined;
+  }
   return isPermanentRefusal(err);
 }
 
-/** Local expiry outcome for an invoice we deliberately did not put on the wire. */
-function expiredFunding(base: {
+/**
+ * The invoice is past its local expiry while the DVM still reports the funding pending. The
+ * intent is retained: a payment sent before expiry may not have been observed yet.
+ */
+function expiredUnresolvedFunding(base: {
   creditId: string;
   fundId: string;
   rail: CreditFundRail;
 }): CreditFundOutcome {
   const error = new DvmError(
     "lightning_invoice_expired",
-    "The original Lightning funding invoice expired before it was confirmed.",
-    "Re-run the funding to start a new intent with a new funding id."
+    "The original Lightning funding invoice expired before the DVM confirmed it.",
+    "Re-run this funding or check 'dvm credit balance' to reconcile the saved funding id. A new invoice is only issued once the DVM resolves this one."
   );
   return {
     ...base,
     status: "refused",
     error,
     display:
-      "The original Lightning invoice expired before it was funded. It was cleared and will not be polled again.",
+      "The original Lightning invoice expired and the DVM has not resolved it yet. Nothing was paid on this attempt; the funding id is saved so a payment sent before expiry can still be credited.",
     hint: error.hint,
+  };
+}
+
+/** An inconclusive answer for an issued invoice whose payment status is unknown. */
+function unresolvedFunding(
+  base: { creditId: string; fundId: string; rail: CreditFundRail },
+  err: unknown
+): CreditFundOutcome {
+  const error =
+    err instanceof DvmError
+      ? err
+      : new DvmError("provider_error", "Could not confirm the Lightning funding.");
+  return {
+    ...base,
+    status: "refused",
+    error,
+    display: `This Lightning funding is unresolved (${error.code}). Its original funding id is saved; payment may already have happened.`,
+    hint: "Re-run this funding or check 'dvm credit balance' to reconcile the saved funding id before paying again.",
+  };
+}
+
+/** The DVM definitively refused a funding whose payment had already left the wallet. */
+function paidButRefused(
+  args: FundCreditArgs,
+  base: { creditId: string; fundId: string; rail: "lightning" },
+  spend: LightningSpend,
+  spendDisplay: string,
+  err: DvmError
+): CreditFundOutcome {
+  // Composed, never the server's own `display`: that copy is written for
+  // a caller who hasn't paid, so `lightning_invoice_expired` relays as
+  // "Nothing was charged" — the one sentence that must not reach someone
+  // whose sats have left. "Won't be crediting it" covers both shapes the
+  // DVM answers with here: a refusal, and `credit_funding_unrecorded`,
+  // which took the payment and lost the row.
+  return {
+    ...base,
+    ...spend,
+    status: "refused",
+    error: err,
+    display: `The Lightning payment went out, but the DVM won't be crediting it (${err.code}). ${err.message} ${spendDisplay}`,
+    hint: `Don't fund again — a fresh funding id issues a second invoice. The payment is on record ('dvm wallet history'); quote funding id ${base.fundId} to the operator of ${args.ref.endpoint}.`,
+  };
+}
+
+/** A recorded payment the DVM has neither confirmed nor definitively refused. */
+function paidAwaitingSettlement(
+  base: { creditId: string; fundId: string; rail: "lightning" },
+  spend: LightningSpend,
+  spendDisplay: string,
+  unconfirmed?: DvmError
+): CreditFundOutcome {
+  return {
+    ...base,
+    ...spend,
+    status: "settlement_pending",
+    ...(unconfirmed ? { error: unconfirmed } : {}),
+    display: unconfirmed
+      ? `The Lightning payment went out and is recorded, but the DVM couldn't be reached to confirm it (${unconfirmed.code}). It credits the balance the next time it hears from you — nothing is lost. ${spendDisplay}`
+      : `The Lightning payment went out and is recorded, but the DVM hasn't seen it land yet. It credits the balance on your next call — nothing is lost. ${spendDisplay}`,
+    // Both verbs poll the durable `(credit_id, fund_id)`: neither can mint a
+    // second invoice while this intent remains in flight.
+    hint: "Re-run this funding or check with 'dvm credit balance' — both re-poll the original funding id, and any next request makes the DVM look for settlement.",
   };
 }
 

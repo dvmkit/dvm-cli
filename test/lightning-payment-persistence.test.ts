@@ -178,6 +178,30 @@ describe("pending Lightning credit accounting", () => {
     expect(outcome.display).toContain("1 sats unitemized wallet fee");
   });
 
+  it("recovers a paid funding from disk after its invoice expired locally", async () => {
+    recordPendingFunding({
+      ...lightningPending({
+        routingFeeMsats: 4_000,
+        totalWalletFeeMsats: 5_000,
+        unitemizedWalletFeeMsats: 1_000,
+        walletDebitMsats: 1_228_000,
+      }),
+      expiresAtMs: Date.now() - 60_000,
+    });
+
+    const outcome = await settleRecordedFunding();
+
+    expect(outcome).toMatchObject({
+      status: "funded",
+      creditId: CREDIT_ID,
+      fundId: FUND_ID,
+      walletDebitSats: 1_228,
+      totalWalletFeeSats: 5,
+      paymentOutcome: "paid",
+    });
+    expect(loadPendingFunding(ENDPOINT, CALLER_PUBKEY, CREDIT_ID)).toBeUndefined();
+  });
+
   it("returns known totals and a null split when the wallet omitted routing fee", async () => {
     recordPendingFunding(
       lightningPending({
