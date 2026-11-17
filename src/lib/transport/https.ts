@@ -79,10 +79,10 @@ function jobTokenHeader(jobToken: string | undefined): Record<string, string> {
   return jobToken ? { "X-Job-Token": jobToken } : {};
 }
 
-function messagePollUnreachable(jobId: string): DvmError {
+function messagePollUnreachable(jobId: string, operation = "fetch messages"): DvmError {
   return new DvmError(
     "provider_unreachable",
-    `Could not reach the provider to fetch messages for job ${jobId}.`,
+    `Could not reach the provider to ${operation} for job ${jobId}.`,
     "The provider may be down or unreachable from this network. Retry once it is back."
   );
 }
@@ -697,6 +697,7 @@ export class HttpsTransport implements Transport {
           `The provider may still be working. Retry with 'dvm status ${jobId}'.`
         );
       }
+      if (err instanceof TypeError) throw messagePollUnreachable(jobId, "read status");
       throw err;
     }
   }
@@ -867,13 +868,13 @@ export class HttpsTransport implements Transport {
       throw new DvmError("not_supported", "HTTPS stream requires a provider with an endpoint.");
     }
     const url = `${endpoint}/v1/job/${jobId}/messages?after=${afterSeq}`;
-    const res = await dvmFetch(url, {
+    const res = await readMessagePollBody(() => dvmFetch(url, {
       headers: { Accept: "text/event-stream", ...jobTokenHeader(options?.jobToken) },
       signal: options?.signal,
-    });
+    }), jobId);
 
     if (!res.ok) {
-      const text = await res.text();
+      const text = await readMessagePollBody(() => res.text(), jobId);
       const credentialErr = jobCredentialError(res.status, text);
       if (credentialErr) throw credentialErr;
       throw providerResponseError("provider_error", `stream failed (${res.status}): ${text}`);
@@ -885,7 +886,7 @@ export class HttpsTransport implements Transport {
     const contentType = res.headers.get("content-type") ?? "";
     const recognize = callerMessageRecognizer(jobId, endpoint);
     if (contentType.includes("application/json")) {
-      const body = (await res.json()) as { messages?: Message[] };
+      const body = (await readMessagePollBody(() => res.json(), jobId)) as { messages?: Message[] };
       const messages = (body.messages ?? []).map(recognize);
       const last = messages.at(-1);
       const reason: StreamResult["reason"] =

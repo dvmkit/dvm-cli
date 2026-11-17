@@ -89,6 +89,20 @@ describe.each(reads)("HTTPS $name deadlines", (read) => {
   });
 });
 
+describe("HTTPS refused read connections", () => {
+  it.each(["status", "stream", "poll"])("maps a refused %s connection to bounded provider_unreachable guidance", async (boundary) => {
+    const server = createServer();
+    const endpoint = await listen(server);
+    await close(server);
+    servers.delete(server);
+    const transport = new HttpsTransport();
+    const read = boundary === "status" ? transport.status("job-1", { endpoint })
+      : boundary === "stream" ? transport.stream("job-1", 0, { endpoint })
+      : transport.getMessages("job-1", 0, { endpoint });
+    await expect(read).rejects.toMatchObject({ code: "provider_unreachable", message: expect.not.stringContaining(endpoint) });
+  });
+});
+
 describe("HTTPS payment send deadlines", () => {
   it.each([undefined, 201, 402])("bounds a payment send including its response body (HTTP %s)", async (status) => {
     const timeout = AbortSignal.timeout.bind(AbortSignal);
