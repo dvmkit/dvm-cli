@@ -1,3 +1,5 @@
+import { MANDATE_RECOVERY_DISPLAY } from "../lib/mandate-recovery";
+import { info } from "../lib/output";
 import {
   DvmError,
   isPublicRequestId,
@@ -66,18 +68,22 @@ async function resumeRequest(requestId: string, opts: RequestResumeOptions): Pro
   const timeoutMs = parseTimeout(opts.timeout);
   const transport = createDvmTransport();
   try {
-    await transport.requestResume(
-      { endpoint: intent.endpoint },
-      requestId,
-      signedIntentEnvelope(intent, signer.privkey, requestRecoveryPath("request-resume", requestId)),
-      timeoutMs === undefined ? undefined : { timeoutMs }
-    );
+    const send = (omitMandate: boolean) => transport.requestResume(
+      { endpoint: intent.endpoint }, requestId,
+      signedIntentEnvelope(intent, signer.privkey, requestRecoveryPath("request-resume", requestId), omitMandate),
+      timeoutMs === undefined ? undefined : { timeoutMs });
+    try { await send(false); }
+    catch (error) {
+      if (!(error instanceof DvmError) || error.code !== "invalid_mandate" || !intent.mandate) throw error;
+      info(MANDATE_RECOVERY_DISPLAY);
+      await send(true);
+    }
   } catch (error) {
     if (error instanceof DvmError && error.code === "request_id_exists") {
       await requestResult(requestId, opts);
       return;
     }
-    if (error instanceof DvmError && error.code === "request_not_accepted") throw error;
+    if (error instanceof DvmError && ["request_not_accepted", "invalid_mandate"].includes(error.code)) throw error;
     throw new DvmError(
       "request_outcome_unknown",
       `The provider did not complete recovery for request ${requestId}.`,

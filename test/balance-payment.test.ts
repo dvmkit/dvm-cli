@@ -31,7 +31,7 @@ const policy = { maxTotalMsats: 4_000, maxIncrementMsats: 2_000, autoPayBelowMsa
 const ask: PaymentRequestContent = { amount_msats: 1_500, reason: "Additional work", credit: { amount_micro: 1_500, currency: "usd" } };
 const token = "ab".repeat(32);
 const messagesPath = "/v1/job/job-a/messages";
-const received: Array<NonNullable<PaymentContent["credit"]>> = [];
+const received: Array<Extract<NonNullable<PaymentContent["credit"]>, { signature: string }>> = [];
 let server: Server;
 let endpoint: string;
 let advertisement = true;

@@ -1,3 +1,5 @@
+import { MANDATE_RECOVERY_DISPLAY, withoutMandate } from "../lib/mandate-recovery";
+import { standingMandateOutput } from "../lib/standing-mandate";
 import { terminalSettlementReport } from "../lib/job-settlement";
 import { hasUnsavedJobState } from "../lib/job-persistence";
 import { completionSnapshot } from "../lib/completion-hints";
@@ -95,8 +97,15 @@ async function requestResultWithWarnings(argument: string, opts: RequestResultOp
     requestRecoveryPath("request-result", requestId)
   );
   let receipt: JobReceipt;
+  let reduced = false;
   try {
-    receipt = await transport.requestResult({ endpoint: intent.endpoint }, requestId, envelope);
+    try { receipt = await transport.requestResult({ endpoint: intent.endpoint }, requestId, envelope); }
+    catch (error) {
+      if (!(error instanceof DvmError) || !["invalid_mandate", "request_not_found"].includes(error.code) || !intent.mandate) throw error;
+      receipt = await transport.requestResult({ endpoint: intent.endpoint }, requestId,
+        signedIntentEnvelope(intent, signer.privkey, requestRecoveryPath("request-result", requestId), true));
+      reduced = true;
+    }
   } catch (err) {
     if (isIdentityFailure(err)) throw recordRequestResultIdentityFailure(err, intent);
     throw err;
@@ -152,6 +161,8 @@ async function requestResultWithWarnings(argument: string, opts: RequestResultOp
     ? { creditId: originalData.credit_id, drawId: originalData.draw_id, callerPubkey: intent.callerPubkey }
     : undefined;
   const restored = {
+    mandate: reduced ? undefined : intent.mandate,
+    mandateUnavailable: reduced ? MANDATE_RECOVERY_DISPLAY : intent.mandateUnavailable,
     ...(creditBinding ? { creditBinding } : {}),
     ...(intent.creditOnly ? { creditOnly: intent.creditOnly } : {}),
     requestId,
@@ -226,6 +237,7 @@ async function requestResultWithWarnings(argument: string, opts: RequestResultOp
 
   const { wallet_remaining } = await terminalSettlementReport(receipt.jobId);
   if (opts.human) {
+    if (reduced) info(MANDATE_RECOVERY_DISPLAY);
     info(`Recovered request ${requestId} as job ${receipt.jobId} (${receipt.status}).`);
     if (wallet_remaining) info(wallet_remaining.display);
     if (confirmed.length > 0) {
@@ -238,6 +250,7 @@ async function requestResultWithWarnings(argument: string, opts: RequestResultOp
     request_id: requestId,
     jobId: receipt.jobId,
     status: receipt.status,
+    ...standingMandateOutput(recovered),
     ...(receipt.transactionHash ? { transaction_hash: receipt.transactionHash } : {}),
     ...dvmIdentity(intent.dvmId, intent.capability),
     ...(receipt.summary !== undefined ? { summary: receipt.summary } : {}),
@@ -291,7 +304,8 @@ export function requestNotFound(requestId: string, unknownHint: string): DvmErro
 export function signedIntentEnvelope(
   intent: RequestIntent,
   privkey: string,
-  route: string
+  route: string,
+  omitMandate = false
 ): JobEnvelope {
   const body = intent.body;
   const data = body.data;
@@ -305,7 +319,7 @@ export function signedIntentEnvelope(
       typeof body.params === "object" && body.params !== null && !Array.isArray(body.params)
         ? Object.entries(body.params as Record<string, string>)
         : undefined,
-    data: signDvmRequestData(privkey, data as Record<string, unknown>, {
+    data: signDvmRequestData(privkey, omitMandate ? withoutMandate(data as Record<string, unknown>) : data as Record<string, unknown>, {
       audience: intent.authAudience,
       method: "POST",
       path: canonicalRequestPath(new URL(route, `${intent.endpoint.replace(/\/$/, "")}/`).href),

@@ -29,7 +29,7 @@ export type PaymentApproval = "auto" | "explicit";
 
 export interface CreditPaymentIntent {
   approval?: PaymentApproval;
-  authorization: NonNullable<PaymentContent["credit"]>;
+  authorization: Extract<NonNullable<PaymentContent["credit"]>, { signature: string }>;
   request: PaymentRequestContent;
   /** Caller-priced consumption, pinned before send for replay after rate changes. */
   amountMsats?: number;
@@ -86,6 +86,8 @@ export type UnconfirmedPaymentSubmission =
     });
 
 export interface JobRecord {
+  mandate?: import("./standing-mandate").SignedStandingMandate;
+  mandateUnavailable?: string;
   /** A successful local cancel send; legacy terminal statuses do not establish caller intent. */
   callerCancelled?: true;
   /**

@@ -22,6 +22,8 @@ import lockfile from "proper-lockfile";
 import { parseUpfrontRailPayment, type UpfrontRailPayment } from "./upfront-payment";
 
 export interface RequestIntent {
+  mandate?: import("./standing-mandate").SignedStandingMandate;
+  mandateUnavailable?: string;
   /** Caller-priced rail charge persisted before its paid submit. */
   railPayment?: UpfrontRailPayment;
   v: 2;

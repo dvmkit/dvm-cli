@@ -1,3 +1,4 @@
+import { MANDATE_RECOVERY_DISPLAY, MANDATE_SUBMIT_DISPLAY, mandateRecoveryNotice } from "../mandate-recovery";
 /**
  * Read-side view of `wallet.pending_submissions[]`.
  *
@@ -146,8 +147,10 @@ export function formatPendingSubmission(view: PendingSubmissionView): string {
   const reqShort = `${view.request_id.slice(0, 8)}…${view.request_id.slice(-4)}`;
   const age = view.age_seconds === null ? "age unknown" : `${formatAge(view.age_seconds)} old`;
   const why = view.reclaim_error ? `: ${view.reclaim_error}` : "";
+  const notice = [MANDATE_RECOVERY_DISPLAY, MANDATE_SUBMIT_DISPLAY].find((text) => view.display.includes(text));
+  const mandate = notice ? ` ${notice}` : "";
   const readBack = view.public_request_id ? `; dvm request-result ${view.public_request_id}` : "";
-  return `${view.amount_sats} sats  ${view.endpoint}  (req ${reqShort}, ${age}, ${view.state}${why}${readBack})`;
+  return `${view.amount_sats} sats  ${view.endpoint}  (req ${reqShort}, ${age}, ${view.state}${why}${readBack})${mandate}`;
 }
 
 export interface ResumedSubmissionView {
@@ -181,6 +184,7 @@ export function describeResumedSubmissions(
     const locate = locateAdvice(outcome.entry, publicRequestId);
     if (outcome.kind === "shipped") {
       const jobId = outcome.jobId ?? null;
+      const mandateNotice = mandateRecoveryNotice(outcome.entry.context).mandateUnavailable;
       views.push({
         request_id: outcome.entry.request_id,
         ...(publicRequestId ? { public_request_id: publicRequestId } : {}),
@@ -188,7 +192,7 @@ export function describeResumedSubmissions(
         amount_sats: outcome.entry.amount_sats,
         job_id: jobId,
         display: jobId
-          ? `${outcome.entry.amount_sats} sats paid to ${outcome.entry.endpoint} was reconciled — the job resumed as ${jobId}. Look it up with \`dvm status ${jobId}\`.`
+          ? `${outcome.entry.amount_sats} sats paid to ${outcome.entry.endpoint} was reconciled — the job resumed as ${jobId}. Look it up with \`dvm status ${jobId}\`.${mandateNotice ? ` ${mandateNotice}` : ""}`
           : `${outcome.entry.amount_sats} sats paid to ${outcome.entry.endpoint} was reconciled, but the provider returned no job id. ${locate}`,
       });
     } else if (outcome.kind === "already_accepted") {
@@ -473,7 +477,7 @@ function toView(entry: PendingSubmission, nowMs: number, reclaimUnsaved: boolean
       state,
       reclaimAt,
       nowMs
-    ),
+    ) + (mandateRecoveryNotice(entry.context).mandateUnavailable ? ` ${mandateRecoveryNotice(entry.context).mandateUnavailable}` : ""),
   };
 }
 

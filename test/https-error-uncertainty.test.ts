@@ -4,6 +4,28 @@ import { HttpsTransport } from "../src/lib/transport/https";
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe.each(["flat", "nested"])("%s invalid mandate reasons", (shape) => {
+  it.each([
+    { reason: "mandate.expires_at_ms must be in the future", expiry: true },
+    { reason: "mandate.max_total_micro must cover the upfront price", expiry: false },
+    { reason: "The credit currency does not match", expiry: false },
+  ])("preserves the provider reason: $reason", async ({ reason, expiry }) => {
+    const fields = { message: reason };
+    const body = shape === "flat" ? { error: "invalid_mandate", ...fields }
+      : { error: { code: "invalid_mandate", ...fields } };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
+      status: 400, headers: { "Content-Type": "application/json" },
+    })));
+    const error = await new HttpsTransport().submit({ endpoint: "https://provider.invalid" }, {
+      capability: "echo", input: "x",
+    }).catch((error: unknown) => error);
+    expect(error).toMatchObject({ code: "invalid_mandate", message: expect.stringContaining(reason),
+      proseSources: { message: "provider" } });
+    if (expiry) expect(error).toMatchObject({ hint: expect.stringContaining("shorter --mandate-until") });
+    else expect((error as { hint?: string }).hint ?? "").not.toMatch(/clock|mandate-until/);
+  });
+});
+
 describe.each([400, 402])("nested HTTP %s submission errors", (status) => {
   it.each([
     { label: "outer payment uncertainty", outer: { payment_state: "unknown" }, nested: {}, expected: { payment_state: "unknown" } },

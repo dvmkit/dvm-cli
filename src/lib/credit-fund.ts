@@ -2038,6 +2038,7 @@ async function fundOverX402(
       await processX402BatchResponseForWallet({
         wallet,
         depositMicro: pending.targetMicro,
+        paymentHeader: pending.paymentHeader,
         paymentResponse: result.x402PaymentResponse,
         channelId: pending.channelId,
       });
