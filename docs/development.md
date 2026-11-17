@@ -62,3 +62,11 @@ SDK lock and pool wrappers preserve their callback
 results. When a construction changes, extend the analyzer or review the precise
 source classification. Do not
 exclude a local code to make the check pass. Stale classifications also fail.
+
+## Internal-error diagnostics
+
+These diagnostic fields are outside the promised core: the `internal` fallback includes `error_name` and optional `error_code`; foreign messages and full stacks stay off stdout and stderr.
+Optional `error_site` lists up to five identifier-only function names from the CLI package, innermost first.
+Optional `error_log` points to private local details, using `~/` for paths under home; it is omitted if logging fails.
+Logs in `<CONFIG_DIR>/logs/internal-errors.jsonl` contain full messages, stacks, and up to five causes; each file is capped at 256 KiB with one `.1` rotation, and oversized single records are skipped.
+Do not read the log into the conversation; it can hold secrets, so give the human its path to inspect or attach to a report.

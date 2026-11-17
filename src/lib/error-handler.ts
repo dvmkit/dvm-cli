@@ -8,6 +8,12 @@ import {
   withOutputWarningContext,
 } from "./output";
 
+import { readFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { appendInternalErrorLog } from "./internal-error-log";
+
 import { takeCreditNoticeFields } from "./credit-notice";
 import { takeFeedbackNoticeFields } from "./feedback-notice";
 
@@ -117,11 +123,15 @@ export function handleError(err: unknown, human?: boolean, jsonFields?: ErrorJso
   }
 
   // Unknown errors may come from any dependency. Their messages are unbounded
-  // third-party content, so publish only a bounded class/code fingerprint.
+  // third-party content, so publish only bounded identifiers and a local log pointer.
   const diagnostic = unknownErrorDiagnostic(err);
-  const message = `An unexpected internal error occurred (${diagnostic.label}).`;
+  const site = unknownErrorSite(err);
+  const log = appendInternalErrorLog(err, diagnostic);
+  const label = site.length ? `${diagnostic.label} at ${site.join(" < ")}` : diagnostic.label;
+  const message = `An unexpected internal error occurred (${label}).`;
   if (human) {
     info(`Error: ${message}`);
+    if (log) info(`Details saved to ${log}`);
   } else {
     json({
       ...jsonFields,
@@ -129,6 +139,8 @@ export function handleError(err: unknown, human?: boolean, jsonFields?: ErrorJso
         code: "internal",
         message,
         error_name: diagnostic.name,
+        ...(site.length ? { error_site: site } : {}),
+        ...(log ? { error_log: log } : {}),
         ...(diagnostic.code ? { error_code: diagnostic.code } : {}),
       },
       ...takeCreditNoticeFields(),
@@ -153,6 +165,8 @@ export function unknownErrorDiagnostic(err: unknown): {
   const code = unknownErrorCode(err);
   return { name, ...(code ? { code } : {}), label: code ? `${name}:${code}` : name };
 }
+
+const CLI_PACKAGE_ROOT = findCliPackageRoot();
 
 const ERROR_NAME_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/;
 
@@ -182,5 +196,49 @@ function unknownErrorCode(err: unknown): string | undefined {
     return typeof code === "string" && /^E[A-Z0-9_]{1,31}$/.test(code) ? code : undefined;
   } catch {
     return undefined;
+  }
+}
+
+function unknownErrorSite(err: unknown): string[] {
+  try {
+    if (!CLI_PACKAGE_ROOT || !(err instanceof Error) || typeof err.stack !== "string" || typeof err.message !== "string") return [];
+    const lines = err.stack.split("\n");
+    const headerLines = err.message.split("\n").length;
+    // Messages can embed frame-shaped lines; a rewritten header is not trusted.
+    if (!lines.slice(0, headerLines).join("\n").endsWith(err.message)) return [];
+    const names: string[] = [];
+    for (const frame of lines.slice(headerLines)) {
+      if (frame.includes("node:")) continue;
+      const match = /^\s+at (?:async )?([^()]+) \((.*):\d+:\d+\)$/.exec(frame);
+      if (!match) continue;
+      const name = match[1].replace(/^new /, "").replace(/ \[as [^\]]+\]$/, "");
+      const segments = name.split(".");
+      // The identifier length limit alone still admits encoded private keys.
+      if (name.length > 128 || !segments.every((segment) => ERROR_NAME_PATTERN.test(segment)
+        && !/^(?:[a-f0-9]{64}|nsec1[a-z0-9]{58})$/i.test(segment))) continue;
+      let location = match[2];
+      if (location.startsWith("file:")) location = fileURLToPath(location);
+      if (!isAbsolute(location)) continue;
+      const fromPackage = relative(CLI_PACKAGE_ROOT, location);
+      if (isAbsolute(fromPackage) || fromPackage === ".." || fromPackage.startsWith(".." + sep)) continue;
+      names.push(name);
+      if (names.length === 5) break;
+    }
+    return names;
+  } catch {
+    return [];
+  }
+}
+
+function findCliPackageRoot(): string | undefined {
+  let dir = import.meta.dirname;
+  for (;;) {
+    try {
+      const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { name?: string };
+      if (manifest.name === "@dvmkit/dvm-cli") return dir;
+    } catch { /* Standalone bundles may have no package manifest. */ }
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
   }
 }
