@@ -60,11 +60,11 @@ If a payment lands as provider credit, it has not necessarily paid the open char
 
 For a long, time-sensitive job, use your harness's scheduled task, routine, or automation to wake you between turns. A hosted agent's sandbox pauses; background `--wait` and `nohup` loops pause with it. Keep the background pattern above for always-on hosts only.
 
-Choose an interval shorter than the provider's payment ask deadline (`expires_at_ms`; Stakeout allows 30 minutes) and no longer than the alert delay the person accepts. Suggest 5–15 minutes, or the DVM's stated reading interval, within those limits. At job start, say: "I'll check every 10 minutes, so an alert can be up to 10 minutes late." Never promise "the moment". Explain that frequent checks use the person's agent allowance.
+Choose an interval shorter than the provider's payment ask deadline (`expires_at_ms`; Stakeout allows 30 minutes) and no longer than the alert delay the person accepts. Suggest 5–15 minutes, or the DVM's stated reading interval, within those limits. At job start, state the interval and give the delay as an estimate: "I'll check every 10 minutes, so it can take about 10 minutes for me to see a reading, longer if a check runs late." Never promise "the moment". Explain that frequent checks use the person's agent allowance.
 
-Save the job ID, spending policy, alert rule, handled message sequences, and schedule ID for each wake. Each check-in runs `dvm messages <job-id> --wait --until 2m` (or another short limit). Without `--after`, its first read can pay an already-open ask within the stored policy. Do not pass `--after`: an explicit cursor skips that first-read payment. `dvm status` and `dvm messages --no-stream` pay nothing.
+Save the job ID, spending policy, alert rule, handled message sequences, and schedule ID for each wake. Each check-in runs `dvm messages <job-id> --wait --until 2m` (or another short limit). Without `--after`, its first read can pay an already-open ask within the stored policy. Do not pass `--after`: an explicit cursor skips the first read's rewind to that open ask. `dvm status` and `dvm messages --no-stream` pay nothing.
 
-Relay each reading that meets the person's rule with its artifact, such as a picture, once. Persist handled `seq` values and skip them on later check-ins. Follow returned actions within authorization. Remove the schedule when the job ends (`next_action: null`) or the person stops it.
+Relay each reading that meets the person's rule with its artifact, such as a picture, once. Persist handled `seq` values and skip them on later check-ins. Follow returned actions within authorization. Remove the schedule when the job ends or the person stops it. A finished job returns `next_action: null`, or a `refund` action when money is left to reclaim: follow that action, and if `dvm status <job-id>` shows the job completed, failed, or cancelled, remove the schedule.
 
 ### Budgets
 
