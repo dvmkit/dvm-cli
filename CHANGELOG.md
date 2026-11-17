@@ -13,6 +13,19 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.21.0](https://github.com/dvmkit/dvm-cli/compare/v0.20.0...v0.21.0) (2026-11-17)
+
+
+### Features
+
+* **messages:** recognise mandate-paid asks and keep them within the signed limits ([#121](https://github.com/dvmkit/dvm-cli/issues/121)) ([c21eb65](https://github.com/dvmkit/dvm-cli/commit/c21eb6580985bee8ed50e53d791ff7b64dd5a9df))
+* **request:** sign a standing mandate when auto-pay limits pay from credit ([#119](https://github.com/dvmkit/dvm-cli/issues/119)) ([1f2f67b](https://github.com/dvmkit/dvm-cli/commit/1f2f67bd7b459138c8a36bce041e8743614e10c6))
+
+
+### Bug Fixes
+
+* **credit:** try landed credit before asking for a choice, and give usable commands in the hint ([#122](https://github.com/dvmkit/dvm-cli/issues/122)) ([5ee4568](https://github.com/dvmkit/dvm-cli/commit/5ee4568504e024a81d0731c1d0e2ab1a66e68beb))
+
 ## [0.20.0](https://github.com/dvmkit/dvm-cli/compare/v0.19.2...v0.20.0) (2026-11-17)
 
 
