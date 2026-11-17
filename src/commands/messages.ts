@@ -61,7 +61,7 @@ export async function messages(jobId: string, opts: MessagesOptions): Promise<vo
   if ((opts.until !== undefined && !opts.wait) || (opts.wait && opts.stream === false)) {
     throw new DvmError("invalid_arguments", "Use --until with --wait, and --wait with streaming enabled.");
   }
-  // Refuse a malformed limit before reading or changing any job state.
+  // Report a malformed limit as a caller argument error.
   const waitDuration = opts.wait ? parseDurationMs(opts.until ?? "12h") : undefined;
   const access = resolveJobAccess(jobId, opts);
   return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => messagesWithAccess(jobId, opts, access, waitDuration), opts.human));

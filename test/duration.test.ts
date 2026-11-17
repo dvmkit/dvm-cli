@@ -5,6 +5,7 @@ describe("parseDurationMs", () => {
   it.each([
     ["30s", 30_000],
     ["12h", 43_200_000],
+    ["365d", 31_536_000_000],
     ["1h30m", 5_400_000],
     ["9h15m", 33_300_000],
     ["9h30m", 34_200_000],
@@ -16,11 +17,22 @@ describe("parseDurationMs", () => {
 
   // A clock time, a fraction, an out-of-order compound or an ISO time is a caller
   // input error with guidance, not an internal failure.
-  it.each(["9am", "7.5h", "30m1h", "1h1h", "", "h", "2026-11-17T06:00:00Z"])("refuses %j as invalid_arguments naming the accepted forms", (input) => {
+  it.each(["9am", "7.5h", "30m1h", "1h1h", "", "h", "2026-11-17T06:00:00Z",
+    "366d", "365d1s", "9007199254740992s", `${"9".repeat(400)}d`])("refuses %j as invalid_arguments naming the accepted forms", (input) => {
     expect(() => parseDurationMs(input)).toThrow(expect.objectContaining({
       code: "invalid_arguments",
       hint: expect.stringContaining("1h30m"),
     }));
+  });
+
+  it.each([
+    [0, "0s"],
+    [999, "1s"],
+    [90_000, "1m30s"],
+    [34_200_000, "9h30m"],
+    [93_784_000, "1d2h3m4s"],
+  ])("formats %i ms as %s", (ms, expected) => {
+    expect(formatDurationMs(ms)).toBe(expected);
   });
 
   // The wait-limit hint prints formatDurationMs output for the caller to pass back as --until.

@@ -1,3 +1,4 @@
+import { isTransientJobReadError } from "./job-read-error";
 import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
 import { computeNextAction, paymentCountHint, paymentInFlightHint, pollNextAction, type NextAction, type PaymentPolicyContext } from "./next-action";
@@ -32,6 +33,8 @@ import { claimInboundPayments, type RefundClaim, withRefundNextAction } from "./
 
 export interface StreamLoopOptions {
   jobId: string;
+  /** Waits reconnect failed reads until their outer deadline. Never applies to sends. */
+  retryUnreachableReads?: boolean;
   transport: Transport;
   provider: ProviderRef;
   policy?: JobBudgetPolicy;
@@ -99,6 +102,8 @@ export interface AutoPayment {
  */
 export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopResult> {
   const { jobId, transport, provider } = opts;
+  const recoverableRead = (error: unknown) => opts.retryUnreachableReads
+    ? isTransientJobReadError(error) : isMessagePollTimeout(error);
   if (hasUnsavedJobState()) return {
     messages: [], autoPayments: [], refunds: [], cursor: opts.afterSeq,
     nextAction: pollNextAction(jobId, "Local state may lag; refresh this job before another payment."),
@@ -198,7 +203,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           // AbortError propagates from fetch rather than from reader.read()
           // (which parseSSEStream catches). Break gracefully so
           // streamToCompletion can synthesise a poll action.
-          if (isAbortError(err) || (deadline !== undefined && isMessagePollTimeout(err))) break;
+          if (isAbortError(err) || (deadline !== undefined && recoverableRead(err))) break;
           throw err;
         }
         batchMessages = result.messages.filter((message) => message.seq > cursor);
@@ -209,7 +214,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           batchMessages = (await transport.getMessages(jobId, cursor, provider, pollOptions))
             .filter((message) => message.seq > cursor);
         } catch (err) {
-          if (deadline !== undefined && isMessagePollTimeout(err)) break;
+          if (deadline !== undefined && recoverableRead(err)) break;
           throw err;
         }
         for (const msg of batchMessages) {
@@ -261,7 +266,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
             break;
           }
         } catch (error) {
-          if (!isMessagePollTimeout(error) && !(error instanceof DvmError &&
+          if (!recoverableRead(error) && !(error instanceof DvmError &&
               ["payment_settling", "payment_request_not_pending"].includes(error.code))) throw error;
           paymentUnresolved = true;
         }
@@ -340,7 +345,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           .filter((message) => message.seq > cursor);
       }
     } catch (err) {
-      if (deadline === undefined || !isMessagePollTimeout(err)) throw err;
+      if (deadline === undefined || !recoverableRead(err)) throw err;
     }
     if (recheck.length > 0) {
       for (const msg of recheck) opts.onMessage?.(msg);

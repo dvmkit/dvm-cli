@@ -1,6 +1,7 @@
+import { isTransientJobReadError } from "./job-read-error";
 import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
-import { DvmError, isAbortError, type Message } from "@dvmkit/sdk/internal";
+import { DvmError, type Message } from "@dvmkit/sdk/internal";
 import { loadJob } from "./job-store";
 import { createMessageAppendSession, maxSeq } from "./messages";
 import { loadAnsweredYieldSeqs, answeredYieldSeqs, reconcilePaymentRequestHistory, settleRecordedPayments, JOB_READ_TIMEOUT_MS } from "./yield-state";
@@ -53,7 +54,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     while (now() < deadline) {
       try { return await read(); }
       catch (error) {
-        if (!isAbortError(error) && !(error instanceof DvmError && error.code === "timeout")) throw error;
+        if (!isTransientJobReadError(error)) throw error;
         await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, Math.max(0, deadline - now()))));
         backoffMs = Math.min(backoffMs * 2, 30_000);
       }
@@ -152,7 +153,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     // streamLoop handles read timeouts at the read boundary. Payment failures
     // must propagate because the provider may already have accepted the send.
     const next = await streamLoop({
-      ...opts, onMessage, messageAppendSession, afterSeq: streamAfter,
+      ...opts, onMessage, messageAppendSession, afterSeq: streamAfter, retryUnreachableReads: true,
       timeoutMs: readOptions().timeoutMs,
     });
     collectMessages(next.messages);

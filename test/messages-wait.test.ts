@@ -168,6 +168,105 @@ describe("messages wait", () => {
     }
   }, 15_000);
 
+  it.each(["status", "stream"])("survives refused HTTP %s reads after progress and pays a later ask", async (boundary) => {
+    let disconnected = false;
+    let refused = 0;
+    let streams = 0;
+    const server = createServer((request, response) => {
+      const isStream = request.headers.accept === "text/event-stream";
+      const target = boundary === "stream" ? isStream : !request.url?.includes("/messages");
+      if (disconnected && target && refused < 2) {
+        refused++;
+        request.socket.destroy();
+        return;
+      }
+      if (isStream) {
+        response.setHeader("content-type", "text/event-stream");
+        const batch = streams++ === 0 ? [msg(1, "progress", { percent_complete: 10 })]
+          : streams === 2 ? [msg(2, "payment-request", { amount_msats: 1000, reason: "Next block" })]
+          : [msg(3, "complete", { summary: "Done" })];
+        for (const message of batch) response.write(`data: ${JSON.stringify(message)}\n\n`);
+        response.end();
+        disconnected = true;
+      } else {
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify(request.url?.includes("/messages") ? { messages: [] } : { status: "processing" }));
+      }
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const originalEndpoint = provider.endpoint;
+    provider.endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    seams.transport = new HttpsTransport();
+    try {
+      await messages(`http-recovery-${boundary}`, { wait: true, until: "20s" });
+      expect(refused).toBe(2);
+      expect(streamedSeqs()).toEqual([1, 2, 3]);
+      expect(seams.pay).toHaveBeenCalledTimes(1);
+      expect(output().next_action).toBeNull();
+    } finally {
+      provider.endpoint = originalEndpoint;
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 15_000);
+
+  it("propagates a dropped payment POST without reconnecting or sending it again", async () => {
+    let posts = 0;
+    let streams = 0;
+    const server = createServer((request, response) => {
+      if (request.method === "POST") {
+        posts++;
+        request.socket.destroy();
+      } else if (request.headers.accept === "text/event-stream") {
+        streams++;
+        response.setHeader("content-type", "text/event-stream");
+        response.end(`data: ${JSON.stringify(msg(1, "payment-request", { amount_msats: 1000, reason: "Next block" }))}\n\n`);
+      } else {
+        response.setHeader("content-type", "application/json");
+        response.end('{"status":"processing"}');
+      }
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const originalEndpoint = provider.endpoint;
+    provider.endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    seams.transport = new HttpsTransport();
+    seams.pay.mockImplementationOnce((jobId, _request, _policy, transport, ref) =>
+      transport.sendMessage(jobId, { type: "payment", content: { amount_msats: 1000 } }, ref));
+    try {
+      await expect(messages("http-payment-drop", { wait: true, until: "3s" })).rejects.toBeInstanceOf(TypeError);
+      expect(posts).toBe(1);
+      expect(streams).toBe(1);
+      expect(seams.pay).toHaveBeenCalledTimes(1);
+    } finally {
+      provider.endpoint = originalEndpoint;
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it.each(["status", "stream", "poll"])("retries unreachable %s reads until the wait limit", async (boundary) => {
+    vi.useFakeTimers();
+    transport([]);
+    const failure = new DvmError("provider_unreachable", "Read unavailable");
+    if (boundary === "status") vi.mocked(seams.transport.status).mockRejectedValue(failure);
+    else if (boundary === "stream") vi.mocked(seams.transport.stream!).mockRejectedValue(failure);
+    else {
+      seams.transport.stream = undefined;
+      vi.mocked(seams.transport.getMessages).mockRejectedValue(failure);
+    }
+    const start = Date.now();
+    const pending = messages(`unreachable-${boundary}`, { wait: true, until: "3s" })
+      .then(() => undefined, (error: unknown) => error);
+    await vi.runAllTimersAsync();
+    expect(await pending).toBeUndefined();
+    expect(Date.now() - start).toBe(3000);
+    expect(output().next_action).toMatchObject({ type: "poll", hint: expect.stringContaining("wait limit (3s)") });
+    if (boundary === "status") expect(output().next_action.hint).toContain("state is unknown");
+    expect(seams.pay).not.toHaveBeenCalled();
+  });
+
   it("returns an over-threshold charge without paying", async () => {
     transport([[msg(1, "payment-request", { amount_msats: 3000, reason: "More work" })]]);
     await messages("wait-expensive", { wait: true });
@@ -379,9 +478,9 @@ describe("messages wait", () => {
     expect(seams.lines.at(-1)).toMatchObject({ event: "error", error: { code: "payment_cap_exceeded" } });
   });
 
-  it("propagates non-timeout transport failures", async () => {
+  it("propagates fatal transport failures", async () => {
     transport([]);
-    const failure = new DvmError("provider_unreachable", "Connection lost");
+    const failure = new DvmError("provider_error", "Read refused");
     vi.mocked(seams.transport.stream!).mockRejectedValue(failure);
     await expect(messages("wait-failed", { wait: true })).rejects.toBe(failure);
     expect(seams.transport.close).toHaveBeenCalled();
@@ -698,16 +797,18 @@ describe("terminal JSON incremental reads", () => {
   });
 });
 
-it.each(["timeout", "AbortError"])("does not reconnect after %s inside a payment step", async (code) => {
+it.each(["timeout", "AbortError", "provider_unreachable", "TypeError"])("does not reconnect after %s inside a payment step", async (code) => {
   vi.useFakeTimers();
   const stream = transport([[msg(5, "payment-request", { amount_msats: 1000, reason: "One block" })]]);
-  const failure = code === "timeout" ? new DvmError("timeout", "Payment reply lost") : new DOMException("Payment reply lost", "AbortError");
+  const failure = code === "AbortError" ? new DOMException("Payment reply lost", "AbortError")
+    : code === "TypeError" ? new TypeError("fetch failed") : new DvmError(code, "Payment reply lost");
   seams.pay.mockRejectedValueOnce(failure);
   const pending = messages(`payment-${code}`, { wait: true, until: "3s" })
     .then(() => undefined, (error: unknown) => error);
   await vi.runAllTimersAsync();
   expect(await pending).toBe(failure);
   expect(stream).toHaveBeenCalledTimes(1);
+  expect(seams.pay).toHaveBeenCalledTimes(1);
   expect(seams.transport.status).toHaveBeenCalledTimes(1);
   expect(seams.transport.close).toHaveBeenCalledTimes(1);
 });
@@ -745,15 +846,16 @@ it("names decline and cancel for an unconfirmed send this CLI cannot re-send", a
 
 // These reads may time out while a long-running provider remains healthy.
 describe("wait metadata read retries", () => {
-  it.each(["status", "initial history", "terminal history"])("reconnects with backoff after a %s timeout", async (boundary) => {
+  it.each(["status", "initial history", "terminal history"].flatMap((boundary) =>
+    ["timeout", "provider_unreachable"].map((code) => ({ boundary, code }))))("reconnects with backoff after $boundary fails with $code", async ({ boundary, code }) => {
     vi.useFakeTimers();
     const start = Date.now();
-    const jobId = `read-timeout-${boundary}`;
+    const jobId = `read-${code}-${boundary}`;
     saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
     const stream = transport([[msg(7, "prompt", { id: "question", text: "Continue?" })]],
       boundary === "initial history" ? "awaiting-input" : boundary === "terminal history" ? "completed" : "processing");
     const read = boundary === "status" ? seams.transport.status : seams.transport.getMessages;
-    vi.mocked(read).mockRejectedValueOnce(new DvmError("timeout", "Read timed out"));
+    vi.mocked(read).mockRejectedValueOnce(new DvmError(code, "Read failed"));
     const pending = messages(jobId, { wait: true, until: "1m" }).then(() => undefined, (error: unknown) => error);
     await vi.runAllTimersAsync();
     expect(await pending).toBeUndefined();
@@ -855,6 +957,51 @@ it("does not claim a job is running when the wait limit passes before any read",
 });
 
 describe("wait stream recovery", () => {
+  it("recovers an unreachable in-flight reconciliation read without paying the ask again", async () => {
+    vi.useFakeTimers();
+    const jobId = "wait-reconcile-unreachable";
+    const ask = msg(5, "payment-request", { amount_msats: 1000, reason: "Held block" });
+    const paid = { ...msg(6, "payment", { amount_msats: 1000 }), from: "requester" } as Message;
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+    markPaymentRequestInFlight(jobId, 5);
+    transport([[ask], [msg(7, "complete", { summary: "Done" })]]);
+    vi.mocked(seams.transport.getMessages).mockRejectedValueOnce(new DvmError("provider_unreachable", "Read unavailable"))
+      .mockResolvedValue([ask, paid]);
+    const first = await streamLoop({ jobId, provider, transport: seams.transport, policy, afterSeq: 4,
+      retryUnreachableReads: true, timeoutMs: 1000 });
+    expect(first).toMatchObject({ paymentInFlight: true, cursor: 4, nextAction: { type: "poll" } });
+    expect(loadJob(jobId)?.inFlightPaymentRequestSeqs).toEqual([5]);
+    expect(seams.pay).not.toHaveBeenCalled();
+    const pending = messages(jobId, { wait: true, until: "3s" });
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(output().next_action).toBeNull();
+    expect(loadJob(jobId)?.inFlightPaymentRequestSeqs ?? []).toEqual([]);
+    expect(seams.transport.getMessages).toHaveBeenCalledTimes(2);
+    expect(seams.pay).not.toHaveBeenCalled();
+  });
+
+  it("recovers an unreachable history recheck after auto-payment without re-paying", async () => {
+    vi.useFakeTimers();
+    const jobId = "wait-post-payment-unreachable";
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+    const ask = msg(1, "payment-request", { amount_msats: 1000, reason: "Paid block" });
+    const stream = transport([[ask], [ask, msg(2, "complete", { summary: "Done" })]]);
+    const deliver = stream.getMockImplementation()!;
+    stream.mockImplementationOnce(deliver)
+      .mockRejectedValueOnce(new DvmError("provider_unreachable", "Stream unavailable"));
+    vi.mocked(seams.transport.getMessages).mockRejectedValueOnce(new DvmError("provider_unreachable", "History unavailable"));
+    const pending = messages(jobId, { wait: true, until: "3s" });
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(output().next_action).toBeNull();
+    expect(seams.transport.getMessages).toHaveBeenCalledTimes(1);
+    expect(stream).toHaveBeenCalledTimes(3);
+    expect(seams.pay).toHaveBeenCalledTimes(1);
+    expect(streamed("payment")).toHaveLength(1);
+    expect(streamedSeqs()).toEqual([1, 2]);
+  });
+
   it("writes a payment confirmed by reconciliation within a second, while the stream stays quiet", async () => {
     vi.useFakeTimers();
     const jobId = "wait-quiet-booking";

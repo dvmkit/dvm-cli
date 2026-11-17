@@ -79,19 +79,19 @@ function jobTokenHeader(jobToken: string | undefined): Record<string, string> {
   return jobToken ? { "X-Job-Token": jobToken } : {};
 }
 
-function messagePollUnreachable(jobId: string): DvmError {
+function messagePollUnreachable(jobId: string, operation = "fetch messages"): DvmError {
   return new DvmError(
     "provider_unreachable",
-    `Could not reach the provider to fetch messages for job ${jobId}.`,
-    "The provider may be down or unreachable from this network. Retry once it is back."
+    `Could not reach the provider to ${operation} for job ${jobId}.`,
+    `The provider may be down or unreachable from this network. Continue watching this job with \`dvm messages ${shellQuoteArg(jobId)} --wait\` once it is back.`
   );
 }
 
-async function readMessagePollBody<T>(read: () => Promise<T>, jobId: string): Promise<T> {
+async function readMessagePollBody<T>(read: () => Promise<T>, jobId: string, operation?: string): Promise<T> {
   try {
     return await read();
   } catch (err) {
-    if (err instanceof TypeError && !isAbortError(err)) throw messagePollUnreachable(jobId);
+    if (err instanceof TypeError && !isAbortError(err)) throw messagePollUnreachable(jobId, operation);
     throw err;
   }
 }
@@ -660,7 +660,7 @@ export class HttpsTransport implements Transport {
         : undefined;
 
     try {
-      const res = await dvmFetch(url, { headers: jobTokenHeader(options?.jobToken), signal });
+      const res = await readMessagePollBody(() => dvmFetch(url, { headers: jobTokenHeader(options?.jobToken), signal }), jobId, "read status");
       captureTraceId(res);
 
       if (res.status === 404) {
@@ -669,12 +669,12 @@ export class HttpsTransport implements Transport {
           storedEndpoint && sameEndpoint(storedEndpoint, endpoint) ? ["job_id"] : []));
       }
       if (!res.ok) {
-        const credentialErr = jobCredentialError(res.status, await res.text());
+        const credentialErr = jobCredentialError(res.status, await readMessagePollBody(() => res.text(), jobId, "read status"));
         if (credentialErr) throw credentialErr;
         throw new DvmError("provider_error", `Status check failed (${res.status})`);
       }
 
-      const data = (await res.json()) as Record<string, unknown>;
+      const data = (await readMessagePollBody(() => res.json(), jobId, "read status")) as Record<string, unknown>;
       return {
         jobId,
         status: data.status as JobStatus["status"],
@@ -867,13 +867,13 @@ export class HttpsTransport implements Transport {
       throw new DvmError("not_supported", "HTTPS stream requires a provider with an endpoint.");
     }
     const url = `${endpoint}/v1/job/${jobId}/messages?after=${afterSeq}`;
-    const res = await dvmFetch(url, {
+    const res = await readMessagePollBody(() => dvmFetch(url, {
       headers: { Accept: "text/event-stream", ...jobTokenHeader(options?.jobToken) },
       signal: options?.signal,
-    });
+    }), jobId);
 
     if (!res.ok) {
-      const text = await res.text();
+      const text = await readMessagePollBody(() => res.text(), jobId);
       const credentialErr = jobCredentialError(res.status, text);
       if (credentialErr) throw credentialErr;
       throw providerResponseError("provider_error", `stream failed (${res.status}): ${text}`);
@@ -885,7 +885,7 @@ export class HttpsTransport implements Transport {
     const contentType = res.headers.get("content-type") ?? "";
     const recognize = callerMessageRecognizer(jobId, endpoint);
     if (contentType.includes("application/json")) {
-      const body = (await res.json()) as { messages?: Message[] };
+      const body = (await readMessagePollBody(() => res.json(), jobId)) as { messages?: Message[] };
       const messages = (body.messages ?? []).map(recognize);
       const last = messages.at(-1);
       const reason: StreamResult["reason"] =

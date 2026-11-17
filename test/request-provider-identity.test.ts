@@ -705,7 +705,7 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     expect(provider.balancePayments).toHaveLength(1);
   });
 
-  it.each([false, true])("pays an hourly ask from a card-funded credit while a later wait stays attached (human=%s)", async (human) => {
+  it.each([false, true])("pays an hourly ask from a card-funded credit in a later wait (human=%s)", async (human) => {
     writeConfig("auto");
     seedCredit(5_000_000);
     provider.draw = (post, accepted) => answer(202, { job_id: accepted, status: "processing", job_token: provider.token,
@@ -721,7 +721,7 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     expect(provider.balancePayments).toMatchObject([{ request_seq: 2, amount_micro: 50_000, currency: "usd" }]);
   });
 
-  it.each([false, true])("pays an ask that arrives on the open stream of a card-funded wait (human=%s)", async (human) => {
+  it.each([false, true])("pays an ask that appears while a card-funded wait is attached (human=%s)", async (human) => {
     writeConfig("auto");
     seedCredit(5_000_000);
     provider.draw = (post, accepted) => answer(202, { job_id: accepted, status: "processing", job_token: provider.token,

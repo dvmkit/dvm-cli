@@ -674,7 +674,7 @@ export function buildProgram(): Command {
     .option("--no-stream", "Non-blocking snapshot instead of streaming until yield")
     .option("--human", "Human-readable output instead of JSON")
     .option("--wait", "Stay attached until the job needs input or ends; JSON output is one line per event")
-    .option("--until <duration>", "Wait limit with --wait (default: 12h; e.g. 30s, 5m, 12h)")
+    .option("--until <duration>", "Wait limit with --wait (default: 12h; e.g. 30s, 5m, 12h, 1h30m)")
     .option("--timeout <sec>", "Read timeout (default: 5s, or 60s with --wait)")
     .action((jobId: string, opts: MessagesOptions) => {
       // --wait streams JSON lines, so its error is the last event of that stream.
@@ -934,7 +934,7 @@ Docs:
     .option("--today", "Only spends since UTC start of today")
     .option(
       "--since <iso-or-duration>",
-      "Only spends since an ISO date (2026-07-01) or a duration (7d, 24h, 30m)"
+      "Only spends since an ISO date (2026-07-01) or a duration (7d, 24h, 30m, 1h30m)"
     )
     .option("--limit <n>", "Max rows to show, newest first (default 50)")
     .option("--offset <n>", "Skip rows in unchanged newest-first history (default 0)")
