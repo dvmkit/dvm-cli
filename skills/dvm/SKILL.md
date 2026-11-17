@@ -26,7 +26,7 @@ Read the matching file before acting. Load another only when the task reaches th
 
 | Task | Read |
 | --- | --- |
-| Find or favourite a DVM, reuse a saved service, call it, or retrieve a result | [Calling](calling.md) |
+| Find or favourite a DVM, reuse a saved service, call it, schedule check-ins for a long job, or retrieve a result | [Calling](calling.md) |
 | Set up, connect, fund, or inspect a wallet | [Wallets](wallets.md) |
 | Prepay for repeated use, change credit settings, or reclaim a balance | [Credit](credit.md) |
 | Resolve an uncertain request, payment, funding, or refund | [Recovery](recovery.md) |
