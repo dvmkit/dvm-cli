@@ -40,6 +40,7 @@ let expectedSeq = 4;
 let expectedCurrency = "usd";
 let reply: "ok" | "drop" | "insufficient" | "conflict" | "malformed" | "unavailable" | "fake-insufficient" | "invalid-insufficient" = "ok";
 let accepted = false;
+let mandateSettled = false;
 let repeatPaidAsk = false;
 const charged = new Set<string>();
 
@@ -48,6 +49,7 @@ beforeEach(async () => {
   received.length = 0;
   charged.clear();
   accepted = false;
+  mandateSettled = false;
   repeatPaidAsk = false;
   reply = "ok";
   advertisement = true;
@@ -69,7 +71,17 @@ beforeEach(async () => {
         return;
       }
       if (request.method === "GET" && request.url === "/v1/job/job-a") {
-        response.end(JSON.stringify({ status: accepted ? "completed" : "awaiting-input" }));
+        response.end(JSON.stringify({ status: accepted || mandateSettled ? "completed" : "awaiting-input" }));
+        return;
+      }
+      if (request.method === "GET" && mandateSettled) {
+        response.end(JSON.stringify({ messages: [
+          { seq: 4, from: "provider", timestamp: Math.floor(Date.now() / 1000), type: "payment-request", content: ask },
+          { seq: 5, from: "requester", timestamp: Math.floor(Date.now() / 1000), type: "payment", content: { credit: {
+            mandate: true, credit_id: "held-credit", draw_id: "draw", payment_id: "mandate:paid", request_seq: 4,
+            amount_micro: 1500, currency: "usd" } } },
+          { seq: 6, from: "provider", timestamp: Math.floor(Date.now() / 1000), type: "complete", content: { status: "success", summary: "Done" } },
+        ] }));
         return;
       }
       if (request.method === "GET") {
@@ -569,4 +581,45 @@ describe("caller-owned non-USD balance valuation", () => {
     expect(source).toHaveBeenCalledOnce();
     expect(received).toHaveLength(2);
   });
+});
+
+function standingLimits() {
+  return { max_total_micro: 4000, max_ask_micro: 2000, expires_at_ms: Date.now() + 60_000,
+    credit_id: "held-credit", draw_id: "draw", currency: "usd", signed_data: {} };
+}
+
+it("waits for mandate settlement rather than posting a second payment for a freshly observed ask", async () => {
+  updateJob("job-a", { mandate: standingLimits() });
+  await expect(respond()).rejects.toMatchObject({ code: "payment_settling" });
+  expect(received).toHaveLength(0);
+  expect(loadJob("job-a")?.mandateAskObservedAtMs?.[4]).toEqual(expect.any(Number));
+});
+
+it("pays a still-open mandate fallback through --wait within the existing policy after the settlement window", async () => {
+  updateJob("job-a", { mandate: standingLimits(), mandateAskObservedAtMs: { 4: Date.now() - 90_000 } });
+  const transport = new HttpsTransport();
+  const result = await waitForJob({ jobId: "job-a", transport, provider: { endpoint }, policy, afterSeq: 0,
+    jobToken: token }, 3000);
+  transport.close();
+  expect(result.nextAction).toBeNull();
+  expect(received).toHaveLength(1);
+  expect(received[0]).toMatchObject({ request_seq: 4, amount_micro: 1500, signature: expect.any(String) });
+  expect(charged.size).toBe(1);
+});
+
+
+it("observes a provider payment arriving after the ask without sending a CLI payment, and books it only once", async () => {
+  updateJob("job-a", { mandate: standingLimits() });
+  await expect(respond()).rejects.toMatchObject({ code: "payment_settling" });
+  mandateSettled = true;
+  const events: unknown[] = [];
+  const transport = new HttpsTransport();
+  const options = { jobId: "job-a", transport, provider: { endpoint }, policy, afterSeq: 0, jobToken: token,
+    onAutoPayment: (payment: unknown) => events.push(payment) };
+  await waitForJob(options, 1000);
+  await waitForJob({ ...options, onAutoPayment: undefined }, 1000);
+  transport.close();
+  expect(received).toHaveLength(0);
+  expect(events).toEqual([expect.objectContaining({ mandate: true, amount: { amount_micro: 1500, currency: "usd", display: expect.any(String) } })]);
+  expect(loadJob("job-a")).toMatchObject({ paymentsHonoured: 1, totalPaidMsats: 1500, mandatePaymentSeqs: [5] });
 });

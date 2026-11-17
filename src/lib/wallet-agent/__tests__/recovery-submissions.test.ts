@@ -1,3 +1,4 @@
+import { saveRequestIntent } from "../../request-intent-store";
 vi.mock("../../cli-identity-resolve", async () => ({ ...(await vi.importActual<typeof import("../../cli-identity-resolve")>("../../cli-identity-resolve")), findSigningIdentityByPubkey: vi.fn() }));
 vi.mock("../../job-store", async () => ({ ...(await vi.importActual<typeof import("../../job-store")>("../../job-store")), saveJob: vi.fn() }));
 vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
@@ -910,6 +911,29 @@ describe("sweepPendingSubmissions — fund-amount correction", () => {
       }),
     });
   }
+
+  it.each([false, true])("restores the signed standing mandate from its recovery intent (existing job: %s)", async (existing) => {
+    const entry = fundEntry();
+    const data = entry.context!.submit_body.data as Record<string, unknown>;
+    const requestId = existing ? "33333333-3333-4333-8333-333333333333" : "44444444-4444-4444-8444-444444444444";
+    const jobId = existing ? "restored-mandate-existing" : "restored-mandate-new";
+    data.request_id = requestId;
+    data.mandate = { max_total_micro: 1_000_000, max_ask_micro: 100_000, expires_at_ms: NOW_MS + 60_000 };
+    const mandate = { ...(data.mandate as { max_total_micro: number; max_ask_micro: number; expires_at_ms: number }),
+      credit_id: "c1", draw_id: "d1", currency: "usd", signed_data: { ...data, signature: "original-authority" } };
+    expect(saveRequestIntent({ v: 2, requestId, endpoint: ENDPOINT, capability: "summarize", body: { data },
+      callerPubkey: "bb".repeat(32), policy: { maxTotalMsats: 1_000_000, autoPayBelowMsats: 100_000, maxIncrementMsats: 100_000, maxPayments: 10 },
+      authAudience: JOB_DOMAIN.audience, createdAt: NOW_MS, mandate })).toBe(true);
+    const store = await vi.importActual<typeof import("../../job-store")>("../../job-store");
+    if (existing) store.saveJob({ id: jobId, endpoint: ENDPOINT, requestId, submittedAt: NOW_MS, status: "submitted" });
+    vi.mocked(loadAgentWallet).mockReturnValue(baseWallet([entry]));
+    const httpPost = vi.fn().mockResolvedValueOnce({ status: 404, body: { error: "request_not_found" } })
+      .mockResolvedValueOnce({ status: 200, body: { job_id: jobId } });
+    const result = await sweepPendingSubmissions({ httpPost, now });
+    expect(result.outcomes[0]).toMatchObject({ kind: "shipped", jobId });
+    const restored = existing ? store.loadJob(jobId) : vi.mocked(saveJob).mock.calls.find(([record]) => record.id === jobId)?.[0];
+    expect(restored).toMatchObject({ mandate, creditBinding: { creditId: "c1", drawId: "d1" } });
+  });
 
   function shippedFund(httpPost: ReturnType<typeof vi.fn>, n: number): Record<string, unknown> {
     const call = httpPost.mock.calls[n][0] as { body: string };

@@ -1,3 +1,4 @@
+import { recoverMandateWinner } from "./mandate-wait";
 import { randomUUID } from "node:crypto";
 import { type PaymentContent } from "@dvmkit/sdk";
 import {
@@ -67,6 +68,11 @@ export async function sendCreditPayment(
   try {
     await transport.sendMessage(jobId, { type: "payment", content: { credit: intent.authorization } }, provider, { jobToken });
   } catch (error) {
+    if (error instanceof DvmError && error.data?.http_status === 409 &&
+        ["credit_payment_ask_mismatch", "credit_payment_conflict"].includes(error.code)) {
+      const won = await recoverMandateWinner(jobId, intent.authorization.request_seq, transport, provider, jobToken).catch(() => false);
+      if (won) throw new DvmError("payment_already_sent", "The provider paid this charge under your standing limit; the unused signed payment was discarded.");
+    }
     if (error instanceof DvmError && error.code === "insufficient_credit" && error.data?.http_status === 402 &&
         Number.isSafeInteger(error.data?.remaining_micro) && Number(error.data?.remaining_micro) >= 0 &&
         Number.isSafeInteger(error.data?.shortfall_micro) && Number(error.data?.shortfall_micro) > 0) {

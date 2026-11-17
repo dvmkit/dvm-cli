@@ -1,5 +1,6 @@
+import { recordMandatePayments } from "./mandate-payments";
 import { DvmError, isAbortError, shellQuoteArg, type Message, type MessagePollOptions, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
-import { clearPaymentRequestInFlight, loadJob, markPaymentRequestAnswered, type UnconfirmedPaymentSubmission } from "./job-store";
+import { bookCreditPayment, clearPaymentRequestInFlight, loadJob, markPaymentRequestAnswered, type UnconfirmedPaymentSubmission } from "./job-store";
 import { settleTakenPayment } from "./taken-payment";
 import { applySubmissionVerdicts } from "./wallet-agent/submission-verdicts";
 import { loadMessages } from "./messages";
@@ -90,6 +91,8 @@ export function loadAnsweredYieldSeqs(jobId: string): Set<number> {
   const answered = answeredYieldSeqs(loadMessages(jobId));
   const job = loadJob(jobId);
   for (const seq of job?.paidPaymentRequestSeqs ?? []) answered.add(seq);
+  for (const landing of Object.values(job?.paymentCreditLandings ?? {}))
+    if (landing.ask_answered && landing.request_seq !== undefined) answered.add(landing.request_seq);
   for (const payment of job?.bookedCreditPayments ?? []) answered.add(payment.authorization.request_seq);
   for (const seq of declinedAskSeqs(jobId)) answered.add(seq);
   return answered;
@@ -162,6 +165,16 @@ export async function reconcilePaymentRequestHistory(
 export async function settleRecordedPayments(jobId: string): Promise<void> {
   await applySubmissionVerdicts().catch(() => undefined);
   const job = loadJob(jobId);
+  const recorded = job?.mandate || job?.pendingCreditPayment ? loadMessages(jobId) : [];
+  if (job?.mandate) recordMandatePayments(jobId, recorded);
+  const pending = loadJob(jobId)?.pendingCreditPayment;
+  if (pending && recorded.some((message) => {
+    const credit = message.type === "payment" && message.from === "requester" ? message.content.credit : undefined;
+    const expected = pending.authorization;
+    return credit && credit.payment_id === expected.payment_id && credit.request_seq === expected.request_seq &&
+      credit.credit_id === expected.credit_id && credit.draw_id === expected.draw_id &&
+      credit.amount_micro === expected.amount_micro && credit.currency === expected.currency;
+  })) bookCreditPayment(jobId, pending);
   const held = new Set([...(job?.inFlightPaymentRequestSeqs ?? []),
     ...Object.keys(job?.unconfirmedPaymentSubmissions ?? {}).map(Number)]);
   for (const seq of job?.paidPaymentRequestSeqs ?? []) held.delete(seq);

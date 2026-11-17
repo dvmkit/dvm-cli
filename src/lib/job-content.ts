@@ -4,7 +4,7 @@ import { type JobContentMetadata } from "@dvmkit/sdk/server";
 import { captureDrawFundingReceipts } from "./draw-funding";
 
 // The transport's shared status type predates these optional wire fields.
-export type ContentStatus = JobStatus & Partial<JobContentMetadata>;
+export type ContentStatus = JobStatus & Partial<JobContentMetadata> & { stop_requested?: boolean; display?: string };
 
 export function parseJobContent(data: Record<string, unknown>): Partial<JobContentMetadata> {
   return {

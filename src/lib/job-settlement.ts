@@ -29,6 +29,7 @@ export interface JobSettlement {
   ceiling_basis?: "payments" | "declined_ask" | "receipt_pieces";
   /** The receipt charges more than `ceiling_micro`. */
   overcharged?: boolean;
+  violated_limits?: string[];
   display: string;
 }
 
@@ -65,6 +66,7 @@ export function receiptSettlement(
       stopped_micro: pieces.stopped_micro, currency: pieces.currency,
       ...(pieces.ceiling_micro !== undefined ? { ceiling_micro: pieces.ceiling_micro, ceiling_basis: pieces.ceiling_basis } : {}),
       overcharged: pieces.overcharged,
+      ...(pieces.violated_limits ? { violated_limits: pieces.violated_limits } : {}),
       display: pieces.display,
     };
   }

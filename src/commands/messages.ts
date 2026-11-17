@@ -1,3 +1,4 @@
+import { mandateCredit, mandatePaymentReports, mandatePaymentSummary } from "../lib/mandate-payments";
 import { observedSettlementFields, renderSettlementHuman } from "../lib/receipt-capture";
 import { readUnansweredPaymentRequest } from "../lib/unanswered-payment";
 import { providerCurrency } from "../lib/provider-currency";
@@ -183,8 +184,9 @@ async function messagesWithAccess(
         jobId,
         ...content,
         ...settlement,
+        ...(!access.endpointOverridden ? mandatePaymentSummary(loadJob(jobId), loadMessages(jobId)) : {}),
         ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
-        messages: msgs.map(serialize),
+        messages: msgs.map((msg) => serialize(msg, access.endpointOverridden ? undefined : jobId)),
         cursor: newCursor,
         next_action: resolvedAction,
         ...(await refundJsonField(refunds)),
@@ -228,7 +230,7 @@ async function messagesWithAccess(
         // An ask is repeated while it may still need an answer; anything else already written is not.
         if (msg.seq <= skipThrough && !((msg.type === "payment-request" || msg.type === "prompt") &&
           !loadAnsweredYieldSeqs(jobId).has(msg.seq))) return;
-        jsonEvent({ event: "message", ...serialize(msg) });
+        jsonEvent({ event: "message", ...serialize(msg, access.endpointOverridden ? undefined : jobId) });
         messageLines++;
         lastDelivered = Math.max(lastDelivered, msg.seq);
       },
@@ -307,6 +309,7 @@ async function messagesWithAccess(
       jobId,
       ...content,
       ...settlement,
+      ...(!access.endpointOverridden ? mandatePaymentSummary(loadJob(jobId), loadMessages(jobId)) : {}),
       ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
       message_count: messageLines,
       auto_payment_count: paymentLines,
@@ -319,8 +322,9 @@ async function messagesWithAccess(
       jobId,
       ...content,
       ...settlement,
+      ...(!access.endpointOverridden ? mandatePaymentSummary(loadJob(jobId), loadMessages(jobId)) : {}),
       ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
-      messages: result.messages.map(serialize),
+      messages: result.messages.map((msg) => serialize(msg, access.endpointOverridden ? undefined : jobId)),
       cursor: result.cursor,
       next_action: resolvedAction,
       ...(result.autoPayments.length > 0 ? { auto_payments: result.autoPayments } : {}),
@@ -339,7 +343,11 @@ export function serializeMessageForOutput(msg: Message): Record<string, unknown>
   return serialize(msg);
 }
 
-function serialize(msg: Message): Record<string, unknown> {
+export function serializeJobMessageForOutput(msg: Message, jobId?: string): Record<string, unknown> {
+  return serialize(msg, jobId);
+}
+
+function serialize(msg: Message, jobId?: string): Record<string, unknown> {
   const fromProvider = !isCallerMessage(msg);
   const base = providerFields({ seq: msg.seq, from: msg.from, timestamp: msg.timestamp, type: msg.type, content: msg.content },
     ["seq", "from", "timestamp", ...(fromProvider ? ["type", "content"] : [])]);
@@ -390,6 +398,11 @@ function serialize(msg: Message): Record<string, unknown> {
       };
     }
     case "payment": {
+      if (mandateCredit(msg)) {
+        const report = mandatePaymentReports(jobId ? loadJob(jobId) : undefined,
+          [...(jobId ? loadMessages(jobId) : []), msg]).find((entry) => entry.seq === msg.seq);
+        if (report) return { ...base, ...report, content: { ...msg.content } };
+      }
       // Requester payments must not borrow provider refund/change wording.
       const amount = paymentAmount(msg);
       const display = msg.from === "provider"

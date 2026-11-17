@@ -1,3 +1,4 @@
+import { takeCreditNoticeFields } from "../src/lib/credit-notice";
 import { rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -66,11 +67,11 @@ beforeEach(() => {
 const ask = { amount_msats: 50_000, reason: "Additional work", lock_pubkey: "02" + "01".repeat(32), mints: ["https://mint.invalid"] };
 const policy = { maxTotalMsats: 1_000_000, maxIncrementMsats: 1_000_000, autoPayBelowMsats: 1_000_000, maxPayments: 3 };
 
-function wire(receipt: unknown = funding(), code = 201, error?: string, seq = 8) {
+function wire(receipt: unknown = funding(), code = 201, error?: string, seq = 8, credit?: Record<string, unknown>) {
   const observed = response();
   const fetch = vi.fn(async (url: string | URL | Request) => {
     if (String(url).endsWith("/v1/info")) return Response.json({ builder: dvm.anchor });
-    if (String(url).endsWith("/messages")) return Response.json({ seq, draw_funding_receipt: receipt,
+    if (String(url).endsWith("/messages")) return Response.json({ seq, draw_funding_receipt: receipt, ...(credit ? { credit } : {}),
       ...(error ? { error } : {}) }, { status: code });
     if (String(url) === `${endpoint}/v1/job/${jobId}`) return Response.json({ status: "completed",
       receipt: observed.receipt, draw_funding_receipts: [funding()] });
@@ -93,6 +94,16 @@ describe("payment acknowledgement funding evidence", () => {
     await expect(pay()).rejects.toMatchObject({ code: "payment_already_sent" });
     expect(prepareAgentSpend).toHaveBeenCalledTimes(1);
     expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith("/messages"))).toHaveLength(1);
+  });
+
+  it("still books the ask when only the unused slice of a rail payment became credit", async () => {
+    seed();
+    wire(funding(), 201, undefined, 8, { credit_id: creditId, credited_micro: 10_000, credit_currency: "usd" });
+    await expect(pay()).resolves.toMatchObject({ status: "paid", rail: "cashu_p2pk" });
+    expect(loadJob(jobId)).toMatchObject({ paymentsHonoured: 1, totalPaidMsats: 50_000 });
+    expect(loadJob(jobId)?.paymentCreditLandings).toBeUndefined();
+    expect(takeCreditNoticeFields().payment_credit_landings?.[0]).toMatchObject({ credited_micro: 10_000,
+      display: expect.stringContaining("unused part") });
   });
 
   it("retains funding when the acknowledgement cursor advances beyond the inbound payment", async () => {

@@ -1,3 +1,5 @@
+import { rememberStandingStop, standingStopOutput } from "../lib/mandate-wait";
+import { storedMandateSummary } from "../lib/mandate-payments";
 import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
 import { readUnansweredPaymentRequest } from "../lib/unanswered-payment";
 import { providerJobJson } from "../lib/provider-output";
@@ -61,7 +63,7 @@ import { appendMessages, maxSeq } from "../lib/messages";
 import { progressNotice } from "../lib/progress-notice";
 import { createDvmTransport } from "../lib/transport";
 import { dvmIdentity } from "./dvm-identity";
-import { serializeMessageForOutput } from "./messages";
+import { serializeJobMessageForOutput } from "./messages";
 
 export interface StatusOptions extends JobAccessOptions {
   human?: boolean;
@@ -149,16 +151,17 @@ async function statusWithAccess(
   const result: ContentStatus = await transport.status(jobId, ref, { timeoutMs: timeout, jobToken });
   if (stored && !access.endpointOverridden) captureDrawFundingReceipts(jobId, result.drawFundingReceipts, { endpoint: ref.endpoint });
 
+  if (!access.endpointOverridden && result.stop_requested) rememberStandingStop(jobId, result.display);
   let msgs: Message[] = [];
   let newCursor: number | undefined;
-  if (opts.messages) {
-    const after = access.endpointOverridden ? 0 : (stored?.messageCursor ?? 0);
+  if (opts.messages || (stored?.mandate && !access.endpointOverridden)) {
+    const after = access.endpointOverridden || !opts.messages ? 0 : (stored?.messageCursor ?? 0);
     msgs = await transport.getMessages(jobId, after, ref, { timeoutMs: timeout, jobToken });
     if (!access.endpointOverridden) {
       appendMessages(jobId, msgs);
       await settleRecordedPayments(jobId);
     }
-    newCursor = maxSeq(msgs, after);
+    if (opts.messages) newCursor = maxSeq(msgs, after);
   }
 
   const nextAction = await resolveNextAction(jobId, result.status, msgs, transport, ref, {
@@ -308,6 +311,8 @@ async function renderStatus(
   const settlement = await terminalSettlementReport(jobId, { status: jobStatus, receipt: receipt?.receipt,
     persistLocalState: !!stored, currency: fetched?.currency });
 
+  const pendingStop = stored && !isTerminalJobStatus(jobStatus) ? standingStopOutput(loadJob(jobId)) : {};
+
   if (opts.human) {
     if (jobStatus === "completed" && completion.summary) {
       info(`Summary:`);
@@ -315,6 +320,11 @@ async function renderStatus(
     } else {
       info(`Status: ${jobStatus}${identifier ? ` [${identifier}]` : ""}`);
       if (completion.message) info(`  ${completion.message}`);
+    }
+    if (pendingStop.display) info(pendingStop.display);
+    if (stored) {
+      const mandate = storedMandateSummary(jobId);
+      if (mandate.overcharged) info(mandate.display!);
     }
     if (fetched?.unanswered) info(fetched.unanswered.display);
     if (artifacts.hint) info(`📎 ${artifacts.hint}`);
@@ -357,6 +367,9 @@ async function renderStatus(
     // read as "this DVM doesn't issue receipts" rather than "not yet".
     ...(receipt ? await receiptJsonFields(receipt) : {}),
     ...settlement,
+    ...pendingStop,
+    ...(pendingStop.display ? { stop_display: pendingStop.display } : {}),
+    ...(stored ? storedMandateSummary(jobId) : {}),
     ...(receipt?.currencyHint ? { settlement_hint: undefined } : {}),
     // `dvm status` is a job-terminal emission for `--no-stream`
     // jobs, so it drains the deferred-notice sinks like the request terminals
@@ -367,7 +380,7 @@ async function renderStatus(
     next_action: nextAction,
   };
   if (opts.messages) {
-    output.messages = msgs.map(serializeMessageForOutput);
+    output.messages = msgs.map((msg) => serializeJobMessageForOutput(msg, stored ? jobId : undefined));
     output.cursor = fetched?.cursor ?? 0;
   }
   providerJobJson(output, !!stored);

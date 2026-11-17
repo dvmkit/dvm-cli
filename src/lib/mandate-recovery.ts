@@ -1,3 +1,7 @@
+import { isPublicRequestId } from "@dvmkit/sdk/internal";
+import { sameEndpoint } from "./job-access";
+import { loadRequestIntent } from "./request-intent-store";
+import type { JobRecord } from "./job-store";
 import { loadAgentWallet, saveAgentWallet, withWalletLock,
   type PendingSubmission, type PendingSubmissionContext } from "@dvmkit/sdk/internal";
 
@@ -34,4 +38,21 @@ export async function dropPendingMandate(args: {
       candidate.request_id === args.requestId ? reduced : candidate) });
     return reduced;
   });
+}
+
+
+export function recoveredStandingMandate(entry: PendingSubmission): Pick<JobRecord, "mandate" | "mandateUnavailable"> {
+  const context = entry.context;
+  const notice = mandateRecoveryNotice(context);
+  if (notice.mandateUnavailable) return { mandate: undefined, ...notice };
+  const data = context?.submit_body.data as Record<string, unknown> | undefined;
+  if (context?.route === "credit" || !isPublicRequestId(data?.request_id) || !data?.mandate) return {};
+  const intent = loadRequestIntent(data.request_id);
+  const mandate = intent?.mandate;
+  if (!intent || !mandate || !sameEndpoint(intent.endpoint, entry.endpoint) || intent.callerPubkey !== context?.signing_pubkey ||
+      mandate.credit_id !== data.credit_id || mandate.draw_id !== data.draw_id) return {};
+  const limits = data.mandate as Record<string, unknown>;
+  if (limits.max_total_micro !== mandate.max_total_micro || limits.max_ask_micro !== mandate.max_ask_micro ||
+      limits.expires_at_ms !== mandate.expires_at_ms) return {};
+  return { mandate };
 }

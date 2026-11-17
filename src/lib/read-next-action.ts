@@ -1,3 +1,5 @@
+import { paymentCreditChoice } from "./payment-credit";
+import { mandateWindowAction } from "./mandate-wait";
 import type { Message } from "@dvmkit/sdk/internal";
 import { loadJob } from "./job-store";
 import { computeNextAction, paymentInFlightHint, type NextAction, type PaymentPolicyContext } from "./next-action";
@@ -17,5 +19,6 @@ export function readNextAction(
   if (request && held && (held.inFlightPaymentRequestSeqs?.includes(request.seq) ||
       held.unconfirmedPaymentSubmissions?.[request.seq] || held.askPaymentBlocks?.[request.seq]))
     return { ...action, hint: paymentInFlightHint(jobId, held, request.seq) };
+  if (request?.type === "payment-request") return paymentCreditChoice(jobId, request.seq, request.content) ?? mandateWindowAction(jobId, request.content, request.seq, messages) ?? action;
   return action;
 }

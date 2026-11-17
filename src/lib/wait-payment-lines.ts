@@ -1,3 +1,5 @@
+import { mandateCredit, mandatePaymentReports } from "./mandate-payments";
+import { loadJob } from "./job-store";
 import { asProviderText, type Message } from "@dvmkit/sdk/internal";
 import { loadMessages } from "./messages";
 import { observePaymentBookings, type PaymentBooking } from "./payment-bookings";
@@ -16,17 +18,19 @@ import type { AutoPayment, StreamLoopOptions } from "./stream-loop";
 export function createWaitPaymentLines(opts: StreamLoopOptions) {
   const report = opts.onAutoPayment;
   const emitted = new Set<number>();
-  const reported = new Set<number>();
+  const reported = new Set<string>();
+  const observed: Message[] = [];
   const waiting = new Map<number, AutoPayment>();
 
   function write(payment: AutoPayment, seq: number, force = false): void {
-    if (reported.has(seq)) return;
+    const key = payment.mandate ? `mandate:${payment.seq}` : `ask:${seq}`;
+    if (reported.has(key)) return;
     if (!force && seq > opts.afterSeq && !emitted.has(seq)) {
       waiting.set(seq, payment);
       return;
     }
     waiting.delete(seq);
-    reported.add(seq);
+    reported.add(key);
     report?.(payment, seq);
   }
   const stop = report ? observePaymentBookings((booking) => {
@@ -37,6 +41,13 @@ export function createWaitPaymentLines(opts: StreamLoopOptions) {
     onMessage(message: Message): void {
       opts.onMessage?.(message);
       emitted.add(message.seq);
+      observed.push(message);
+      if (opts.persistLocalState !== false && mandateCredit(message)) {
+        const history = [...loadMessages(opts.jobId), ...observed];
+        const payment = mandatePaymentReports(loadJob(opts.jobId), history).find((entry) => entry.seq === message.seq);
+        if (payment) write({ ...payment, rail: "credit",
+          reason: { _source: "provider", text: "" } }, payment.request_seq, true);
+      }
       const pending = waiting.get(message.seq);
       if (pending) write(pending, message.seq);
     },

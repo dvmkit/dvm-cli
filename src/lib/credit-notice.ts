@@ -1,3 +1,4 @@
+import type { PaymentCreditLanding } from "./payment-credit";
 import { fundingRailLabel } from "./rail-labels";
 /**
  * What a job says about the credit it did or didn't buy.
@@ -394,6 +395,7 @@ export interface CreditRailPinConflict {
  * what lets every terminal emission spread the sink in blind.
  */
 export interface CreditNoticeFields {
+  payment_credit_landings?: PaymentCreditLanding[];
   refused_fundings?: ReturnType<typeof refusedFundingReport>[];
   credit_suggestion?: CreditSuggestion;
   credit_funding?: CreditFundingReport[];
@@ -1372,3 +1374,11 @@ function exactUsd(micro: number): string {
 
 let pending: CreditNoticeFields = {};
 let staged: { suggestion: CreditSuggestion; human: boolean | undefined } | undefined;
+
+export function notePaymentCreditLanding(landing: PaymentCreditLanding): void {
+  const list = pending.payment_credit_landings ??= [];
+  const prior = list.findIndex((entry) => entry.fund_id === landing.fund_id && entry.endpoint === landing.endpoint);
+  if (prior !== -1) { list[prior] = landing; return; }
+  info(landing.display);
+  list.push(landing);
+}

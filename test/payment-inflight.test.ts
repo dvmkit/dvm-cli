@@ -7,6 +7,7 @@ loadJob: sdk.loadJob }));
 import type {
   JobPolicy,
   PaymentRequestContent,
+  PendingSubmission,
   ProviderRef,
   Transport,
 } from "@dvmkit/sdk/internal";
@@ -61,6 +62,7 @@ import { streamLoop } from "../src/lib/stream-loop";
 import { waitForJob } from "../src/lib/wait-for-job";
 import { DvmError, type Message } from "@dvmkit/sdk/internal";
 import { handlePaymentRequest } from "../src/lib/payment-responder";
+import { abandonPendingSubmission } from "../src/lib/wallet-agent/spend";
 
 const policy: JobPolicy = {
   maxTotalMsats: 100_000,
@@ -298,6 +300,84 @@ describe("mid-job payment rail selection", () => {
     expect(transport.sendMessage).toHaveBeenCalledTimes(1);
     expect(store.loadJob(jobId)?.inFlightPaymentRequestSeqs).toBeUndefined();
     expect(store.loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([5]);
+  });
+
+  it("keeps definitely refused Cashu outputs reclaimable without recording a job spend", async () => {
+    const { store, jobId, transport } = await setup("refused-cashu");
+    const actual = await vi.importActual<typeof import("@dvmkit/sdk/internal")>("@dvmkit/sdk/internal");
+    const spend = await vi.importActual<typeof import("../src/lib/wallet-agent/spend")>("../src/lib/wallet-agent/spend");
+    sdk.loadAgentWallet.mockImplementation(actual.loadAgentWallet);
+    vi.mocked(abandonPendingSubmission).mockImplementationOnce(spend.abandonPendingSubmission);
+    const ask = { ...railAsk(), credit: { amount_micro: 10_000, currency: "usd" } };
+    const pending: PendingSubmission = { request_id: "spend-race", endpoint: provider.endpoint, mint: "https://mint.example",
+      amount_sats: 10, intended_lock_pubkey: ask.lock_pubkey!, cashu_token: "refused-race-token",
+      output_proofs: [{ id: "keyset", amount: 10, secret: "recoverable-secret", C: "02" + "ff".repeat(32),
+        mint: "https://mint.example", locked_to_pubkey: ask.lock_pubkey!, status: "valid" }],
+      refund_pubkey: "02" + actual.receiptPubkeyFromSecret("01".repeat(32)), t_expire: Date.now() + 60_000,
+      created_at: new Date().toISOString(), context: { submit_body: { input: "refused ask" } } };
+    actual.saveAgentWallet({ version: actual.WALLET_VERSION, lock_privkey: "01".repeat(32), lock_pubkey: pending.refund_pubkey!,
+      mnemonic_fingerprint: null, mints: [pending.mint], proofs: [], nut13_counters: {}, pending_mints: [], pending_melts: [],
+      pending_submissions: [], recent_spends: [], created_at: pending.created_at });
+    sdk.prepareAgentSpend.mockImplementationOnce(async () => {
+      actual.saveAgentWallet({ ...actual.loadAgentWallet()!, pending_submissions: [pending] });
+      return { cashuToken: pending.cashu_token, requestId: pending.request_id, mint: pending.mint,
+        totalSats: pending.amount_sats, swapFeeSats: 0, intendedLockPubkey: pending.intended_lock_pubkey };
+    });
+    const open: Message = { seq: 5, from: "provider", timestamp: 0, type: "payment-request", content: ask };
+    transport.getMessages.mockResolvedValue([open]);
+    transport.sendMessage.mockImplementationOnce(async () => {
+      throw new DvmError("payment_invalid", "Invalid Cashu token", undefined, { http_status: 402 });
+    });
+    const pay = () => handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "cashu", requestSeq: 5 });
+    await expect(pay()).rejects.toMatchObject({ code: "payment_invalid" });
+    const wallet = actual.loadAgentWallet()!;
+    expect(wallet.pending_submissions).toEqual([{ ...pending, context: undefined }]);
+    expect(wallet.recent_spends).toEqual([]);
+    expect(store.loadJob(jobId)?.paymentsHonoured ?? 0).toBe(0);
+    expect(store.loadJob(jobId)?.totalPaidMsats ?? 0).toBe(0);
+    expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
+    expect(sdk.recordSpend).not.toHaveBeenCalled();
+    expect(sdk.commitAgentSpend).not.toHaveBeenCalled();
+    expect(sdk.commitHeldSubmission).not.toHaveBeenCalled();
+    expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+    expect(sdk.prepareAgentSpend).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["cashu", "x402", "tempo"] as const)("keeps a 201 %s balance landing out of job spending", async (rail) => {
+    const { store, jobId, transport } = await setup(`credit-landing-${rail}`);
+    const ask = railAsk(); walletPrep(ask);
+    transport.status.mockResolvedValue({ status: "completed" });
+    transport.sendMessage.mockResolvedValueOnce({ seq: 7, credit: { credit_id: "imp:rail:balance",
+      credited_micro: 10_000, credit_currency: "usd" } });
+    const pay = () => handlePaymentRequest(jobId, ask, policy, transport, provider, { rail, requestSeq: 5 });
+    await expect(pay()).resolves.toMatchObject({ status: "credited", credit: { credited_micro: 10_000, drainable: false } });
+    await expect(pay()).resolves.toMatchObject({ status: "credited" });
+    expect(store.loadJob(jobId)?.paymentsHonoured ?? 0).toBe(0);
+    expect(store.loadJob(jobId)?.totalPaidMsats ?? 0).toBe(0);
+    expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
+    expect(sdk.recordSpend).not.toHaveBeenCalled();
+    expect(sdk.addPayment).not.toHaveBeenCalled();
+    expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["paid", "credited"] as const)("allows one explicitly different rail after a landing, then prevents another send (%s)", async (outcome) => {
+    const { store, jobId, transport } = await setup(`different-rail-${outcome}`);
+    const ask = railAsk(); walletPrep(ask);
+    const credit = { credit_id: "imp:cashu:first", credited_micro: 10_000, credit_currency: "usd" };
+    transport.sendMessage.mockResolvedValueOnce({ seq: 7, credit }).mockResolvedValueOnce({ seq: 8,
+      ...(outcome === "credited" ? { credit: { ...credit, credit_id: "imp:x402:second" } } : {}) });
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "cashu", approval: "explicit", requestSeq: 5 }))
+      .resolves.toMatchObject({ status: "credited" });
+    await expect(handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", approval: "explicit", requestSeq: 5 }))
+      .resolves.toMatchObject({ status: outcome, rail: "x402" });
+    const repeated = handlePaymentRequest(jobId, ask, policy, transport, provider, { rail: "x402", approval: "explicit", requestSeq: 5 });
+    if (outcome === "credited") await expect(repeated).rejects.toMatchObject({ code: "payment_credit_rail_repeated" });
+    else await expect(repeated).resolves.toMatchObject({ status: "credited", credit: { ask_answered: true } });
+    expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+    expect(sdk.prepareAgentSpend).toHaveBeenCalledTimes(1);
+    expect(sdk.tryX402Payment).toHaveBeenCalledTimes(1);
+    expect(store.loadJob(jobId)?.paymentsHonoured ?? 0).toBe(outcome === "paid" ? 1 : 0);
+    expect(sdk.recordSpend).toHaveBeenCalledTimes(outcome === "paid" ? 1 : 0);
   });
 
   it.each(["refused", "unknown"])("records a %s outcome after lock loss during the send", async (outcome) => {

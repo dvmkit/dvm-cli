@@ -1,3 +1,4 @@
+import { rememberStandingStop } from "../lib/mandate-wait";
 import { terminalSettlementReport } from "../lib/job-settlement";
 import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
 import { DvmError } from "@dvmkit/sdk/internal";
@@ -40,10 +41,19 @@ async function declineWithAccess(jobId: string, opts: DeclineOptions, access: Re
 
   progressNotice("Declining...", opts.human);
   const content = opts.reason !== undefined ? { reason: opts.reason } : {};
-  await retryWhilePaymentInProgress(
+  const acknowledgement = await retryWhilePaymentInProgress(
     () => transport.sendMessage(jobId, { type: "decline", content }, ref, { jobToken }),
     { human: opts.human }
   );
+  const pending = acknowledgement as { stop_requested?: boolean; display?: string } | undefined;
+  if (pending?.stop_requested === true) {
+    const display = pending.display ?? "The job will stop at its next payment ask. Only finished pieces will be charged.";
+    if (!access.endpointOverridden) rememberStandingStop(jobId, display);
+    transport.close();
+    if (opts.human) info(display);
+    else json({ jobId, stop_requested: true, display, next_action: pollNextAction(jobId, display) });
+    return;
+  }
   // A confirmed decline releases the piece in progress; the receipt is checked with that recorded.
   const ending = await readEnding({ jobId, transport, ref, jobToken,
     persistLocalState: !access.endpointOverridden, human: opts.human,
