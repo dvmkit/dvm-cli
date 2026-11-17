@@ -172,6 +172,45 @@ afterAll(() => {
   vi.unstubAllGlobals();
 });
 
+it.each([5_000, 6_000])("names a Cashu receipt's USD currency only when its hold (%i) matches the quoted price", async (held) => {
+  const { attestedDvm } = await import("../src/lib/__tests__/fixtures/receipt-fixture");
+  const { loadJob } = await import("../src/lib/job-store");
+  const dvm = attestedDvm("echo-provider");
+  const provider = await seams.describe();
+  seams.describe.mockResolvedValue({ ...provider, builder: dvm.anchor,
+    authAudience: { dvm_id: "dvm-echo-provider", builder_pubkey: dvm.identity.pubkey } });
+  seams.rate = 100_000;
+  writeConfig("off");
+  seams.submit.mockImplementation(async (_ref, _envelope, payment?: Payment) => payment ? {
+    jobId: "cashu-piece", status: "completed", summary: "Done",
+    receipt: dvm.sign({ job_id: "cashu-piece", capability: "echo", result_hash: sdk.computeResultHash("Done", []),
+      paid: { msats: 5_000, rail: "cashu", native_amount: null, native_asset: null, tx_hash: null, mint },
+      credit: { credit_id: "imp:cashu:payment-1", draw_id: "payment-1", amount: held, balance_after: 0, ledger_seq: 1 },
+      settlement: { held, charged: held, released: 0,
+        pieces: [{ amount: held, charged: held, paid_seq: 0, state: "finished" }] } }),
+  } : {
+    jobId: "", status: "payment-required",
+    quotes: [{ priceMsats: 5_000, upfront: { amount: 0.005, amount_micro: 5_000, currency: "usd" } }],
+  });
+
+  await paidRequest();
+
+  expect(loadJob("cashu-piece")).toMatchObject({
+    upfrontRailPayment: { method: "cashu", amountMsats: 5_000, usdMicro: 5_000 },
+  });
+  expect(loadJob("cashu-piece")?.upfrontPayment).toBeUndefined();
+  expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk", receipt_verified: "verified",
+    settlement: { currency: held === 5_000 ? "usd" : null } });
+  if (held === 5_000) {
+    expect(terminal().receipt_display).toContain("Charged $0.0050 USD for");
+    expect(terminal()).not.toHaveProperty("receipt_hint");
+    expect(terminal()).not.toHaveProperty("settlement_hint");
+  } else {
+    expect(terminal().receipt_display).toContain("Charged 0.006 (currency not recorded) for");
+    expect(terminal().receipt_hint).toContain("does not name the currency");
+  }
+});
+
 describe("automatic credit funding notices", () => {
   it("explains a skipped open on the second paid request when the rate fetch fails with no cache", async () => {
     await paidRequest();

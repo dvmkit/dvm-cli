@@ -141,3 +141,37 @@ describe("piece settlement ceiling", () => {
     expect(pieceSettlement({ outcome: "cancelled" } as JobReceipt, { job: job() })).toBeUndefined();
   });
 });
+
+describe("rail payment currency fallback", () => {
+  const signed = receipt("completed", 360_000, honest);
+  it.each(["cashu", "x402", "tempo"] as const)("uses a matching exact USD price from %s", (method) => {
+    expect(pieceSettlement(signed, { job: job({ upfrontPayment: undefined,
+      upfrontRailPayment: { method, amountMsats: 1_000, usdMicro: 360_000 } }) }))
+      .toMatchObject({ currency: "usd", display: expect.stringContaining("Charged $0.36 USD") });
+  });
+
+  it.each([undefined, 359_999, -1, 360_000.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("keeps the currency unknown for an unusable USD price (%s)", (usdMicro) => {
+    expect(pieceSettlement(signed, { job: job({ upfrontPayment: undefined,
+      upfrontRailPayment: { method: "cashu", amountMsats: 360_000, usdMicro } }) }))
+      .toMatchObject({ currency: null, display: expect.stringContaining("(currency not recorded)") });
+  });
+
+  it.each([160_000, 360_000])("compares the USD price (%i) to the full hold after a partial release", (usdMicro) => {
+    const partial = receipt("failed", 160_000, [piece(0, UPFRONT, "finished"), piece(2, 200_000, "released")]);
+    expect(pieceSettlement(partial, { job: job({ upfrontPayment: undefined,
+      upfrontRailPayment: { method: "cashu", amountMsats: 1_000, usdMicro } }) }))
+      .toMatchObject({ charged_micro: 160_000, released_micro: 200_000, currency: usdMicro === 360_000 ? "usd" : null });
+  });
+
+  it("keeps the currency unknown when the rail payment record conflicts", () => {
+    expect(pieceSettlement(signed, { job: job({ upfrontPayment: undefined, upfrontRailConflict: true,
+      upfrontRailPayment: { method: "cashu", amountMsats: 1_000, usdMicro: 360_000 } }) }))
+      .toMatchObject({ currency: null });
+  });
+
+  it("does not replace a recorded credit currency with the rail's USD valuation", () => {
+    expect(pieceSettlement(signed, { job: job({ upfrontPayment: { amount_msats: 1_000, amount_micro: 360_000, currency: "eur" },
+      upfrontRailPayment: { method: "cashu", amountMsats: 1_000, usdMicro: 360_000 } }) }))
+      .toMatchObject({ currency: "eur" });
+  });
+});

@@ -89,6 +89,41 @@ it("labels the amount and explains why when no local record names the currency",
   expect(verified.stdout + human.stderr + JSON.stringify(listed)).not.toContain("micro-units");
 });
 
+it.each([5_000, 6_000, undefined])("renders a stored Cashu receipt with recorded USD price %s", async (usdMicro) => {
+  const root = mkdtempSync(join(tmpdir(), "receipt-amounts-"));
+  roots.push(root);
+  const dvm = attestedDvm();
+  const receipt = dvm.sign({ job_id: "cashu-job", paid: { ...unsignedReceipt().paid, msats: 5_000 },
+    credit: { credit_id: "imp:cashu:payment-1", draw_id: "payment-1", amount: 5_000, balance_after: 0, ledger_seq: 1 },
+    settlement: { held: 5_000, charged: 5_000, released: 0,
+      pieces: [{ amount: 5_000, charged: 5_000, paid_seq: 0, state: "finished" }] } });
+  writeFileSync(join(root, "receipts.jsonl"), JSON.stringify({ receipt, builder: dvm.anchor,
+    endpoint, verification: "verified", verified_at: 1 }) + "\n");
+  writeFileSync(join(root, "jobs.json"), JSON.stringify([{ id: "cashu-job", endpoint, status: "completed", submittedAt: 1,
+    builderAnchor: dvm.anchor, paymentMethod: "cashu", upfrontRailPayment: { method: "cashu", amountMsats: 5_000, usdMicro } }]));
+
+  const named = usdMicro === 5_000;
+  const display = named ? "Charged $0.0050 USD for" : "Charged 0.005 (currency not recorded) for";
+  for (const command of ["verify", "show"]) {
+    const result = await run(root, [command, "cashu-job"]);
+    expect(result.code).toBe(0);
+    const output = JSON.parse(result.stdout);
+    expect(output.receipt_verified).toBe("verified");
+    expect(output.settlement.currency).toBe(named ? "usd" : null);
+    expect(output.display).toContain(display);
+    expect(output.hint.includes("does not name the currency")).toBe(!named);
+  }
+  const human = await run(root, ["verify", "cashu-job", "--human"]);
+  expect(human.code).toBe(0);
+  expect(human.stderr).toContain(display);
+  expect(human.stderr.includes("does not name the currency")).toBe(!named);
+  const listed = JSON.parse((await run(root, ["list"])).stdout).entries[0];
+  expect(listed.settlement.currency).toBe(named ? "usd" : null);
+  expect(listed.display).toContain(display);
+  if (named) expect(listed).not.toHaveProperty("hint");
+  else expect(listed.hint).toContain("does not name the currency");
+});
+
 it.each([
   ["flags a charge above", 2_900_000, true],
   ["accepts a charge within", 2_500_000, false],

@@ -232,6 +232,9 @@ function settlementCurrency(receipt: JobReceipt, job: JobRecord | undefined, mes
   candidates.push(hint);
   const creditId = receipt.credit?.credit_id;
   if (creditId) candidates.push(safeCredits().find((credit) => credit.creditId === creditId)?.currency);
+  const railUsd = typeof job?.upfrontRailPayment === "object" ? job.upfrontRailPayment?.usdMicro : undefined;
+  // A rail's dollar valuation names the settlement currency only when it matches the entire hold.
+  if (!job?.upfrontRailConflict && validMicro(railUsd) && railUsd === receipt.settlement?.held) candidates.push("usd");
   const found = candidates.find((currency) => typeof currency === "string" && /^[a-z]{3}$/i.test(currency));
   return found ? found.toLowerCase() : null;
 }
