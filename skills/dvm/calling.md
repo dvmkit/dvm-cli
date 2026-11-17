@@ -70,7 +70,7 @@ Choose an interval shorter than the provider's payment ask deadline (`expires_at
 
 Save the job ID, spending policy, alert rule, handled message sequences, and schedule ID for each wake. Each check-in runs `dvm messages <job-id> --wait --until 2m` (or another short limit). Without `--after`, its first read can pay an already-open ask within the stored policy. Do not pass `--after`: an explicit cursor skips the first read's rewind to that open ask. `dvm status` and `dvm messages --no-stream` pay nothing. On a mandated job, the check-in normally just reads and relays: the CLI gives the provider about 80 seconds to pay an eligible ask, which a 2-minute wait covers, and pays within the stored policy only an ask the mandate leaves open.
 
-Relay each reading that meets the person's rule with its artifact, such as a picture, once. Persist handled `seq` values and skip them on later check-ins. Follow returned actions within authorization. Remove the schedule when the job ends or the person stops it. A finished job returns `next_action: null`, or a `refund` action when money is left to reclaim: follow that action, and if `dvm status <job-id>` shows the job completed, failed, or cancelled, remove the schedule.
+Relay each reading that meets the person's rule with its artifact, such as a picture, once. Persist handled `seq` values and skip them on later check-ins. Follow returned actions within authorization. Remove the schedule when the job ends or the person stops it. A finished job usually returns `next_action: null`. On any `refund` action, follow its guidance and run `dvm status <job-id>`; remove the schedule if the status is `completed`, `failed`, or `cancelled`.
 
 ### Budgets
 
