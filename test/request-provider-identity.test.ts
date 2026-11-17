@@ -21,6 +21,7 @@ const seams = vi.hoisted(() => ({
   prepareAgentSpend: vi.fn(),
   info: vi.fn(),
   json: vi.fn(),
+  jsonEvent: vi.fn(),
   progress: vi.fn(),
   rate: 100_000,
   x402Wallet: null as X402Wallet | null,
@@ -40,6 +41,7 @@ let intents: typeof import("../src/lib/request-intent-store");
 let jobs: typeof import("../src/lib/job-store");
 let budget: typeof import("../src/lib/budget-ledger");
 let requestResult: typeof import("../src/commands/request-result")["requestResult"];
+let messages: typeof import("../src/commands/messages")["messages"];
 let requestResume: typeof import("../src/commands/request-resume")["requestResume"];
 let access: typeof import("../src/lib/job-access");
 let views: typeof import("../src/lib/wallet-agent/submissions-view");
@@ -51,6 +53,7 @@ beforeAll(async () => {
     ...(await vi.importActual<typeof import("../src/lib/output")>("../src/lib/output")),
     info: seams.info,
     json: seams.json,
+    jsonEvent: seams.jsonEvent,
     progress: seams.progress,
   }));
   vi.doMock("../src/lib/cli-identity-resolve", async (importOriginal) => ({
@@ -95,6 +98,7 @@ beforeAll(async () => {
   budget = await import("../src/lib/budget-ledger");
   ({ request } = await import("../src/commands/request"));
   ({ requestResult } = await import("../src/commands/request-result"));
+  ({ messages } = await import("../src/commands/messages"));
   ({ requestResume } = await import("../src/commands/request-resume"));
   access = await import("../src/lib/job-access");
   views = await import("../src/lib/wallet-agent/submissions-view");
@@ -701,6 +705,37 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     expect(provider.balancePayments).toHaveLength(1);
   });
 
+  it.each([false, true])("pays an hourly ask from a card-funded credit while a later wait stays attached (human=%s)", async (human) => {
+    writeConfig("auto");
+    seedCredit(5_000_000);
+    provider.draw = (post, accepted) => answer(202, { job_id: accepted, status: "processing", job_token: provider.token,
+      upfront_payment: { amount_msats: 50_000, amount_micro: 50_000, currency: "usd",
+        credit_id: post.body.credit_id, draw_id: post.body.draw_id, rail: "stripe" } }, { [FIELD]: accepted });
+    await request({ endpoint: provider.endpoint, input: "Echo", autoPay: true, budget: "$1", maxPayments: "25", stream: false });
+    provider.job = { status: "awaiting-input", messages: [
+      { seq: 1, from: "provider", timestamp: 1, type: "working", content: {} },
+      { seq: 2, from: "provider", timestamp: 2, type: "payment-request", content: { amount_msats: 50_000, reason: "Next hour",
+        fiat_amount: { amount: 0.05, currency: "USD" }, credit: { amount_micro: 50_000, currency: "usd" } } },
+    ] };
+    await messages("job-a", { wait: true, until: "10s", human });
+    expect(provider.balancePayments).toMatchObject([{ request_seq: 2, amount_micro: 50_000, currency: "usd" }]);
+  });
+
+  it.each([false, true])("pays an ask that arrives on the open stream of a card-funded wait (human=%s)", async (human) => {
+    writeConfig("auto");
+    seedCredit(5_000_000);
+    provider.draw = (post, accepted) => answer(202, { job_id: accepted, status: "processing", job_token: provider.token,
+      upfront_payment: { amount_msats: 50_000, amount_micro: 50_000, currency: "usd",
+        credit_id: post.body.credit_id, draw_id: post.body.draw_id, rail: "stripe" } }, { [FIELD]: accepted });
+    await request({ endpoint: provider.endpoint, input: "Echo", autoPay: true, budget: "$1", maxPayments: "25", stream: false });
+    provider.job = { status: "processing", messages: [
+      { seq: 1, from: "provider", timestamp: 1, type: "progress", content: { percent_complete: 10 } },
+    ], askOnStream: { seq: 2, from: "provider", timestamp: 2, type: "payment-request", content: { amount_msats: 50_000,
+      reason: "Next hour", fiat_amount: { amount: 0.05, currency: "USD" }, credit: { amount_micro: 50_000, currency: "usd" } } } };
+    await messages("job-a", { wait: true, until: "10s", human });
+    expect(provider.balancePayments).toMatchObject([{ request_seq: 2, amount_micro: 50_000, currency: "usd" }]);
+  });
+
   it("counts a recovered draw toward max-payments without drawing again", async () => {
     writeConfig("auto");
     seedCredit(40_000);
@@ -1064,6 +1099,8 @@ interface Provider {
   draw?: (post: JobPost, accepted: string) => Reply;
   /** Overrides the request-result answer. */
   requestResult?: (requestId: string) => Reply;
+  /** The accepted job's status and message history, served to status and message reads. */
+  job?: { status: string; messages: Record<string, unknown>[]; askOnStream?: Record<string, unknown> };
   paidPosts(): JobPost[];
 }
 
@@ -1204,7 +1241,36 @@ async function startProvider(): Promise<Provider> {
         verifier.checkAuth(authorization, { audience, method: "POST", path, capability: null });
         expect(request.headers["x-job-token"]).toBe(state.token);
         state.balancePayments.push(authorization);
+        if (state.job) {
+          // The provider resumes on payment and finishes the job.
+          const seq = state.job.messages.length + 1;
+          state.job.messages.push({ seq, from: "requester", timestamp: seq, type: "payment", content: { credit: authorization } },
+            { seq: seq + 1, from: "provider", timestamp: seq + 1, type: "complete", content: { status: "success", summary: "Done" } });
+          state.job.status = "completed";
+          return answer(201, { seq })(response);
+        }
         return answer(201, { seq: 5 })(response);
+      }
+      if (request.method === "GET" && state.job && path === "/v1/job/job-a") return answer(200, { status: state.job.status })(response);
+      if (request.method === "GET" && state.job && path === "/v1/job/job-a/messages") {
+        const after = Number(new URL(request.url ?? "/", "http://fixture.invalid").searchParams.get("after") ?? 0);
+        const tail = state.job.messages.filter((message) => (message.seq as number) > after);
+        if (request.headers.accept === "text/event-stream") {
+          response.writeHead(200, { "Content-Type": "text/event-stream" });
+          for (const message of tail) response.write(`data: ${JSON.stringify(message)}\n\n`);
+          const job = state.job;
+          const ask = job.askOnStream;
+          if (!ask) return response.end();
+          // The ask arrives on a stream the caller already holds open.
+          job.askOnStream = undefined;
+          setTimeout(() => {
+            job.messages.push(ask);
+            job.status = "awaiting-input";
+            response.end(`data: ${JSON.stringify(ask)}\n\n`);
+          }, 200);
+          return;
+        }
+        return answer(200, { messages: tail })(response);
       }
       const result = /^\/v1\/request-result\/([^/]+)$/.exec(path);
       if (request.method === "POST" && result) {

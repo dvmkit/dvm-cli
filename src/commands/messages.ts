@@ -61,16 +61,18 @@ export async function messages(jobId: string, opts: MessagesOptions): Promise<vo
   if ((opts.until !== undefined && !opts.wait) || (opts.wait && opts.stream === false)) {
     throw new DvmError("invalid_arguments", "Use --until with --wait, and --wait with streaming enabled.");
   }
+  // Refuse a malformed limit before reading or changing any job state.
+  const waitDuration = opts.wait ? parseDurationMs(opts.until ?? "12h") : undefined;
   const access = resolveJobAccess(jobId, opts);
-  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => messagesWithAccess(jobId, opts, access), opts.human));
+  return withJobTokenRedaction(access.jobToken, () => withOutputWarnings(() => messagesWithAccess(jobId, opts, access, waitDuration), opts.human));
 }
 
 async function messagesWithAccess(
   jobId: string,
   opts: MessagesOptions,
-  access: ResolvedJobAccess
+  access: ResolvedJobAccess,
+  waitDuration: number | undefined
 ): Promise<void> {
-  const waitDuration = opts.wait ? parseDurationMs(opts.until ?? "12h") : undefined;
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
   const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);

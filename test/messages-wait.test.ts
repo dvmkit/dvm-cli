@@ -220,6 +220,14 @@ describe("messages wait", () => {
     expect(stream).not.toHaveBeenCalled();
   });
 
+  // A compound limit such as 9h30m once failed as an internal error before any read.
+  it.each([false, true])("accepts a compound --until limit (human=%s)", async (human) => {
+    transport([], "completed");
+    await messages(`wait-compound-${String(human)}`, { wait: true, until: "9h30m", human });
+    if (!human) expect(output()).toMatchObject({ event: "result", next_action: null });
+    expect(seams.transport.status).toHaveBeenCalled();
+  });
+
   it("retrieves the final artifact when completion races a reconnect", async () => {
     vi.useFakeTimers();
     const stream = transport([[msg(1, "working")]]);
