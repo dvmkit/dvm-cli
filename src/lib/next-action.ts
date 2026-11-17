@@ -31,6 +31,7 @@ export interface NextActionRespond {
 }
 
 export interface NextActionPay {
+  requires_approval?: boolean;
   type: "pay";
   job_id: string;
   /** Provisional: provider-requested msats; not a rail-neutral debit amount. */
@@ -66,6 +67,7 @@ export interface NextActionPay {
  * `hint` is a `ProviderText` when supplied by the provider; a plain `string` is the CLI fallback.
  */
 export interface NextActionPoll {
+  display?: string;
   type: "poll";
   job_id: string;
   estimate_seconds?: number;

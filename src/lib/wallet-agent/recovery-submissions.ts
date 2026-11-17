@@ -1,4 +1,4 @@
-import { dropPendingMandate, mandateRecoveryNotice } from "../mandate-recovery";
+import { dropPendingMandate, recoveredStandingMandate } from "../mandate-recovery";
 import type { SignedRequestDomain } from "@dvmkit/sdk";
 import { dvmFetch } from "../http";
 /**
@@ -1187,8 +1187,7 @@ async function shipEntry(
             return { kind: "still_pending", entry, reason: `recovery conflict: job ${identity.jobId} is already a different local job` };
           updateJob(identity.jobId, {
             ...recoveredCreditBinding(active),
-            ...mandateRecoveryNotice(active.context),
-            ...(mandateRecoveryNotice(active.context).mandateUnavailable ? { mandate: undefined } : {}),
+            ...recoveredStandingMandate(active),
             ...(record.requestId ? { requestId: record.requestId } : {}),
             ...(record.jobToken && !existing.jobToken ? { jobToken: record.jobToken } : {}),
           });
@@ -1382,6 +1381,7 @@ function saveRecoveredJob(
     if (existing.requestId !== undefined && existing.requestId !== requestId) return "other_request";
     updateJob(jobId, {
       ...recoveredCreditBinding(entry),
+      ...recoveredStandingMandate(entry),
       requestId,
       ...(jobToken && !existing.jobToken ? { jobToken } : {}),
     });
@@ -1693,7 +1693,7 @@ function jobRecordFromEntry(
     id: jobId,
     endpoint: entry.endpoint,
     ...recoveredCreditBinding(entry),
-    ...mandateRecoveryNotice(ctx),
+    ...recoveredStandingMandate(entry),
     ...(publicRequestId ? { requestId: publicRequestId } : {}),
     ...(ctx?.dvm_id ? { dvmId: ctx.dvm_id } : {}),
     ...(feedbackClaim ? { feedbackClaim } : {}),

@@ -33,6 +33,13 @@ try {
       if (step.uses?.startsWith("actions/checkout@")) assert.equal(step.with["persist-credentials"], false);
     }
   }
+  const postgres = workflow.jobs.build.services?.postgres;
+  assert.match(postgres?.image ?? "", /^postgres:16@sha256:[a-f0-9]{64}$/u);
+  assert.deepEqual(postgres.ports, ["5432:5432"]);
+  assert.equal(postgres.env.POSTGRES_DB, "dvmkit_test");
+  assert.ok(postgres.options.includes("pg_isready"));
+  assert.equal(workflow.jobs.build.env?.DVM_CLI_MANDATE_DATABASE_URL,
+    "postgres://postgres:postgres@localhost:5432/dvmkit_test");
   const runtimeRuns = workflow.jobs.runtime.steps.filter((step) => step.run).map((step) => step.run);
   assert.deepEqual(runtimeRuns, ["node scripts/runtime-smoke.mjs .artifacts/runtime"]);
   const buildRuns = workflow.jobs.build.steps.map((step) => step.run);

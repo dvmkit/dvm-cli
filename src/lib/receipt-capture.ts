@@ -127,7 +127,12 @@ export function captureJobReceipt(
  */
 function warnPieceOvercharge(jobId: string, receipt: SignedJobReceipt, job: JobRecord | null): void {
   const pieces = pieceSettlement(receipt, { job, messages: loadMessages(jobId) });
-  if (!pieces?.overcharged || pieces.ceiling_micro === undefined) return;
+  if (!pieces?.overcharged) return;
+  if (pieces.violated_limits?.length) {
+    info(`Warning: ${pieces.display} Keep the receipt for job ${jobId} as evidence.`);
+    return;
+  }
+  if (pieces.ceiling_micro === undefined) return;
   const ceiling = formatMicro(pieces.ceiling_micro, pieces.currency);
   const basis = pieces.ceiling_basis === "payments"
     ? `the ${ceiling} of finished pieces this CLI paid for`

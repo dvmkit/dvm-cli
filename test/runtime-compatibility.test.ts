@@ -28,9 +28,12 @@ it.each(["success", "failure", "skipped", "cancelled"])("aggregate accepts only 
   }
 });
 
-it.each(["minimum", "major", "os", "allow-failure", "skipped-aggregate", "untrusted", "unpinned-action", "rebuild", "missing-verification", "missing-pack"])("policy rejects weakened runtime coverage: %s", (mutation) => {
+it.each(["minimum", "major", "os", "allow-failure", "skipped-aggregate", "untrusted", "unpinned-action", "rebuild", "missing-verification", "missing-pack", "missing-mandate-database", "missing-postgres", "unpinned-postgres"])("policy rejects weakened runtime coverage: %s", (mutation) => {
   const workflow = parse(readFileSync(join(root, ".github/workflows/verify.yml"), "utf8"));
   const matrix = workflow.jobs.runtime.strategy.matrix;
+  if (mutation === "missing-mandate-database") delete workflow.jobs.build.env.DVM_CLI_MANDATE_DATABASE_URL;
+  if (mutation === "unpinned-postgres") workflow.jobs.build.services.postgres.image = "postgres:16";
+  if (mutation === "missing-postgres") delete workflow.jobs.build.services.postgres;
   if (mutation === "minimum") matrix.node.shift();
   if (mutation === "major") matrix.node.pop();
   if (mutation === "os") matrix.os.pop();
@@ -49,6 +52,11 @@ it.each(["minimum", "major", "os", "allow-failure", "skipped-aggregate", "untrus
   expect(outcome.status).toBe(1);
   expect(outcome.stderr).toContain("incompatible workflow");
   expect(outcome.stderr).not.toContain(temporary);
+});
+
+it.each(["verify.yml", "release.yml"])("pins the PostgreSQL service by content in %s", (name) => {
+  const workflow = parse(readFileSync(join(root, ".github/workflows", name), "utf8"));
+  expect(workflow.jobs.build.services.postgres.image).toMatch(/^postgres:16@sha256:[a-f0-9]{64}$/u);
 });
 
 it("accepts the complete runtime workflow", () => {

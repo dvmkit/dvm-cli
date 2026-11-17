@@ -86,8 +86,14 @@ export type UnconfirmedPaymentSubmission =
     });
 
 export interface JobRecord {
+  paymentCreditLandings?: Record<string, import("./payment-credit").PaymentCreditLanding>;
   mandate?: import("./standing-mandate").SignedStandingMandate;
   mandateUnavailable?: string;
+  stopRequested?: boolean;
+  stopRequestedDisplay?: string;
+  mandatePaymentSeqs?: number[];
+  mandatePaymentMsats?: Record<number, number>;
+  mandateAskObservedAtMs?: Record<number, number>;
   /** A successful local cancel send; legacy terminal statuses do not establish caller intent. */
   callerCancelled?: true;
   /**
@@ -502,6 +508,21 @@ export function recordBudgetRefusal(jobId: string, requestSeq: number, overrun: 
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (job) (job.budgetRefusals ??= {})[String(requestSeq)] = overrun;
+  }, true);
+}
+
+export function recordPaymentCreditLanding(jobId: string, requestSeq: number, credit: import("./payment-credit").PaymentCreditLanding): void {
+  mutateCreditPayment(jobId, (job) => {
+    const landings = job.paymentCreditLandings ??= {};
+    // Keep every deposit if more than one payment lands for the same ask.
+    const existing = Object.keys(landings).find((key) => landings[key].fund_id === credit.fund_id);
+    landings[existing ?? (landings[requestSeq] ? credit.fund_id : String(requestSeq))] = credit;
+    // A refresh of an old deposit cannot acknowledge a newer dispatch.
+    if (existing !== undefined) return;
+    clearUnconfirmedSubmission(job, requestSeq);
+    job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs?.filter((seq) => seq !== requestSeq);
+    if (!job.inFlightPaymentRequestSeqs?.length) delete job.inFlightPaymentRequestSeqs;
+    clearPaymentRequestStartTime(job, requestSeq);
   }, true);
 }
 

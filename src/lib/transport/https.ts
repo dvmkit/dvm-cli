@@ -1,3 +1,4 @@
+import { parsePaymentCredit, type CreditMessageResult } from "../payment-credit";
 import { invalidMandateError, creditTermsWithStandingMandate } from "../standing-mandate";
 import { sameEndpoint } from "../provider-endpoint";
 import { callerMessageRecognizer, rememberCallerMessage } from "../message-ownership";
@@ -679,6 +680,8 @@ export class HttpsTransport implements Transport {
         jobId,
         status: data.status as JobStatus["status"],
         ...parseJobContent(data),
+        ...(data.stop_requested === true ? { stop_requested: true,
+          ...(typeof data.display === "string" ? { display: data.display } : {}) } : {}),
         summary: data.summary as string | undefined,
         hasArtifacts: data.has_artifacts as boolean | undefined,
         artifactCount: data.artifact_count as number | undefined,
@@ -759,7 +762,7 @@ export class HttpsTransport implements Transport {
     message: OutboundMessage,
     provider?: ProviderRef,
     options?: SendMessageOptions
-  ): Promise<void | SendMessageResult> {
+  ): Promise<void | (CreditMessageResult & { stop_requested?: boolean; display?: string })> {
     try {
       return await this.sendMessageWithSignal(jobId, message, provider, options,
         message.type === "payment" ? AbortSignal.timeout(60_000) : undefined);
@@ -773,7 +776,7 @@ export class HttpsTransport implements Transport {
   private async sendMessageWithSignal(
     jobId: string, message: OutboundMessage, provider?: ProviderRef,
     options?: SendMessageOptions, signal?: AbortSignal
-  ): Promise<void | SendMessageResult> {
+  ): Promise<void | (CreditMessageResult & { stop_requested?: boolean; display?: string })> {
     const endpoint = provider?.endpoint;
     if (!endpoint) {
       throw new DvmError(
@@ -845,14 +848,18 @@ export class HttpsTransport implements Transport {
       throw providerResponseError("provider_error", `sendMessage failed (${res.status}): ${text}`);
     }
     rememberCallerMessage(jobId, endpoint, message);
-    if (message.type !== "payment") return;
+    if (message.type !== "payment" && message.type !== "decline") return;
     const acknowledgement = parseJsonObject(await res.text());
     if (message.type === "payment" && message.content.credit) {
       if (res.status !== 201 || !Number.isSafeInteger(acknowledgement?.seq) || Number(acknowledgement?.seq) < 0)
         throw new DvmError("invalid_credit_payment_response", "The balance payment outcome is unknown; replay the saved payment.");
     }
     if (acknowledgement && Number.isSafeInteger(acknowledgement.seq) && Number(acknowledgement.seq) >= 0) {
-      return { seq: Number(acknowledgement.seq), ...parseDrawFundingReceipt(acknowledgement.draw_funding_receipt) };
+      return { seq: Number(acknowledgement.seq),
+        ...(message.type === "payment" && acknowledgement.credit !== undefined ? { credit: parsePaymentCredit(acknowledgement.credit) } : {}),
+        ...(message.type === "decline" && acknowledgement.stop_requested === true ? { stop_requested: true,
+          ...(typeof acknowledgement.display === "string" ? { display: acknowledgement.display } : {}) } : {}),
+        ...parseDrawFundingReceipt(acknowledgement.draw_funding_receipt) };
     }
   }
 
@@ -1522,6 +1529,8 @@ const CREDIT_CONTEXT_FIELDS = [
  */
 function withCreditErrorContext(err: DvmError, body: Record<string, unknown>): DvmError {
   const extra: Record<string, unknown> = {};
+  if (err.code === "payment_unapplied" && body.credit_id !== undefined)
+    extra.paymentCredit = parsePaymentCredit(body);
   if (err.code === "tempo_channel_exit_required" && typeof body.status === "string") {
     extra.status = body.status;
   }

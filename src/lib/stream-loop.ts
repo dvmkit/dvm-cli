@@ -1,3 +1,5 @@
+import { paymentCreditChoice, type CreditedPaymentResult } from "./payment-credit";
+import { mandateWindowAction } from "./mandate-wait";
 import { isTransientJobReadError } from "./job-read-error";
 import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
@@ -86,6 +88,13 @@ export interface StreamLoopResult {
 }
 
 export interface AutoPayment {
+  seq?: number;
+  mandate?: boolean;
+  amount?: { amount_micro: number; currency: string; display: string };
+  total_micro?: number;
+  budget_micro?: number;
+  overcharged?: boolean;
+  violated_limits?: string[];
   amount_msats: number;
   rail: PaidPaymentResult["rail"];
   reason: ProviderText;
@@ -120,6 +129,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   // across machines), this gates a final re-check before computing next_action.
   let justAutoPaid = false;
   let paymentUnresolved = false;
+  let mandateWaitAction: NextAction = null;
   let cursor = opts.afterSeq;
   let messageAppendSession = opts.messageAppendSession;
   // when the caller didn't pass an explicit jobToken, fall back to
@@ -129,7 +139,14 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   const jobToken = opts.jobToken ?? loadJob(jobId)?.jobToken;
   // A decline the provider confirmed ended the job, even when its message is not in this batch.
   const declined = () => persistLocalState && loadJob(jobId)?.callerDeclined === true;
-  async function recordAutoPayment(result: PaidPaymentResult, request: PaymentRequestContent, seq: number): Promise<void> {
+  async function recordAutoPayment(result: PaidPaymentResult | CreditedPaymentResult, request: PaymentRequestContent, seq: number): Promise<void> {
+    if (result.status === "credited") {
+      if (result.credit.ask_answered) {
+        answeredSeqs.add(seq);
+        justAutoPaid = true;
+      }
+      return;
+    }
     const payment: AutoPayment = {
       amount_msats: result.amountMsats,
       rail: result.rail,
@@ -147,19 +164,22 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   let pendingAction: NextAction = null;
   const pending = persistLocalState ? loadJob(jobId)?.pendingCreditPayment : undefined;
   if (pending && policy) {
-    let result: PaymentResult;
+    let result: PaymentResult | undefined;
     try {
       result = await handlePaymentRequest(jobId, pending.request, policy, transport, provider, {
         jobToken, requestSeq: pending.authorization.request_seq, useStoredPolicy: true,
       });
     } catch (error) {
-      if (error instanceof DvmError && error.code === "payment_settling")
+      if (error instanceof DvmError && error.code === "payment_already_sent") answeredSeqs.add(pending.authorization.request_seq);
+      else if (error instanceof DvmError && ["payment_settling", "payment_request_not_pending"].includes(error.code))
         return { messages: [], autoPayments, refunds, cursor, paymentInFlight: true,
-          nextAction: pollNextAction(jobId, paymentInFlightHint(jobId, loadJob(jobId), pending.authorization.request_seq)) };
-      throw error;
+          nextAction: error.data?.mandate_wait ? { type: "poll", job_id: jobId,
+            display: String(error.data.display ?? error.message), hint: error.hint ?? error.message }
+            : pollNextAction(jobId, paymentInFlightHint(jobId, loadJob(jobId), pending.authorization.request_seq)) };
+      else throw error;
     }
     if (typeof result === "object") await recordAutoPayment(result, pending.request, pending.authorization.request_seq);
-    else pendingAction = computeNextAction(jobId, [{
+    else if (result !== undefined) pendingAction = computeNextAction(jobId, [{
       seq: pending.authorization.request_seq, from: "provider", timestamp: 0,
       type: "payment-request", content: pending.request,
     }], undefined, policy ? budgetContext(policy, loadJob(jobId)) : undefined);
@@ -276,23 +296,30 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           break;
         }
       }
-      if (lastYield?.type === "payment-request" && lastYield.seq === pendingPayment?.seq && policy && !declined()) {
+      const stopRequested = persistLocalState && loadJob(jobId)?.stopRequested === true;
+      if (lastYield?.type === "payment-request" && lastYield.seq === pendingPayment?.seq && (policy || stopRequested) && !declined()) {
         const req = lastYield.content;
-        const activePolicy = persistLocalState ? loadJob(jobId)?.policy ?? policy : policy;
+        const activePolicy = (persistLocalState ? loadJob(jobId)?.policy ?? policy : policy) ?? { maxTotalMsats: 0, maxIncrementMsats: 0, autoPayBelowMsats: 0, maxPayments: 0 };
         if (
-          req.amount_msats <= activePolicy.autoPayBelowMsats &&
-          (activePolicy.maxIncrementMsats === 0 || req.amount_msats <= activePolicy.maxIncrementMsats)
+          stopRequested || (req.amount_msats <= activePolicy.autoPayBelowMsats &&
+          (activePolicy.maxIncrementMsats === 0 || req.amount_msats <= activePolicy.maxIncrementMsats))
         ) {
           let result: PaymentResult;
           try {
-            result = await handlePaymentRequest(jobId, req, policy, transport, provider, {
+            result = await handlePaymentRequest(jobId, req, activePolicy, transport, provider, {
               jobToken, requestSeq: lastYield.seq, useStoredPolicy: true,
             });
           } catch (error) {
-            if (error instanceof DvmError && ["payment_settling", "payment_unconfirmed"].includes(error.code)) {
+            if (error instanceof DvmError && error.code === "payment_credit_choice_required") {
+              cursor = Math.min(cursor, lastYield.seq - 1);
+              break;
+            }
+            if (error instanceof DvmError && ["payment_settling", "payment_unconfirmed", "payment_request_not_pending"].includes(error.code)) {
               paymentUnresolved = true;
+              if (error.data?.mandate_wait) mandateWaitAction = { type: "poll", job_id: jobId,
+                display: String(error.data.display ?? error.message), hint: error.hint ?? error.message };
               // The ask stays open; a reconnect must read it again.
-              if (error.code === "payment_unconfirmed") cursor = Math.min(cursor, lastYield.seq - 1);
+              if (error.code === "payment_unconfirmed" || loadJob(jobId)?.mandate) cursor = Math.min(cursor, lastYield.seq - 1);
               break;
             }
             if (error instanceof DvmError && error.code === "payment_already_sent") {
@@ -303,11 +330,18 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           }
           if (typeof result === "object") {
             await recordAutoPayment(result, req, lastYield.seq);
+            if (result.status === "credited" && !result.credit.ask_answered) {
+              // Leave the open charge for the next payer invocation, rather
+              // than repeatedly funding it in this same read.
+              cursor = Math.min(cursor, lastYield.seq - 1);
+              if (!result.credit.ask_open) paymentUnresolved = true;
+              break;
+            }
             continue;
           }
           if (result === "payment-cap-exceeded") {
             const j = loadJob(jobId);
-            const cap = policy.maxPayments;
+            const cap = activePolicy.maxPayments;
             throw new DvmError(
               "payment_cap_exceeded",
               "Job has reached its maximum payment count.",
@@ -385,8 +419,12 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     }
   }
 
-  if (paymentUnresolved) nextAction = pollNextAction(jobId, paymentInFlightHint(jobId, heldJob,
+  if (paymentUnresolved) nextAction = mandateWaitAction ?? pollNextAction(jobId, paymentInFlightHint(jobId, heldJob,
     lastYield?.type === "payment-request" ? lastYield.seq : undefined));
+  if (!paymentUnresolved && nextAction?.type === "pay" && lastYield?.type === "payment-request" && persistLocalState)
+    nextAction = mandateWindowAction(jobId, lastYield.content, lastYield.seq) ?? nextAction;
+  if (!paymentUnresolved && !terminal && nextAction?.type === "pay" && lastYield?.type === "payment-request" && persistLocalState)
+    nextAction = paymentCreditChoice(jobId, lastYield.seq, lastYield.content) ?? nextAction;
   if (hasUnsavedJobState() && !terminal)
     nextAction = pollNextAction(jobId, "Local state may lag; refresh this job before another payment.");
   return { messages: allMessages, autoPayments, refunds, nextAction, cursor, ...(paymentUnresolved && { paymentInFlight: true }) };

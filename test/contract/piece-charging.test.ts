@@ -31,7 +31,7 @@ let state: string;
 let history: Message[];
 let receipt: JobReceipt | undefined;
 let endingReceipt: (kind: "decline" | "cancel") => JobReceipt | undefined;
-let declineReply: "ends" | "no_open_ask" | "ignored" | "unavailable";
+let declineReply: "ends" | "no_open_ask" | "ignored" | "unavailable" | "pending";
 let cancelConflicts: number;
 let requests: { method: string; path: string; body?: { type?: string; content?: unknown } }[];
 
@@ -96,6 +96,12 @@ beforeEach(async () => {
           response.statusCode = 409;
           response.end(JSON.stringify({ error: "no_open_ask", message: "The job has no open payment request or prompt to decline.",
             hint: "Decline answers an open ask." }));
+          return;
+        }
+        if (declineReply === "pending") {
+          response.statusCode = 201;
+          response.end(JSON.stringify({ seq: history.length, stop_requested: true,
+            display: "The job will stop at its next payment ask. Only finished pieces will be charged." }));
           return;
         }
         history.push({ seq: history.length + 1, from: "requester", timestamp: 9, type: "decline", content: body.content } as Message);
@@ -432,4 +438,51 @@ it("states a portable job's charge in the provider's currency", async () => {
     display: "Charged $0.36 USD of $0.36 USD held, $0.00 USD released." });
   expect(status.output.receipt_display).toContain("Charged $0.36 USD for");
   expect(JSON.stringify(status.output)).not.toContain("micro-units");
+});
+
+const mandate = () => ({ max_total_micro: 1_000_000, max_ask_micro: 300_000, expires_at_ms: Date.now() + 60_000,
+  credit_id: "credit", draw_id: "draw", currency: "usd", signed_data: {} });
+
+it("relays the provider's pending standing decline between asks without claiming the job has ended", async () => {
+  history = [askOne, payOne] as Message[];
+  seed("processing", history, { mandate: mandate() });
+  declineReply = "pending";
+  const result = await run("decline");
+  expect(result.code).toBe(0);
+  expect(result.output).toMatchObject({ stop_requested: true,
+    display: "The job will stop at its next payment ask. Only finished pieces will be charged.", next_action: { type: "poll" } });
+  expect(JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"))[0]).toMatchObject({ status: "processing", stopRequested: true });
+  const status = await run("status");
+  expect(status.output).toMatchObject({ stop_requested: true,
+    display: "The job will stop at its next payment ask. Only finished pieces will be charged." });
+  expect(sentPayments()).toEqual([]);
+});
+
+it.each([
+  { limit: "max_ask_micro", limits: { max_ask_micro: 100_000 } },
+  { limit: "max_total_micro", limits: { max_total_micro: 300_000 } },
+  { limit: "expires_at_ms", limits: { expires_at_ms: 1000 } },
+  { limit: "credit_id", limits: { credit_id: "another-credit" } },
+  { limit: "draw_id", limits: { draw_id: "another-draw" } },
+  { limit: "currency", limits: { currency: "eur" } },
+])("reports a provider mandate overcharge naming $limit in messages, status, and receipts", async ({ limit, limits }) => {
+  history = [askOne, { ...payOne, content: { credit: { ...payOne.content.credit, mandate: true } } },
+    { seq: 3, from: "provider", timestamp: 3, type: "complete", content: { status: "success", summary: "Done" } }] as Message[];
+  state = "cancelled";
+  receipt = settled("cancelled", 360_000, [
+    { amount: UPFRONT, charged: UPFRONT, paid_seq: 0, state: "finished" },
+    { amount: 200_000, charged: 200_000, paid_seq: 2, state: "finished" }]);
+  const { signature: _signature, ...unsigned } = receipt;
+  receipt = dvm.sign({ ...unsigned, result_hash: computeResultHash(undefined, []) });
+  seed("processing", [], { mandate: { ...mandate(), ...limits } });
+  const messages = await run("messages", ["--no-stream"]);
+  expect(messages.code).toBe(0);
+  expect(messages.output).toMatchObject({ overcharged: true, violated_limits: expect.arrayContaining([limit]),
+    mandate_payments: [expect.objectContaining({ mandate: true, amount: { amount_micro: 200_000, currency: "usd", display: expect.any(String) } })] });
+  const status = await run("status");
+  expect(status.output.settlement).toMatchObject({ overcharged: true, violated_limits: expect.arrayContaining([limit]) });
+  const verified = await run(["receipts", "verify"]);
+  expect(verified.code).toBe(0);
+  expect(verified.output.settlement).toMatchObject({ overcharged: true, violated_limits: expect.arrayContaining([limit]), display: expect.stringContaining("Provider overcharge") });
+  expect(sentPayments()).toEqual([]);
 });

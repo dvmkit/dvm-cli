@@ -1,3 +1,4 @@
+import { storedMandateSummary } from "./mandate-payments";
 import { formatFiat, type SignedRequestDomain } from "@dvmkit/sdk";
 import { DvmError, signDvmRequestData, unsignRequestData,
   parseCreditTerms, type JobEnvelope, type ProviderInfo, type Quote } from "@dvmkit/sdk/internal";
@@ -184,7 +185,7 @@ export function creditTermsWithStandingMandate(raw: unknown) {
 }
 
 export function mandateRequestJson(data: Record<string, unknown>): void {
-  providerJobJson({ ...data, ...(typeof data.jobId === "string" ? standingMandateOutput(loadJob(data.jobId)) : {}) });
+  providerJobJson({ ...data, ...(typeof data.jobId === "string" ? { ...standingMandateOutput(loadJob(data.jobId)), ...storedMandateSummary(data.jobId) } : {}) });
 }
 
 export function invalidMandateError(reason?: string): DvmError {

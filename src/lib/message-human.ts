@@ -1,3 +1,6 @@
+import { mandateCredit, mandatePaymentReports } from "./mandate-payments";
+import { loadJob } from "./job-store";
+import { loadMessages } from "./messages";
 import type { Message } from "@dvmkit/sdk/internal";
 import { formatAmountBestEffort, formatPaymentAmount } from "./currency";
 import { info } from "./output";
@@ -67,6 +70,11 @@ export function formatMessageHuman(
       );
       break;
     case "payment": {
+      if (mandateCredit(msg)) {
+        const report = mandatePaymentReports(jobId ? loadJob(jobId) : undefined,
+          [...(jobId ? loadMessages(jobId) : []), msg]).find((entry) => entry.seq === msg.seq);
+        if (report) { info(`[${msg.seq}] ${report.display}`); break; }
+      }
       const amount = paymentAmount(msg);
       if (msg.from === "provider") {
         const noun = msg.content.reason === "change" ? "change" : "refund";

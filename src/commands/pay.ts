@@ -216,7 +216,7 @@ async function payWithAccess(
     throw await buildNeedsApprovalError(paymentReq, rail, !stored.creditBinding && !!paymentReq.credit);
   }
 
-  const paid = paymentConfirmation(result, paymentReq.reason, paymentReq.fiat_amount);
+  const paid = result.status === "credited" ? result.credit : paymentConfirmation(result, paymentReq.reason, paymentReq.fiat_amount);
 
   const timeoutMs = opts.timeout ? Number(opts.timeout) * 1000 : undefined;
   const afterSeq = access.endpointOverridden ? 0 : (stored.messageCursor ?? 0);
@@ -283,7 +283,7 @@ async function payWithAccess(
     json({
       jobId,
       ...dvmIdentity(stored.dvmId, stored.capability),
-      paid,
+      ...(result.status === "credited" ? { credit_landing: paid, display: paid.display } : { paid }),
       ...settlement,
       messages: streamResult.messages.map(serializeMessageForOutput),
       // Retain delivery hints when the payment resumes work through completion.

@@ -19,6 +19,8 @@ function control(message: Record<string, unknown>): Promise<Record<string, any>>
 }
 
 beforeAll(async () => {
+  if (process.env.CI && !process.env.DVM_CLI_MANDATE_DATABASE_URL)
+    throw new Error("CI requires DVM_CLI_MANDATE_DATABASE_URL for the provider-settled mandate contract.");
   child = fork(resolve(import.meta.dirname, "../support/standing-mandate-provider.mjs"), [], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
   completion = new Promise((done) => child.once("exit", done));
   const ready = await new Promise<Record<string, any>>((done, reject) => {
@@ -37,7 +39,8 @@ beforeEach(async () => {
   await control({ op: "configure" });
 });
 afterAll(async () => {
-  if (child?.connected) child.send({ op: "shutdown" });
+  if (!child) return;
+  if (child.connected) child.send({ op: "shutdown" });
   const timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
   try { expect(await completion).toBe(0); } finally { clearTimeout(timeout); }
   for (const directory of roots) rmSync(directory, { recursive: true, force: true });
@@ -129,6 +132,8 @@ it("caps total at upfront plus the remaining payment-count times the smaller per
   expect(output.mandate).toMatchObject({ max_total_micro: 300_000, max_ask_micro: 200_000 });
 });
 
+// Two CLI startups and PostgreSQL submissions include a deliberate 1 s quote
+// deadline (the fixture replies at 1.5 s); allow headroom under shared CI load.
 it("keeps a valid submit working when its price quote is missing or times out", async () => {
   for (const quote of ["fail", "timeout"]) {
     await control({ op: "configure", quote });
@@ -139,7 +144,7 @@ it("keeps a valid submit working when its price quote is missing or times out", 
     const snapshot = await control({ op: "snapshot", ids: [output.jobId] });
     expect(snapshot.jobs[0].mandate).toBeUndefined();
   }
-});
+}, 15_000);
 
 it("shows no future authority when the upfront exhausts max-payments", async () => {
   const run = await request(["--max-payments", "1"]);
@@ -174,3 +179,27 @@ it("explains a provider's invalid mandate refusal without sending another job", 
   expect(after.submissions.length).toBe(before.submissions.length + 1);
   expect(after.submissions.at(-1).data.mandate.expires_at_ms).toBeLessThan(Date.now() + 7 * 86_400_000 - 290_000);
 });
+
+
+it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("reports the SDK's second and third mandate-paid pieces once each without a CLI payment POST", async () => {
+  await control({ op: "configure", hold: true, pieces: 2 });
+  const submitted = await request();
+  expect(submitted.code, submitted.stdout + submitted.stderr).toBe(0);
+  const { jobId } = JSON.parse(submitted.stdout);
+  const before = await control({ op: "snapshot", ids: [] });
+  await control({ op: "release" });
+  const run = await execute(process.execPath, [binary, "messages", jobId, "--wait", "--until", "5s"], {
+    env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
+  });
+  const events = run.stdout.trim().split("\n").map((line) => JSON.parse(line));
+  const payments = events.filter((event) => event.event === "payment");
+  expect(payments, JSON.stringify({ events, snapshot: await control({ op: "snapshot", ids: [jobId] }) })).toHaveLength(2);
+  expect(payments.map((event) => event.amount.amount_micro)).toEqual([200_000, 200_000]);
+  expect(payments.map((event) => event.total_micro)).toEqual([300_000, 500_000]);
+  for (const payment of payments) expect(payment).toMatchObject({ mandate: true, budget_micro: 1_100_000,
+    overcharged: false, display: expect.stringContaining("paid from your credit under your standing limit") });
+  const snapshot = await control({ op: "snapshot", ids: [jobId] });
+  expect(snapshot.paymentPosts).toHaveLength(before.paymentPosts.length);
+  expect(snapshot.jobs[0].status).toBe("completed");
+  expect(records()[0]).toMatchObject({ totalPaidMsats: 500_000, paymentsHonoured: 3 });
+}, 15_000);

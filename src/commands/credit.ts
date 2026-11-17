@@ -1,3 +1,5 @@
+import { describePaymentCreditLanding } from "../lib/payment-credit";
+import { loadAllJobs } from "../lib/job-store";
 import { fundingRailLabel } from "../lib/rail-labels";
 /**
  * Stable Commander adapters for `dvm credit`. Policy/list commands remain local;
@@ -432,6 +434,11 @@ export async function creditRail(
 /** Show every locally-tracked credit — the caller's own projection, no network. */
 export function creditList(opts: CreditListOptions): void {
   const credits = listCredits();
+  const paymentLandings = loadAllJobs().flatMap((job) => Object.values(job.paymentCreditLandings ?? {}))
+    .filter((landing) => !credits.some((credit) => credit.endpoint === landing.endpoint &&
+      credit.callerPubkey === landing.caller_pubkey && credit.creditId === landing.credit_id &&
+      credit.status === "drained" && credit.remainingMicro === 0))
+    .map((landing) => describePaymentCreditLanding(landing));
   const implicitCredits = listImplicitCredits();
   const snapshots = listFundingMenuSnapshots();
   const pending = listPendingFundings();
@@ -453,6 +460,7 @@ export function creditList(opts: CreditListOptions): void {
   const totals = localCreditCurrencyTotals(credits, implicitCredits, postureOff);
 
   if (opts.human) {
+    for (const landing of paymentLandings) info(landing.display);
     info(humanPostureLine(globalPosture));
     for (const [endpoint, per] of postureOverrides(creditConfig)) {
       info(`  At ${dvmLabelFromEndpoint(endpoint)}: ${per} (overrides the global setting).${per === "off" ? " Spending held credit is also switched off." : ""}`);
@@ -531,6 +539,7 @@ export function creditList(opts: CreditListOptions): void {
       ...fundingRailFields(fundingRailOf(snapshot.endpoint)),
     })),
     dvm_count: snapshots.length,
+    ...(paymentLandings.length ? { payment_credit_landings: paymentLandings } : {}),
     pending_fundings: pending.map(pendingFundingJson),
     pending_count: pending.length,
     display:
@@ -540,7 +549,7 @@ export function creditList(opts: CreditListOptions): void {
           ? pendingFundingsDisplay(pending)
           : snapshots.length > 0
             ? `${String(snapshots.length)} cached DVM funding menu${snapshots.length === 1 ? " is" : "s are"} available; no prepaid credits are held.`
-            : "No prepaid credits tracked yet.",
+            : paymentLandings.length ? paymentLandings.map((landing) => landing.display).join(" ") : "No prepaid credits tracked yet.",
     hint:
       credits.length === 0 &&
       implicitCredits.length === 0 &&

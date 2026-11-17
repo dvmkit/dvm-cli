@@ -1,3 +1,4 @@
+import { mandatePaymentSummary } from "./mandate-payments";
 import { formatFiat } from "@dvmkit/sdk";
 import { listCredits, type JobReceipt, type Message } from "@dvmkit/sdk/internal";
 import type { JobRecord } from "./job-store";
@@ -24,7 +25,8 @@ export interface PieceSettlement {
    * or, when those cannot be trusted, the pieces the receipt itself lists.
    */
   ceiling_basis?: CeilingBasis;
-  /** The receipt charges more than {@link ceiling_micro}. */
+  violated_limits?: string[];
+  /** The receipt exceeds its ceiling, or mandate payment history breaks a signed limit. */
   overcharged: boolean;
   display: string;
 }
@@ -85,10 +87,12 @@ export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {})
     (best, entry) => best === undefined || entry[1] < best[1] ? entry : best, undefined);
   const basis = lowest?.[0];
   const ceiling = lowest?.[1];
-  const overcharged = ceiling !== undefined && settlement.charged > ceiling;
+  const mandateCheck = mandatePaymentSummary(job, messages);
+  const overcharged = mandateCheck.overcharged === true || ceiling !== undefined && settlement.charged > ceiling;
   const money = (micro: number) => formatMicro(micro, currency);
   let display = `Charged ${money(settlement.charged)} of ${money(settlement.held)} held, ${money(settlement.released)} released.`;
-  if (overcharged) display += ` ${overchargeClause(basis!, money(ceiling!))}`;
+  if (mandateCheck.overcharged) display += ` ${mandateCheck.display}`;
+  if (ceiling !== undefined && settlement.charged > ceiling) display += ` ${overchargeClause(basis!, money(ceiling!))}`;
   return {
     held_micro: settlement.held,
     charged_micro: settlement.charged,
@@ -96,6 +100,7 @@ export function pieceSettlement(receipt: JobReceipt, context: PieceContext = {})
     stopped_micro: stopped,
     currency,
     ...(ceiling !== undefined ? { ceiling_micro: ceiling, ceiling_basis: basis! } : {}),
+    ...(mandateCheck.violated_limits ? { violated_limits: mandateCheck.violated_limits } : {}),
     overcharged,
     display,
   };

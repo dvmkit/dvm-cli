@@ -195,6 +195,8 @@
     "oversize",
     "payment_already_sent",
     "payment_cap_exceeded",
+    "payment_credit_choice_required",
+    "payment_credit_rail_repeated",
     "payment_failed",
     "payment_in_progress",
     "payment_insufficient",

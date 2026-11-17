@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { finishPaymentCredit, receivePaymentCredit, refreshPaymentCredit, paymentCreditChoice, type PaymentCredit, type CreditMessageResult, type CreditedPaymentResult } from "./payment-credit";
+import { guardMandatePayment } from "./mandate-wait";
 import { hasPendingAcceptedJobAccess } from "./submission-evidence";
 import { askUsdMicro, describeBudgetOverrun, formatUsdMicro, budgetVerdict, dollarBoundUsdMicro, usdMicro, type BudgetOverrun, type JobBudgetPolicy } from "./job-budget";
 import { withJobPaymentLock } from "./payment-lock";
@@ -82,6 +85,7 @@ export interface PaidPaymentResult {
 
 export type PaymentResult =
   | PaidPaymentResult
+  | CreditedPaymentResult
   | "needs-approval"
   | "over-budget"
   | "payment-cap-exceeded";
@@ -161,6 +165,7 @@ export async function handlePaymentRequest(
   }).catch((error: unknown) => {
     if (budgetSaved && !(error instanceof DvmError)) error = new DvmError("payment_failed", "The payment was not completed.");
     if (!(error instanceof DvmError)) throw error;
+    if (["payment_credit_choice_required", "payment_credit_rail_repeated"].includes(error.code)) throw error;
     if (error.code === "budget_below_spend" || error.code === "invalid_budget" ||
         (error.code === "over_budget" && opts?.budget !== undefined && !budgetSaved)) {
       error.data = providerFields({ ...error.data, job_id: jobId, next_step: error.hint,
@@ -256,6 +261,19 @@ async function handleLockedPaymentRequest(
     requestSeq: opts.requestSeq, approval: opts.approval ?? "auto",
   };
   const job = loadJob(jobId);
+  const credited = opts?.requestSeq === undefined ? undefined : Object.values(job?.paymentCreditLandings ?? {})
+    .findLast((entry) => entry.request_seq === opts.requestSeq);
+  let priorLanding = credited;
+  if (credited && provider.endpoint && sameEndpoint(credited.endpoint, provider.endpoint)) {
+    const current = credited.ask_answered ? credited : await refreshPaymentCredit(credited, transport, provider, opts?.jobToken ?? job?.jobToken);
+    priorLanding = current;
+    const result = await finishPaymentCredit(current);
+    if (current.ask_answered) return result;
+    if (!current.ask_open) throw new DvmError("payment_settling", "The payment became provider credit, but the charge's current state could not be confirmed.",
+      `Read \`dvm status ${shellQuoteArg(jobId)}\` before sending a new payment.`);
+  }
+  if (job?.stopRequested && opts?.requestSeq !== undefined && provider.endpoint && sameEndpoint(job.endpoint, provider.endpoint))
+    await guardMandatePayment(jobId, opts.requestSeq, transport, provider, opts.jobToken ?? job.jobToken);
   if (job && hasUnknownUpfrontRail(job))
     throw new DvmError("upfront_rail_unknown", "The original upfront rail charge is unknown or conflicting.",
       "Recover the original job price before authorizing more payments.");
@@ -272,11 +290,15 @@ async function handleLockedPaymentRequest(
   const jobToken = opts?.jobToken ?? job?.jobToken;
 
   const matchingEndpoint = !!job && !!provider.endpoint && sameEndpoint(job.endpoint, provider.endpoint);
+  if (!matchingEndpoint && job?.stopRequested)
+    throw new DvmError("no_payment_pending", "This job has a recorded stop. No later charge will be paid.");
   if (!matchingEndpoint && job?.pendingCreditPayment)
     throw new DvmError("credit_payment_endpoint_mismatch", "Recover this balance payment at its original endpoint.");
   if (job?.creditOnly && (!matchingEndpoint || !job.creditBinding || "unbound" in job.creditBinding ||
       job.creditBinding.creditId !== job.creditOnly || opts?.rail !== undefined))
     throw new DvmError("credit_only_unavailable", "This job may spend only its original prepaid credit.");
+  if (matchingEndpoint && opts?.requestSeq !== undefined)
+    await guardMandatePayment(jobId, opts.requestSeq, transport, provider, jobToken);
   let balanceRefused = false;
   const booked = matchingEndpoint ? bookedCreditPayment(jobId, opts?.requestSeq) : undefined;
   if (booked && (booked.request.amount_msats !== request.amount_msats ||
@@ -391,12 +413,28 @@ async function handleLockedPaymentRequest(
   if (opts?.requestSeq !== undefined && loadJob(jobId)?.askPaymentBlocks?.[opts.requestSeq] && opts.approval !== "explicit")
     return "needs-approval";
 
+  // A landing bought no ask. Automatic fallbacks must not keep buying credit;
+  // only a human can choose a different rail for this same charge.
+  const explicitRail = opts?.approval === "explicit" && opts.rail !== undefined;
+  if (priorLanding && explicitRail && Object.values(loadJob(jobId)?.paymentCreditLandings ?? {}).some((entry) =>
+      entry.request_seq === opts?.requestSeq && sameEndpoint(entry.endpoint, provider.endpoint!) &&
+      (entry.rail === "cashu_p2pk" ? "cashu" : entry.rail) === opts?.rail)) {
+    const action = paymentCreditChoice(jobId, opts!.requestSeq!, request)!;
+    throw new DvmError("payment_credit_rail_repeated", "This rail already funded credit for this charge; repeating it would land as credit again.",
+      action.hint, { display: action.display, next_action: action });
+  }
+
   beforeNewPayment?.();
 
   if (matchingEndpoint && !balanceRefused && opts?.rail === undefined) {
     const creditPaid = await tryCreditPayment({ jobId, request, policy,
       requestSeq: opts?.requestSeq, approval: opts?.approval ?? "auto", transport, provider, jobToken });
     if (creditPaid !== false) return { status: "paid", rail: "credit", amountMsats: creditPaid };
+  }
+
+  if (priorLanding && !explicitRail) {
+    const action = paymentCreditChoice(jobId, opts!.requestSeq!, request)!;
+    throw new DvmError("payment_credit_choice_required", action.display, action.hint, { display: action.display, next_action: action });
   }
 
   if (job?.creditOnly)
@@ -449,6 +487,7 @@ async function handleLockedPaymentRequest(
       jobToken,
       requestSeq: matchingEndpoint ? opts?.requestSeq : undefined,
     });
+    if (typeof paid === "object") return paid;
     if (paid) {
       return { status: "paid", rail: "cashu_p2pk", amountMsats: request.amount_msats };
     }
@@ -581,7 +620,7 @@ async function redeliverUnconfirmedPayment(args: {
   provider: ProviderRef;
   jobToken?: string;
   rail?: RailFlag;
-}): Promise<PaidPaymentResult> {
+}): Promise<PaidPaymentResult | CreditedPaymentResult> {
   const { jobId, request, submission, provider } = args;
   const sentRail: RailFlag = submission.rail === "cashu_p2pk" ? "cashu" : submission.rail;
   if (submission.requestAmountMsats !== request.amount_msats)
@@ -606,7 +645,7 @@ async function redeliverUnconfirmedPayment(args: {
     ? getEncodedToken({ mint: held.mint, proofs: toCashuProofs(held.output_proofs) }) : undefined);
   if (!cashuToken || !sameEndpoint(held.endpoint, provider.endpoint))
     throw unconfirmedPaymentError(jobId, "The unconfirmed Cashu payment for this request cannot be re-delivered.");
-  await deliverAgentWalletPayment({
+  const credited = await deliverAgentWalletPayment({
     ...args,
     submission: held.output_proofs.some((proof) => proof.reserved_for !== undefined) ? { ...submission, reserve: true } : submission,
     redelivery: true,
@@ -620,7 +659,7 @@ async function redeliverUnconfirmedPayment(args: {
       intendedLockPubkey: held.intended_lock_pubkey,
     },
   });
-  return { status: "paid", rail: "cashu_p2pk", amountMsats: request.amount_msats };
+  return credited ?? { status: "paid", rail: "cashu_p2pk", amountMsats: request.amount_msats };
 }
 
 /** Send a signed x402 or Tempo payment and book it once the provider takes it. */
@@ -634,11 +673,12 @@ async function deliverSignedRailPayment(args: {
   requestSeq?: number;
   approval?: { requestSeq: number; approval: PaymentApproval };
   redelivery?: boolean;
-}): Promise<PaidPaymentResult> {
+}): Promise<PaidPaymentResult | CreditedPaymentResult> {
   const { jobId, submission, provider } = args;
   const sent = await sendRailPayment(args.transport, jobId,
     { type: "payment", content: submission.content } as OutboundMessage,
     provider, { jobToken: args.jobToken }, args.requestSeq, submission, args.redelivery);
+  if ("credit" in sent) return sent.credit;
   if (!sent.tracked) {
     addPayment(jobId, submission.amountMsats, args.approval, submission.usdMicro);
     recordSpend({ msats: submission.amountMsats, btcRate: submission.btcRate, jobId,
@@ -685,7 +725,7 @@ async function tryAgentWalletMidJobPayment(args: {
   /** anonymous-flow per-job token; sent as `X-Job-Token` on the `payment` POST. */
   jobToken?: string;
   requestSeq?: number;
-}): Promise<boolean> {
+}): Promise<boolean | CreditedPaymentResult> {
   const {
     jobId,
     request,
@@ -774,7 +814,7 @@ async function tryAgentWalletMidJobPayment(args: {
     );
   }
 
-  await deliverAgentWalletPayment({ jobId, request, prepared, transport, provider, approval, jobToken,
+  const credited = await deliverAgentWalletPayment({ jobId, request, prepared, transport, provider, approval, jobToken,
     requestSeq: args.requestSeq,
     submission: {
       rail: "cashu_p2pk",
@@ -788,7 +828,7 @@ async function tryAgentWalletMidJobPayment(args: {
       reason: request.reason,
     },
   });
-  return true;
+  return credited ?? true;
 }
 
 /** Ship a prepared or held Cashu token and book it once the provider takes it. */
@@ -803,7 +843,7 @@ async function deliverAgentWalletPayment(args: {
   jobToken?: string;
   requestSeq?: number;
   redelivery?: boolean;
-}): Promise<void> {
+}): Promise<void | CreditedPaymentResult> {
   const { jobId, request, prepared, submission, transport, provider, approval, jobToken } = args;
   let sent: SentPayment;
   try {
@@ -839,6 +879,7 @@ async function deliverAgentWalletPayment(args: {
     throw err;
   }
 
+  if ("credit" in sent) return sent.credit;
   if (sent.tracked) {
     if (sent.booked) await finishBookedSubmission(jobId, sent.booked, provider.endpoint);
     return;
@@ -914,7 +955,7 @@ async function sendMidJobPaymentWithRetry(args: {
  * submission this send booked, absent when a concurrent reader booked it first.
  * An untracked send (another endpoint) leaves booking to its caller.
  */
-type SentPayment = { tracked: true; booked?: UnconfirmedPaymentSubmission } | { tracked: false };
+type SentPayment = { credit: CreditedPaymentResult } | { tracked: true; booked?: UnconfirmedPaymentSubmission } | { tracked: false };
 
 async function sendRailPayment(
   transport: Transport,
@@ -944,17 +985,33 @@ async function sendRailPayment(
   } catch (error) {
     // A failure after deposit acceptance can still carry signed funding evidence.
     if (error instanceof DvmError && error.data) capture(error.data);
-    const outcome = sendOutcome(error, submission, redelivery);
-    if (requestSeq === undefined) {
-      if (outcome.kind === "taken" && error instanceof DvmError && error.code === "replay_rejected") return { tracked: false };
+    const accepted = error instanceof DvmError && error.code === "payment_unapplied" ? error.data?.paymentCredit as PaymentCredit | undefined : undefined;
+    if (accepted && submission) result = { seq: 0, credit: accepted } as CreditMessageResult;
+    else {
+      const outcome = sendOutcome(error, submission, redelivery);
+      if (requestSeq === undefined) {
+        if (outcome.kind === "taken" && error instanceof DvmError && error.code === "replay_rejected") return { tracked: false };
+        throw error;
+      }
+      if (outcome.kind === "taken") return { tracked: true, booked: markPaymentRequestPaid(jobId, requestSeq) };
+      if (outcome.kind === "blocked") blockHeldPayment(jobId, requestSeq, outcome.blocked);
+      else if (outcome.kind === "refused") clearPaymentRequestInFlight(jobId, requestSeq);
+      else if (outcome.kind === "not_sent") clearPaymentRequestInFlight(jobId, requestSeq, { keepSubmission: true });
+      else markPaymentRequestInFlight(jobId, requestSeq);
       throw error;
     }
-    if (outcome.kind === "taken") return { tracked: true, booked: markPaymentRequestPaid(jobId, requestSeq) };
-    if (outcome.kind === "blocked") blockHeldPayment(jobId, requestSeq, outcome.blocked);
-    else if (outcome.kind === "refused") clearPaymentRequestInFlight(jobId, requestSeq);
-    else if (outcome.kind === "not_sent") clearPaymentRequestInFlight(jobId, requestSeq, { keepSubmission: true });
-    else markPaymentRequestInFlight(jobId, requestSeq);
-    throw error;
+  }
+  const credit = (result as CreditMessageResult | undefined)?.credit;
+  if (credit && submission) {
+    const funding = (result as CreditMessageResult).drawFundingReceipt;
+    // The SDK can also return only the unused slice of an overpayment. Its
+    // funding receipt states the whole deposit; that case still paid the ask.
+    const partial = funding?.currency === credit.credit_currency && credit.credited_micro < funding.funded_micro;
+    const credited = await receivePaymentCredit({ jobId, requestSeq, credit, partial,
+      rail: submission.rail, amountMsats: submission.amountMsats, btcRate: submission.btcRate,
+      fundId: submission.rail === "cashu_p2pk" ? submission.cashuRequestId : `${submission.rail}:${createHash("sha256").update(JSON.stringify(submission.content)).digest("hex")}`,
+      ...(submission.rail === "cashu_p2pk" ? { cashuRequestId: submission.cashuRequestId } : {}), transport, provider });
+    if (!partial) return { credit: credited };
   }
   // Book the accepted ask before receipt parsing can fail, so a later stream
   // never constructs a fresh payment for the same seq.
