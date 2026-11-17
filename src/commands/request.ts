@@ -1,8 +1,13 @@
+import {
+  mandateRequestJson as json, mandateJobData, mandateDurationMs, prepareStandingMandate,
+  setMandateUpfront, signJobData, standingMandateRecord, type PreparedStandingMandate,
+} from "../lib/standing-mandate";
+import { dropPendingMandate, MANDATE_SUBMIT_DISPLAY } from "../lib/mandate-recovery";
 import { hasUnsavedJobState } from "../lib/job-persistence";
 import { terminalSettlementReport } from "../lib/job-settlement";
 import { autoPayWarnings } from "../lib/auto-pay-warning";
 import { addOutputWarnings, withOutputWarnings } from "../lib/output";
-import { guidanceJobArg, providerFields, providerJobJson as json } from "../lib/provider-output";
+import { guidanceJobArg, providerFields } from "../lib/provider-output";
 import { buildTempoCredential } from "../lib/payment-rails/tempo-credential";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { parseBudget } from "../lib/currency";
@@ -234,6 +239,8 @@ export interface RequestOptions {
    */
   autoPayBelow?: string;
   maxIncrement?: string;
+  mandate?: boolean;
+  mandateUntil?: string;
   /** Max number of payments to honour for this job. Required — agents must declare expectations. */
   maxPayments?: string;
   outputType?: string;
@@ -313,6 +320,7 @@ async function requestWithWarnings(
   opts: RequestOptions,
   stage: { intentReached: boolean }
 ): Promise<void> {
+  if (opts.mandateUntil !== undefined) mandateDurationMs(opts.mandateUntil);
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const timeout = opts.timeout ? Number(opts.timeout) * 1000 : 30000;
   // Validate the money cap before warmup or quote I/O. The wallet repeats the
@@ -720,6 +728,17 @@ async function requestWithWarnings(
         }
       );
     }
+    if (probePlan.mode === "draw") {
+      signing.standingMandate = await prepareStandingMandate(opts, providerInfo, btcRate, policy.maxPayments);
+      setMandateUpfront(signing.standingMandate, previewQuotes[0]);
+      const creditId = probePlan.creditId;
+      const bound = [storedCredit, ...(storedCredit?.siblingCredits ?? []), ...implicitCredits]
+        .find((credit) => credit?.creditId === creditId);
+      if (signing.standingMandate && bound && bound.currency !== signing.standingMandate.currency) {
+        signing.standingMandate.supported = false;
+        signing.standingMandate.unavailable = "The mandate was skipped because the bound credit currency differs from the provider's advertised currency. Later charges need a payer attached or scheduled check-ins.";
+      }
+    }
     if (probePlan.mode === "draw" && opts.requestId) {
       probePlan = { ...probePlan, drawId: opts.requestId };
     }
@@ -741,7 +760,7 @@ async function requestWithWarnings(
             ...(drawRequestId ? { request_id: drawRequestId } : {}),
           }
         : unsignedData;
-    data = signDvmRequestData(signer.privkey, probeData, signing.domain);
+    data = signJobData(signing, probeData);
     if (opts.human) info(`Signed as ${signer.pubkey}.`);
     if (opts.human && probePlan.mode === "draw") {
       info(
@@ -940,6 +959,7 @@ async function requestWithWarnings(
   saveSubmittedJob({
     id: receipt.jobId,
     ...transactionRecordFields(receipt),
+    ...standingMandateRecord(envelope, signing?.standingMandate, opts.human),
     endpoint,
     dvmId,
     feedbackClaim: receipt.feedbackClaim,
@@ -976,10 +996,12 @@ async function requestWithWarnings(
   if (noStream && !isTerminalJobStatus(receipt.status)) {
     transport.close();
     const nextAction = pollNextAction(receipt.jobId);
-    if (policy.maxPayments > 1) {
+    if (policy.maxPayments > 1 && !loadJob(receipt.jobId)?.mandate) {
       const job = guidanceJobArg(receipt.jobId);
       nextAction.hint += ` Later payment asks are paid only while \`dvm messages ${job} --wait\` stays attached within the saved spending policy, or by running \`dvm pay ${job}\` for each ask. An unanswered payment ask ends the job. Neither \`dvm status ${job}\` nor \`dvm messages ${job} --no-stream\` pays later asks.`;
     }
+    if (loadJob(receipt.jobId)?.mandate)
+      nextAction.hint += " Automatic payments stop if the credit runs out or a limit or expiry is reached; check in and attach a payer if the job needs another charge.";
     if (opts.human) {
       info(`Job published: ${receipt.jobId}`);
       echoTraceIdHuman();
@@ -1256,6 +1278,7 @@ interface RequestSigningContext {
   pubkey: string;
   unsignedData: Record<string, unknown>;
   domain: SignedRequestDomain;
+  standingMandate?: PreparedStandingMandate;
 }
 
 interface RequestCreditContext {
@@ -1538,11 +1561,7 @@ async function recoverDrawProbe(
   const { signing } = args;
   const reSign = (fields?: Record<string, unknown>): JobEnvelope => ({
     ...args.envelope,
-    data: signDvmRequestData(
-      signing.privkey,
-      fields ? { ...signing.unsignedData, ...fields } : signing.unsignedData,
-      signing.domain
-    ),
+    data: signJobData(signing, fields ? { ...signing.unsignedData, ...fields } : signing.unsignedData),
   });
 
   if (err.code === "credit_not_found" || err.code === "credit_expired") {
@@ -1738,6 +1757,8 @@ async function handleAutoPayQuotes(
     outputOverBudget(jobId || null, quotes, opts, identity, action);
     return;
   }
+
+  setMandateUpfront(creditCtx?.signing.standingMandate, chosen);
 
   // Check auto-pay threshold (mirrors payment-responder.ts for mid-job payments)
   if (
@@ -2043,7 +2064,7 @@ async function handleAutoPayQuotes(
     };
     railEnvelope = {
       ...plainEnvelope,
-      data: signDvmRequestData(railSigning.privkey, railSigning.unsignedData, railSigning.domain),
+      data: signJobData(railSigning, railSigning.unsignedData),
     };
     railOpts = { ...opts, requestId: generatedRequestId };
     persistRequestIntent({
@@ -2636,6 +2657,7 @@ function persistRequestIntent(args: {
   body.data = unsigned.body;
   const maxCashuFeeSats = parseMaxCashuFeeSats(opts.maxCashuFeeSats);
   const saved = saveRequestIntent({
+    ...standingMandateRecord(args.envelope, args.signing?.standingMandate),
     v: 2,
     requestId,
     endpoint: args.endpoint,
@@ -2932,6 +2954,11 @@ async function tryAgentWalletPayment(
     (plan.mode === "open" || plan.mode === "topup") && signing && plan.wireAmountMicro !== undefined
       ? plan
       : undefined;
+  if (fundPlan && signing) {
+    if (!signing.standingMandate)
+      signing.standingMandate = await prepareStandingMandate(opts, providerInfo, btcRate, policy.maxPayments);
+    setMandateUpfront(signing.standingMandate, chosen);
+  }
   const priceSats = Math.ceil(chosen.priceMsats / 1000);
   const maxCashuFeeSats = parseMaxCashuFeeSats(opts.maxCashuFeeSats);
   const baseContext = {
@@ -2982,11 +3009,7 @@ async function tryAgentWalletPayment(
     generatedRequestId && signing
       ? {
           ...envelope,
-          data: signDvmRequestData(
-            signing.privkey,
-            withGeneratedRequestId(signing.unsignedData),
-            signing.domain
-          ),
+          data: signJobData(signing, withGeneratedRequestId(signing.unsignedData)),
         }
       : envelope;
   let finalEnvelope = perCallEnvelope;
@@ -2995,7 +3018,7 @@ async function tryAgentWalletPayment(
     const activeFund = fundPlan;
     const fundData =
       activeFund && signing
-        ? withGeneratedRequestId({
+        ? withGeneratedRequestId(mandateJobData(signing, {
             ...signing.unsignedData,
             credit_id: activeFund.creditId,
             draw_id: activeFund.drawId,
@@ -3003,7 +3026,7 @@ async function tryAgentWalletPayment(
               amount_micro: activeFund.wireAmountMicro ?? activeFund.fundMicro,
               commitment: "",
             },
-          })
+          }))
         : null;
     const payload = envelopeToPayload(envelope);
     return {
@@ -3085,9 +3108,7 @@ async function tryAgentWalletPayment(
   if (fundPlan && signing) {
     finalEnvelope = {
       ...envelope,
-      data: signDvmRequestData(
-        signing.privkey,
-        withGeneratedRequestId({
+      data: signJobData(signing, withGeneratedRequestId({
           ...signing.unsignedData,
           credit_id: fundPlan.creditId,
           draw_id: fundPlan.drawId,
@@ -3095,9 +3116,7 @@ async function tryAgentWalletPayment(
             amount_micro: fundPlan.wireAmountMicro ?? fundPlan.fundMicro,
             commitment: sha256Hex(prepared.cashuToken),
           },
-        }),
-        signing.domain
-      ),
+        })),
     };
   }
   // Persisted against the exact `data` about to go on the wire, so a later
@@ -3250,7 +3269,9 @@ function withSpentSpendContext(
     new DvmError(
       err.code,
       `${err.message} The ${held} payment was already sent — it is held against request ${requestId}, not lost.`,
-      err.hint,
+      err.code === "invalid_mandate"
+        ? "Do not submit or pay for a replacement. The held payment will be retried without a mandate on your next call; check 'dvm wallet show'."
+        : err.hint,
       {
         ...err.data,
         spend_committed: true,
@@ -3348,6 +3369,7 @@ async function payWithAgentWallet(
   let receipt;
   let activeEnvelope = envelope;
   let correctedOnce = false;
+  let mandateRemoved = false;
   for (;;) {
     try {
       receipt = await submitAgentWalletWithRetry(
@@ -3387,6 +3409,18 @@ async function payWithAgentWallet(
         }
         throw error;
       }
+      if (err instanceof DvmError && err.code === "invalid_mandate" && !mandateRemoved && fundPlan && signing &&
+          unsignRequestData(activeEnvelope.data)?.body.mandate) {
+        const reduced = await dropPendingMandate({ requestId: prepared.requestId, display: MANDATE_SUBMIT_DISPLAY });
+        mandateRemoved = true;
+        if (signing.standingMandate) {
+          signing.standingMandate.supported = false;
+          signing.standingMandate.unavailable = MANDATE_SUBMIT_DISPLAY;
+        }
+        activeEnvelope = { ...activeEnvelope,
+          data: signDvmRequestData(signing.privkey, reduced.context!.submit_body.data as Record<string, unknown>, signing.domain) };
+        continue;
+      }
       // the server valued the attached token differently than we
       // did (its fiat price isn't always exactly reproducible from the wire —
       // fx rotation, or an msats-priced DVM whose quote rounds the fiat).
@@ -3414,16 +3448,12 @@ async function payWithAgentWallet(
         if (generatedRequestId) publicRequestId = undefined;
         activeEnvelope = {
           ...envelope,
-          data: signDvmRequestData(
-            signing.privkey,
-            {
+          data: signJobData(signing, {
               ...signing.unsignedData,
               credit_id: fundPlan.creditId,
               draw_id: fundPlan.drawId,
               fund: { amount_micro: expected, commitment: sha256Hex(prepared.cashuToken) },
-            },
-            signing.domain
-          ),
+            }),
         };
         continue;
       }
@@ -3499,6 +3529,7 @@ async function payWithAgentWallet(
       feedbackClaim: receipt.feedbackClaim,
       capability: identity.capability,
       requestId: publicRequestId,
+      ...standingMandateRecord(activeEnvelope, signing?.standingMandate, opts.human),
       ...(fundPlan && signing ? { creditBinding: {
         creditId: fundPlan.creditId, drawId: fundPlan.drawId, callerPubkey: signing.pubkey,
       } } : {}),

@@ -349,13 +349,15 @@ export function buildProgram(): Command {
       "--auto-pay-below <amount>",
       "Auto-pay any single charge at or below this — upfront quote or mid-job (millisats or $USD). Bounded consent: implies --auto-pay, except with --credit-only where only that prepaid credit may be spent."
     )
+    .option("--mandate-until <duration>", "Automatic credit payment expiry (default: 24h; maximum: 7d; e.g. 2h, 1d)")
+    .option("--no-mandate", "Keep later credit charges dependent on an attached payer or scheduled check-ins")
     .option("--max-increment <amount>", "Max single payment (millisats or $USD)")
     .option(
       "--max-payments <n>",
       "Max payments to honour per job (default: 5); 0 = free, 1 = typical, 3+ = multi-turn"
     )
     .option("--output-type <mime>", "Desired output MIME type")
-    .option("--no-stream", "Submit and return immediately; later asks need dvm messages <job> --wait or dvm pay <job>")
+    .option("--no-stream", "Submit and return immediately; later asks use a supported credit mandate, otherwise need dvm messages <job> --wait or dvm pay <job>")
     .option(
       "--auto-pay",
       "Pay without prompting, bounded by --auto-pay-below (else config autoPayThreshold, else 20% of --budget). Unnecessary when --auto-pay-below is set."

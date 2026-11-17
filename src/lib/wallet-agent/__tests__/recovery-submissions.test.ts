@@ -995,6 +995,35 @@ describe("sweepPendingSubmissions — fund-amount correction", () => {
     );
   });
 
+  it("keeps an active fund correction when persisting a refused mandate removal", async () => {
+    const entry = fundEntry();
+    const data = entry.context!.submit_body.data as Record<string, unknown>;
+    data.mandate = { max_total_micro: 1_000_000, max_ask_micro: 100_000, expires_at_ms: NOW_MS + 60_000 };
+    vi.mocked(loadAgentWallet).mockReturnValue(baseWallet([entry]));
+    const httpPost = vi.fn()
+      .mockResolvedValueOnce({ status: 402, body: { error: "funding_commitment_mismatch", expected_micro: PROVIDER_MICRO } })
+      .mockResolvedValueOnce({ status: 400, body: { error: "invalid_mandate" } })
+      .mockResolvedValueOnce({ status: 200, body: { job_id: "job-9" } });
+
+    const result = await sweepPendingSubmissions({ httpPost, now });
+
+    expect(result.outcomes[0]).toMatchObject({ kind: "shipped", jobId: "job-9" });
+    expect(httpPost).toHaveBeenCalledTimes(3);
+    expect(shippedFund(httpPost, 2)).toMatchObject({ amount_micro: PROVIDER_MICRO, commitment: COMMITMENT });
+    const sent = httpPost.mock.calls.map(([call]) => JSON.parse(call.body));
+    expect(sent[1].data.mandate).toBeDefined();
+    expect(sent[2].data).not.toHaveProperty("mandate");
+    expect(new Set(httpPost.mock.calls.map(([call]) => call.headers["X-Cashu"])).size).toBe(1);
+    const reduced = vi.mocked(saveAgentWallet).mock.calls.find(([wallet]) => {
+      const context = wallet.pending_submissions[0]?.context;
+      return context && "mandate_unavailable" in context;
+    })?.[0];
+    expect(reduced?.pending_submissions[0].context?.submit_body.data).toMatchObject({
+      fund: { amount_micro: PROVIDER_MICRO, commitment: COMMITMENT },
+    });
+    expect(reduced?.pending_submissions[0].context?.submit_body.data).not.toHaveProperty("mandate");
+  });
+
   it("abandons the commitment-hash branch, which no re-sign can fix", async () => {
     vi.mocked(loadAgentWallet).mockReturnValue(baseWallet([fundEntry()]));
     const httpPost = vi.fn().mockResolvedValue({

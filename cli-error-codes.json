@@ -125,6 +125,7 @@
     "invalid_limit",
     "invalid_local_correlation_id",
     "invalid_locktime",
+    "invalid_mandate",
     "invalid_max_cashu_fee",
     "invalid_max_cashu_principal",
     "invalid_max_fee",

@@ -154,7 +154,7 @@ it("does not dispatch a payment when its pre-send pin cannot be saved", async ()
 
 it("retains an accepted balance payment and its recovery intent when booking is locked", async () => {
   const intent: CreditPaymentIntent = { request: ask.content, amountMsats: 1000,
-    authorization: { timestamp: Math.floor(Date.now() / 1000), payment_id: "payment-a", request_seq: 4 } as NonNullable<PaymentContent["credit"]> };
+    authorization: { timestamp: Math.floor(Date.now() / 1000), payment_id: "payment-a", request_seq: 4 } as Extract<NonNullable<PaymentContent["credit"]>, { signature: string }> };
   updateJob(jobId, { pendingCreditPayment: intent });
   await holdJobsLock();
   await withOutputWarnings(async () => {

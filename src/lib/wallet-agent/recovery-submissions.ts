@@ -1,3 +1,4 @@
+import { dropPendingMandate, mandateRecoveryNotice } from "../mandate-recovery";
 import type { SignedRequestDomain } from "@dvmkit/sdk";
 import { dvmFetch } from "../http";
 /**
@@ -1146,9 +1147,10 @@ async function shipEntry(
 
   // `active` is the entry as re-signed *this* pass: identical to the persisted
   // one except after a fund-amount correction, which rewrites one field of the
-  // fund block. The loop runs at most twice.
+  // fund block, or after dropping a refused mandate. Each correction is attempted once.
   let active = entry;
   let correctedOnce = false;
+  let mandateRemoved = false;
   for (;;) {
     const body = resumeBody(active);
     if (!body) return { kind: "unresumable", entry };
@@ -1185,6 +1187,8 @@ async function shipEntry(
             return { kind: "still_pending", entry, reason: `recovery conflict: job ${identity.jobId} is already a different local job` };
           updateJob(identity.jobId, {
             ...recoveredCreditBinding(active),
+            ...mandateRecoveryNotice(active.context),
+            ...(mandateRecoveryNotice(active.context).mandateUnavailable ? { mandate: undefined } : {}),
             ...(record.requestId ? { requestId: record.requestId } : {}),
             ...(record.jobToken && !existing.jobToken ? { jobToken: record.jobToken } : {}),
           });
@@ -1193,7 +1197,7 @@ async function shipEntry(
         recordUpfrontCreditPayment(identity.jobId, response.body?.upfront_payment, true);
       }
       await reconcileResumedJobCredit(active, response.body, httpPost);
-      return { kind: "shipped", entry, jobId: identity.jobId };
+      return { kind: "shipped", entry: active, jobId: identity.jobId };
     }
     // Checked before the generic 409 below, which would book the spend and
     // drop the entry as an ordinary replay.
@@ -1220,6 +1224,12 @@ async function shipEntry(
     }
     const errCode = typeof response.body?.error === "string" ? response.body.error : null;
 
+    if (errCode === "invalid_mandate" && !mandateRemoved && route === "/v1/job" &&
+        (active.context?.submit_body.data as Record<string, unknown> | undefined)?.mandate) {
+      active = await dropPendingMandate({ requestId: active.request_id, context: active.context });
+      mandateRemoved = true;
+      continue;
+    }
     // FX can change the provider valuation while the entry is pending. This
     // pre-commit refusal permits one corrected signature over the same token.
     if (errCode === "funding_commitment_mismatch") {
@@ -1683,6 +1693,7 @@ function jobRecordFromEntry(
     id: jobId,
     endpoint: entry.endpoint,
     ...recoveredCreditBinding(entry),
+    ...mandateRecoveryNotice(ctx),
     ...(publicRequestId ? { requestId: publicRequestId } : {}),
     ...(ctx?.dvm_id ? { dvmId: ctx.dvm_id } : {}),
     ...(feedbackClaim ? { feedbackClaim } : {}),

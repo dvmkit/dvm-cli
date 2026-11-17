@@ -19,6 +19,7 @@ const FIELD = "DVM-Job-Identity-V1";
 
 const seams = vi.hoisted(() => ({
   prepareAgentSpend: vi.fn(),
+  commitAgentSpend: vi.fn(),
   info: vi.fn(),
   json: vi.fn(),
   jsonEvent: vi.fn(),
@@ -81,7 +82,7 @@ beforeAll(async () => {
   vi.doMock("../src/lib/wallet-agent/spend", async (importOriginal) => ({
     ...(await importOriginal<typeof import("../src/lib/wallet-agent/spend")>()),
     prepareAgentSpend: seams.prepareAgentSpend,
-    commitAgentSpend: vi.fn(async () => undefined),
+    commitAgentSpend: seams.commitAgentSpend,
   }));
   // The paid path sweeps before it spends. The tests run the real sweep
   // themselves, after the paid call, as the restart.
@@ -113,6 +114,7 @@ beforeEach(async () => {
   writeConfig("off");
   seedWallet();
   seams.prepareAgentSpend.mockImplementation(journalSpend);
+  seams.commitAgentSpend.mockImplementation(async () => undefined);
   provider = await startProvider();
   // Only the provider's own origin is reachable.
   vi.stubGlobal("fetch", (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
@@ -1062,6 +1064,132 @@ describe("an x402 payment whose outcome is unknown", () => {
   });
 });
 
+describe("standing-mandate credit and recovery boundaries", () => {
+  it.each([false, true])("retries a refused first Cashu mandate inline with one payment (second refusal=%s)", async (refuseAgain) => {
+    writeConfig("auto"); seedCredit(0); provider.mandate = true; provider.refuseMandate = true;
+    const spend = await vi.importActual<typeof import("../src/lib/wallet-agent/spend")>("../src/lib/wallet-agent/spend");
+    seams.commitAgentSpend.mockImplementation(spend.commitAgentSpend);
+    let durableAtRetry: unknown;
+    provider.paid = () => {
+      durableAtRetry = onlyJournalEntry().context?.submit_body.data;
+      return refuseAgain ? answer(400, { error: "invalid_mandate", message: "The credit currency does not match." })
+        : answer(200, { job_id: "job-a", status: "completed", summary: "Done" }, { [FIELD]: "job-a" });
+    };
+    if (refuseAgain) {
+      const error = await paidRequest({ maxPayments: "2" }).catch((error: unknown) => error);
+      expect(error).toMatchObject({
+        code: "invalid_mandate", hint: expect.stringContaining("Do not submit or pay for a replacement"),
+      });
+      expect((error as { hint: string }).hint).not.toContain("--no-mandate");
+      expect(onlyJournalEntry().context?.submit_body.data).not.toHaveProperty("mandate");
+      expect(sdk.loadAgentWallet()!.recent_spends).toEqual([]);
+    } else {
+      await paidRequest({ maxPayments: "2" });
+      expect(jobs.loadAllJobs()).toHaveLength(1);
+      expect(jobs.loadJob("job-a")).toMatchObject({ mandateUnavailable: expect.stringContaining("submitted without") });
+      expect(seams.json.mock.calls.at(-1)?.[0]).toMatchObject({ mandate: { status: "skipped", display: expect.stringContaining("submitted without") } });
+      expect(sdk.loadAgentWallet()!.pending_submissions).toEqual([]);
+      expect(sdk.loadAgentWallet()!.recent_spends).toHaveLength(1);
+      await seams.realSweep!({ fetchImpl: globalThis.fetch });
+    }
+    const posts = provider.paidPosts();
+    expect(posts).toHaveLength(2);
+    expect(posts[0].status).toBe(400);
+    expect(posts[1].status).toBe(refuseAgain ? 400 : 200);
+    expect(posts[0].body.mandate).toBeDefined();
+    expect(posts[0].body.request_id).toEqual(expect.any(String));
+    expect(posts[1].body).toEqual(Object.fromEntries(Object.entries(posts[0].body).filter(([key]) => key !== "mandate")));
+    expect(durableAtRetry).toEqual(posts[1].body);
+    expect(new Set(posts.map((post) => post.payment)).size).toBe(1);
+    expect(seams.prepareAgentSpend).toHaveBeenCalledTimes(1);
+    expect(seams.commitAgentSpend).toHaveBeenCalledTimes(refuseAgain ? 0 : 1);
+  });
+
+  it("keeps direct Cashu requests independent of credit FX and zero auto-pay limits", async () => {
+    provider.mandate = true;
+    provider.creditCurrency = "eur";
+    const rates = vi.spyOn(await import("../src/lib/credit-currency"), "balanceCurrencyRate");
+    await paidRequest({ rail: "cashu" });
+    expect(provider.paidPosts()).toHaveLength(1);
+    expect(provider.paidPosts()[0].body).not.toHaveProperty("mandate");
+    await expect(request({ endpoint: provider.endpoint, input: "Echo", budget: "100000", autoPayBelow: "0", stream: false })).resolves.toBeUndefined();
+    expect(rates).not.toHaveBeenCalled();
+  });
+
+  it("journals and submits a Cashu-funded credit mandate", async () => {
+    writeConfig("auto"); seedCredit(0); provider.mandate = true;
+    await paidRequest({ maxPayments: "2" });
+    const body = provider.paidPosts()[0].body;
+    expect(body).toHaveProperty("fund");
+    expect(body.mandate).toMatchObject({ max_total_micro: 100_000, max_ask_micro: 100_000 });
+    expect(onlyJournalEntry().context?.submit_body.data).toMatchObject({ mandate: body.mandate, fund: body.fund });
+    expect(jobs.loadJob("job-a")?.mandate).toMatchObject({ ...body.mandate as object, signed_data: expect.objectContaining({ signature: expect.any(String) }) });
+  });
+
+  it.each([false, true])("recovers a rejected Cashu mandate once with the same money (second refusal=%s)", async (refuseAgain) => {
+    writeConfig("auto"); seedCredit(0); provider.mandate = true;
+    provider.bindsPaid = false;
+    provider.paid = () => (response) => response.socket?.destroy();
+    await paidRequest({ maxPayments: "2" }).catch(() => undefined);
+    const held = onlyJournalEntry();
+    const original = held.context!.submit_body.data as Record<string, unknown>;
+    expect(original.mandate).toBeDefined();
+    const proofsBefore = sdk.loadAgentWallet()!.proofs;
+    provider.bindsPaid = true;
+    provider.refuseMandate = true;
+    let durableAtPost: unknown;
+    let reducedPost: unknown;
+    provider.paid = (post, accepted) => {
+      durableAtPost = onlyJournalEntry().context?.submit_body.data;
+      reducedPost = post.body;
+      return refuseAgain ? answer(400, { error: "invalid_mandate" })
+        : answer(202, { job_id: accepted, status: "processing", job_token: provider.token,
+          upfront_payment: { credit_id: post.body.credit_id, draw_id: post.body.draw_id,
+            amount_msats: 1000, amount_micro: 1000, currency: "usd", rail: "cashu" } }, { [FIELD]: accepted });
+    };
+    const postsBefore = provider.paidPosts().length;
+    const result = await seams.realSweep!({ fetchImpl: globalThis.fetch });
+    expect(provider.paidPosts().length).toBe(postsBefore + 2);
+    expect(durableAtPost).not.toHaveProperty("mandate");
+    expect(reducedPost).toEqual(Object.fromEntries(Object.entries(original).filter(([key]) => key !== "mandate")));
+    expect(new Set(provider.paidPosts().map((post) => post.payment))).toEqual(new Set([held.cashu_token]));
+    expect(sdk.loadAgentWallet()!.proofs).toEqual(proofsBefore);
+    if (refuseAgain) {
+      expect(result.outcomes).toMatchObject([{ kind: "still_pending", reason: "invalid_mandate" }]);
+      expect(onlyJournalEntry()).toMatchObject({ amount_sats: held.amount_sats, output_proofs: held.output_proofs });
+      expect(onlyJournalEntry().context?.submit_body.data).not.toHaveProperty("mandate");
+      expect(sdk.loadAgentWallet()!.recent_spends).toEqual([]);
+      const view = views.describePendingSubmissions(sdk.loadAgentWallet()!).entries[0];
+      expect(view.display).toContain("retried once without");
+      expect(views.formatPendingSubmission(view)).toContain("retried once without");
+    } else {
+      expect(result.outcomes).toMatchObject([{ kind: "shipped", jobId: "job-a" }]);
+      expect(sdk.loadAgentWallet()!.pending_submissions).toEqual([]);
+      expect(sdk.loadAgentWallet()!.recent_spends).toMatchObject([{ request_id: held.request_id, amount_sats: held.amount_sats }]);
+      expect(jobs.loadJob("job-a")).toMatchObject({ totalPaidMsats: 1000, paymentsHonoured: 1,
+        mandateUnavailable: expect.stringContaining("retried once without") });
+      expect(views.describeResumedSubmissions(result.outcomes)[0].display).toContain("retried once without");
+      // The immutable original intent remains useful; request-result can find the reduced accepted body.
+      await requestResult(original.request_id as string);
+      expect(jobs.loadJob("job-a")?.mandate).toBeUndefined();
+    }
+  });
+
+  it("retries a dedicated request-resume without a rejected mandate", async () => {
+    writeConfig("auto"); seedCredit(0); provider.mandate = true;
+    provider.bindsPaid = false;
+    provider.paid = () => (response) => response.socket?.destroy();
+    await paidRequest({ maxPayments: "2" }).catch(() => undefined);
+    const original = onlyJournalEntry().context!.submit_body.data as Record<string, unknown>;
+    provider.resumeRejectMandate = true;
+    await requestResume(original.request_id as string);
+    expect(provider.resumedBodies).toHaveLength(2);
+    expect(provider.resumedBodies![0].mandate).toBeDefined();
+    expect(provider.resumedBodies![1]).toEqual(Object.fromEntries(Object.entries(original).filter(([key]) => key !== "mandate")));
+    expect(jobs.loadJob("job-a")).toMatchObject({ mandateUnavailable: expect.stringContaining("retried once without") });
+  });
+});
+
 interface JobPost {
   paid: boolean;
   rail: "cashu" | "x402" | null;
@@ -1075,6 +1203,11 @@ interface JobPost {
 type Reply = (response: ServerResponse) => void;
 
 interface Provider {
+  mandate?: boolean;
+  creditCurrency?: string;
+  refuseMandate?: boolean;
+  resumeRejectMandate?: boolean;
+  resumedBodies?: Record<string, unknown>[];
   endpoint: string;
   inputSchema?: Record<string, unknown>;
   /** Advertise `request_recovery`. */
@@ -1187,6 +1320,7 @@ async function startProvider(): Promise<Provider> {
     const drawn = !post.paid && typeof unsigned.credit_id === "string" ? state.draw : undefined;
     if (!post.paid && !drawn) return state.unpaid(post)(response);
     const accepted = "job-a";
+    if (unsigned.mandate && state.refuseMandate) return answer(400, { error: "invalid_mandate" })(response);
     if (requestId && state.bindsPaid) bound.set(requestId, { jobId: accepted, pubkey, fingerprint });
     (drawn ?? state.paid)(post, accepted)(response);
   };
@@ -1221,6 +1355,10 @@ async function startProvider(): Promise<Provider> {
     } catch {
       return answer(401, { error: "auth_error" })(response);
     }
+    state.resumedBodies ??= [];
+    state.resumedBodies.push(signer.unsigned);
+    if (state.resumeRejectMandate && signer.unsigned.mandate)
+      return answer(400, { error: "invalid_mandate" })(response);
     if (signer.unsigned.request_id !== requestId) {
       return answer(404, { error: "request_not_found", status: "unknown", request_id: requestId })(response);
     }
@@ -1301,7 +1439,9 @@ function info(state: Provider): Record<string, unknown> {
     auth_audience: audience,
     capabilities: { echo: { description: "Echo", ...(state.inputSchema ? { input_schema: state.inputSchema } : {}) } },
     cashu: { mints: [mint], lock_pubkeys: [lockPubkey], min_locktime: 60, canonical_id: null },
-    credit: { ...creditTerms, balance_payment: true },
+    credit: { ...creditTerms, balance_payment: true,
+      ...(state.creditCurrency ? { currency: state.creditCurrency } : {}),
+      ...(state.mandate ? { standing_mandate: true } : {}) },
     ...(state.recovery ? { request_recovery: true } : {}),
     ...(state.x402
       ? { x402: { pay_to: `0x${"77".repeat(20)}`, network: "eip155:84532", asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" } }

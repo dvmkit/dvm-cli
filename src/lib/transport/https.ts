@@ -1,3 +1,4 @@
+import { invalidMandateError, creditTermsWithStandingMandate } from "../standing-mandate";
 import { sameEndpoint } from "../provider-endpoint";
 import { callerMessageRecognizer, rememberCallerMessage } from "../message-ownership";
 import { loadJob } from "../job-store";
@@ -25,7 +26,6 @@ import {
   type MppxChallenge,
   type OutboundMessage,
   parseCreditMenu,
-  parseCreditTerms,
   parseJobIdentityHeader,
   parseTraceparent,
   type Payment,
@@ -167,7 +167,7 @@ export class HttpsTransport implements Transport {
       inputSchema: data.input_schema as Record<string, unknown> | undefined,
       protocolVersion: providerVersion,
       paymentMethods: (data.payment as { methods?: string[] } | undefined)?.methods,
-      credit: parseCreditTerms(data.credit),
+      credit: creditTermsWithStandingMandate(data.credit),
       x402: data.x402 as ProviderInfo["x402"],
       tempo: data.tempo as ProviderInfo["tempo"],
       cashu: data.cashu as ProviderInfo["cashu"],
@@ -1274,6 +1274,11 @@ function parseStructuredError(body: string): DvmError | null {
   if (!parsed) return null;
 
   const err = parsed.error;
+  if (err === "invalid_mandate" || (err && typeof err === "object" && "code" in err && err.code === "invalid_mandate")) {
+    const fields = err && typeof err === "object" ? err as Record<string, unknown> : parsed;
+    const reason = [fields.message, fields.details, fields.display].find((value) => typeof value === "string");
+    return invalidMandateError(typeof reason === "string" ? reason : undefined);
+  }
 
   if (err && typeof err === "object" && !Array.isArray(err)) {
     const e = err as Record<string, unknown>;
