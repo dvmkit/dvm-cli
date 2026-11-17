@@ -419,7 +419,7 @@ async function handleLockedPaymentRequest(
   if (priorLanding && explicitRail && Object.values(loadJob(jobId)?.paymentCreditLandings ?? {}).some((entry) =>
       entry.request_seq === opts?.requestSeq && sameEndpoint(entry.endpoint, provider.endpoint!) &&
       (entry.rail === "cashu_p2pk" ? "cashu" : entry.rail) === opts?.rail)) {
-    const action = paymentCreditChoice(jobId, opts!.requestSeq!, request)!;
+    const action = paymentCreditChoice(jobId, opts!.requestSeq!, request, false)!;
     throw new DvmError("payment_credit_rail_repeated", "This rail already funded credit for this charge; repeating it would land as credit again.",
       action.hint, { display: action.display, next_action: action });
   }
@@ -433,7 +433,7 @@ async function handleLockedPaymentRequest(
   }
 
   if (priorLanding && !explicitRail) {
-    const action = paymentCreditChoice(jobId, opts!.requestSeq!, request)!;
+    const action = paymentCreditChoice(jobId, opts!.requestSeq!, request, false)!;
     throw new DvmError("payment_credit_choice_required", action.display, action.hint, { display: action.display, next_action: action });
   }
 

@@ -1,3 +1,4 @@
+import { sameEndpoint } from "./provider-endpoint";
 import { recoverMandateWinner } from "./mandate-wait";
 import { randomUUID } from "node:crypto";
 import { type PaymentContent } from "@dvmkit/sdk";
@@ -79,6 +80,11 @@ export async function sendCreditPayment(
       recordRefusedDrawBalance({ endpoint: provider.endpoint!, callerPubkey: intent.authorization.pubkey,
         creditId: intent.authorization.credit_id, remainingMicro: error.data?.remaining_micro });
       mutateCreditPayment(jobId, (job) => {
+        for (const landing of Object.values(job.paymentCreditLandings ?? {})) {
+          if (landing.request_seq === intent.authorization.request_seq && !landing.ask_answered &&
+              provider.endpoint && sameEndpoint(landing.endpoint, provider.endpoint))
+            landing.credit_payment_unavailable = true;
+        }
         if (job.pendingCreditPayment?.authorization.payment_id === intent.authorization.payment_id) {
           delete job.pendingCreditPayment;
           if (intent.selectedUnbound) job.creditBinding = { unbound: true, callerPubkey: intent.authorization.pubkey };
