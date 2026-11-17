@@ -8,6 +8,12 @@ The following core is an additive compatibility promise. Its names, value types,
 
 This promise covers the fields below, not every JSON response. Balances, history, funding details other than the recovery handles below, and unrelated action types remain free to change. Human-readable wording in `display` and `hint` is not fixed.
 
+### Internal-error diagnostics
+
+These diagnostic fields are outside the promised core: `error_site` optionally lists up to five identifier-only stack function names from the CLI package, innermost first; foreign messages and full stacks are never published.
+Optional `error_log` points to private local details (`~/` under home); it is absent if logging fails or the complete record exceeds 256 KiB, and logs retain one `.1` rotation.
+Do not read the log into the conversation; it can hold secrets, so give the human its path to inspect or attach to a report.
+
 ### Job actions
 
 `next_action` is an object with a string `type`, or `null` when this output has no next action. `null` alone does not prove that an uncertain payment settled. These job action types and fields are promised:
