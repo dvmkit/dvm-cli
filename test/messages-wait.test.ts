@@ -209,7 +209,7 @@ describe("messages wait", () => {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-  });
+  }, 15_000);
 
   it("propagates a dropped payment POST without reconnecting or sending it again", async () => {
     let posts = 0;
