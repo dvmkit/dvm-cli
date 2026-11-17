@@ -99,8 +99,19 @@ describe("HTTPS refused read connections", () => {
     const read = boundary === "status" ? transport.status("job-1", { endpoint })
       : boundary === "stream" ? transport.stream("job-1", 0, { endpoint })
       : transport.getMessages("job-1", 0, { endpoint });
-    await expect(read).rejects.toMatchObject({ code: "provider_unreachable", message: expect.not.stringContaining(endpoint) });
+    await expect(read).rejects.toMatchObject({ code: "provider_unreachable", message: expect.not.stringContaining(endpoint),
+      hint: expect.stringContaining("dvm messages job-1 --wait") });
   });
+});
+
+it("does not treat a null status body from a reachable provider as a network failure", async () => {
+  const endpoint = await listen(createServer((_request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.end("null");
+  }));
+  const error = await new HttpsTransport().status("job-null", { endpoint }).catch((caught: unknown) => caught);
+  expect(error).toBeInstanceOf(TypeError);
+  expect(error).not.toBeInstanceOf(DvmError);
 });
 
 describe("HTTPS payment send deadlines", () => {

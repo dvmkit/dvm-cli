@@ -957,6 +957,51 @@ it("does not claim a job is running when the wait limit passes before any read",
 });
 
 describe("wait stream recovery", () => {
+  it("recovers an unreachable in-flight reconciliation read without paying the ask again", async () => {
+    vi.useFakeTimers();
+    const jobId = "wait-reconcile-unreachable";
+    const ask = msg(5, "payment-request", { amount_msats: 1000, reason: "Held block" });
+    const paid = { ...msg(6, "payment", { amount_msats: 1000 }), from: "requester" } as Message;
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+    markPaymentRequestInFlight(jobId, 5);
+    transport([[ask], [msg(7, "complete", { summary: "Done" })]]);
+    vi.mocked(seams.transport.getMessages).mockRejectedValueOnce(new DvmError("provider_unreachable", "Read unavailable"))
+      .mockResolvedValue([ask, paid]);
+    const first = await streamLoop({ jobId, provider, transport: seams.transport, policy, afterSeq: 4,
+      retryUnreachableReads: true, timeoutMs: 1000 });
+    expect(first).toMatchObject({ paymentInFlight: true, cursor: 4, nextAction: { type: "poll" } });
+    expect(loadJob(jobId)?.inFlightPaymentRequestSeqs).toEqual([5]);
+    expect(seams.pay).not.toHaveBeenCalled();
+    const pending = messages(jobId, { wait: true, until: "3s" });
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(output().next_action).toBeNull();
+    expect(loadJob(jobId)?.inFlightPaymentRequestSeqs ?? []).toEqual([]);
+    expect(seams.transport.getMessages).toHaveBeenCalledTimes(2);
+    expect(seams.pay).not.toHaveBeenCalled();
+  });
+
+  it("recovers an unreachable history recheck after auto-payment without re-paying", async () => {
+    vi.useFakeTimers();
+    const jobId = "wait-post-payment-unreachable";
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, policy });
+    const ask = msg(1, "payment-request", { amount_msats: 1000, reason: "Paid block" });
+    const stream = transport([[ask], [ask, msg(2, "complete", { summary: "Done" })]]);
+    const deliver = stream.getMockImplementation()!;
+    stream.mockImplementationOnce(deliver)
+      .mockRejectedValueOnce(new DvmError("provider_unreachable", "Stream unavailable"));
+    vi.mocked(seams.transport.getMessages).mockRejectedValueOnce(new DvmError("provider_unreachable", "History unavailable"));
+    const pending = messages(jobId, { wait: true, until: "3s" });
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(output().next_action).toBeNull();
+    expect(seams.transport.getMessages).toHaveBeenCalledTimes(1);
+    expect(stream).toHaveBeenCalledTimes(3);
+    expect(seams.pay).toHaveBeenCalledTimes(1);
+    expect(streamed("payment")).toHaveLength(1);
+    expect(streamedSeqs()).toEqual([1, 2]);
+  });
+
   it("writes a payment confirmed by reconciliation within a second, while the stream stays quiet", async () => {
     vi.useFakeTimers();
     const jobId = "wait-quiet-booking";

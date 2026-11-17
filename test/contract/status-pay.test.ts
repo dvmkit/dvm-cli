@@ -92,7 +92,7 @@ it.each(["paid", "expired", "completed", "cancelled", "working", "unavailable"])
   if (change === "unavailable") { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); }
   const result = await run("pay");
   expect(result.code).toBe(1);
-  expect(result.output.error?.code).toBe(change === "unavailable" ? "internal" : "no_payment_pending");
+  expect(result.output.error?.code).toBe(change === "unavailable" ? "provider_unreachable" : "no_payment_pending");
   expect(posts).toBe(0);
 });
 it("refuses a foreign endpoint before sending the stored bearer credential", async () => {

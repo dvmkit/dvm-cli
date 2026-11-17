@@ -43,7 +43,7 @@ it("ends a JSON --wait with an unreadable --until as one invalid_arguments line"
   const lines = outcome.stdout.trimEnd().split("\n");
   expect(lines).toHaveLength(1);
   expect(JSON.parse(lines[0])).toEqual({ event: "error", error: {
-    code: "invalid_arguments", message: 'Invalid duration "9am"; use e.g. 30s, 5m, 2h, 1d', hint: expect.stringContaining("1h30m") } });
+    code: "invalid_arguments", message: 'Invalid duration "9am"; use e.g. 30s, 5m, 2h, 1d or 1h30m', hint: expect.stringContaining("1h30m") } });
 });
 
 it("explains an unreadable --until in --human --wait instead of an internal error", () => {

@@ -35,7 +35,7 @@ it("ends a failed wait with the local-state warning after messages already writt
         throw Object.assign(new Error("Storage unavailable"), { code: "EACCES" });
       });
       updateObservedJob(jobId, { messageCursor: 1 });
-      throw new DvmError("provider_unreachable", `Connection lost for ${token}`);
+      throw new DvmError("provider_error", `Connection lost for ${token}`);
     }),
     close: vi.fn(),
   } as unknown as Transport;
@@ -50,7 +50,7 @@ it("ends a failed wait with the local-state warning after messages already writt
   expect(lines[0]).toMatchObject({ seq: 1, type: "text" });
   expect(lines[0]).not.toHaveProperty("warnings");
   expect(lines[1]).toMatchObject({
-    error: { code: "provider_unreachable", message: "Connection lost for [REDACTED]" },
+    error: { code: "provider_error", message: "Connection lost for [REDACTED]" },
     warnings: [{
       code: "local_job_state_unsaved",
       display: expect.stringContaining("Automatic payments are paused"),
