@@ -190,6 +190,12 @@ it("separates active recovery and completed outcomes from funding and draw total
     "refund completed: 2 eur · refunded · rail tempo · fee unknown",
   );
 });
+it("refuses an oversized --since duration before it can create a negative history window", () => {
+  expect(() => walletHistory({ since: "99999999999999999999999d" }, new Date(timestamp)))
+    .toThrow(expect.objectContaining({ code: "invalid_arguments" }));
+  expect(output.json).not.toHaveBeenCalled();
+});
+
 it("rejects invalid offsets and keeps unknown valuations out of totals", () => {
   expect(() => walletHistory({ offset: "-1" })).toThrow(
     "Invalid history offset",
