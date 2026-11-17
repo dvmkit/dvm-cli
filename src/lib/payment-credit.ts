@@ -36,6 +36,7 @@ export interface PaymentCreditLanding extends PaymentCredit {
   ask_open?: boolean;
   job_terminal?: boolean;
   balance_unheld?: boolean;
+  credit_payment_unavailable?: boolean;
   drainable: boolean;
   display: string;
   reclaim_command?: string;
@@ -71,17 +72,15 @@ export function describePaymentCreditLanding(landing: PaymentCreditLanding, part
   const pending = pendingDrainFor(stored, landing.credit_id);
   const balance = stored?.creditId === landing.credit_id ? stored : stored?.siblingCredits?.find((entry) => entry.creditId === landing.credit_id);
   const hasBalance = balance === undefined || balance.remainingMicro > 0;
-  const drainable = owned && !!answered && landing.balance_unheld === true && !pending && hasBalance;
+  const terminal = landing.job_terminal === true || !!job && isTerminalJobStatus(job.status);
+  const drainable = terminal && owned && !!answered && landing.balance_unheld === true && !pending && hasBalance;
   let command: string | undefined;
   if (drainable) {
-    let signer: ReturnType<typeof findSigningIdentityByPubkey> = null;
-    try { signer = findSigningIdentityByPubkey(landing.caller_pubkey!); } catch { /* The balance remains owned when the identity store is unavailable. */ }
-    const identity = signer && "name" in signer.source ? ` --as ${shellQuoteArg(signer.source.name)}` : "";
-    command = `dvm credit drain ${shellQuoteArg(landing.endpoint)} --credit-id ${shellQuoteArg(landing.credit_id)}${identity}`;
+    command = landingDrainCommand(landing);
   }
-  return { ...landing, ask_answered: !!answered, ask_open: !!open, drainable, reclaim_command: command,
+  return { ...landing, ...(answered ? { credit_payment_unavailable: undefined } : {}), ask_answered: !!answered, ask_open: !!open, drainable, reclaim_command: command,
     display: (partial ? `The unused part of the payment, ${amount}, became credit at ${landing.endpoint}. `
-      : answered ? `The charge was already settled or is no longer payable; ${amount} became credit at ${landing.endpoint}. `
+      : answered ? `The charge was already settled or is no longer payable; ${amount} became credit at ${landing.endpoint}. Some or all of that credit may since have paid job charges. `
       : `The payment landed as credit at ${landing.endpoint}: ${amount}. ` +
         (open ? "The charge is still open. This credit may still pay the charge; the provider may hold the credit until the job ends. " : "Whether the charge is settled has not been confirmed. ")) +
       (!owned ? (landing.credit_id.startsWith("imp:") ? "This is unsigned credit; no caller key can drain it. " : "No signed caller is recorded for this job. For an unsigned payment, no caller key can drain this credit. ") +
@@ -91,20 +90,32 @@ export function describePaymentCreditLanding(landing: PaymentCreditLanding, part
             : "Check the job and credit balance before reclaiming it.") };
 }
 
-export function paymentCreditChoice(jobId: string, seq: number, request: PaymentRequestContent): NextActionPay | undefined {
+function landingDrainCommand(landing: PaymentCreditLanding): string {
+  let signer: ReturnType<typeof findSigningIdentityByPubkey> = null;
+  try { signer = findSigningIdentityByPubkey(landing.caller_pubkey!); } catch { /* The balance remains owned when the identity store is unavailable. */ }
+  const identity = signer && "name" in signer.source ? ` --as ${shellQuoteArg(signer.source.name)}` : "";
+  return `dvm credit drain ${shellQuoteArg(landing.endpoint)} --credit-id ${shellQuoteArg(landing.credit_id)}${identity}`;
+}
+
+export function paymentCreditChoice(jobId: string, seq: number, request: PaymentRequestContent, requireCreditAttempt = true): NextActionPay | undefined {
   const job = loadJob(jobId);
   const landings = Object.values(job?.paymentCreditLandings ?? {}).filter((entry) => entry.request_seq === seq &&
     sameEndpoint(entry.endpoint, job!.endpoint));
-  if (!landings.length) return undefined;
+  const creditMayPay = !!job?.creditBinding && !!request.credit;
+  if (!landings.length || requireCreditAttempt && creditMayPay && !landings.some((entry) => entry.credit_payment_unavailable)) return undefined;
   const descriptions = landings.map((entry) => {
     const amount = formatFiat(entry.credited_micro / 1_000_000, entry.credit_currency);
     const owned = entry.caller_pubkey && !entry.credit_id.startsWith("imp:");
-    return `${amount} is held as credit${owned ? ` (${entry.credit_id})` : "; no caller key can drain this unsigned credit"} at ${entry.endpoint}.`;
+    return `${amount} is held as credit${owned ? ` (${entry.credit_id})` : entry.credit_id.startsWith("imp:") ? "; no caller key can drain this unsigned credit" : ""} at ${entry.endpoint}.`;
   });
+  const reclaim = landings.map((entry) => entry.credit_id.startsWith("imp:")
+    ? "Unsigned credit cannot be reclaimed by a caller key; contact the provider about returning it."
+    : entry.caller_pubkey ? `After the job ends, check the remaining balance and reclaim available credit with \`${landingDrainCommand(entry)}\`.`
+      : "No signed caller is recorded for this credit; contact the provider about returning it.");
   return { type: "pay", job_id: jobId, amount_msats: request.amount_msats, reason: asProviderText(request.reason), requires_approval: true,
     display: `${descriptions.join(" ")} The charge is still open. A human must choose what to do next.`,
-    hint: `Automatic payment may use credit only. Ask your human to choose: pay with a different rail explicitly using \`dvm pay ${shellQuoteArg(jobId)} --rail <different-rail>\`, or stop the job and reclaim owned credit when available. ` +
-      "Do not repeat a rail whose payment already landed as credit. Unsigned credit cannot be reclaimed by a caller key; contact the provider about returning it." };
+    hint: `Automatic payment may use credit only. Ask your human to choose: pay with a different rail explicitly using \`dvm pay ${shellQuoteArg(jobId)} --rail <different-rail>\`, or stop the job with ` +
+      `\`dvm decline ${shellQuoteArg(jobId)}\`. ${reclaim.join(" ")} Do not repeat a rail whose payment already landed as credit.` };
 }
 
 export async function refreshPaymentCredit(landing: PaymentCreditLanding, transport: Transport, provider: ProviderRef, jobToken?: string): Promise<PaymentCreditLanding> {

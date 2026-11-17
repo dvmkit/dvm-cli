@@ -173,7 +173,7 @@ async function payWithAccess(
   );
   // anonymous-flow per-job token threaded through the `payment`
   // POST and the follow-up streamLoop's reads.
-  const result = await handlePaymentRequest(jobId, paymentReq, payPolicy, transport, ref, {
+  let result = await handlePaymentRequest(jobId, paymentReq, payPolicy, transport, ref, {
     jobToken,
     rail,
     maxCashuPrincipalSats,
@@ -183,6 +183,10 @@ async function payWithAccess(
     budget: opts.budget,
     useStoredPolicy: true,
   });
+  if (typeof result === "object" && result.status === "credited" && result.credit.ask_open)
+    result = await handlePaymentRequest(jobId, paymentReq, payPolicy, transport, ref, {
+      jobToken, requestSeq, approval: "explicit", useStoredPolicy: true,
+    });
 
   if (result === "over-budget") {
     transport.close();

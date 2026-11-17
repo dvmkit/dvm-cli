@@ -422,7 +422,10 @@ export function hasUnknownUpfrontRail(job: JobRecord): boolean {
 export function updateJob(id: string, update: Partial<Omit<JobRecord, "id">>): void {
   mutateJobs((jobs) => {
     const idx = jobs.findIndex((j) => j.id === id);
-    if (idx !== -1) jobs[idx] = { ...jobs[idx], ...update };
+    if (idx !== -1) {
+      jobs[idx] = { ...jobs[idx], ...update };
+      if (update.status && ["completed", "failed", "cancelled"].includes(update.status)) clearPaymentCreditRefusals(jobs[idx]);
+    }
   });
 }
 
@@ -430,7 +433,10 @@ export function updateJob(id: string, update: Partial<Omit<JobRecord, "id">>): v
 export function updateObservedJob(id: string, update: Partial<Omit<JobRecord, "id">>): void {
   mutateJobs((jobs) => {
     const idx = jobs.findIndex((j) => j.id === id);
-    if (idx !== -1) jobs[idx] = { ...jobs[idx], ...update };
+    if (idx !== -1) {
+      jobs[idx] = { ...jobs[idx], ...update };
+      if (update.status && ["completed", "failed", "cancelled"].includes(update.status)) clearPaymentCreditRefusals(jobs[idx]);
+    }
   }, true);
 }
 
@@ -573,6 +579,7 @@ export function markPaymentRequestPaid(jobId: string, requestSeq: number): Uncon
   const booked = mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (!job) return undefined;
+    clearPaymentCreditRefusals(job, requestSeq);
     if (!job.paidPaymentRequestSeqs?.includes(requestSeq))
       (job.paidPaymentRequestSeqs ??= []).push(requestSeq);
     if (job.inFlightPaymentRequestSeqs) {
@@ -599,6 +606,12 @@ export function markPaymentRequestPaid(jobId: string, requestSeq: number): Uncon
   return booked;
 }
 
+function clearPaymentCreditRefusals(job: JobRecord, requestSeq?: number): void {
+  for (const landing of Object.values(job.paymentCreditLandings ?? {})) {
+    if (requestSeq === undefined || landing.request_seq === requestSeq) delete landing.credit_payment_unavailable;
+  }
+}
+
 /**
  * Record that the ask was answered without evidence it was by the held
  * submission (another payment, or history that no longer carries the content).
@@ -608,6 +621,7 @@ export function markPaymentRequestAnswered(jobId: string, requestSeq: number): v
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
     if (!job) return;
+    clearPaymentCreditRefusals(job, requestSeq);
     if (!job.paidPaymentRequestSeqs?.includes(requestSeq))
       (job.paidPaymentRequestSeqs ??= []).push(requestSeq);
     job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs?.filter((seq) => seq !== requestSeq);
@@ -840,6 +854,7 @@ export function mutateCreditPayment<T>(jobId: string, change: (job: JobRecord) =
 
 export function bookCreditPayment(jobId: string, intent: CreditPaymentIntent): void {
   const booked = mutateCreditPayment(jobId, (job) => {
+    clearPaymentCreditRefusals(job, intent.authorization.request_seq);
     let booked = false;
     if (!job.bookedCreditPayments?.some((entry) =>
       entry.authorization.payment_id === intent.authorization.payment_id)) {

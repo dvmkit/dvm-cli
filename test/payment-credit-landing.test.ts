@@ -8,7 +8,7 @@ import { CREDITS_FILE, JOBS_FILE, WALLET_FILE, WALLET_VERSION, loadAgentWallet, 
 import { prepareAgentSpend } from "../src/lib/wallet-agent/spend";
 import { loadLedger } from "../src/lib/budget-ledger";
 import { handlePaymentRequest } from "../src/lib/payment-responder";
-import { loadJob, saveJob, markPaymentRequestInFlight } from "../src/lib/job-store";
+import { loadJob, saveJob, updateJob, markPaymentRequestAnswered, markPaymentRequestPaid, markPaymentRequestInFlight } from "../src/lib/job-store";
 import { HttpsTransport } from "../src/lib/transport/https";
 import { streamLoop } from "../src/lib/stream-loop";
 import { pay as payCommand } from "../src/commands/pay";
@@ -46,11 +46,15 @@ let posts: number;
 let balanceReads: number;
 let balanceUnavailable: boolean;
 let jobUnavailable: boolean;
+let statusReads: number;
+let failStatusAt: number;
 let held: boolean;
 let invalidCredit: boolean;
 let fresh: boolean;
 let refuseCredit: boolean;
 let unapplied500: boolean;
+let omitCredit: boolean;
+let refuseCreditBeforeLanding: boolean;
 let sends: number;
 let drainRequests: Record<string, unknown>[];
 let ask: PaymentRequestContent;
@@ -65,7 +69,8 @@ function history(): Message[] {
     ...(landed && cause === "expired" ? [{ seq: 5, from: "provider", timestamp: 2, type: "cancel", content: { reason: "Payment request expired" } } as Message] : [])];
 }
 beforeEach(async () => {
-  invalidCredit = false; fresh = false; refuseCredit = false; unapplied500 = false; sends = 0; drainRequests = []; implicit = false; creditPayments = 0; creditPayment = undefined; jobUnavailable = false; held = false;
+  statusReads = 0; failStatusAt = 0;
+  omitCredit = false; refuseCreditBeforeLanding = false; invalidCredit = false; fresh = false; refuseCredit = false; unapplied500 = false; sends = 0; drainRequests = []; implicit = false; creditPayments = 0; creditPayment = undefined; jobUnavailable = false; held = false;
   cause = "mandate"; signed = true; landed = false; posts = 0; balanceReads = 0; balanceUnavailable = false;
   for (const file of [BUDGET_FILE, CREDITS_FILE, JOBS_FILE, WALLET_FILE]) rmSync(file, { force: true });
   rmSync(join(process.env.DVM_CONFIG_DIR!, "messages"), { recursive: true, force: true });
@@ -92,12 +97,15 @@ beforeEach(async () => {
       return void response.end(JSON.stringify({ op: "balance", credit: wireCredit() }));
     }
     if (jobUnavailable && request.method === "GET") { response.statusCode = 503; return void response.end('{"error":"unavailable"}'); }
+    if (request.url === "/v1/job/job-landing" && ++statusReads === failStatusAt) {
+      response.statusCode = 503; return void response.end('{"error":"unavailable"}');
+    }
     if (request.url === "/v1/job/job-landing") return void response.end(JSON.stringify({ status: landed && cause === "expired" ? "cancelled" : (creditPayment || (landed && cause === "mandate")) ? "processing" : "awaiting-input" }));
     if (request.method === "GET") return void response.end(JSON.stringify({ messages: history() }));
     const body = JSON.parse(Buffer.concat(chunks).toString());
     if (body.content?.credit) {
       creditPayments++;
-      if (refuseCredit) { response.statusCode = 402; return void response.end(JSON.stringify({ error: "insufficient_credit", remaining_micro: 0, shortfall_micro: 1500 })); }
+      if (refuseCredit || (refuseCreditBeforeLanding && !landed)) { response.statusCode = 402; return void response.end(JSON.stringify({ error: "insufficient_credit", remaining_micro: 0, shortfall_micro: 1500 })); }
       expect(body.content.credit).toMatchObject({ credit_id: "held-credit", request_seq: 4, amount_micro: 1500, pubkey: caller });
       creditPayment = { seq: 7, from: "requester", timestamp: 3, type: "payment", content: body.content };
       response.statusCode = 201; return void response.end(JSON.stringify({ seq: 7 }));
@@ -106,7 +114,7 @@ beforeEach(async () => {
     posts++; landed = true;
     if (unapplied500) {
       response.statusCode = posts === 1 ? 500 : 409;
-      return void response.end(JSON.stringify(posts === 1 ? { error: "payment_unapplied", credit_id: creditId(), credited_micro: 1500, credit_currency: "usd",
+      return void response.end(JSON.stringify(posts === 1 ? { error: "payment_unapplied", ...(omitCredit ? {} : { credit_id: creditId(), credited_micro: 1500, credit_currency: "usd" }),
         display: "The payment was received but whether it paid the charge is unconfirmed.", hint: "Read the job status before paying again." }
         : { error: "replay_rejected" }));
     }
@@ -148,8 +156,8 @@ it.each(["mandate", "expired"] as const)("records the real 201 Cashu balance lan
   const transport = new HttpsTransport();
   const pay = () => handlePaymentRequest("job-landing", ask, policy, transport, { endpoint }, { rail: "cashu", requestSeq: 4 });
   const result = await pay();
-  expect(result).toMatchObject({ status: "credited", credit: { credit_id: "held-credit", credited_micro: 1500, drainable: true,
-    reclaim_command: expect.stringContaining("dvm credit drain"), display: expect.stringContaining("$0.0015") } });
+  expect(result).toMatchObject({ status: "credited", credit: { credit_id: "held-credit", credited_micro: 1500, drainable: reason === "expired",
+    ...(reason === "expired" ? { reclaim_command: expect.stringContaining("dvm credit drain") } : {}), display: expect.stringContaining("$0.0015") } });
   expect(loadJob("job-landing")?.paymentsHonoured ?? 0).toBe(0);
   expect(loadJob("job-landing")?.paidPaymentRequestSeqs).toBeUndefined();
   expect(loadCredit(endpoint, caller)).toMatchObject({ creditId: "held-credit", remainingMicro: 11_500 });
@@ -335,11 +343,17 @@ it("stops automatic rail payments after a fresh mismatch landing and repeated bo
   cause = "mismatch"; refuseCredit = true; seed(); fresh = true;
   const transport = new HttpsTransport();
   let last;
-  for (let read = 0; read < 3; read++) last = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  for (let read = 0; read < 3; read++) {
+    last = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+    expect(last.nextAction).toMatchObject({ type: "pay", requires_approval: true });
+    expect(creditPayments).toBeGreaterThanOrEqual(2);
+  }
   expect(posts).toBe(1);
   expect(last?.nextAction).toMatchObject({ type: "pay", requires_approval: true, display: expect.stringContaining("charge is still open") });
   expect(last?.nextAction?.hint).toContain("different rail");
-  expect(last?.nextAction?.hint).toContain("reclaim");
+  expect(last?.nextAction?.hint).toContain(`dvm credit drain ${endpoint} --credit-id fresh-credit`);
+  expect(last?.nextAction?.hint).toContain("dvm decline job-landing");
+  expect(JSON.stringify(last?.nextAction)).not.toMatch(/unsigned/i);
   expect(last?.nextAction?.display).toContain("$0.0015");
   expect(last?.nextAction?.display).toContain("fresh-credit");
   expect(readNextAction("job-landing", history())).toMatchObject({ type: "pay", requires_approval: true });
@@ -350,14 +364,14 @@ it("stops automatic rail payments after a fresh mismatch landing and repeated bo
 
 it("refuses repeated explicit Cashu payments after one mismatch landing", async () => {
   cause = "mismatch"; refuseCredit = true; seed(); fresh = true;
-  await payCommand("job-landing", { rail: "cashu" });
+  await expect(payCommand("job-landing", { rail: "cashu" })).rejects.toMatchObject({ code: "payment_credit_choice_required" });
   for (let attempt = 0; attempt < 2; attempt++) await expect(payCommand("job-landing", { rail: "cashu" }))
     .rejects.toMatchObject({ code: "payment_credit_rail_repeated", message: expect.stringContaining("land as credit again") });
   expect(posts).toBe(1); expect(loadLedger().entries).toHaveLength(1);
 });
 
-it("stops unsigned mismatch landings after one rail payment without offering a drain", async () => {
-  cause = "mismatch"; signed = false; seed();
+it.each([false, true])("stops implicit mismatch landings without offering a drain (signed caller: %s)", async (signedCaller) => {
+  cause = "mismatch"; signed = signedCaller; implicit = true; refuseCredit = true; seed();
   const transport = new HttpsTransport();
   let last;
   for (let read = 0; read < 3; read++) last = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
@@ -396,7 +410,8 @@ it("describes an open landing as potential charge funding without a reclaim comm
   await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
   creditList({});
   expect(vi.mocked(json).mock.calls.at(-1)![0]).toMatchObject({ payment_credit_landings: [{ ask_answered: true, ask_open: false,
-    display: expect.stringContaining("settled") }] });
+    display: expect.stringContaining("settled"), drainable: false }] });
+  expect(JSON.stringify((vi.mocked(json).mock.calls.at(-1)![0] as Record<string, unknown>).payment_credit_landings)).not.toContain("dvm credit drain");
   transport.close();
 });
 
@@ -423,5 +438,130 @@ it("does not offer a stale drain for an exhausted sibling credit", async () => {
   const entries = (vi.mocked(json).mock.calls.at(-1)![0] as Record<string, unknown>).payment_credit_landings;
   expect(JSON.stringify(entries)).toContain("settled");
   expect(JSON.stringify(entries)).not.toContain("dvm credit drain");
+  transport.close();
+});
+
+it("tries bound credit after an automatic landing before asking a human", async () => {
+  cause = "mismatch"; refuseCreditBeforeLanding = true; seed();
+  const transport = new HttpsTransport();
+  const first = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  expect(first.nextAction).not.toMatchObject({ requires_approval: true });
+  const next = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  expect(next.nextAction).not.toMatchObject({ requires_approval: true });
+  expect(creditPayments).toBe(2);
+  expect(posts).toBe(1);
+  expect(loadJob("job-landing")).toMatchObject({ paymentsHonoured: 1, totalPaidMsats: 1500 });
+  transport.close();
+});
+
+it("does not present a human choice on an ordinary read before trying landed credit", async () => {
+  cause = "mismatch"; seed();
+  const transport = new HttpsTransport();
+  await handlePaymentRequest("job-landing", ask, policy, transport, { endpoint }, { rail: "cashu", requestSeq: 4, approval: "explicit" });
+  expect(creditPayments).toBe(0);
+  expect(readNextAction("job-landing", history())).not.toMatchObject({ requires_approval: true });
+  const next = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  expect(next.autoPayments).toMatchObject([{ rail: "credit" }]);
+  expect(next.nextAction).not.toMatchObject({ requires_approval: true });
+  expect(posts).toBe(1);
+  transport.close();
+});
+
+it("returns a settling action for payment_unapplied without readable credit fields", async () => {
+  cause = "unconfirmed"; refuseCredit = true; unapplied500 = true; omitCredit = true; seed();
+  const transport = new HttpsTransport();
+  const result = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  expect(result).toMatchObject({ nextAction: { type: "poll", hint: expect.stringContaining("re-sends that same payment") }, paymentInFlight: true });
+  expect(loadJob("job-landing")?.unconfirmedPaymentSubmissions?.[4]).toBeDefined();
+  expect(loadJob("job-landing")?.paymentCreditLandings).toBeUndefined();
+  expect(loadJob("job-landing")?.paymentsHonoured ?? 0).toBe(0);
+  const retry = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  expect(retry.nextAction).toMatchObject({ type: "poll" });
+  expect(posts).toBe(1); expect(sends).toBe(1);
+  transport.close();
+});
+
+it.each([false, true])("uses explicit approval to try landed credit above the auto-pay limit (refused: %s)", async (refused) => {
+  cause = "mismatch"; refuseCredit = refused; seed();
+  updateJob("job-landing", { policy: { ...policy, autoPayBelowMsats: 1000 } });
+  if (refused) {
+    await expect(payCommand("job-landing", { rail: "cashu" })).rejects.toMatchObject({
+      code: "payment_credit_choice_required", data: { next_action: { requires_approval: true, hint: expect.stringContaining("dvm decline job-landing") } },
+    });
+    expect(loadJob("job-landing")?.paymentsHonoured ?? 0).toBe(0);
+  } else {
+    await payCommand("job-landing", { rail: "cashu" });
+    expect(vi.mocked(json).mock.calls.at(-1)![0]).toMatchObject({ paid: { rail: "credit" }, next_action: { type: "poll" } });
+    expect(loadJob("job-landing")).toMatchObject({ paymentsHonoured: 1, paymentApprovals: [{ requestSeq: 4, approval: "explicit" }] });
+  }
+  expect(creditPayments).toBe(1);
+  expect(posts).toBe(1); expect(sends).toBe(1);
+  await expect(payCommand("job-landing", { rail: "cashu" })).rejects.toMatchObject({ code: refused ? "payment_credit_rail_repeated" : "no_payment_pending" });
+  expect(posts).toBe(1); expect(sends).toBe(1);
+});
+
+it.each([
+  [1, false], [1, true], [2, false], [2, true],
+])("re-examines a landed ask from the returned cursor after status read %i fails (refused: %s)", async (failAt, refused) => {
+  cause = "mismatch"; refuseCreditBeforeLanding = true; failStatusAt = failAt; seed();
+  const transport = new HttpsTransport();
+  const first = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  expect(statusReads).toBe(failAt);
+  expect(first).toMatchObject({ cursor: 3, nextAction: { type: "poll", hint: expect.stringContaining("credit") } });
+  expect(first.nextAction?.hint).not.toMatch(/unconfirmed|no copy|re-send/i);
+  refuseCredit = refused;
+  const next = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: first.cursor });
+  if (refused) expect(next.nextAction).toMatchObject({ type: "pay", requires_approval: true });
+  else {
+    expect(next.autoPayments).toMatchObject([{ rail: "credit" }]);
+    expect(next.nextAction).toMatchObject({ type: "poll" });
+    expect(loadJob("job-landing")?.paymentsHonoured).toBe(1);
+  }
+  expect(creditPayments).toBe(2);
+  expect(posts).toBe(1); expect(sends).toBe(1);
+  transport.close();
+});
+
+it.each(["pinned rail", "no binding"])("does not save a credit refusal when no credit attempt was made: %s", async (mode) => {
+  cause = "mismatch"; signed = mode !== "no binding"; seed();
+  const transport = new HttpsTransport();
+  await handlePaymentRequest("job-landing", ask, policy, transport, { endpoint }, { rail: "cashu", requestSeq: 4 });
+  await expect(handlePaymentRequest("job-landing", ask, policy, transport, { endpoint }, { rail: "cashu", requestSeq: 4 }))
+    .rejects.toMatchObject({ code: "payment_credit_choice_required" });
+  expect(creditPayments).toBe(0);
+  if (mode === "no binding") expect(readNextAction("job-landing", history())).toMatchObject({ requires_approval: true });
+  else expect(readNextAction("job-landing", history())).not.toMatchObject({ requires_approval: true });
+  expect(Object.values(loadJob("job-landing")?.paymentCreditLandings ?? {})[0].credit_payment_unavailable).toBeUndefined();
+  expect(posts).toBe(1);
+  transport.close();
+});
+
+it("clears a real credit refusal after a top-up pays the landed ask", async () => {
+  cause = "mismatch"; refuseCredit = true; seed();
+  const transport = new HttpsTransport();
+  const first = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  expect(first.nextAction).toMatchObject({ requires_approval: true });
+  expect(creditPayments).toBe(2);
+  expect(Object.values(loadJob("job-landing")?.paymentCreditLandings ?? {})[0].credit_payment_unavailable).toBe(true);
+  recordFundResponse({ endpoint, callerPubkey: caller, credit: { ...wireCredit(), ledger_seq: 3 }, targetMicro: 10_000 });
+  refuseCredit = false;
+  const next = await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: first.cursor });
+  expect(next.autoPayments).toMatchObject([{ rail: "credit" }]);
+  expect(loadJob("job-landing")?.paymentsHonoured).toBe(1);
+  expect(Object.values(loadJob("job-landing")?.paymentCreditLandings ?? {})[0].credit_payment_unavailable).toBeUndefined();
+  expect(posts).toBe(1); expect(sends).toBe(1);
+  transport.close();
+});
+
+it.each(["external answer", "rail payment", "terminal job"])("clears a credit refusal when the charge is resolved by %s", async (answer) => {
+  cause = "mismatch"; refuseCredit = true; seed();
+  const transport = new HttpsTransport();
+  await streamLoop({ jobId: "job-landing", transport, provider: { endpoint }, policy, afterSeq: 0 });
+  expect(Object.values(loadJob("job-landing")?.paymentCreditLandings ?? {})[0].credit_payment_unavailable).toBe(true);
+  if (answer === "external answer") markPaymentRequestAnswered("job-landing", 4);
+  else if (answer === "rail payment") markPaymentRequestPaid("job-landing", 4);
+  else updateJob("job-landing", { status: "cancelled" });
+  expect(Object.values(loadJob("job-landing")?.paymentCreditLandings ?? {})[0].credit_payment_unavailable).toBeUndefined();
+  expect(posts).toBe(1);
   transport.close();
 });
