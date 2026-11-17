@@ -13,6 +13,29 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.20.0](https://github.com/dvmkit/dvm-cli/compare/v0.19.2...v0.20.0) (2026-11-17)
+
+
+### Features
+
+* **credit:** support manual Lightning invoice funding ([0891cac](https://github.com/dvmkit/dvm-cli/commit/0891cacd1e74094ac2ad04f081a051f433821098))
+* **wallet:** itemise Cashu mint fees in job results and cash-out ([704285c](https://github.com/dvmkit/dvm-cli/commit/704285c189827c403c80d9e2edab62bcc3d89a6e))
+
+
+### Bug Fixes
+
+* **credit:** honor advertised card funding minimums ([e7ceef1](https://github.com/dvmkit/dvm-cli/commit/e7ceef15dbff3e87ccbf305ea7fc223753682881))
+* **credit:** reconcile expired automatic Lightning funding before retiring it ([1ad1a10](https://github.com/dvmkit/dvm-cli/commit/1ad1a10aabb8020f0ef9c77011c84d704137ff88))
+* **credit:** refuse a replacement Lightning invoice unless the wallet proves the original unpaid ([b78fc48](https://github.com/dvmkit/dvm-cli/commit/b78fc480d2dad913eda18edabed96f23e9b95cbc))
+* **credit:** report paid Lightning refusals in balance output ([52b93a6](https://github.com/dvmkit/dvm-cli/commit/52b93a609880539deff9910a65c378a768763543))
+* **errors:** name an internal error's throw site and keep its details in a private log ([#116](https://github.com/dvmkit/dvm-cli/issues/116)) ([6d5aaea](https://github.com/dvmkit/dvm-cli/commit/6d5aaea52743a69639682b976b908f54380113f5))
+* **messages:** accept compound --until durations and report a malformed one as invalid arguments ([#117](https://github.com/dvmkit/dvm-cli/issues/117)) ([78762c4](https://github.com/dvmkit/dvm-cli/commit/78762c49da5637da7f41a8804a5e65bfb7b116c8))
+* **messages:** keep a wait attached through a provider that is briefly unreachable ([#118](https://github.com/dvmkit/dvm-cli/issues/118)) ([359fc5d](https://github.com/dvmkit/dvm-cli/commit/359fc5d81b3cb50a605c428d1712f7088c53d150))
+* **receipts:** resolve currency from matching rail prices ([766be94](https://github.com/dvmkit/dvm-cli/commit/766be941fe078671214f1bf150946dfbd85adeb2))
+* **setup:** exclude missing wallets from partial setup warnings ([6d83ba8](https://github.com/dvmkit/dvm-cli/commit/6d83ba8b346a7d935478ee33795e64c5c985177e))
+* **wallet:** bound failed Cashu spend diagnostics ([47aa613](https://github.com/dvmkit/dvm-cli/commit/47aa6131c4a48e3e5246a80e8a43d23e289bd120))
+* **wallet:** reuse the unpaid melt quote when cashing out a fixed invoice ([f7c9274](https://github.com/dvmkit/dvm-cli/commit/f7c9274a49e5f96ed1991065fd879bf933f464d6))
+
 ## [0.19.2](https://github.com/dvmkit/dvm-cli/compare/v0.19.1...v0.19.2) (2026-11-16)
 
 
