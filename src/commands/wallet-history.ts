@@ -26,7 +26,7 @@ import {
   completedDrainMatches,
   completedServiceMatches,
 } from "../lib/completed-credit-history";
-import { parseDurationMs } from "../lib/duration";
+import { isDuration, parseDurationMs } from "../lib/duration";
 
 export interface WalletHistoryOptions {
   /** Only rows since UTC start of today. */
@@ -565,7 +565,7 @@ function resolveWindow(
 }
 
 function parseSince(raw: string, now: Date): number {
-  if (/^\d+[smhd]$/.test(raw.trim())) {
+  if (isDuration(raw)) {
     return now.getTime() - parseDurationMs(raw);
   }
   const parsed = Date.parse(raw);
@@ -573,7 +573,7 @@ function parseSince(raw: string, now: Date): number {
     throw new DvmError(
       "invalid_since",
       `Could not parse --since "${raw}".`,
-      "Pass an ISO date (2026-07-01) or a duration like 7d, 24h, 30m.",
+      "Pass an ISO date (2026-07-01) or a duration like 7d, 24h, 30m or 1h30m.",
     );
   }
   return parsed;
