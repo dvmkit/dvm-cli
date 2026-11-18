@@ -76,7 +76,10 @@ beforeEach(() => {
   seams.claim.mockResolvedValue([]);
   seams.pay.mockResolvedValue({ status: "paid", rail: "cashu_p2pk", amountMsats: 1000 });
 });
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
 
 // The transport ends each stream; the command must preserve its policy and output across reconnects.
 describe("messages wait", () => {
@@ -244,6 +247,118 @@ describe("messages wait", () => {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  describe("HTTP gateway responses", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      seams.transport = new HttpsTransport();
+      seams.pay.mockImplementation(async (jobId, request, _policy, transport, ref) => {
+        await transport.sendMessage(jobId, { type: "payment", content: { amount_msats: request.amount_msats } }, ref);
+        return { status: "paid", rail: "cashu_p2pk", amountMsats: request.amount_msats };
+      });
+    });
+
+    const ask = msg(1, "payment-request", { amount_msats: 1000, reason: "Next block" });
+    const complete = msg(2, "complete", { summary: "Done" });
+    const eventStream = (message: Message) => new Response(`data: ${JSON.stringify(message)}\n\n`, {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+
+    it("recovers from a status and stream 503 and pays a later ask once", async () => {
+      let statuses = 0;
+      let streams = 0;
+      let posts = 0;
+      vi.stubGlobal("fetch", async (url: string, options?: RequestInit) => {
+        if (options?.method === "POST") {
+          posts++;
+          return new Response(null, { status: 201 });
+        }
+        if (new Headers(options?.headers).get("Accept") === "text/event-stream") {
+          if (++streams === 1) return new Response("Service unavailable", { status: 503 });
+          return eventStream(posts ? complete : ask);
+        }
+        if (url.includes("/messages")) throw new Error("Unexpected history read");
+        if (++statuses === 1) return new Response("Service unavailable", { status: 503 });
+        return Response.json({ status: "processing" });
+      });
+
+      const wait = messages("gateway-recovery", { wait: true, until: "10s" }).catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      expect(await wait).toBeUndefined();
+      expect(statuses).toBe(3);
+      expect(streams).toBe(3);
+      expect(posts).toBe(1);
+      expect(streamedSeqs()).toEqual([1, 2]);
+      expect(output()).toMatchObject({ auto_payment_count: 1, next_action: null });
+    });
+
+    it("retries terminal message history after a 504", async () => {
+      let historyReads = 0;
+      vi.stubGlobal("fetch", async (url: string) => {
+        if (!url.includes("/messages")) return Response.json({ status: "completed" });
+        if (++historyReads === 1) return new Response("Gateway timeout", { status: 504 });
+        return Response.json({ messages: [complete] });
+      });
+
+      const wait = messages("gateway-history", { wait: true, until: "5s" }).catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      expect(await wait).toBeUndefined();
+      expect(historyReads).toBe(2);
+      expect(streamedSeqs()).toEqual([2]);
+      expect(output()).toMatchObject({ cursor: 2, next_action: null });
+    });
+
+    it("ends at the wait limit when status keeps returning 502", async () => {
+      const fetch = vi.fn(async () => new Response("Bad gateway", { status: 502 }));
+      vi.stubGlobal("fetch", fetch);
+
+      const start = Date.now();
+      const wait = messages("gateway-limit", { wait: true, until: "3s" }).catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      expect(await wait).toBeUndefined();
+      expect(Date.now() - start).toBe(3000);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(output().next_action).toMatchObject({ type: "poll", hint: expect.stringContaining("wait limit (3s)") });
+    });
+
+    it.each([
+      { status: 400, message: "Status check failed (400)" },
+      { status: 500, message: "stream failed (500): Read failed" },
+    ])("ends the wait on a read returning $status", async ({ status, message }) => {
+      const fetch = vi.fn(async (url: string) => {
+        if (status === 500 && !url.includes("/messages")) return Response.json({ status: "processing" });
+        return new Response("Read failed", { status });
+      });
+      vi.stubGlobal("fetch", fetch);
+
+      const wait = messages(`fatal-read-${status}`, { wait: true, until: "3s" }).catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      expect(await wait).toMatchObject({ code: "provider_error", message });
+      expect(fetch).toHaveBeenCalledTimes(status === 400 ? 1 : 2);
+    });
+
+    it("propagates a payment POST 502 without reconnecting or sending it again", async () => {
+      let posts = 0;
+      let streams = 0;
+      vi.stubGlobal("fetch", async (_url: string, options?: RequestInit) => {
+        if (options?.method === "POST") {
+          posts++;
+          return new Response("Bad gateway", { status: 502 });
+        }
+        if (new Headers(options?.headers).get("Accept") === "text/event-stream") {
+          streams++;
+          return eventStream(ask);
+        }
+        return Response.json({ status: "processing" });
+      });
+
+      const wait = messages("gateway-payment", { wait: true, until: "3s" }).catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      expect(await wait).toMatchObject({ code: "provider_error", message: "sendMessage failed (502): Bad gateway" });
+      expect(posts).toBe(1);
+      expect(streams).toBe(1);
+    });
   });
 
   it.each(["status", "stream", "poll"])("retries unreachable %s reads until the wait limit", async (boundary) => {

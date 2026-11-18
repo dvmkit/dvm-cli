@@ -71,6 +71,7 @@ import { dvmFetch } from "../http";
 import { requestRecoveryPath } from "../request-recovery-path";
 import { envelopeToPayload } from "../job-envelope";
 import { assertConfiguredTempoChallengeNetwork } from "../tempo-network";
+import { jobReadHttpError } from "../job-read-error";
 
 /**
  * build the `X-Job-Token` header object for a per-job opaque token,
@@ -682,7 +683,7 @@ export class HttpsTransport implements Transport {
       if (!res.ok) {
         const credentialErr = jobCredentialError(res.status, await readJobResponse(() => res.text(), jobId, "status"));
         if (credentialErr) throw credentialErr;
-        throw new DvmError("provider_error", `Status check failed (${res.status})`);
+        throw jobReadHttpError(res.status, `Status check failed (${res.status})`);
       }
 
       const data = (await readJobResponse(() => res.json(), jobId, "status")) as Record<string, unknown>;
@@ -749,7 +750,7 @@ export class HttpsTransport implements Transport {
         const text = await readJobResponse(() => res.text(), jobId);
         const credentialErr = jobCredentialError(res.status, text);
         if (credentialErr) throw credentialErr;
-        throw providerResponseError("provider_error", `getMessages failed (${res.status}): ${text}`);
+        throw jobReadHttpError(res.status, `getMessages failed (${res.status}): ${text}`, { message: "provider" });
       }
 
       const data = (await readJobResponse(() => res.json(), jobId)) as { messages: Message[] };
@@ -893,7 +894,7 @@ export class HttpsTransport implements Transport {
       const text = await readJobResponse(() => res.text(), jobId);
       const credentialErr = jobCredentialError(res.status, text);
       if (credentialErr) throw credentialErr;
-      throw providerResponseError("provider_error", `stream failed (${res.status}): ${text}`);
+      throw jobReadHttpError(res.status, `stream failed (${res.status}): ${text}`, { message: "provider" });
     }
 
     // Defence in depth: if the server responded with JSON instead of SSE
