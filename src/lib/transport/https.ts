@@ -82,10 +82,13 @@ function jobTokenHeader(jobToken: string | undefined): Record<string, string> {
 
 function jobReadUnreachable(jobId: string, operation: "status" | "messages" = "messages"): DvmError {
   if (operation === "status") {
+    const needsSeparator = jobId.startsWith("-");
+    const retryCommand = `dvm status ${needsSeparator ? "-- " : ""}${guidanceJobArg(jobId)}`;
+    const flagPlacement = needsSeparator ? ", with any flags before `--`" : "";
     return new DvmError(
       "provider_unreachable",
-      `Could not reach the provider to read status for job ${jobId}.`,
-      `Retry with \`dvm status ${guidanceJobArg(jobId)}\` once the provider is reachable. Keep the same endpoint and job access options.`
+      "Could not reach the provider to read job status.",
+      `Retry with \`${retryCommand}\` once the provider is reachable. Keep the same endpoint and job access options${flagPlacement}.`
     );
   }
   return new DvmError(
