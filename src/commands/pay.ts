@@ -39,7 +39,7 @@ import {
   sameEndpoint,
   withJobTokenRedaction,
 } from "../lib/job-access";
-import { loadMessages } from "../lib/messages";
+import { loadMessages } from "../lib/messages/index";
 import { isTerminalJobStatus, overBudgetHint, paymentCountHint } from "../lib/next-action";
 import { describeBudgetOverrun } from "../lib/job-budget";
 import { JOB_READ_TIMEOUT_MS, pendingPaymentRequest, reconcileInFlightPaymentRequest } from "../lib/yield-state";
@@ -50,7 +50,7 @@ import { finalizeProgressLine } from "../lib/progress-bar";
 import { createArtifactSaveSession } from "../lib/save-artifact";
 import { streamLoop } from "../lib/stream-loop";
 import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { dvmIdentity } from "./dvm-identity";
 import { formatMessageHuman, serializeMessageForOutput } from "./messages";
 

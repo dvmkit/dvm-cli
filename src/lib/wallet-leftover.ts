@@ -5,7 +5,7 @@ import { formatUsd, getLastKnownBtcRate, loadAgentWallet, msatsToUsd,
 import { formatSats } from "./currency";
 import { loadConfig } from "./identity";
 import type { JobRecord } from "./job-store";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 import { isTerminalJobStatus } from "./next-action";
 import { localInputFee } from "./wallet-keyset-fees";
 

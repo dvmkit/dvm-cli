@@ -13,7 +13,7 @@ import {
 import { capabilityQuoteCommand, resolveCapability, resolveDvmReference } from "../lib/dvm-identifier";
 import { resolveEndpoint } from "../lib/favorites";
 import { progressNotice } from "../lib/progress-notice";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { resolveProviderEndpoint } from "../lib/resolve-provider-endpoint";
 
 export interface DescribeOptions {

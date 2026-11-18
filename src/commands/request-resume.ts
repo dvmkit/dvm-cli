@@ -11,7 +11,7 @@ import {
 import { withOutputWarnings } from "../lib/output";
 import { loadRequestIntent } from "../lib/request-intent-store";
 import { requestRecoveryPath } from "../lib/request-recovery-path";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { requestNotFound, requestResult, type RequestResultOptions, signedIntentEnvelope } from "./request-result";
 
 export interface RequestResumeOptions extends RequestResultOptions {

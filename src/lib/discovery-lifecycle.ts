@@ -8,7 +8,7 @@ import {
   type Transport
 } from "@dvmkit/sdk/internal";
 
-import { createMessageAppendSession } from "./messages";
+import { createMessageAppendSession } from "./messages/index";
 import { streamLoop } from "./stream-loop";
 import { resolveSigningIdentity } from "./cli-identity-resolve";
 import { loadConfig } from "./identity";

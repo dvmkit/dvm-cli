@@ -1,7 +1,7 @@
 import { formatFiat } from "@dvmkit/sdk";
 import { type Message } from "@dvmkit/sdk/internal";
 import { loadJob, mutateCreditPayment, type JobRecord } from "./job-store";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 
 type CreditPayment = NonNullable<Extract<Message, { type: "payment" }>["content"]["credit"]> & { mandate?: boolean };
 export function mandateCredit(message: Message): CreditPayment | undefined {

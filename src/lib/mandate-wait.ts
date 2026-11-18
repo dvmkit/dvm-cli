@@ -1,6 +1,6 @@
 import { DvmError, type PaymentRequestContent, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
 import { loadJob, markJobTerminal, mutateCreditPayment, updateObservedJob, type JobRecord } from "./job-store";
-import { appendMessages, loadMessages } from "./messages";
+import { appendMessages, loadMessages } from "./messages/index";
 import { mandateCredit, mandateDrawTotal, recordMandatePayments } from "./mandate-payments";
 import { guidanceJobArg } from "./provider-output";
 

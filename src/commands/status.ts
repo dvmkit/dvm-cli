@@ -59,9 +59,9 @@ import {
   resolveJobAccess,
   withJobTokenRedaction,
 } from "../lib/job-access";
-import { appendMessages, maxSeq } from "../lib/messages";
+import { appendMessages, maxSeq } from "../lib/messages/index";
 import { progressNotice } from "../lib/progress-notice";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { dvmIdentity } from "./dvm-identity";
 import { serializeJobMessageForOutput } from "./messages";
 

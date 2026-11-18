@@ -29,7 +29,7 @@ import { reserveAgentWallet } from "../lib/wallet-agent/reserve";
 import { toString as qrToString } from "qrcode";
 
 import { resolveEndpoint } from "../lib/favorites";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import {
   amountSourceFields,
   describeAmount,

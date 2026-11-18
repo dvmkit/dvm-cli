@@ -16,7 +16,7 @@ import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { info, withOutputWarnings } from "../lib/output";
 import { guidanceJobArg, providerJobJson } from "../lib/provider-output";
 import { progressNotice } from "../lib/progress-notice";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { dvmIdentity } from "./dvm-identity";
 
 export interface DeclineOptions extends JobAccessOptions {

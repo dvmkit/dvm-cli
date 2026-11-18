@@ -16,7 +16,7 @@ import {
 import { statSync } from "node:fs";
 
 import { resolveDvmReference } from "../lib/dvm-identifier";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { hashFile, streamUpload } from "../lib/upload-stream";
 import { resolveUploadTarget, type UploadKind } from "../lib/upload-targets";
 

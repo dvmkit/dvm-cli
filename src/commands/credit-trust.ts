@@ -23,7 +23,7 @@ import {
 
 import { resolveDvmReference } from "../lib/dvm-identifier";
 import { resolveEndpoint } from "../lib/favorites";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 
 const BUILDER_PUBKEY_RE = /^[0-9a-f]{64}$/i;
 

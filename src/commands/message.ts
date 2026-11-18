@@ -26,7 +26,7 @@ import { progressNotice } from "../lib/progress-notice";
 import { createArtifactSaveSession } from "../lib/save-artifact";
 import { streamLoop } from "../lib/stream-loop";
 import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { formatMessageHuman, serializeMessageForOutput } from "./messages";
 
 export interface MessageOptions extends JobAccessOptions {

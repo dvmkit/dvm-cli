@@ -65,9 +65,9 @@ import {
 import { resolveEndpoint } from "../lib/favorites";
 import { receiptSettlement } from "../lib/job-settlement";
 import { unknownCurrencyHint } from "../lib/piece-settlement";
-import { loadMessages } from "../lib/messages";
+import { loadMessages } from "../lib/messages/index";
 import { isTerminalJobStatus } from "../lib/next-action";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 
 export interface ReceiptsListOptions {
   /** Only receipts whose display DVM name matches this value. */

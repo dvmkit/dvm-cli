@@ -2,7 +2,7 @@ import { walletRemaining, type WalletRemaining } from "./wallet-leftover";
 import { isSignedJobReceipt, verifyJobReceipt, type JobReceipt, type ReceiptVerification } from "@dvmkit/sdk/internal";
 import { formatAmount, formatPaymentAmount, formatSats } from "./currency";
 import { hasUnknownUpfrontCredit, hasUnknownUpfrontRail, loadJob, type JobRecord } from "./job-store";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 import { isTerminalJobStatus } from "./next-action";
 import { type PieceContext, pieceSettlement, settlementCurrencyHint } from "./piece-settlement";
 

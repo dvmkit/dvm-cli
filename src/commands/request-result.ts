@@ -43,7 +43,7 @@ import { loadRequestRefusal } from "../lib/request-refusal-store";
 import { requestRecoveryPath } from "../lib/request-recovery-path";
 import { recordLocalJobCollision, recordSubmissionEvidence } from "../lib/submission-evidence";
 import { bookRecoveredSubmissions } from "../lib/wallet-agent/recovery-submissions";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { settleCreditAfterRead } from "../lib/credit-topup";
 import { dvmIdentity } from "./dvm-identity";
 

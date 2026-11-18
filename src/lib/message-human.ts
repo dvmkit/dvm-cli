@@ -1,6 +1,6 @@
 import { mandateCredit, mandatePaymentReports } from "./mandate-payments";
 import { loadJob } from "./job-store";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 import type { Message } from "@dvmkit/sdk/internal";
 import { formatAmountBestEffort, formatPaymentAmount } from "./currency";
 import { info } from "./output";

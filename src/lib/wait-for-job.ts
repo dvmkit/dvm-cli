@@ -3,7 +3,7 @@ import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
 import { DvmError, type Message } from "@dvmkit/sdk/internal";
 import { loadJob } from "./job-store";
-import { createMessageAppendSession, maxSeq } from "./messages";
+import { createMessageAppendSession, maxSeq } from "./messages/index";
 import { loadAnsweredYieldSeqs, answeredYieldSeqs, reconcilePaymentRequestHistory, settleRecordedPayments, JOB_READ_TIMEOUT_MS } from "./yield-state";
 import { claimInboundPayments, withRefundNextAction } from "./refund-claim";
 import { isTerminalJobStatus, paymentInFlightHint, pollNextAction, type NextAction } from "./next-action";

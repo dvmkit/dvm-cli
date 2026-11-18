@@ -18,7 +18,7 @@ import { completionSnapshot } from "./completion-hints";
 import { parseJobContent, type ContentStatus } from "./job-content";
 import { receiptSettlement, type SettlementFields, terminalSettlementReport } from "./job-settlement";
 import { isTerminalJobStatus } from "./next-action";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 import { formatMicro, pieceSettlement, type PieceContext, settlementCurrencyHint } from "./piece-settlement";
 
 /** Verify and persist a funding receipt; callers may anchor state only on a sound verdict. */
