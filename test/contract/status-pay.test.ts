@@ -14,6 +14,8 @@ let endpoint: string;
 let state: string;
 let history: unknown[];
 let posts: number;
+let requests: string[];
+let dropStatusResponse: boolean;
 let creditReply: "accepted" | "refused" | undefined;
 let paymentBodies: Array<{ type: string; content: unknown }>;
 let terminalAfterPayment: "completed" | "failed" | "cancelled";
@@ -27,12 +29,19 @@ beforeEach(async () => {
   state = "awaiting-input";
   history = [ask];
   posts = 0;
+  requests = [];
+  dropStatusResponse = false;
   creditReply = undefined;
   paymentBodies = [];
   terminalAfterPayment = "completed";
   terminalReceipt = undefined;
   server = createServer((request, response) => {
     expect(request.headers["x-job-token"]).toBe(token);
+    requests.push(`${request.method} ${request.url}`);
+    if (dropStatusResponse && request.method === "GET" && request.url === "/v1/job/job") {
+      response.destroy();
+      return;
+    }
     response.setHeader("content-type", "application/json");
     if (request.method === "POST") posts++;
     if (request.method === "POST" && creditReply) {
@@ -69,10 +78,10 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 function run(command: string, flags: string[] = []) {
-  return new Promise<{ code: number; stderr: string; output: { error?: { code: string }; [key: string]: unknown } }>((done) => {
+  return new Promise<{ code: number; stdout: string; stderr: string; output: { [key: string]: unknown } }>((done) => {
     execFile(process.execPath, [binary, command, "job", ...flags], {
       env: Object.fromEntries(Object.entries({ ...process.env, DVM_CONFIG_DIR: root }).filter(([key]) => !["DVM_JOB_ENDPOINT", "DVM_JOB_TOKEN", "DVM_IDENTITY_KEY"].includes(key))), timeout: 15000,
-    }, (error, stdout, stderr) => done({ code: error ? 1 : 0, stderr, output: stdout.trim() ? JSON.parse(stdout) : {} }));
+    }, (error, stdout, stderr) => done({ code: error ? 1 : 0, stdout, stderr, output: stdout.trim() ? JSON.parse(stdout) : {} }));
   });
 }
 it("ordinary status then pay reaches the wallet guard and leaves unread messages available", async () => {
@@ -83,18 +92,46 @@ it("ordinary status then pay reaches the wallet guard and leaves unread messages
   expect(messages.output).toMatchObject({ messages: [{ seq: 5, type: "payment-request", content: { amount_msats: 1500, mints: ["https://mint.example"] } }], cursor: 5 });
   expect(posts).toBe(0);
 });
-it.each(["paid", "expired", "completed", "cancelled", "working", "unavailable"])("does not debit a %s request discovered by status", async (change) => {
+it.each(["paid", "expired", "completed", "cancelled", "working"])("does not debit a %s request discovered by status", async (change) => {
   expect((await run("status")).output).toMatchObject({ next_action: { type: "pay" } });
   if (change === "paid") history.push({ seq: 6, from: "requester", timestamp: 1700000001, type: "payment", content: { amount_msats: 1500 } });
   if (change === "expired") history = [{ ...ask, content: { ...ask.content, expires_at_ms: 1 } }];
   if (change === "completed" || change === "cancelled") state = change;
   if (change === "working") history.push({ seq: 6, from: "provider", timestamp: 1700000001, type: "working", content: {} });
-  if (change === "unavailable") { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); }
   const result = await run("pay");
   expect(result.code).toBe(1);
-  expect(result.output.error?.code).toBe(change === "unavailable" ? "provider_unreachable" : "no_payment_pending");
+  expect(result.output).toMatchObject({ error: { code: "no_payment_pending" } });
   expect(posts).toBe(0);
 });
+
+it("gives status and pay a safe retry hint when the provider refuses the connection", async () => {
+  expect((await run("status")).output).toMatchObject({ next_action: { type: "pay" } });
+  const before = readFileSync(join(root, "jobs.json"), "utf8");
+  server.closeAllConnections();
+  await new Promise<void>((done) => server.close(() => done()));
+
+  for (const command of ["status", "pay"]) {
+    const result = await run(command);
+    expect(result.code).toBe(1);
+    expect(result.output).toMatchObject({ error: {
+      code: "provider_unreachable", hint: expect.stringContaining("dvm status job"),
+    } });
+    expect(result.stdout + result.stderr).not.toContain(token);
+  }
+  expect(readFileSync(join(root, "jobs.json"), "utf8")).toBe(before);
+});
+
+it("stops pay at the failed status read while the provider can still accept requests", async () => {
+  expect((await run("status")).output).toMatchObject({ next_action: { type: "pay" } });
+  requests.length = 0;
+  dropStatusResponse = true;
+
+  const result = await run("pay");
+  expect(result.code).toBe(1);
+  expect(result.output).toMatchObject({ error: { code: "provider_unreachable" } });
+  expect(requests).toEqual(["GET /v1/job/job"]);
+});
+
 it("refuses a foreign endpoint before sending the stored bearer credential", async () => {
   const before = readFileSync(join(root, "jobs.json"), "utf8");
   expect((await run("pay", ["--endpoint", "http://127.0.0.1:1"])).output).toMatchObject({ error: { code: "job_token_required" } });
