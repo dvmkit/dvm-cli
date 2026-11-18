@@ -90,7 +90,11 @@ describe.each(reads)("HTTPS $name deadlines", (read) => {
 });
 
 describe("HTTPS refused read connections", () => {
-  it.each(["status", "stream", "poll"])("maps a refused %s connection to bounded provider_unreachable guidance", async (boundary) => {
+  it.each([
+    { boundary: "status", retryCommand: "dvm status job-1" },
+    { boundary: "stream", retryCommand: "dvm messages job-1 --wait" },
+    { boundary: "poll", retryCommand: "dvm messages job-1 --wait" },
+  ])("maps a refused $boundary connection to bounded provider_unreachable guidance", async ({ boundary, retryCommand }) => {
     const server = createServer();
     const endpoint = await listen(server);
     await close(server);
@@ -100,7 +104,7 @@ describe("HTTPS refused read connections", () => {
       : boundary === "stream" ? transport.stream("job-1", 0, { endpoint })
       : transport.getMessages("job-1", 0, { endpoint });
     await expect(read).rejects.toMatchObject({ code: "provider_unreachable", message: expect.not.stringContaining(endpoint),
-      hint: expect.stringContaining("dvm messages job-1 --wait") });
+      hint: expect.stringContaining(retryCommand) });
   });
 });
 

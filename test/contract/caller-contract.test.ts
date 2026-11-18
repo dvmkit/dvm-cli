@@ -1003,7 +1003,11 @@ describe("standalone caller contract", () => {
 
     expect(result.code).toBe(1);
     expect(result.stdout + result.stderr).not.toContain(portableToken);
-    expect(result.stdout).toContain("[REDACTED]");
+    expect(JSON.parse(result.stdout)).toMatchObject({ error: {
+      code: "job_credential_invalid",
+      message: { _source: "provider", text: "Provider rejected [REDACTED]" },
+      hint: { _source: "provider", text: "Replace [REDACTED]" },
+    } });
   });
 
   describe("credit command boundary", () => {
