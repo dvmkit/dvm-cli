@@ -41,7 +41,7 @@ import {
 } from "../favorites";
 import {
   createDvmTransport,
-} from "../transport";
+} from "../transport/index";
 import {
   dvmLabelFromEndpoint,
 } from "../../commands/wallet-history";

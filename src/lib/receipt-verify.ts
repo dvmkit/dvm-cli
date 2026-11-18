@@ -6,7 +6,7 @@ import { formatUsd, msatsToUsd } from "@dvmkit/sdk/internal";
 import { type JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
 import { receiptSettlement } from "./job-settlement";
 import { loadJob } from "./job-store";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 import { formatMicro, type PieceContext, unknownCurrencyHint } from "./piece-settlement";
 
 /**

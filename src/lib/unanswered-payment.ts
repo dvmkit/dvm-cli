@@ -2,7 +2,7 @@ import { asProviderText, type Message, type Transport } from "@dvmkit/sdk/intern
 import { isDeepStrictEqual } from "node:util";
 import type { ResolvedJobAccess } from "./job-access";
 import { loadJob, updateObservedJob, type JobRecord } from "./job-store";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 import { answeredYieldSeqs, loadAnsweredYieldSeqs } from "./yield-state";
 import { formatPaymentAmount } from "./currency";
 import { providerFields } from "./provider-output";

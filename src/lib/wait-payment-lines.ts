@@ -1,7 +1,7 @@
 import { mandateCredit, mandatePaymentReports } from "./mandate-payments";
 import { loadJob } from "./job-store";
 import { asProviderText, type Message } from "@dvmkit/sdk/internal";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 import { observePaymentBookings, type PaymentBooking } from "./payment-bookings";
 import { paidConfirmationDisplay } from "./payment-copy";
 import type { AutoPayment, StreamLoopOptions } from "./stream-loop";

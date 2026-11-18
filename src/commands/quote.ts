@@ -41,7 +41,7 @@ import { withInputSchemaHint } from "../lib/input-schema-hint";
 import { buildJobEnvelope, paramsToData } from "../lib/job-envelope";
 import { progressNotice } from "../lib/progress-notice";
 import { applyJsonSchemaDefaults, formatAppliedDefaults } from "../lib/schema-defaults";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { resolveProviderEndpoint } from "../lib/resolve-provider-endpoint";
 import { dvmIdentity } from "./dvm-identity";
 

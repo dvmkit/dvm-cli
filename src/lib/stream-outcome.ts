@@ -11,7 +11,7 @@ import {
   updateObservedJob,
 } from "./job-store";
 
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 
 export type TerminalExtra = Partial<
   Omit<JobRecord, "id" | "status" | "completedAt" | "completion">

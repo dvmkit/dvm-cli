@@ -167,7 +167,7 @@ import {
   normalizeLocalCorrelationId,
   prepareLocalCorrelationId,
 } from "../lib/local-correlation";
-import { appendMessages, createMessageAppendSession, maxSeq } from "../lib/messages";
+import { appendMessages, createMessageAppendSession, maxSeq } from "../lib/messages/index";
 import { applyMintPin } from "../lib/mint-pin";
 import { selectRailOrder } from "../lib/payment-rails/select";
 import { finalizeProgressLine } from "../lib/progress-bar";
@@ -186,7 +186,7 @@ import {
   streamTerminalStatus,
   type TerminalExtra,
 } from "../lib/stream-outcome";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import {
   assertTempoChallengeNetwork,
   tempoAccountNetwork,

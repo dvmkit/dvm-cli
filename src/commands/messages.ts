@@ -28,7 +28,7 @@ import {
   withJobTokenRedaction,
 } from "../lib/job-access";
 import { jobContentFields, observeJobContent, type ContentStatus } from "../lib/job-content";
-import { appendMessages, loadMessages, maxSeq } from "../lib/messages";
+import { appendMessages, loadMessages, maxSeq } from "../lib/messages/index";
 import { loadJob, updateObservedJob } from "../lib/job-store";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
@@ -45,7 +45,7 @@ import { loadAnsweredYieldSeqs, settleRecordedPayments } from "../lib/yield-stat
 import { waitForJob } from "../lib/wait-for-job";
 import { streamLoop, type AutoPayment } from "../lib/stream-loop";
 import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 
 export interface MessagesOptions extends JobAccessOptions {
   after?: string;

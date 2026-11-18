@@ -26,7 +26,7 @@ import { runDiscoveryLifecycle } from "../lib/discovery-lifecycle";
 import { loadFavorites, resolveEndpoint } from "../lib/favorites";
 import { parseDiscoveryInteger, parseDiscoveryTimeout } from "../lib/discovery-options";
 import { progressNotice } from "../lib/progress-notice";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 
 export interface SearchOptions {
   query?: string;

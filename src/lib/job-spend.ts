@@ -1,7 +1,7 @@
 import { asProviderText, type JobReceipt, type PaymentRequestContent } from "@dvmkit/sdk/internal";
 import { formatPaymentAmount } from "./currency";
 import { hasUnknownUpfrontCredit, type JobRecord } from "./job-store";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 import { isTerminalJobStatus } from "./next-action";
 import { jobSettlement } from "./job-settlement";
 import { MINT_FEE_EXPLAINER } from "./mint-fee";

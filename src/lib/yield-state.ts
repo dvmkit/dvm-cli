@@ -3,7 +3,7 @@ import { DvmError, isAbortError, shellQuoteArg, type Message, type MessagePollOp
 import { bookCreditPayment, clearPaymentRequestInFlight, loadJob, markPaymentRequestAnswered, type UnconfirmedPaymentSubmission } from "./job-store";
 import { settleTakenPayment } from "./taken-payment";
 import { applySubmissionVerdicts } from "./wallet-agent/submission-verdicts";
-import { loadMessages } from "./messages";
+import { loadMessages } from "./messages/index";
 
 export const JOB_READ_TIMEOUT_MS = 60_000;
 // A lost send may still be processing before history records it. Give every

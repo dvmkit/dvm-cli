@@ -41,7 +41,7 @@ import {
 } from "../credit-reclaim";
 import {
   createDvmTransport,
-} from "../transport";
+} from "../transport/index";
 import {
   dvmLabelFromEndpoint,
 } from "../../commands/wallet-history";

@@ -17,7 +17,7 @@ import {
   saveFavorite,
 } from "../lib/favorites";
 import { getAllProviderHistory } from "../lib/history";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 
 export interface FavAddOptions {
   name?: string;

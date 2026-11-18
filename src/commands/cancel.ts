@@ -21,9 +21,9 @@ import {
 import { cancelledDisplay, readEnding, retryWhilePaymentInProgress } from "../lib/job-ending";
 import { settlementCurrencyHint } from "../lib/piece-settlement";
 import { isTerminalJobStatus } from "../lib/next-action";
-import { loadMessages } from "../lib/messages";
+import { loadMessages } from "../lib/messages/index";
 import { progressNotice } from "../lib/progress-notice";
-import { createDvmTransport } from "../lib/transport";
+import { createDvmTransport } from "../lib/transport/index";
 import { dvmIdentity } from "./dvm-identity";
 
 export interface CancelOptions extends JobAccessOptions {

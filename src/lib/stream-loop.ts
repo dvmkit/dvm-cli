@@ -28,7 +28,7 @@ import {
   loadMessages,
   maxSeq,
   type MessageAppendSession,
-} from "./messages";
+} from "./messages/index";
 import { answeredYieldSeqs, declinedAskSeqs, loadAnsweredYieldSeqs, pendingPaymentRequest, reconcileInFlightPaymentRequest, settleAnsweredAsk, settleRecordedPayments } from "./yield-state";
 import { paidConfirmationDisplay } from "./payment-copy";
 import { handlePaymentRequest, type PaymentResult, type PaidPaymentResult } from "./payment-responder";
