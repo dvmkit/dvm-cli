@@ -332,26 +332,17 @@ export interface ConfigUpdate {
    */
   authorize?: ProtectedFieldAuthorization;
   /**
-   * Extra protected targets to strip from both stored copies as part of *this*
-   * commit. Removals and rotations are stripped automatically; this is for a
-   * command that wants a credential gone from the copies for some other reason,
-   * and it exists so that never has to be a second critical section with a
-   * window in the middle.
+   * Extra protected credentials to strip as part of this commit. Removals and
+   * rotations are handled automatically. The pin is subject to `preservePin`.
    */
   sanitizeBackup?: readonly ProtectedTarget[];
   /**
-   * Which *existing* stored copies this change may strip the departing
-   * credentials out of. Defaults to both.
-   *
-   * The rolling copy this change writes is always credential-free — it is
-   * authored here, so it never carries what this change removed, and that is
-   * not configurable. What this narrows is the pinned snapshot: an explicit
-   * whole-configuration reset pins the state it is about to destroy and then
-   * declares `sweepSlots: ["backup"]`, which says in one line "these removals
-   * are intended, and the pin is the survivor". Without it the reset would
-   * sweep the very snapshot it had just taken.
+   * Preserve the existing pinned snapshot. Defaults to false, so matching
+   * credentials are swept from the pin. The rolling backup this update writes
+   * always excludes removed, rotated, and explicitly sanitized credentials,
+   * regardless of this option.
    */
-  sweepSlots?: readonly ConfigSnapshotSlot[];
+  preservePin?: boolean;
 }
 
 export interface ConfigUpdateResult {
@@ -434,11 +425,8 @@ export async function updateConfig(update: ConfigUpdate): Promise<ConfigUpdateRe
       ...new Set<ProtectedTarget>([...removals, ...superseded, ...(update.sanitizeBackup ?? [])]),
     ].filter(isSecretProtectedTarget);
 
-    const sweeping = update.sweepSlots ?? CONFIG_SNAPSHOT_SLOTS;
     const swept: ConfigSnapshotSlot[] = [];
     if (raw !== null) {
-      // The rolling copy is authored by this change, so it is written without
-      // the departing credentials whatever `sweepSlots` says.
       if (stripped.length > 0) {
         writeConfigBackup(withoutProtectedTargets(raw, stripped));
         swept.push("backup");
@@ -446,7 +434,7 @@ export async function updateConfig(update: ConfigUpdate): Promise<ConfigUpdateRe
         retainConfigBackup();
       }
     }
-    if (stripped.length > 0 && sweeping.includes("pinned")) {
+    if (stripped.length > 0 && update.preservePin !== true) {
       if (sweepPinnedSnapshot(stripped, base ?? {}, update.reason)) swept.push("pinned");
     }
     const backup = describeConfigBackup();
@@ -688,9 +676,9 @@ export async function retireConfigSnapshots(reason: string): Promise<ConfigSnaps
  * A copy that cannot be parsed is retired instead of edited. Returns false when
  * nothing needed doing.
  *
- * A removal or rotation made through {@link updateConfig} already sweeps both
- * slots inside its own critical section — reach for this only for a credential
- * that some *other* command put in a copy.
+ * By default, {@link updateConfig} sweeps both slots inside its own critical
+ * section when a credential is removed or rotated. Use this to strip
+ * credentials independently of a config update.
  */
 export async function sanitizeConfigBackup(
   targets: readonly ProtectedTarget[],

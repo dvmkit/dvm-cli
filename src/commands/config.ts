@@ -113,10 +113,7 @@ export async function configReset(opts: ConfigResetOptions): Promise<void> {
       // and to `CONNECTED_RAILS`, a blanket grant turns the refusal that would
       // have caught it into a silent credential removal. Without one this fails
       // closed with `config_protected_field`.
-      //
-      // The pin was taken a moment ago and is the survivor of this command, so
-      // only the rolling copy is swept.
-      sweepSlots: ["backup"],
+      preservePin: true,
       patch: (current) => {
         // Re-read under the lock: a rail connected between the gate above and
         // this write must still send the caller to its disconnect.
