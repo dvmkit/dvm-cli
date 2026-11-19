@@ -28,6 +28,7 @@ import {
   type PendingDrain,
   pendingDrainById,
   pendingDrainFor,
+  type Payment,
   type PendingX402Funding,
   type ProviderInfo,
   type ReceiptTrustAnchor,
@@ -85,11 +86,13 @@ import {
   randomUUID,
 } from "crypto";
 import {
+  creditDrainCommand,
   reclaimCommand,
 } from "../credit-reclaim";
 import {
   createDvmTransport,
 } from "../transport/index";
+import { CreditOperationTimeoutError } from "../transport/https";
 import {
   dvmLabelFromEndpoint,
 } from "../../commands/wallet-history";
@@ -442,6 +445,30 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
   }
   const signCredit = (body: Record<string, unknown>) =>
     signDvmRequestData(signer.privkey, body, authDomain);
+  // Convert the timeout at the POST boundary so channel adapters can carry the
+  // retry guidance through, and wallet or metadata failures keep their own errors.
+  const postDrain = async (body: Record<string, unknown>, payment?: Payment): Promise<CreditOpResult> => {
+    try {
+      return await creditOp(transport, endpoint, body, payment);
+    } catch (err) {
+      if (!(err instanceof CreditOperationTimeoutError)) throw err;
+      const address = !channelBacked && drain.payout.address;
+      const command = [
+        creditDrainCommand(endpoint, creditId),
+        "--drain-id", shellQuoteArg(drain.drainId),
+        "--method", shellQuoteArg(drain.method),
+        ...(address ? ["--address", shellQuoteArg(address)] : []),
+        ...("name" in signer.source ? ["--as", shellQuoteArg(signer.source.name)] : []),
+      ].join(" ");
+      const identityHint = signer.source.kind === "env" ? " Keep the same DVM_IDENTITY_KEY." : "";
+      throw new DvmError(
+        "drain_outcome_unknown",
+        `The response for drain ${drain.drainId} timed out. The refund outcome is unknown.`,
+        `Retry with the same drain ID using \`${command}\`.${identityHint}`,
+        { status: "unknown", retryable: true, credit_id: creditId, drain_id: drain.drainId, next_command: command }
+      );
+    }
+  };
   let result: CreditOpResult;
   // The trust anchor the drain receipts below chain to, read off the same live
   // endpoint that just answered the drain. Sits inside this `try` because
@@ -503,7 +530,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
         mppAtRiskMicro = authorized < deposit ? authorized : deposit;
         if (!drain.mppCredential) {
           try {
-            return await creditOp(transport, endpoint, body);
+            return await postDrain(body);
           } catch (err) {
             const challenge = tempoSessionChallenge(err);
             if (!challenge) throw err;
@@ -516,11 +543,11 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
             drain = { ...drain, mppCredential: credential };
             // Persist the exact close authorization before it can be consumed.
             recordPendingDrain(endpoint, signer.pubkey, drain, ...identityArg);
-            return creditOp(transport, endpoint, body, { mppCredentialRaw: credential });
+            return postDrain(body, { mppCredentialRaw: credential });
           }
         }
         try {
-          return await creditOp(transport, endpoint, body, {
+          return await postDrain(body, {
             mppCredentialRaw: drain.mppCredential,
           });
         } catch (err) {
@@ -548,7 +575,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
           // drain body so the fresh credential is not paired with a replayed
           // request envelope.
           const refreshedBody = signCredit(unsignedBody());
-          return creditOp(transport, endpoint, refreshedBody, {
+          return postDrain(refreshedBody, {
             mppCredentialRaw: credential,
           });
         }
@@ -570,9 +597,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
           creditId,
           depositMicro: Math.max(stored?.targetMicro ?? 0, 1),
           post: (paymentHeader) =>
-            creditOp(
-              transport,
-              endpoint,
+            postDrain(
               signCredit(unsignedBody()),
               paymentHeader ? { x402Payment: paymentHeader, x402Version: 2 } : undefined
             ),
@@ -592,7 +617,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
         // would earn `drain_conflict`. Nothing is stranded either way: the
         // challenge is issued before any drain row exists.
         try {
-          result = await creditOp(transport, endpoint, signCredit(unsignedBody()));
+          result = await postDrain(signCredit(unsignedBody()));
         } catch (err) {
           if (!(err instanceof DvmError) || !x402RequiredFromError(err)) throw err;
           drain = { ...drain, payout: {} };
@@ -603,7 +628,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
     } else if (drain.method === "stripe") {
       const card = await postCardDrain({
         drainId: () => drain.drainId,
-        post: () => creditOp(transport, endpoint, signCredit(unsignedBody())),
+        post: () => postDrain(signCredit(unsignedBody())),
         adopt: (blocking) => {
           // The DVM allows one card refund per credit at a time and named the
           // one in flight. Following it is the reclaim; the id this run posted
@@ -616,7 +641,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
       result = card.result;
       cardAdoptedFrom = card.adoptedFrom;
     } else {
-      result = await creditOp(transport, endpoint, signCredit(unsignedBody()));
+      result = await postDrain(signCredit(unsignedBody()));
     }
     // Only worth a GET when the response actually carried evidence to chain.
     if (result.drain?.receipts.length) {

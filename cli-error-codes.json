@@ -64,6 +64,7 @@
     "decline_unsupported",
     "describe_failed",
     "drain_not_found",
+    "drain_outcome_unknown",
     "endpoint_required",
     "endpoint_unreachable",
     "favorites_locked",

@@ -108,6 +108,17 @@ async function readJobResponse<T>(read: () => Promise<T>, jobId: string, operati
   }
 }
 
+export class CreditOperationTimeoutError extends DvmError {
+  constructor() {
+    super("timeout", "Credit operation timed out.", "The provider may be starting up. Retry in a few seconds.");
+  }
+}
+
+function rethrowCreditBodyError(err: unknown): never {
+  if (isAbortError(err)) throw new CreditOperationTimeoutError();
+  throw err;
+}
+
 /**
  * Extract the `traceparent` response header and store the trace_id for
  * automatic injection into CLI JSON output via `setOutputTraceId`. Mirrors
@@ -584,13 +595,7 @@ export class HttpsTransport implements Transport {
       });
     } catch (err) {
       if (err instanceof DvmError) throw err;
-      if (isAbortError(err)) {
-        throw new DvmError(
-          "timeout",
-          "Credit operation timed out.",
-          "The provider may be starting up. Retry in a few seconds."
-        );
-      }
+      if (isAbortError(err)) throw new CreditOperationTimeoutError();
       throw new DvmError(
         "provider_unreachable",
         `Could not reach ${url}: ${err instanceof Error ? err.message : String(err)}`,
@@ -606,7 +611,7 @@ export class HttpsTransport implements Transport {
           ? (await import("mppx")).Challenge.fromHeadersList(res.headers)
           : [];
       assertConfiguredTempoChallengeNetwork(mppChallenges, ["charge", "session"]);
-      const text = await res.text();
+      const text = await res.text().catch(rethrowCreditBodyError);
       const parsed = parseJsonObject(text);
       const structured = parseStructuredError(text);
       if (structured) {
@@ -643,7 +648,7 @@ export class HttpsTransport implements Transport {
         `Credit operation failed (${res.status}): ${text}`
       );
     }
-    const result = (await res.json()) as Record<string, unknown>;
+    const result = (await res.json().catch(rethrowCreditBodyError)) as Record<string, unknown>;
     const { menu: rawMenu, funding_receipt: rawFundingReceipt, ...creditResult } = result;
     const menu = parseCreditMenu(rawMenu);
     const x402PaymentResponse =

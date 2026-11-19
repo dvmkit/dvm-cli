@@ -158,6 +158,27 @@ describe("HTTPS payment send deadlines", () => {
   });
 });
 
+describe("HTTPS credit deadlines", () => {
+  it.each([
+    { boundary: "withheld headers", status: undefined },
+    { boundary: "a stalled error body", status: 503 },
+  ])("reports a credit timeout for $boundary", async ({ status }) => {
+    let closed = 0;
+    const endpoint = await listen(createServer((_request, response) => {
+      response.once("close", () => { closed += 1; });
+      if (status !== undefined) {
+        response.writeHead(status, { "Content-Type": "application/json" });
+        response.write('{"error":');
+      }
+    }));
+
+    const transport = new HttpsTransport();
+    await expect(transport.credit({ endpoint }, { op: "balance" }, undefined, { timeoutMs: 300 }))
+      .rejects.toMatchObject({ code: "timeout", message: "Credit operation timed out." });
+    await expect.poll(() => closed).toBe(1);
+  });
+});
+
 describe("HTTPS payment refusals", () => {
   const send = (endpoint: string) => new HttpsTransport().sendMessage("job-1", {
     type: "payment", content: { cashu_token: "token", cashu_request_id: "request-1", amount_msats: 10_000 },
