@@ -322,3 +322,33 @@ describe("posture-aware credit reporting", () => {
     expect(readFileSync(join(root, "config.json"), "utf8")).toBe(config);
   });
 });
+
+describe("server and local credit status", () => {
+  it("names a drained credit's local reclaim state and the server's lifecycle separately", async () => {
+    const store = JSON.parse(readFileSync(join(root, "credits.json"), "utf8"));
+    Object.assign(store.credits[0], { status: "drained", remainingMicro: 0, siblingCredits: [] });
+    writeFileSync(join(root, "credits.json"), JSON.stringify(store));
+    const emptied: CreditWire = { ...primary, status: "active", remaining_micro: 0, drainable: false };
+    seams.credit.mockResolvedValue({ credit: emptied, credits: [emptied] });
+
+    creditList({});
+    const listed = output().credits[0];
+    expect(listed).toMatchObject({ credit_id: "held-credit", local_status: "drained" });
+    expect(listed).not.toHaveProperty("server_status");
+    creditList({ human: true });
+    expect(seams.info.mock.calls.flat().join("\n")).toContain("local status: drained");
+
+    await creditBalance(endpoint, {});
+    const balance = output().credits[0];
+    expect(balance).toMatchObject({ credit_id: "held-credit", server_status: "active", remaining_micro: 0 });
+    expect(balance).not.toHaveProperty("local_status");
+  });
+
+  it("labels a sibling's provider-reported status as the server's", () => {
+    const store = JSON.parse(readFileSync(join(root, "credits.json"), "utf8"));
+    store.credits[0].siblingCredits[0].status = "unbacked";
+    writeFileSync(join(root, "credits.json"), JSON.stringify(store));
+    creditList({});
+    expect(output().credits[0].sibling_credits[0]).toMatchObject({ status: "unbacked", server_status: "unbacked" });
+  });
+});

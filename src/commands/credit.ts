@@ -556,7 +556,7 @@ export function creditList(opts: CreditListOptions): void {
       pending.length === 0 &&
       snapshots.length === 0
         ? `${postureAdoptionSentence(globalPosture.posture)} This view is local; nothing was queried.`
-        : "This is the caller's local projection from signed receipts and signed balance reads. `implicit_credits` are released per-call balances spent automatically before prepaid credit; an expired row is lost because it has no drain path. `sibling_credits` are server-confirmed at `observed_at_ms`, but draws use only the tracked row; each drainable sibling names the exact reclaim command. Cached `dvms` entries are funding guidance, not a fresh balance. Reconcile again with 'dvm credit balance <dvm>'.",
+        : "This is the caller's local projection from signed receipts and signed balance reads. `implicit_credits` are released per-call balances spent automatically before prepaid credit; an expired row is lost because it has no drain path. `sibling_credits` are server-confirmed at `observed_at_ms`, but draws use only the tracked row; each drainable sibling names the exact reclaim command. Credit rows' `local_status` is this machine's record (`drained` once a reclaim was sent); the provider's lifecycle is `server_status`, shown by 'dvm credit balance'. Cached `dvms` entries are funding guidance, not a fresh balance. Reconcile again with 'dvm credit balance <dvm>'.",
   });
 }
 
@@ -697,6 +697,7 @@ function storedCreditJson(c: StoredCredit, headroom: CreditHeadroom, postureOff:
     ledger_seq: c.ledgerSeq,
     expiry_ms: c.expiryMs || null,
     status: c.status,
+    local_status: c.status,
     ...(channelId ? { channel_id: channelId } : {}),
     ...(c.reconciliationPending ? { reconciliation_pending: true } : {}),
     tracked: c.selectionCleared !== true,
@@ -744,6 +745,7 @@ function siblingCreditJson(
   return {
     credit_id: sibling.creditId,
     status: sibling.status ?? "active",
+    server_status: sibling.status ?? "active",
     currency: sibling.currency,
     balance_micro: sibling.balanceMicro,
     remaining_micro: sibling.remainingMicro,
@@ -1104,7 +1106,7 @@ function humanCreditRow(c: StoredCredit, postureOff: boolean): string {
     postureOff && c.status === "active" && !c.reconciliationPending
       ? "held but spending switched off by credit posture; balance remains reclaimable"
       : undefined,
-    c.status !== "active" ? c.status : undefined,
+    c.status !== "active" ? `local status: ${c.status}` : undefined,
     c.reconciliationPending ? "backing reconciliation pending" : undefined,
     c.provisional ? "syncing" : undefined,
     pendingDrainFor(c, c.creditId) ? "drain pending" : undefined,
