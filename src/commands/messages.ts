@@ -84,7 +84,14 @@ async function messagesWithAccess(
     const summary = mandatePaymentSummary(access.endpointOverridden ? undefined : loadJob(jobId),
       access.endpointOverridden ? batch : [...batch, ...loadMessages(jobId)], fullHistoryThrough);
     for (const report of summary.mandate_payments ?? []) bySeq.set(report.seq, report);
-    return { summary: access.endpointOverridden ? {} : summary, bySeq };
+    if (access.endpointOverridden && !opts.wait) return { summary: {}, bySeq };
+    if (access.endpointOverridden && summary.mandate_payments) {
+      summary.mandate_payments = summary.mandate_payments.map((report) => providerFields({
+        ...report,
+        amount: providerFields(report.amount, ["amount_micro", "currency"]),
+      }, ["seq", "request_seq", "amount_msats"]));
+    }
+    return { summary, bySeq };
   }
 
   function actionFromMessages(batch: Message[]): NextAction {
