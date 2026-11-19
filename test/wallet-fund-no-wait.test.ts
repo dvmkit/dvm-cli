@@ -528,6 +528,29 @@ describe("human-paid funding without waiting", () => {
     expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
   });
 
+  it("keeps a quote paid during confirmation before issuance starts", async () => {
+    const fixture = mint();
+    const quoteId = "quote-1";
+    await runFund();
+
+    vi.spyOn(process, "stdin", "get").mockReturnValue(
+      Object.create(process.stdin, { isTTY: { value: true } })
+    );
+    vi.mocked(createInterface).mockReturnValueOnce({
+      close() {},
+      question(_prompt: string, answer: (line: string) => void) {
+        expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledWith(quoteId);
+        fixture.states.set(quoteId, "PAID");
+        answer(quoteId);
+      },
+    } as Interface);
+
+    await expect(walletForgetQuote(quoteId, { human: true })).rejects.toMatchObject({
+      code: "mint_quote_collectable",
+    });
+    expect(sdk.loadAgentWallet()?.pending_mints).toMatchObject([{ quote_id: quoteId }]);
+  });
+
   it.each([
     { situation: "issuance is in progress", replyLost: false, lookupError: undefined },
     { situation: "the mint reply was lost", replyLost: true, lookupError: undefined },
