@@ -10,8 +10,10 @@ import {
   deriveIdentityFromPrivkey,
   DvmError,
   DvmX402ChannelStorage,
+  encodePaymentRequiredHeader,
   listPendingX402FundingsForChannel,
   loadCredit,
+  loadResumableX402Funding,
   recordFundResponse,
   recordPendingX402Funding,
   recordX402ChannelMetadata,
@@ -48,6 +50,7 @@ vi.mock("../src/commands/credit/render", async (original) => ({
 import { renderCreditDrain } from "../src/commands/credit/render";
 import { fundCredit } from "../src/lib/credit-fund";
 import { runCreditDrain } from "../src/lib/credit/drain";
+import { HttpsTransport } from "../src/lib/transport/https";
 import { loadX402Wallet } from "../src/lib/x402/wallet";
 
 const endpoint = "https://provider.example";
@@ -70,6 +73,7 @@ const channelId = computeChannelId(config, network);
 const otherChannelId = computeChannelId({ ...config, receiver: `0x${"44".repeat(20)}` }, network);
 const storage = new DvmX402ChannelStorage();
 const root = process.env.DVM_CONFIG_DIR!;
+const unexpectedFetch = vi.fn(() => Promise.reject(new Error("Unexpected live request")));
 const menu: CreditMenu = {
   min_micro: 10_000, max_micro: 5_000_000, ttl_ms: 60_000, currency: "usd",
   funding: ["x402"], x402: { schemes: [{ scheme: "batch-settlement", network }] },
@@ -82,7 +86,7 @@ const provider = {
   credit: menu,
 } as ProviderInfo;
 
-function required(amount: string): PaymentRequired {
+function required(amount: string): PaymentRequired & { x402Version: 2 } {
   return {
     x402Version: 2,
     resource: { url: `${endpoint}/v1/credit` },
@@ -125,7 +129,7 @@ beforeEach(async () => {
   external.describe.mockResolvedValue(provider);
   external.readContract.mockResolvedValue([200_000n, 10_000n]);
   vi.stubEnv("DVM_IDENTITY_KEY", signer.privkey);
-  vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("Unexpected live request"))));
+  vi.stubGlobal("fetch", unexpectedFetch);
   recordX402ChannelMetadata({
     channelId, endpoint, callerPubkey: signer.pubkey, creditId, network, config, updatedAt: 1,
   });
@@ -141,9 +145,119 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  expect(fetch).not.toHaveBeenCalled();
+  expect(unexpectedFetch).not.toHaveBeenCalled();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
+});
+
+describe("x402 funding with changed requirements", () => {
+  const scope = { endpoint, callerPubkey: signer.pubkey, creditId };
+  const previous = required("200000");
+  const fresh = {
+    ...previous,
+    accepts: previous.accepts.map((terms) => ({ ...terms, maxTimeoutSeconds: 90 })),
+  };
+  const mismatch = encodePaymentRequiredHeader({ ...fresh, error: "requirements_mismatch" });
+
+  function fund() {
+    return fundCredit({
+      transport: new HttpsTransport(), ref: { endpoint }, signing: signer,
+      creditId, fundId: "fund-new", amountMicro: 200_000, targetMicro: 200_000,
+      menu, providerInfo: provider, rail: "x402", float: null, tempoAccount: null,
+      signBody: (_key, body) => body,
+    });
+  }
+
+  async function journalDeposit(expired: boolean) {
+    const { scheme: _scheme, ...payment } = await createX402BatchPayment({
+      wallet, paymentRequired: previous, ...scope, depositMicro: 200_000,
+    });
+    const pending = {
+      ...scope, ...payment, fundId: "fund-original", amountMicro: 200_000, targetMicro: 200_000,
+      requestedAt: Date.now(),
+    };
+    recordPendingX402Funding(pending);
+    if (expired) {
+      vi.spyOn(Date, "now").mockReturnValue((Number(payment.authorizationValidBefore) + 2) * 1000);
+    }
+    return pending;
+  }
+
+  function refusal(status = 402, settlementHeader?: string) {
+    return Response.json({ error: "payment_invalid", message: "Payment requirements changed." }, {
+      status,
+      headers: {
+        "PAYMENT-REQUIRED": mismatch,
+        ...(settlementHeader ? { [settlementHeader]: "settlement evidence" } : {}),
+      },
+    });
+  }
+
+  it("retires an expired unused deposit and signs the current requirements on the next funding", async () => {
+    const pending = await journalDeposit(true);
+    external.readContract.mockImplementation(async ({ functionName }) =>
+      functionName === "authorizationState" ? false : [0n, 0n]
+    );
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(refusal())
+      .mockResolvedValueOnce(Response.json({ error: "payment_required" }, {
+        status: 402, headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(fresh) },
+      }))
+      .mockResolvedValueOnce(Response.json({ op: "fund", funded_micro: 200_000, credit: credit(200_000) }, {
+        headers: { "PAYMENT-RESPONSE": response({
+          channelId, balance: "200000", totalClaimed: "0", chargedCumulativeAmount: "200000",
+        }, "200000") },
+      }));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
+
+    expect(external.readContract).toHaveBeenCalledWith(expect.objectContaining({
+      address: config.token, functionName: "authorizationState",
+    }));
+    expect(loadResumableX402Funding(scope)).toBeUndefined();
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([
+      { ...pending, refusedAt: expect.any(Number) },
+    ]);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(new Headers(fetch.mock.calls[0][1]?.headers).get("PAYMENT-SIGNATURE")).toBe(pending.paymentHeader);
+
+    await expect(fund()).resolves.toMatchObject({ status: "funded", fundId: "fund-new" });
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(new Headers(fetch.mock.calls[1][1]?.headers).has("PAYMENT-SIGNATURE")).toBe(false);
+    const replacement = new Headers(fetch.mock.calls[2][1]?.headers).get("PAYMENT-SIGNATURE");
+    expect(replacement).toBeTruthy();
+    expect(decodePaymentSignatureHeader(replacement!).accepted).toEqual(fresh.accepts[0]);
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([
+      { ...pending, refusedAt: expect.any(Number) },
+    ]);
+  });
+
+  it.each([
+    { name: "an unexpired deposit", expired: false },
+    { name: "a consumed nonce", expired: true, consumed: true },
+    { name: "an unavailable chain", expired: true, chainUnavailable: true },
+    { name: "a settlement response", expired: true, settlementHeader: "PAYMENT-RESPONSE" },
+    { name: "a legacy settlement response", expired: true, settlementHeader: "X-PAYMENT-RESPONSE" },
+    { name: "a server failure", expired: true, status: 503 },
+    { name: "a transport failure", expired: true, transportFailure: true },
+  ])("keeps the journal for $name", async ({ expired, consumed, chainUnavailable, settlementHeader, status, transportFailure }) => {
+    const pending = await journalDeposit(expired);
+    if (chainUnavailable) external.readContract.mockRejectedValue(new Error("Chain unavailable"));
+    else external.readContract.mockResolvedValue(consumed ?? false);
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    if (transportFailure) fetch.mockRejectedValue(new TypeError("Connection closed"));
+    else fetch.mockImplementation(async () => refusal(status, settlementHeader));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
+    expect(loadResumableX402Funding(scope)).toEqual(pending);
+    await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
+    expect(loadResumableX402Funding(scope)).toEqual(pending);
+    expect(fetch.mock.calls.map(([, init]) => new Headers(init?.headers).get("PAYMENT-SIGNATURE")))
+      .toEqual([pending.paymentHeader, pending.paymentHeader]);
+  });
 });
 
 describe.each(["fresh", "resumed"] as const)("%s x402 credit funding", (path) => {

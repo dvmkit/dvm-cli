@@ -49,6 +49,7 @@ import {
   SUPPORTED_PROTOCOL_VERSION,
   type Transport,
   usdToMsats,
+  X402_BATCH_SETTLEMENT_SCHEME,
   X402_V1_VERSION,
   X402_VERSION,
 } from "@dvmkit/sdk/internal";
@@ -112,6 +113,12 @@ export class CreditOperationTimeoutError extends DvmError {
   constructor() {
     super("timeout", "Credit operation timed out.", "The provider may be starting up. Retry in a few seconds.");
   }
+}
+
+const creditRefusalsWithoutX402Receipt = new WeakSet<DvmError>();
+
+export function isCreditRefusalWithoutX402Receipt(error: DvmError): boolean {
+  return creditRefusalsWithoutX402Receipt.has(error);
 }
 
 function rethrowCreditBodyError(err: unknown): never {
@@ -629,7 +636,7 @@ export class HttpsTransport implements Transport {
             transaction_hash: tempoTransactionHash,
           };
         }
-        throw mppChallenges.length > 0
+        const error = mppChallenges.length > 0
           ? new DvmError(
               contextual.code,
               contextual.message,
@@ -642,6 +649,22 @@ export class HttpsTransport implements Transport {
               contextual.proseSources
             )
           : contextual;
+        // Keep HTTP evidence separate from provider fields and the public error JSON.
+        if (
+          res.status === 402 &&
+          payment?.x402Version === X402_VERSION &&
+          payment.x402Payment &&
+          error.code === "payment_invalid" &&
+          x402PaymentRequired?.x402Version === X402_VERSION &&
+          x402PaymentRequired.accepts.some((terms) => terms.scheme === X402_BATCH_SETTLEMENT_SCHEME) &&
+          !res.headers.has("PAYMENT-RESPONSE") &&
+          !res.headers.has("X-PAYMENT-RESPONSE") &&
+          error.data?.payment_state !== "unknown" &&
+          error.data?.status !== "unknown"
+        ) {
+          creditRefusalsWithoutX402Receipt.add(error);
+        }
+        throw error;
       }
       throw providerResponseError(
         "provider_error",
