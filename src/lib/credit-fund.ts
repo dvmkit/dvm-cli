@@ -2149,6 +2149,20 @@ async function fundOverX402(
         hint: `Nothing was credited. ${x402RetiredDepositWindow(pending)}, so fund again with an amount this DVM accepts after that. ${x402RetiredVoucherResidual(pending)}`,
       };
     }
+    if (
+      err instanceof DvmError &&
+      err.code === "settlement_not_on_chain" &&
+      err.data?.retryable === true
+    ) {
+      return {
+        ...base,
+        status: "refused",
+        error: err,
+        display:
+          "The DVM confirmed that the reusable x402 channel deposit did not land on chain. The signed payment header remains journalled.",
+        hint: "Re-run the same funding command to resend the signed payment header, and do not request a fresh quote.",
+      };
+    }
     return {
       ...base,
       status: "refused",

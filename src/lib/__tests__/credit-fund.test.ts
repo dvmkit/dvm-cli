@@ -747,6 +747,49 @@ describe("fundCredit over x402 batch settlement", () => {
     expect(retirePendingX402Funding).not.toHaveBeenCalled();
   });
 
+  it("retries the journalled voucher after the DVM confirms the deposit did not land", async () => {
+    const pending = journalled({ depositMicro: "400000" });
+    vi.mocked(loadResumableX402Funding).mockReturnValue(pending);
+    mockCreditOp
+      .mockRejectedValueOnce(
+        new DvmError("settlement_not_on_chain", "x402 channel deposit was not found on chain", undefined, {
+          retryable: true,
+        })
+      )
+      .mockResolvedValueOnce({ ...fundedResponse(), x402PaymentResponse: "settled-response" });
+    const funding = args({ creditId: pending.creditId, rail: "x402" });
+
+    const refusal = await fundCredit(funding);
+
+    expect(refusal).toMatchObject({
+      status: "refused",
+      error: { code: "settlement_not_on_chain", data: { retryable: true } },
+      display: expect.stringContaining("deposit did not land on chain"),
+      hint: expect.stringContaining("Re-run the same funding command"),
+    });
+    expect(refusal.hint).toContain("do not request a fresh quote");
+    expect(mockCreditOp).toHaveBeenCalledTimes(1);
+    expect(clearPendingX402Funding).not.toHaveBeenCalled();
+    expect(retirePendingX402Funding).not.toHaveBeenCalled();
+    expect(recordPendingX402Funding).not.toHaveBeenCalled();
+
+    const retried = await fundCredit(funding);
+
+    expect(retried).toMatchObject({ status: "funded", fundId: pending.fundId });
+    expect(mockCreditOp).toHaveBeenCalledTimes(2);
+    const [, firstBody, firstPayment] = mockCreditOp.mock.calls[0];
+    const [, retryBody, retryPayment] = mockCreditOp.mock.calls[1];
+    expect(retryBody.fund).toEqual(firstBody.fund);
+    expect(retryBody).toMatchObject({
+      credit_id: pending.creditId,
+      fund: { fund_id: pending.fundId, amount_micro: pending.amountMicro },
+    });
+    expect(retryPayment).toEqual(firstPayment);
+    expect(retryPayment).toEqual({ x402Payment: pending.paymentHeader, x402Version: 2 });
+    expect(createX402BatchPayment).not.toHaveBeenCalled();
+    expect(clearPendingX402Funding).toHaveBeenCalledExactlyOnceWith(pending);
+  });
+
   it("retires the journal on a terminal instrument-binding refusal", async () => {
     const pending = journalled({ authorizationValidBefore: "1900000000" });
     vi.mocked(loadResumableX402Funding).mockReturnValue(pending);
