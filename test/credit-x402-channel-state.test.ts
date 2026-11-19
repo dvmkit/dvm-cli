@@ -154,9 +154,10 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("x402 funding with changed requirements", () => {
+describe("x402 funding recovery", () => {
   const scope = { endpoint, callerPubkey: signer.pubkey, creditId };
   const finalizedBlockHash = `0x${"ab".repeat(32)}`;
+  const expiryCode = "invalid_batch_settlement_evm_payload_authorization_valid_before";
   const previous = required("200000");
   const fresh = {
     ...previous,
@@ -203,6 +204,49 @@ describe("x402 funding with changed requirements", () => {
     });
   }
 
+  function expiryRefusal(requirementError = expiryCode, message = `x402 channel payment refused: ${expiryCode}`) {
+    return Response.json({ error: "payment_invalid", message }, {
+      status: 402,
+      headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader({ ...previous, error: requirementError }) },
+    });
+  }
+
+  function challengeResponse(terms = previous) {
+    return Response.json({ error: "payment_required" }, {
+      status: 402, headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(terms) },
+    });
+  }
+
+  function fundedDeposit() {
+    return Response.json({ op: "fund", funded_micro: 200_000, credit: credit(200_000) }, {
+      headers: { "PAYMENT-RESPONSE": response({
+        channelId, balance: "200000", totalClaimed: "0", chargedCumulativeAmount: "200000",
+      }, "200000") },
+    });
+  }
+
+  function submittedFunding(init?: RequestInit) {
+    const body = JSON.parse(String(init?.body)) as { fund: { fund_id: string } };
+    return {
+      paymentHeader: new Headers(init?.headers).get("PAYMENT-SIGNATURE"),
+      fundId: body.fund.fund_id,
+    };
+  }
+
+  function expectFinalizedNonceRead(paymentHeader: string) {
+    const { payload } = decodePaymentSignatureHeader(paymentHeader);
+    if (!isBatchSettlementDepositPayload(payload) || !payload.deposit.authorization.erc3009Authorization) {
+      throw new Error("Expected a signed USDC deposit");
+    }
+    const { salt } = payload.deposit.authorization.erc3009Authorization;
+    expect(external.getBlock).toHaveBeenCalledExactlyOnceWith({ blockTag: "finalized" });
+    expect(external.readContract).toHaveBeenCalledWith(expect.objectContaining({
+      address: config.token, functionName: "authorizationState",
+      args: [account.address, keccak256(concatHex([channelId, salt]))],
+      blockHash: finalizedBlockHash, requireCanonical: true,
+    }));
+  }
+
   it("retires an expired unused deposit and signs the current requirements on the next funding", async () => {
     const pending = await journalDeposit(true);
     external.readContract.mockImplementation(async ({ functionName }) =>
@@ -210,29 +254,14 @@ describe("x402 funding with changed requirements", () => {
     );
     const fetch = vi.fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(refusal())
-      .mockResolvedValueOnce(Response.json({ error: "payment_required" }, {
-        status: 402, headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(fresh) },
-      }))
-      .mockResolvedValueOnce(Response.json({ op: "fund", funded_micro: 200_000, credit: credit(200_000) }, {
-        headers: { "PAYMENT-RESPONSE": response({
-          channelId, balance: "200000", totalClaimed: "0", chargedCumulativeAmount: "200000",
-        }, "200000") },
-      }));
+      .mockResolvedValueOnce(challengeResponse(fresh))
+      .mockResolvedValueOnce(fundedDeposit());
     vi.stubGlobal("fetch", fetch);
 
     await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
 
-    const { payload } = decodePaymentSignatureHeader(pending.paymentHeader);
-    if (!isBatchSettlementDepositPayload(payload) || !payload.deposit.authorization.erc3009Authorization) {
-      throw new Error("Expected a signed USDC deposit");
-    }
-    const { salt } = payload.deposit.authorization.erc3009Authorization;
-    expect(external.getBlock).toHaveBeenCalledExactlyOnceWith({ blockTag: "finalized" });
-    expect(external.readContract).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      address: config.token, functionName: "authorizationState",
-      args: [account.address, keccak256(concatHex([channelId, salt]))],
-      blockHash: finalizedBlockHash, requireCanonical: true,
-    }));
+    expectFinalizedNonceRead(pending.paymentHeader);
+    expect(external.readContract).toHaveBeenCalledTimes(1);
     expect(loadResumableX402Funding(scope)).toBeUndefined();
     expect(listPendingX402FundingsForChannel(channelId)).toEqual([
       { ...pending, refusedAt: expect.any(Number) },
@@ -279,6 +308,90 @@ describe("x402 funding with changed requirements", () => {
     expect(loadResumableX402Funding(scope)).toEqual(pending);
     expect(fetch.mock.calls.map(([, init]) => new Headers(init?.headers).get("PAYMENT-SIGNATURE")))
       .toEqual([pending.paymentHeader, pending.paymentHeader]);
+  });
+
+  it.each([
+    { name: "the CLI clock is ahead of the chain", finalizedOffset: -1n },
+    {
+      name: "the expiry refusal carries a cumulative correction", finalizedOffset: -1n, consumed: true,
+      requirementError: "invalid_batch_settlement_evm_cumulative_amount_mismatch",
+    },
+    { name: "the finalized block is at the signed deadline", finalizedOffset: 0n },
+    { name: "the finalized nonce is consumed", consumed: true },
+    { name: "the finalized block is unavailable", blockUnavailable: true },
+  ])("replays the original funding after an expiry refusal when $name", async ({ finalizedOffset, requirementError, consumed, blockUnavailable }) => {
+    const pending = await journalDeposit(true, finalizedOffset);
+    if (blockUnavailable) external.getBlock.mockRejectedValue(new Error("Finalized block unavailable"));
+    external.readContract.mockImplementation(async ({ functionName }) =>
+      functionName === "authorizationState" ? consumed ?? false : [0n, 0n]
+    );
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_request, init) => {
+      const { paymentHeader } = submittedFunding(init);
+      if (paymentHeader === pending.paymentHeader) return expiryRefusal(requirementError);
+      return paymentHeader ? fundedDeposit() : challengeResponse();
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
+    expect(loadResumableX402Funding(scope)).toEqual(pending);
+    await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
+    expect(loadResumableX402Funding(scope)).toEqual(pending);
+    expect(fetch.mock.calls.map(([, init]) => submittedFunding(init))).toEqual([
+      { paymentHeader: pending.paymentHeader, fundId: pending.fundId },
+      { paymentHeader: pending.paymentHeader, fundId: pending.fundId },
+    ]);
+  });
+
+  it("submits a replacement under the original funding ID after finalized proof", async () => {
+    const pending = await journalDeposit(true);
+    external.readContract.mockImplementation(async ({ functionName }) =>
+      functionName === "authorizationState" ? false : [0n, 0n]
+    );
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(expiryRefusal(expiryCode, "The deposit authorization expired."))
+      .mockResolvedValueOnce(challengeResponse())
+      .mockResolvedValueOnce(fundedDeposit());
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(fund()).resolves.toMatchObject({ status: "funded", creditId, fundId: pending.fundId });
+
+    expectFinalizedNonceRead(pending.paymentHeader);
+    const submissions = fetch.mock.calls.map(([, init]) => submittedFunding(init));
+    expect(submissions).toEqual([
+      { paymentHeader: pending.paymentHeader, fundId: pending.fundId },
+      { paymentHeader: null, fundId: pending.fundId },
+      { paymentHeader: expect.any(String), fundId: pending.fundId },
+    ]);
+    expect(submissions[2].paymentHeader).not.toBe(pending.paymentHeader);
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([]);
+  });
+
+  it("keeps the original intent after a failed replacement probe until the provider confirms funding", async () => {
+    const pending = await journalDeposit(true);
+    external.readContract.mockResolvedValue(false);
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(expiryRefusal())
+      .mockRejectedValueOnce(new TypeError("Connection closed"))
+      .mockResolvedValueOnce(expiryRefusal())
+      .mockResolvedValueOnce(Response.json({
+        op: "fund", funded_micro: 200_000, credit: credit(200_000), replayed: true,
+      }));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
+
+    expectFinalizedNonceRead(pending.paymentHeader);
+    expect(loadResumableX402Funding(scope)).toEqual(pending);
+
+    await expect(fund()).resolves.toMatchObject({ status: "funded", fundId: pending.fundId });
+
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([]);
+    expect(fetch.mock.calls.map(([, init]) => submittedFunding(init))).toEqual([
+      { paymentHeader: pending.paymentHeader, fundId: pending.fundId },
+      { paymentHeader: null, fundId: pending.fundId },
+      { paymentHeader: pending.paymentHeader, fundId: pending.fundId },
+      { paymentHeader: null, fundId: pending.fundId },
+    ]);
   });
 });
 

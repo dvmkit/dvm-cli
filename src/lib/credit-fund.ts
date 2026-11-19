@@ -118,7 +118,6 @@ import {
 import {
   acknowledgeReplayedX402Payment,
   assertX402RequirementDescribesChannel,
-  canReplaceExpiredX402Deposit,
   createX402BatchPayment,
   processX402BatchCorrection,
   processX402BatchResponse,
@@ -2079,6 +2078,25 @@ async function fundOverX402(
     return outcome;
   } catch (err) {
     const correction = err instanceof DvmError ? x402RequiredFromError(err) : undefined;
+    const expiryCode = "invalid_batch_settlement_evm_payload_authorization_valid_before";
+    if (
+      err instanceof DvmError &&
+      (err.code === expiryCode ||
+        err.message.includes(expiryCode) ||
+        (correction?.x402Version === X402_VERSION && correction.error === expiryCode))
+    ) {
+      if (
+        corrected ||
+        !(await finalizedX402DepositExpiredUnused(pending.paymentHeader, wallet.network).catch(() => false))
+      ) {
+        return pendingX402Refusal(base, err);
+      }
+      // The journal write supersedes the original header. Keeping it until then
+      // preserves the funding ID if discovery or signing fails first.
+      const outcome = await fundOverX402(args, pending.fundId, undefined, true, true);
+      if (outcome.status === "funded") clearPendingX402Funding(pending);
+      return outcome.status === "unavailable" ? pendingX402Refusal(base, outcome.error ?? err) : outcome;
+    }
     if (
       err instanceof DvmError &&
       err.code === "payment_invalid" &&
@@ -2102,21 +2120,6 @@ async function fundOverX402(
           "The DVM changed its x402 payment requirements. The deposit authorization expired unused, so its header was retired from replay.",
         hint: `Re-run the funding command to request the current requirements. ${x402RetiredVoucherResidual(pending)}`,
       };
-    }
-    if (
-      !corrected &&
-      err instanceof DvmError &&
-      (err.code === "invalid_batch_settlement_evm_payload_authorization_valid_before" ||
-        err.message.includes("invalid_batch_settlement_evm_payload_authorization_valid_before"))
-    ) {
-      try {
-        if (await canReplaceExpiredX402Deposit({ wallet, paymentHeader: pending.paymentHeader })) {
-          clearPendingX402Funding(pending);
-          return await fundOverX402(args, pending.fundId, undefined, true, true);
-        }
-      } catch {
-        // Fail closed: retain the exact authorization unless onchain non-use is proven.
-      }
     }
     if (correction && !corrected) {
       try {
