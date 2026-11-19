@@ -17,11 +17,17 @@ const binary = join(repositoryRoot, "dist", "dvm.js");
 const IDENTITY = "0d".repeat(32);
 const SLOW = 60_000;
 
+interface DrainBinding {
+  creditId: string;
+  drainId: string;
+}
+
 interface Snapshot {
   chargeAttempts: number;
   intents: Array<{ id: string; amount: number; refunded: number }>;
   refundCreates: number;
-  drainRequests: Array<{ creditId: string; drainId: string; replayed: boolean }>;
+  drainPosts: DrainBinding[];
+  drainCreations: DrainBinding[];
   stalledDrain?: { drain_id: string; credit_id: string; status: string; refund_ids: string[] };
   jobs: number;
 }
@@ -222,10 +228,11 @@ describe("card refund drain", () => {
     const timedOut = await dvm(["credit", "drain", endpoint, "--method", "stripe"]);
     expect(timedOut.code).toBe(1);
     const afterTimeout = await snapshot();
-    const posted = afterTimeout.drainRequests.slice(before.drainRequests.length);
-    expect(posted).toEqual([{ creditId, drainId: expect.any(String), replayed: false }]);
+    const posted = afterTimeout.drainPosts.slice(before.drainPosts.length);
+    expect(posted).toEqual([{ creditId, drainId: expect.any(String) }]);
+    const { drainId } = posted[0]!;
+    expect(afterTimeout.drainCreations.slice(before.drainCreations.length)).toEqual([{ creditId, drainId }]);
     expect(afterTimeout.refundCreates - before.refundCreates).toBe(1);
-    const drainId = posted[0]!.drainId;
     expect(afterTimeout.stalledDrain).toMatchObject({
       credit_id: creditId, drain_id: drainId, status: "sent", refund_ids: [expect.stringMatching(/^re_test_/)],
     });
@@ -249,9 +256,8 @@ describe("card refund drain", () => {
       refund_ids: afterTimeout.stalledDrain!.refund_ids,
     });
     const afterRetry = await snapshot();
-    expect(afterRetry.drainRequests.slice(afterTimeout.drainRequests.length)).toEqual([
-      { creditId, drainId, replayed: true },
-    ]);
+    expect(afterRetry.drainPosts.slice(afterTimeout.drainPosts.length)).toEqual([{ creditId, drainId }]);
+    expect(afterRetry.drainCreations).toEqual(afterTimeout.drainCreations);
     expect(afterRetry.refundCreates).toBe(afterTimeout.refundCreates);
   }, SLOW);
 
