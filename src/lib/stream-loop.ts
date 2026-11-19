@@ -1,5 +1,5 @@
 import { paymentCreditChoice, type CreditedPaymentResult } from "./payment-credit";
-import { MandateGuardReadError, mandateWindowAction } from "./mandate-wait";
+import { DeclineConfirmationPending, MandateGuardReadError, mandateWindowAction } from "./mandate-wait";
 import { isTransientJobReadError } from "./job-read-error";
 import { hasUnsavedJobState } from "./job-persistence";
 import { sameEndpoint } from "./provider-endpoint";
@@ -49,7 +49,7 @@ export interface StreamLoopOptions {
   onAutoPayment?: (payment: AutoPayment, requestSeq: number) => void;
   /** Timeout in milliseconds. If exceeded, returns whatever has been collected. */
   timeoutMs?: number;
-  /** Remaining wait budget, capped by the read timeout, checked before each mandate guard read. */
+  /** Remaining wait budget, capped by the read timeout, for mandate guard and decline confirmation reads. */
   mandateReadTimeoutMs?: () => number;
   /**
    * Whether messages, refund claims, and policy-driven payments may update local
@@ -88,6 +88,8 @@ export interface StreamLoopResult {
   cursor: number;
   /** A payment this read sent or found is still unresolved; `nextAction` carries its hint. */
   paymentInFlight?: boolean;
+  /** Request sequence whose accepted decline is awaiting a status read. */
+  declineConfirmationSeq?: number;
 }
 
 export interface AutoPayment {
@@ -177,6 +179,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
         ...paymentOptions, requestSeq: pending.authorization.request_seq,
       });
     } catch (error) {
+      if (error instanceof DeclineConfirmationPending)
+        return { messages: [], autoPayments, refunds, cursor, nextAction: pollNextAction(jobId), declineConfirmationSeq: error.requestSeq };
       if (error instanceof MandateGuardReadError)
         return { messages: [], autoPayments, refunds, cursor, nextAction: pollNextAction(jobId) };
       if (error instanceof DvmError && error.code === "payment_already_sent") answeredSeqs.add(pending.authorization.request_seq);
@@ -325,6 +329,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
                 ...paymentOptions, requestSeq: lastYield.seq,
               });
           } catch (error) {
+            if (error instanceof DeclineConfirmationPending)
+              return { messages: allMessages, autoPayments, refunds, cursor, nextAction: pollNextAction(jobId), declineConfirmationSeq: error.requestSeq };
             if (error instanceof MandateGuardReadError) {
               // Reconnect behind the ask so the guard can recheck it after releasing the payment lock.
               paymentWaitAction = pollNextAction(jobId);

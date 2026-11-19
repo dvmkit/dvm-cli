@@ -12,6 +12,7 @@ import { formatDurationMs } from "./duration";
 import { guidanceJobArg } from "./provider-output";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "./stream-loop";
 import { createWaitPaymentLines, type WaitPaymentLineOptions } from "./wait-payment-lines";
+import { recordStoppedAskStatus } from "./mandate-wait";
 
 export interface WaitForJobResult extends StreamLoopResult {
   /** Highest sequence in a provider history read that started at zero. */
@@ -57,24 +58,31 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
   let paymentInFlight = false;
   // Whether any status read showed the job still open, which the wait-limit hint states.
   let seenRunning = false;
+  let declineConfirmationSeq: number | undefined;
   const idleTimeoutMs = opts.timeoutMs ?? JOB_READ_TIMEOUT_MS;
+  async function waitBeforeRetry(): Promise<void> {
+    const delay = Math.min(backoffMs, Math.max(0, deadline - now()));
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    backoffMs = Math.min(backoffMs * 2, 30_000);
+  }
   async function readWithRetry<T>(read: () => Promise<T>): Promise<T | undefined> {
     while (now() < deadline) {
       try { return await read(); }
       catch (error) {
         if (!isTransientJobReadError(error)) throw error;
-        await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, Math.max(0, deadline - now()))));
-        backoffMs = Math.min(backoffMs * 2, 30_000);
+        await waitBeforeRetry();
       }
     }
     return undefined;
   }
   while (now() < deadline && !hasUnsavedJobState()) {
-    const readOptions = () => ({ jobToken: opts.jobToken, timeoutMs: Math.max(1, Math.min(idleTimeoutMs, deadline - now())) });
+    const jobToken = opts.jobToken ?? (declineConfirmationSeq === undefined ? undefined : loadJob(opts.jobId)?.jobToken);
+    const readOptions = () => ({ jobToken, timeoutMs: Math.max(1, Math.min(idleTimeoutMs, deadline - now())) });
     const snapshot: ContentStatus | undefined = await readWithRetry(() => opts.transport.status(opts.jobId, opts.provider, readOptions()));
     if (!snapshot) break;
     seenRunning = !isTerminalJobStatus(snapshot.status);
     if (isTerminalJobStatus(snapshot.status)) {
+      if (declineConfirmationSeq !== undefined) recordStoppedAskStatus(opts.jobId, declineConfirmationSeq, snapshot.status);
       result.providerStatus = snapshot;
       result.nextAction = null;
       const history = await readWithRetry(() => opts.transport.getMessages(opts.jobId, result.cursor, opts.provider, readOptions()));
@@ -93,6 +101,11 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       }
       result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
       break;
+    }
+    if (declineConfirmationSeq !== undefined) {
+      // A lagging status can still show the declined ask as open.
+      await waitBeforeRetry();
+      continue;
     }
     // A previous command may have advanced the cursor past an unanswered yield.
     const inFlight = opts.persistLocalState === false ? [] : loadJob(opts.jobId)?.inFlightPaymentRequestSeqs ?? [];
@@ -176,11 +189,10 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     result.cursor = Math.min(next.cursor, cursorLimit);
     result.nextAction = next.nextAction;
     paymentInFlight = next.paymentInFlight === true;
+    declineConfirmationSeq = next.declineConfirmationSeq;
     if (hasUnsavedJobState() || next.nextAction?.type !== "poll") break;
     if (progressed) backoffMs = 1000;
-    const delay = Math.min(backoffMs, Math.max(0, deadline - now()));
-    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-    backoffMs = Math.min(backoffMs * 2, 30_000);
+    await waitBeforeRetry();
   }
   if (opts.persistLocalState !== false) {
     const remaining = loadJob(opts.jobId)?.inFlightPaymentRequestSeqs ?? [];

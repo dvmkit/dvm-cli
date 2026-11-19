@@ -1,4 +1,4 @@
-import { DvmError, type Message, type Transport } from "@dvmkit/sdk/internal";
+import { DvmError, signDvmRequestData, type Message, type Transport } from "@dvmkit/sdk/internal";
 import { expect, it, vi } from "vitest";
 import { loadJob, saveJob } from "../src/lib/job-store";
 import { mandateWindowAction } from "../src/lib/mandate-wait";
@@ -82,4 +82,91 @@ it.each(["recovers", "keeps timing out"])("reconciles the ask within the wait li
   } finally {
     vi.useRealTimers();
   }
+});
+
+it.each(["recovers", "reports stale status before recovering", "keeps timing out", "recovers with a saved credit authorization"])(
+  "keeps watching an accepted decline when its confirmation %s", async (confirmation) => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(start);
+      const jobId = `decline-${confirmation.replaceAll(" ", "-")}`;
+      const policy = { maxTotalMsats: 300_000, autoPayBelowMsats: 200_000, maxIncrementMsats: 200_000, maxPayments: 3 };
+      const stopRequestedDisplay = "Stop recorded for the next payment ask.";
+      const jobToken = "ab".repeat(32);
+      const credit = { credit_id: "credit", draw_id: "draw", request_seq: 4, payment_id: "pending", ...ask.credit };
+      const pendingCreditPayment = confirmation === "recovers with a saved credit authorization" ? {
+        request: ask,
+        authorization: { ...credit, ...signDvmRequestData("01".repeat(32), credit,
+          { audience: { dvm_id: "provider", builder_pubkey: "cd".repeat(32) }, method: "POST", path: `/v1/job/${jobId}/messages`, capability: null }) },
+      } : undefined;
+      saveJob({ ...job, id: jobId, policy, jobToken, stopRequested: true, stopRequestedDisplay, pendingCreditPayment });
+      const request: Message = { seq: 4, from: "provider", timestamp: start / 1000, type: "payment-request", content: ask };
+      const cancel: Message = { seq: 5, from: "provider", timestamp: start / 1000 + 3, type: "cancel", content: { reason: "Declined" } };
+      const provider = { endpoint: job.endpoint };
+      let accepted = false;
+      let terminal = false;
+      let staleStatus = confirmation === "reports stale status before recovering";
+      const statusTimeouts: number[] = [];
+      const status = vi.fn<Transport["status"]>(async (_id, _provider, options) => {
+        if (!accepted) return { jobId, status: "awaiting-input" };
+        expect(options?.jobToken).toBe(jobToken);
+        const timeoutMs = options?.timeoutMs ?? 0;
+        if (statusTimeouts.length === 0 || confirmation === "keeps timing out") {
+          statusTimeouts.push(timeoutMs);
+          await new Promise((resolve) => setTimeout(resolve, timeoutMs));
+          throw new DvmError("timeout", "Decline confirmation timed out");
+        }
+        if (staleStatus) {
+          staleStatus = false;
+          return { jobId, status: "awaiting-input" };
+        }
+        terminal = true;
+        return { jobId, status: "cancelled" };
+      });
+      const getMessages = vi.fn<Transport["getMessages"]>(async (_id, after) =>
+        (terminal ? [request, cancel] : [request]).filter((message) => message.seq > after));
+      const stream = vi.fn<NonNullable<Transport["stream"]>>(async () => ({ messages: [request], reason: "yield" }));
+      const sendMessage = vi.fn<Transport["sendMessage"]>(async () => { accepted = true; });
+      const transport = { status, getMessages, stream, sendMessage } as unknown as Transport;
+      const until = confirmation === "keeps timing out" ? 3_000 : 8_000;
+      const waiting = waitForJob({ jobId, transport, provider, policy, afterSeq: 2,
+        afterSeqExplicit: true, timeoutMs: 1_500 }, until).catch((error: unknown) => ({ error }));
+      await vi.runAllTimersAsync();
+      const result = await waiting;
+
+      expect(sendMessage.mock.calls.map(([, message]) => message.type)).toEqual(["decline"]);
+      expect(stream).toHaveBeenCalledTimes(pendingCreditPayment ? 0 : 1);
+      expect(loadJob(jobId)).toMatchObject({ stopRequested: true, stopRequestedDisplay });
+      if (confirmation === "keeps timing out") {
+        expect(result).toMatchObject({ nextAction: { type: "poll", hint: expect.stringContaining("wait limit (3s)") }, autoPayments: [] });
+        expect(statusTimeouts).toEqual([1_500, 500]);
+        expect(Date.now() - start).toBe(until);
+        expect(loadJob(jobId)).toMatchObject({ status: "processing" });
+        expect(loadJob(jobId)?.callerDeclined).toBeUndefined();
+      } else {
+        expect(result).toMatchObject({ providerStatus: { status: "cancelled" }, nextAction: null, messages: [request, cancel], autoPayments: [] });
+        expect(statusTimeouts).toEqual([1_500]);
+        expect(loadJob(jobId)).toMatchObject({ status: "cancelled", callerCancelled: true, callerDeclined: true });
+        if (pendingCreditPayment) expect(loadJob(jobId)?.pendingCreditPayment).toBeUndefined();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+it("surfaces a timeout in the decline send without retrying it or reading confirmation", async () => {
+  const jobId = "decline-send-timeout";
+  saveJob({ ...job, id: jobId, stopRequested: true });
+  const request: Message = { seq: 4, from: "provider", timestamp: start / 1000, type: "payment-request", content: ask };
+  const status = vi.fn<Transport["status"]>().mockResolvedValue({ jobId, status: "awaiting-input" });
+  const sendFailure = new DvmError("timeout", "Decline send timed out");
+  const sendMessage = vi.fn<Transport["sendMessage"]>().mockRejectedValue(sendFailure);
+  const transport = { status, sendMessage,
+    getMessages: vi.fn<Transport["getMessages"]>().mockResolvedValue([request]) } as unknown as Transport;
+
+  await expect(waitForJob({ jobId, transport, provider: { endpoint: job.endpoint }, afterSeq: 2,
+    afterSeqExplicit: true }, 3_000)).rejects.toBe(sendFailure);
+  expect(sendMessage.mock.calls.map(([, message]) => message.type)).toEqual(["decline"]);
+  expect(status).toHaveBeenCalledTimes(1);
 });
