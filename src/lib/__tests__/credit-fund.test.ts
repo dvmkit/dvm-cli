@@ -33,7 +33,6 @@ retirePendingX402Funding: vi.fn(),
 withX402ChannelLock: vi.fn((operation: () => Promise<unknown>) => operation()),
 acknowledgeReplayedX402Payment: vi.fn(() => Promise.resolve()),
 assertX402RequirementDescribesChannel: vi.fn(),
-canReplaceExpiredX402Deposit: vi.fn(() => Promise.resolve(false)),
 createX402BatchPayment: vi.fn(),
 processX402BatchCorrection: vi.fn(),
 processX402BatchResponse: vi.fn(() => Promise.resolve()),
@@ -164,7 +163,6 @@ import { abandonPendingSubmission, prepareAgentSpend } from "../wallet-agent/spe
 import {
   acknowledgeReplayedX402Payment,
   assertX402RequirementDescribesChannel,
-  canReplaceExpiredX402Deposit,
   createX402BatchPayment,
   processX402BatchResponse,
   processX402BatchResponseForWallet,
@@ -317,7 +315,6 @@ beforeEach(async () => {
   // `clearAllMocks` empties the call log but not the queued `…Once` values, so
   // a test that leaves one unconsumed would answer the next test's first POST.
   mockCreditOp.mockReset();
-  vi.mocked(canReplaceExpiredX402Deposit).mockResolvedValue(false);
   vi.mocked(assertX402RequirementDescribesChannel).mockImplementation(() => undefined);
   vi.mocked(loadAgentWallet).mockReturnValue({ lock_pubkey: `02${"cd".repeat(32)}` } as never);
   vi.mocked(loadPendingFunding).mockReturnValue(undefined);
@@ -670,34 +667,6 @@ describe("fundCredit over x402 batch settlement", () => {
     expect(outcome).toMatchObject({ status: "unavailable", rail: "cashu" });
     expect(outcome.error?.code).toBe("x402_voucher_pending");
     expect(mockCreditOp).not.toHaveBeenCalled();
-  });
-
-  it("retires and re-signs an expired unconsumed deposit authorization", async () => {
-    const pending = journalled({ creditId: "credit-original", paymentHeader: "expired-header" });
-    vi.mocked(loadResumableX402Funding).mockReturnValue(pending);
-    vi.mocked(canReplaceExpiredX402Deposit).mockResolvedValue(true);
-    mockCreditOp
-      .mockRejectedValueOnce(
-        new DvmError(
-          "payment_invalid",
-          "invalid_batch_settlement_evm_payload_authorization_valid_before"
-        )
-      )
-      .mockRejectedValueOnce(
-        new DvmError("payment_required", "Channel payment required.", undefined, {
-          x402_payment_required: required,
-        })
-      )
-      .mockResolvedValueOnce({ ...fundedResponse(), x402PaymentResponse: "replacement-response" });
-
-    const outcome = await fundCredit(args({ creditId: "credit-original", rail: "x402" }));
-
-    expect(outcome).toMatchObject({ status: "funded", creditId: "credit-original" });
-    expect(canReplaceExpiredX402Deposit).toHaveBeenCalledWith(
-      expect.objectContaining({ paymentHeader: "expired-header" })
-    );
-    expect(clearPendingX402Funding).toHaveBeenCalledWith(pending);
-    expect(createX402BatchPayment).toHaveBeenCalledTimes(1);
   });
 
   it("retires the journal on a refusal that can never be answered", async () => {
