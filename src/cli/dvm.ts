@@ -1143,12 +1143,12 @@ Docs:
   wallet
     .command("forget-quote <quote-id>")
     .description(
-      "Stop tracking one pending funding invoice, named by its mint quote ID. Asks the mint first and refuses while the invoice is paid or its state is unknown. A payment made after forgetting cannot be collected"
+      "Stop tracking a pending funding invoice by its mint quote ID. Paid quotes, saved mint outputs, and quotes whose state cannot be checked require --force. A payment made after forgetting cannot be collected"
     )
     .option("--yes", "Skip the confirmation prompt (required to forget non-interactively)")
     .option(
       "--force",
-      "Forget a quote the mint reports as paid, or whose state could not be checked. This gives up the only record that can collect that payment"
+      "Discard the recovery record for a paid quote, a quote with saved mint outputs, or a quote whose state cannot be checked"
     )
     .option("--human", "Human-readable output instead of JSON")
     .action((quoteId: string, opts: WalletForgetQuoteOptions) => {

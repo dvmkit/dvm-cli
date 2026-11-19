@@ -2,6 +2,7 @@ import { Amount, OutputData, type Wallet } from "@cashu/cashu-ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface, type Interface } from "node:readline";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const MINT = "https://mint.invalid";
@@ -22,6 +23,10 @@ vi.mock("../src/lib/output", async (importOriginal) => ({
   json: seams.json,
   info: seams.info,
 }));
+vi.mock("node:readline", async (importOriginal) => {
+  const readline = await importOriginal<typeof import("node:readline")>();
+  return { ...readline, createInterface: vi.fn(readline.createInterface) };
+});
 
 let root: string;
 let sdk: typeof import("@dvmkit/sdk/internal");
@@ -32,7 +37,7 @@ let buildProgram: typeof import("../src/cli/dvm")["buildProgram"];
 let originalConfigRoot: string | undefined;
 
 function mint(expiry: number | null = Math.floor(Date.now() / 1000) + 3600) {
-  const states = new Map<string, "UNPAID" | "PAID">();
+  const states = new Map<string, "UNPAID" | "PAID" | "ISSUED">();
   const wallet = {
     createLockedMintQuote: vi.fn(async () => {
       const quote = `quote-${states.size + 1}`;
@@ -479,9 +484,12 @@ describe("human-paid funding without waiting", () => {
     expect(sdk.loadAgentWallet()?.pending_mints.map((entry) => entry.quote_id)).toEqual(["quote-1"]);
   });
 
-  it("forgets an unpaid quote on request, and only then", async () => {
-    mint(null);
+  it.each(["unpaid", "gone"] as const)("forgets a %s quote with no saved outputs on request", async (state) => {
+    const fixture = mint(null);
     await runFund();
+    if (state === "gone") {
+      fixture.wallet.checkMintQuoteBolt11.mockRejectedValue(mintError("quote not found", 0));
+    }
 
     await expect(walletForgetQuote("quote-1", {})).rejects.toMatchObject({ code: "confirmation_required" });
     await expect(walletForgetQuote("no-such-quote", { yes: true })).rejects.toMatchObject({ code: "mint_quote_not_found" });
@@ -490,7 +498,7 @@ describe("human-paid funding without waiting", () => {
     await expect(
       buildProgram().parseAsync(["wallet", "forget-quote", "quote-1", "--yes"], { from: "user" })
     ).rejects.toMatchObject({ code: 0 });
-    expect(lastEvent()).toMatchObject({ status: "forgotten", quote_id: "quote-1", mint_state: "unpaid", amount_sats: 1000 });
+    expect(lastEvent()).toMatchObject({ status: "forgotten", quote_id: "quote-1", mint_state: state, amount_sats: 1000 });
     expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
   });
 
@@ -521,6 +529,108 @@ describe("human-paid funding without waiting", () => {
   });
 
   it.each([
+    { situation: "issuance is in progress", replyLost: false, lookupError: undefined },
+    { situation: "the mint reply was lost", replyLost: true, lookupError: undefined },
+    { situation: "the quote expired after a lost reply", replyLost: true, lookupError: mintError("quote expired", 20007) },
+    { situation: "the mint forgot the quote after a lost reply", replyLost: true, lookupError: mintError("quote not found", 0) },
+  ])(
+    "protects the paid quote after an unpaid forget prompt when $situation",
+    async ({ replyLost, lookupError }) => {
+      const fixture = mint();
+      const quoteId = "quote-1";
+      const polling = Promise.withResolvers<void>();
+      const paid = Promise.withResolvers<void>();
+      const prompted = Promise.withResolvers<(answer: string) => void>();
+      const issuing = Promise.withResolvers<void>();
+      const finishIssuance = Promise.withResolvers<void>();
+      const blinded = { amount: Amount.from(1000), B_: `02${"a".repeat(64)}`, id: "01ab" };
+      fixture.wallet.prepareMint.mockResolvedValueOnce({
+        keysetId: "01ab",
+        outputData: [new OutputData(blinded, 5n, new TextEncoder().encode("saved-secret"))],
+      });
+      const checkQuote = fixture.wallet.checkMintQuoteBolt11.getMockImplementation()!;
+      fixture.wallet.checkMintQuoteBolt11.mockImplementationOnce(async (id) => {
+        polling.resolve();
+        await paid.promise;
+        return checkQuote(id);
+      });
+      const finish = fixture.wallet.completeMint.getMockImplementation()!;
+      fixture.wallet.completeMint.mockImplementationOnce(async () => {
+        issuing.resolve();
+        await finishIssuance.promise;
+        if (replyLost) {
+          fixture.states.set(quoteId, "ISSUED");
+          throw Object.assign(new Error("Mint reply lost"), { name: "NetworkError" });
+        }
+        return finish();
+      });
+      vi.spyOn(process, "stdin", "get").mockReturnValue(
+        Object.create(process.stdin, { isTTY: { value: true } })
+      );
+      vi.mocked(createInterface).mockReturnValueOnce({
+        close() {},
+        question(prompt: string, answer: (line: string) => void) {
+          if (prompt.includes("a payment made to its invoice afterwards")) prompted.resolve(answer);
+          else prompted.reject(new Error(`Expected an unpaid quote prompt, got: ${prompt}`));
+        },
+      } as Interface);
+
+      const funding = walletFund("1000", {
+        sats: true, mint: MINT, float: false, qrImage: join(root, "invoice.png"),
+      }).then(() => undefined, (error: unknown) => error);
+      let forgetting: Promise<unknown> | undefined;
+      try {
+        await Promise.race([
+          polling.promise,
+          funding.then((error) => { throw error ?? new Error("Funding ended before the quote was checked"); }),
+        ]);
+        forgetting = walletForgetQuote(quoteId, { human: true })
+          .then(() => undefined, (error: unknown) => error);
+        const confirm = await Promise.race([
+          prompted.promise,
+          forgetting.then((error) => { throw error ?? new Error("Forget ended before confirmation"); }),
+        ]);
+        fixture.states.set(quoteId, "PAID");
+        paid.resolve();
+        await Promise.race([
+          issuing.promise,
+          funding.then((error) => { throw error ?? new Error("Funding ended before issuance"); }),
+        ]);
+        if (replyLost) {
+          finishIssuance.resolve();
+          expect(await funding).toMatchObject({ code: "fund_mint_interrupted" });
+        }
+        if (lookupError) fixture.wallet.checkMintQuoteBolt11.mockRejectedValue(lookupError);
+        confirm(quoteId);
+        const forgetError = await forgetting;
+        expect(sdk.loadAgentWallet()?.pending_mints[0]).toMatchObject({
+          quote_id: quoteId,
+          minting: { outputs: [{ blinded_message: { B_: blinded.B_ } }] },
+        });
+        expect(forgetError).toMatchObject({
+          code: replyLost ? "mint_quote_collectable" : "mint_quote_busy",
+        });
+        if (!replyLost) {
+          finishIssuance.resolve();
+          expect(await funding).toBeUndefined();
+          expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+        }
+        if (lookupError) {
+          await walletForgetQuote(quoteId, { yes: true, force: true });
+          expect(lastEvent()).toMatchObject({ status: "forgotten", mint_state: "gone" });
+          expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
+        }
+      } finally {
+        paid.resolve();
+        finishIssuance.resolve();
+        void prompted.promise.then((answer) => answer(quoteId), () => undefined);
+        await funding;
+        await forgetting;
+      }
+    }
+  );
+
+  it.each([
     { opts: { testSkipLightning: true }, connected: false, code: "invalid_fund_options" },
     { opts: {}, connected: true, code: "invalid_fund_options" },
     { opts: { rail: "tempo" }, connected: false, code: "invalid_flags_for_rail" },
@@ -539,7 +649,9 @@ describe("human-paid funding without waiting", () => {
       quote, request: "lnbc10u1fake", expiry: fixture.expiry, state: "PAID",
     }));
     await runFund(fundArgs().filter((arg) => arg !== "--no-wait"));
-    expect(lastEvent()).toMatchObject({ status: "minted", sats_minted: 1000 });
+    expect(lastEvent()).toMatchObject({
+      status: "minted", sats_minted: 1000, denominations: [8, 32, 64, 128, 256, 512],
+    });
     expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledExactlyOnceWith("quote-1");
     expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
   });

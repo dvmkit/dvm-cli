@@ -1,5 +1,4 @@
 import { rememberKeysetFees } from "../wallet-keyset-fees";
-import { prepareP2PKMint, maxKeysetDenomination } from "@dvmkit/sdk/internal";
 /**
  * NUT-20 quotes bind issuance to the wallet key. Persist the quote before
  * payment and its blinded outputs before issuance so a crash can resume or
@@ -12,19 +11,15 @@ import { MintQuoteState } from "@cashu/cashu-ts";
 import { getWallet } from "@dvmkit/sdk/internal";
 import { DvmError } from "@dvmkit/sdk/internal";
 import { type FloatPayment, floatPaymentJson } from "../float";
-import { computeSmartDenominations } from "@dvmkit/sdk/internal";
+import { reconcilePendingMint } from "./recovery";
 import {
   createMintQuoteRetryState,
   retryMintQuoteOperation,
 } from "@dvmkit/sdk/internal";
-import { serializeOutputData } from "@dvmkit/sdk/internal";
-import { toAgentProof } from "@dvmkit/sdk/internal";
 import {
   type AgentProof,
-  type AgentWallet,
   loadAgentWallet,
   type PendingMint,
-  type PendingMintMintingState,
   saveAgentWallet,
   withWalletLock,
 } from "@dvmkit/sdk/internal";
@@ -132,7 +127,7 @@ export async function createPendingMintQuote(
  * on the next run.
  */
 export async function fundAgentWallet(amountSats: number, opts: FundOptions): Promise<FundResult> {
-  const { initial, cashuWallet, quote, pending } = await createPendingMintQuote(amountSats, opts);
+  const { cashuWallet, quote, pending } = await createPendingMintQuote(amountSats, opts);
   const sats = pending.amount_sats;
 
   // Three ways this invoice gets paid, in priority order:
@@ -154,14 +149,7 @@ export async function fundAgentWallet(amountSats: number, opts: FundOptions): Pr
 
   const finalState = await pollUntilPaidOrTimeout(cashuWallet, quote.quote, opts);
   if (finalState === MintQuoteState.ISSUED) {
-    // Rare race: a concurrent `dvm wallet …` invocation against the same
-    // wallet file already collected this quote's proofs. Distinguish from a
-    // timeout so the operator/agent doesn't think they need to (re)pay.
-    throw new DvmError(
-      "fund_already_issued",
-      `Mint quote ${quote.quote} was already collected by a concurrent run.`,
-      "Inspect wallet state with `dvm wallet show` — the proofs should be persisted by the other instance."
-    );
+    throw mintAlreadyIssuedError("fund", quote.quote);
   }
   if (finalState !== MintQuoteState.PAID) {
     // A float payment that settled but never reached the mint is money in
@@ -185,50 +173,65 @@ export async function fundAgentWallet(amountSats: number, opts: FundOptions): Pr
     );
   }
 
-  const denominations = computeSmartDenominations(sats, {
-    maxDenomination: maxKeysetDenomination(cashuWallet),
-    includeTinyTail: false,
-  });
-  const preview = await prepareP2PKMint(
-    cashuWallet,
-    sats,
-    quote,
-    initial.lock_privkey,
-    initial.lock_pubkey,
-    denominations
-  );
-  const minting: PendingMintMintingState = {
-    keyset_id: preview.keysetId,
-    outputs: serializeOutputData(preview.outputData),
-  };
-  // Persist the blinded outputs before posting to the mint so a crash
-  // here is recoverable on the next sweep via the ISSUED+minting branch.
-  // Wrapped in `withWalletLock` and `upsertPending` re-adds our
-  // entry if a concurrent run dropped it — preserves the recovery handle.
-  await withWalletLock(() => {
-    const fresh = loadAgentWallet() ?? initial;
-    saveAgentWallet(upsertPending(fresh, { ...pending, minting }));
-  });
-
-  const proofs = await cashuWallet.completeMint(preview);
-  const agentProofs = proofs.map((p) => toAgentProof(p, opts.mintUrl, initial.lock_pubkey));
-  await withWalletLock(() => {
-    const post = loadAgentWallet() ?? initial;
-    saveAgentWallet({
-      ...post,
-      proofs: [...post.proofs, ...agentProofs],
-      pending_mints: post.pending_mints.filter((p) => p.quote_id !== quote.quote),
-    });
-  });
+  const { proofs, denominations } = await completePaidMint("fund", pending, quote, cashuWallet, opts);
 
   return {
     mint: opts.mintUrl,
     amount_sats: sats,
     quote_id: quote.quote,
     denominations,
-    proofs: agentProofs,
+    proofs,
     ...(floatPayment ? { float_payment: floatPayment } : {}),
   };
+}
+
+export async function completePaidMint(
+  flow: "fund" | "reserve",
+  pending: PendingMint,
+  quote: MintQuoteBolt11Response,
+  cashuWallet: Wallet,
+  { now, sleep }: Pick<FundOptions, "now" | "sleep">
+) {
+  const outcome = await reconcilePendingMint(pending, {
+    getWalletForMint: async () => cashuWallet,
+    paidQuote: { ...quote, state: MintQuoteState.PAID },
+    now,
+    sleep,
+  });
+  switch (outcome.kind) {
+    case "minted":
+      return outcome;
+    case "restored":
+      return { ...outcome, denominations: outcome.proofs.map((proof) => proof.amount) };
+    case "busy":
+    case "error":
+      throw outcome.cause;
+    case "already_issued":
+      throw mintAlreadyIssuedError(flow, quote.quote);
+    case "no_longer_pending": {
+      const checked = await cashuWallet.checkMintQuoteBolt11(quote.quote).catch(() => undefined);
+      if (checked?.state === MintQuoteState.ISSUED) throw mintAlreadyIssuedError(flow, quote.quote);
+      throw new DvmError(
+        "mint_quote_no_longer_pending",
+        `Mint quote ${quote.quote} is no longer recorded in this wallet.`,
+        "Run `dvm wallet show` to inspect the wallet before starting a new payment."
+      );
+    }
+    default:
+      throw new DvmError(
+        flow === "fund" ? "fund_mint_interrupted" : "reserve_mint_interrupted",
+        `Mint quote ${quote.quote} could not be collected.`,
+        "Run `dvm wallet show` to check the quote before starting a new payment."
+      );
+  }
+}
+
+export function mintAlreadyIssuedError(flow: "fund" | "reserve", quoteId: string): DvmError {
+  return new DvmError(
+    flow === "fund" ? "fund_already_issued" : "reserve_already_issued",
+    `Mint quote ${quoteId} was already collected by a concurrent run.`,
+    "Inspect wallet state with `dvm wallet show` — the proofs should be persisted by the other instance."
+  );
 }
 
 /** Read `DVM_FUND_TIMEOUT_SEC` from process.env, falling back to 10 minutes. */
@@ -238,15 +241,6 @@ export function fundTimeoutMs(): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT_SEC * 1_000;
   return Math.floor(n) * 1_000;
-}
-
-export function withoutPendingMint(wallet: AgentWallet, quoteId: string): AgentWallet {
-  return { ...wallet, pending_mints: wallet.pending_mints.filter((p) => p.quote_id !== quoteId) };
-}
-
-function upsertPending(wallet: AgentWallet, entry: PendingMint): AgentWallet {
-  const others = wallet.pending_mints.filter((p) => p.quote_id !== entry.quote_id);
-  return { ...wallet, pending_mints: [...others, entry] };
 }
 
 export interface PollUntilPaidOptions {

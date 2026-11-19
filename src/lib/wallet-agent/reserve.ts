@@ -25,18 +25,12 @@ import { DvmError } from "@dvmkit/sdk/internal";
 import type { ProviderInfo } from "@dvmkit/sdk/internal";
 import { readAgentMnemonic } from "@dvmkit/sdk/internal";
 import { reservedForMarker } from "./builder-handle";
-import { computeSmartDenominations } from "@dvmkit/sdk/internal";
-import { fundTimeoutMs, pollUntilPaidOrTimeout } from "./fund";
-import { maxKeysetDenomination, prepareP2PKMint } from "@dvmkit/sdk/internal";
+import { completePaidMint, fundTimeoutMs, mintAlreadyIssuedError, pollUntilPaidOrTimeout } from "./fund";
 import { DEFAULT_RESERVE_LOCKTIME_SECONDS } from "./locktime";
-import { serializeOutputData } from "@dvmkit/sdk/internal";
-import { toAgentProof } from "@dvmkit/sdk/internal";
+import type { WalletPendingMint } from "./recovery";
 import {
   type AgentProof,
-  type AgentWallet,
   loadAgentWallet,
-  type PendingMint,
-  type PendingMintMintingState,
   saveAgentWallet,
   withWalletLock,
 } from "@dvmkit/sdk/internal";
@@ -169,12 +163,18 @@ export async function reserveAgentWallet(
   const cashuWallet = await (opts.getWalletForMint ?? getWallet)(opts.mintUrl);
   const quote = await cashuWallet.createLockedMintQuote(sats, initial.lock_pubkey);
 
-  const pending: PendingMint = {
+  const pending: WalletPendingMint = {
     mint: opts.mintUrl,
     quote_id: quote.quote,
     amount_sats: sats,
     requested_at: new Date().toISOString(),
     ...(quote.expiry === null ? {} : { expires_at: quote.expiry }),
+    reserve: {
+      lock_pubkey: lockPubkey,
+      refund_pubkey: refundPubkey,
+      reserved_for: reservedForMarker(opts.builderHandle),
+      locktime_seconds: locktimeSeconds,
+    },
   };
   await withWalletLock(() => {
     const fresh = loadAgentWallet() ?? initial;
@@ -194,11 +194,7 @@ export async function reserveAgentWallet(
     onPoll: opts.onPoll,
   });
   if (finalState === MintQuoteState.ISSUED) {
-    throw new DvmError(
-      "reserve_already_issued",
-      `Mint quote ${quote.quote} was already collected by a concurrent run.`,
-      "Inspect wallet state with `dvm wallet show` — the proofs should be persisted by the other instance."
-    );
+    throw mintAlreadyIssuedError("reserve", quote.quote);
   }
   if (finalState !== MintQuoteState.PAID) {
     throw new DvmError(
@@ -208,61 +204,25 @@ export async function reserveAgentWallet(
     );
   }
 
-  const denominations = computeSmartDenominations(sats, {
-    maxDenomination: maxKeysetDenomination(cashuWallet),
-  });
-  const nowMs = (opts.now ?? Date.now)();
-  const tExpireSeconds = Math.floor(nowMs / 1000) + locktimeSeconds;
-  const tExpireMs = tExpireSeconds * 1000;
-  const preview = await prepareP2PKMint(
-    cashuWallet,
-    sats,
-    quote,
-    initial.lock_privkey,
-    lockPubkey,
-    denominations,
-    { locktimeUnixSec: tExpireSeconds, refundKeys: [refundPubkey] }
-  );
-  const minting: PendingMintMintingState = {
-    keyset_id: preview.keysetId,
-    outputs: serializeOutputData(preview.outputData),
-  };
-  await withWalletLock(() => {
-    const fresh = loadAgentWallet() ?? initial;
-    saveAgentWallet(upsertPending(fresh, { ...pending, minting }));
-  });
-
-  const reservedFor = reservedForMarker(opts.builderHandle);
-  const proofs = await cashuWallet.completeMint(preview);
-  const agentProofs = proofs.map((p) =>
-    toAgentProof(p, opts.mintUrl, lockPubkey, {
-      reservedFor,
-      tExpireMs,
-    })
-  );
-  await withWalletLock(() => {
-    const post = loadAgentWallet() ?? initial;
-    saveAgentWallet({
-      ...post,
-      proofs: [...post.proofs, ...agentProofs],
-      pending_mints: post.pending_mints.filter((p) => p.quote_id !== quote.quote),
-    });
-  });
+  const { entry, proofs, denominations } = await completePaidMint("reserve", pending, quote, cashuWallet, opts);
+  const tExpireMs = entry.reserve?.t_expire_ms;
+  if (tExpireMs === undefined) {
+    throw new DvmError(
+      "reserve_mint_interrupted",
+      `Mint quote ${quote.quote} is missing its reserve expiry.`,
+      "Run `dvm wallet show` to inspect the wallet before starting a new payment."
+    );
+  }
 
   return {
     mint: opts.mintUrl,
     amount_sats: sats,
     quote_id: quote.quote,
     denominations,
-    proofs: agentProofs,
+    proofs,
     builder_handle: opts.builderHandle,
     t_expire_ms: tExpireMs,
     refund_pubkey: refundPubkey,
     lock_pubkey: lockPubkey,
   };
-}
-
-function upsertPending(wallet: AgentWallet, entry: PendingMint): AgentWallet {
-  const others = wallet.pending_mints.filter((p) => p.quote_id !== entry.quote_id);
-  return { ...wallet, pending_mints: [...others, entry] };
 }
