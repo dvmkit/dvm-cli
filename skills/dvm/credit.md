@@ -4,7 +4,7 @@ Use this procedure for repeated work at a service, an existing credit balance, c
 
 ## Inspect before funding
 
-Read `dvm credit list` and `dvm credit balance <dvm>` for the selected provider and signing identity. Establish the active balance, any sibling balances, and the effective posture. Reuse funds already held before proposing new funding.
+Read `dvm credit list` and `dvm credit balance <dvm>` for the selected provider and signing identity. Establish the active balance, any sibling balances, and the effective posture. Reuse funds already held before proposing new funding. Two different statuses exist: `server_status` is the provider's view of the credit (from `dvm credit balance`, and on `sibling_credits`), while `local_status` on `dvm credit list` rows is this machine's record, which becomes `drained` once a reclaim was sent. A drained credit can legitimately be `server_status: "active"` with nothing left; read `status` as the same value as the command's own field.
 
 Explain the distinction that affects consent: drawing existing credit spends a balance already parked at the provider; funding or refilling it moves new money. The CLI can draw held credit without `--auto-pay`. Posture `off` stops drawing as well as funding; a per-job budget can also prevent a draw. When output says credit was skipped, relay its reason instead of claiming the provider refused it.
 
