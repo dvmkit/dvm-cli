@@ -18,7 +18,6 @@ import {
 } from "@dvmkit/sdk/internal";
 import {
   type AgentProof,
-  type AgentWallet,
   loadAgentWallet,
   type PendingMint,
   saveAgentWallet,
@@ -204,6 +203,7 @@ export async function completePaidMint(
       return outcome;
     case "restored":
       return { ...outcome, denominations: outcome.proofs.map((proof) => proof.amount) };
+    case "busy":
     case "error":
       throw outcome.cause;
     case "already_issued":
@@ -217,12 +217,6 @@ export async function completePaidMint(
         "Run `dvm wallet show` to inspect the wallet before starting a new payment."
       );
     }
-    case "busy":
-      throw new DvmError(
-        "mint_quote_busy",
-        `Another command is checking mint quote ${quote.quote}.`,
-        "Once that command finishes, run `dvm wallet show` to check or collect the paid quote."
-      );
     default:
       throw new DvmError(
         flow === "fund" ? "fund_mint_interrupted" : "reserve_mint_interrupted",
@@ -247,10 +241,6 @@ export function fundTimeoutMs(): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT_SEC * 1_000;
   return Math.floor(n) * 1_000;
-}
-
-export function withoutPendingMint(wallet: AgentWallet, quoteId: string): AgentWallet {
-  return { ...wallet, pending_mints: wallet.pending_mints.filter((p) => p.quote_id !== quoteId) };
 }
 
 export interface PollUntilPaidOptions {

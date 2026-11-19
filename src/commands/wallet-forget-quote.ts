@@ -24,9 +24,8 @@ import {
 } from "@dvmkit/sdk/internal";
 
 import { info, json } from "../lib/output";
-import { withoutPendingMint } from "../lib/wallet-agent/fund";
 import { classifyMintError, type MintFailureCause } from "../lib/wallet-agent/fund-wait";
-import { mintQuoteRefusal } from "../lib/wallet-agent/recovery";
+import { mintQuoteRefusal, readPendingMint, withPendingMintLock } from "../lib/wallet-agent/recovery";
 
 export interface WalletForgetQuoteOptions {
   /** Skip the confirmation prompt. Required to forget non-interactively. */
@@ -58,21 +57,28 @@ export async function walletForgetQuote(
     );
   }
   const entry = wallet.pending_mints.find((p) => p.quote_id === quoteId);
-  if (!entry) {
-    throw new DvmError(
-      "mint_quote_not_found",
-      `No pending mint quote with ID "${quoteId}".`,
-      "List pending quotes with: dvm wallet show"
-    );
+  if (!entry) throw quoteNotFound(quoteId);
+
+  if (!opts.yes) {
+    const preview = await quoteStanding(entry);
+    refuseIfCollectable(entry, preview, opts);
+    await confirmForget(entry, preview, opts);
   }
 
-  const standing = await quoteStanding(entry);
-  refuseIfCollectable(entry, standing, opts);
-  await confirmForget(entry, standing, opts);
-
-  await withWalletLock(() => {
-    const fresh = loadAgentWallet() ?? wallet;
-    saveAgentWallet(withoutPendingMint(fresh, quoteId));
+  const standing = await withPendingMintLock(entry, async () => {
+    const current = readPendingMint(entry, wallet.lock_pubkey);
+    if (!current) throw quoteNotFound(quoteId);
+    const checked = await quoteStanding(current.entry);
+    await withWalletLock(() => {
+      const fresh = readPendingMint(entry, wallet.lock_pubkey);
+      if (!fresh) throw quoteNotFound(quoteId);
+      refuseIfCollectable(fresh.entry, checked, opts);
+      saveAgentWallet({
+        ...fresh.wallet,
+        pending_mints: fresh.wallet.pending_mints.filter((pending) => pending !== fresh.entry),
+      });
+    });
+    return checked;
   });
 
   const display = `Forgot mint quote ${quoteId} (${entry.amount_sats} sats at ${entry.mint}). ${forgottenConsequence(standing)}`;
@@ -89,6 +95,14 @@ export async function walletForgetQuote(
     display,
     hint: "The quote is gone from the wallet. This cannot be undone.",
   });
+}
+
+function quoteNotFound(quoteId: string): DvmError {
+  return new DvmError(
+    "mint_quote_not_found",
+    `No pending mint quote with ID "${quoteId}".`,
+    "List pending quotes with: dvm wallet show"
+  );
 }
 
 async function quoteStanding(entry: PendingMint): Promise<QuoteStanding> {
@@ -141,8 +155,6 @@ async function confirmForget(
   standing: QuoteStanding,
   opts: WalletForgetQuoteOptions
 ): Promise<void> {
-  if (opts.yes) return;
-
   const consequence = forgetConsequence(standing);
   if (opts.human && process.stdin.isTTY) {
     const rl = createInterface({ input: process.stdin, output: process.stderr });

@@ -84,7 +84,7 @@ export interface SweepOptions {
 type PendingMintOutcome =
   | Exclude<SweepEntryOutcome, { kind: "error" }>
   | { kind: "error"; entry: PendingMint; cause: unknown }
-  | { kind: "busy" }
+  | { kind: "busy"; cause: DvmError }
   | { kind: "no_longer_pending" };
 
 interface PendingMintOptions extends SweepOptions {
@@ -147,48 +147,65 @@ export async function sweepPendingMints(opts: SweepOptions = {}): Promise<SweepR
   };
 }
 
-export async function reconcilePendingMint(
+export async function withPendingMintLock<T>(
   entry: PendingMint,
-  opts: PendingMintOptions = {}
-): Promise<PendingMintOutcome> {
-  // A quote lock covers status, issuance and commit. Wallet writes still take
-  // the wallet lock, which stays available while the mint is answering.
+  run: () => Promise<T>
+): Promise<T> {
+  // Hold the quote lock across mint I/O and the commit. The wallet lock is
+  // acquired inside it only for the journal write.
   const key = createHash("sha256").update(JSON.stringify([entry.mint, entry.quote_id])).digest("hex");
   let release: () => Promise<void>;
   try {
     release = await lockfile.lock(`${WALLET_FILE}.mint-${key}`, { realpath: false, stale: 30_000, retries: 0 });
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ELOCKED") return { kind: "busy" };
-    return { kind: "error", entry, cause: err };
+    if ((err as NodeJS.ErrnoException).code === "ELOCKED") {
+      throw new DvmError(
+        "mint_quote_busy",
+        `Another command is checking mint quote ${entry.quote_id}.`,
+        "Once that command finishes, run `dvm wallet show` to check the quote."
+      );
+    }
+    throw err;
   }
 
   try {
-    const wallet = loadAgentWallet();
-    const current = wallet?.pending_mints.find((pending) => matchesPendingMint(pending, entry));
-    if (!wallet || !current) return { kind: "no_longer_pending" };
-
-    const outcome = await processEntry(wallet, current, opts);
-
-    if (outcome.kind === "minted" || outcome.kind === "restored" ||
-        outcome.kind === "already_issued" || outcome.kind === "expired") {
-      const committed = await withMintWriteLock(opts.deadlineMs, () => {
-        const fresh = currentMintWallet(wallet, current);
-        if (!fresh) return false;
-        const proofs = outcome.kind === "minted" || outcome.kind === "restored" ? outcome.proofs : [];
-        saveAgentWallet({
-          ...fresh,
-          pending_mints: fresh.pending_mints.filter((pending) => !matchesPendingMint(pending, current)),
-          proofs: [...fresh.proofs, ...proofs],
-        });
-        return true;
-      });
-      if (!committed) return { kind: "no_longer_pending" };
-    }
-    return outcome;
-  } catch (err) {
-    return { kind: "error", entry, cause: err };
+    return await run();
   } finally {
     await release().catch(() => undefined);
+  }
+}
+
+export async function reconcilePendingMint(
+  entry: PendingMint,
+  opts: PendingMintOptions = {}
+): Promise<PendingMintOutcome> {
+  try {
+    return await withPendingMintLock<PendingMintOutcome>(entry, async () => {
+      const snapshot = readPendingMint(entry);
+      if (!snapshot) return { kind: "no_longer_pending" };
+      const { wallet, entry: current } = snapshot;
+      const outcome = await processEntry(wallet, current, opts);
+
+      if (outcome.kind === "minted" || outcome.kind === "restored" ||
+          outcome.kind === "already_issued" || outcome.kind === "expired") {
+        const committed = await withMintWriteLock(opts.deadlineMs, () => {
+          const fresh = readPendingMint(current, wallet.lock_pubkey);
+          if (!fresh) return false;
+          const proofs = outcome.kind === "minted" || outcome.kind === "restored" ? outcome.proofs : [];
+          saveAgentWallet({
+            ...fresh.wallet,
+            pending_mints: fresh.wallet.pending_mints.filter((pending) => !matchesPendingMint(pending, current)),
+            proofs: [...fresh.wallet.proofs, ...proofs],
+          });
+          return true;
+        });
+        if (!committed) return { kind: "no_longer_pending" };
+      }
+      return outcome;
+    });
+  } catch (err) {
+    if (err instanceof DvmError && err.code === "mint_quote_busy") return { kind: "busy", cause: err };
+    return { kind: "error", entry, cause: err };
   }
 }
 
@@ -196,11 +213,11 @@ function matchesPendingMint(left: PendingMint, right: PendingMint): boolean {
   return left.mint === right.mint && left.quote_id === right.quote_id && left.requested_at === right.requested_at;
 }
 
-function currentMintWallet(wallet: AgentWallet, entry: PendingMint): AgentWallet | undefined {
-  const fresh = loadAgentWallet();
-  if (fresh?.lock_pubkey === wallet.lock_pubkey && fresh.pending_mints.some((pending) => matchesPendingMint(pending, entry))) {
-    return fresh;
-  }
+export function readPendingMint(entry: PendingMint, lockPubkey?: string) {
+  const wallet = loadAgentWallet();
+  if (!wallet || (lockPubkey !== undefined && wallet.lock_pubkey !== lockPubkey)) return;
+  const current = wallet.pending_mints.find((pending) => matchesPendingMint(pending, entry));
+  if (current) return { wallet, entry: current };
 }
 
 async function withMintWriteLock<T>(deadlineMs: number | undefined, write: () => T): Promise<T> {
@@ -337,11 +354,11 @@ async function processEntry(
           ...(reserve ? { reserve } : {}),
         };
         const saved = await withMintWriteLock(opts.deadlineMs, () => {
-          const fresh = currentMintWallet(wallet, entry);
+          const fresh = readPendingMint(entry, wallet.lock_pubkey);
           if (!fresh) return false;
           saveAgentWallet({
-            ...fresh,
-            pending_mints: fresh.pending_mints.map((p) => matchesPendingMint(p, entry) ? journaled : p),
+            ...fresh.wallet,
+            pending_mints: fresh.wallet.pending_mints.map((p) => matchesPendingMint(p, entry) ? journaled : p),
           });
           return true;
         });

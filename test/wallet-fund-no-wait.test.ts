@@ -2,6 +2,7 @@ import { Amount, OutputData, type Wallet } from "@cashu/cashu-ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface, type Interface } from "node:readline";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const MINT = "https://mint.invalid";
@@ -22,6 +23,10 @@ vi.mock("../src/lib/output", async (importOriginal) => ({
   json: seams.json,
   info: seams.info,
 }));
+vi.mock("node:readline", async (importOriginal) => {
+  const readline = await importOriginal<typeof import("node:readline")>();
+  return { ...readline, createInterface: vi.fn(readline.createInterface) };
+});
 
 let root: string;
 let sdk: typeof import("@dvmkit/sdk/internal");
@@ -32,7 +37,7 @@ let buildProgram: typeof import("../src/cli/dvm")["buildProgram"];
 let originalConfigRoot: string | undefined;
 
 function mint(expiry: number | null = Math.floor(Date.now() / 1000) + 3600) {
-  const states = new Map<string, "UNPAID" | "PAID">();
+  const states = new Map<string, "UNPAID" | "PAID" | "ISSUED">();
   const wallet = {
     createLockedMintQuote: vi.fn(async () => {
       const quote = `quote-${states.size + 1}`;
@@ -519,6 +524,97 @@ describe("human-paid funding without waiting", () => {
     expect(lastEvent()).toMatchObject({ status: "forgotten", mint_state: "unchecked" });
     expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
   });
+
+  it.each(["issuance in progress", "mint reply lost"] as const)(
+    "protects the paid quote after an unpaid forget prompt when %s",
+    async (interruption) => {
+      const fixture = mint();
+      const quoteId = "quote-1";
+      const polling = Promise.withResolvers<void>();
+      const paid = Promise.withResolvers<void>();
+      const prompted = Promise.withResolvers<(answer: string) => void>();
+      const issuing = Promise.withResolvers<void>();
+      const finishIssuance = Promise.withResolvers<void>();
+      const blinded = { amount: Amount.from(1000), B_: `02${"a".repeat(64)}`, id: "01ab" };
+      fixture.wallet.prepareMint.mockResolvedValueOnce({
+        keysetId: "01ab",
+        outputData: [new OutputData(blinded, 5n, new TextEncoder().encode("saved-secret"))],
+      });
+      const checkQuote = fixture.wallet.checkMintQuoteBolt11.getMockImplementation()!;
+      fixture.wallet.checkMintQuoteBolt11.mockImplementationOnce(async (id) => {
+        polling.resolve();
+        await paid.promise;
+        return checkQuote(id);
+      });
+      const finish = fixture.wallet.completeMint.getMockImplementation()!;
+      fixture.wallet.completeMint.mockImplementationOnce(async () => {
+        issuing.resolve();
+        await finishIssuance.promise;
+        if (interruption === "mint reply lost") {
+          fixture.states.set(quoteId, "ISSUED");
+          throw Object.assign(new Error("Mint reply lost"), { name: "NetworkError" });
+        }
+        return finish();
+      });
+      vi.spyOn(process, "stdin", "get").mockReturnValue(
+        Object.create(process.stdin, { isTTY: { value: true } })
+      );
+      vi.mocked(createInterface).mockReturnValueOnce({
+        close() {},
+        question(prompt: string, answer: (line: string) => void) {
+          if (prompt.includes("a payment made to its invoice afterwards")) prompted.resolve(answer);
+          else prompted.reject(new Error(`Expected an unpaid quote prompt, got: ${prompt}`));
+        },
+      } as Interface);
+
+      const funding = walletFund("1000", {
+        sats: true, mint: MINT, float: false, qrImage: join(root, "invoice.png"),
+      }).then(() => undefined, (error: unknown) => error);
+      let forgetting: Promise<unknown> | undefined;
+      try {
+        await Promise.race([
+          polling.promise,
+          funding.then((error) => { throw error ?? new Error("Funding ended before the quote was checked"); }),
+        ]);
+        forgetting = walletForgetQuote(quoteId, { human: true })
+          .then(() => undefined, (error: unknown) => error);
+        const confirm = await Promise.race([
+          prompted.promise,
+          forgetting.then((error) => { throw error ?? new Error("Forget ended before confirmation"); }),
+        ]);
+        fixture.states.set(quoteId, "PAID");
+        paid.resolve();
+        await Promise.race([
+          issuing.promise,
+          funding.then((error) => { throw error ?? new Error("Funding ended before issuance"); }),
+        ]);
+        if (interruption === "mint reply lost") {
+          finishIssuance.resolve();
+          expect(await funding).toMatchObject({ code: "fund_mint_interrupted" });
+        }
+        confirm(quoteId);
+        const forgetError = await forgetting;
+        expect(sdk.loadAgentWallet()?.pending_mints[0]).toMatchObject({
+          quote_id: quoteId,
+          minting: { outputs: [{ blinded_message: { B_: blinded.B_ } }] },
+        });
+        expect(forgetError).toMatchObject({
+          code: interruption === "mint reply lost" ? "mint_quote_collectable" : "mint_quote_busy",
+        });
+        if (interruption === "issuance in progress") {
+          finishIssuance.resolve();
+          expect(await funding).toBeUndefined();
+          expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+        }
+      } finally {
+        paid.resolve();
+        finishIssuance.resolve();
+        void prompted.promise.then((answer) => answer(quoteId), () => undefined);
+        await funding;
+        await forgetting;
+      }
+    }
+  );
 
   it.each([
     { opts: { testSkipLightning: true }, connected: false, code: "invalid_fund_options" },
