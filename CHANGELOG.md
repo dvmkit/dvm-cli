@@ -13,6 +13,23 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.22.0](https://github.com/dvmkit/dvm-cli/compare/v0.21.0...v0.22.0) (2026-11-19)
+
+
+### Features
+
+* **wallet:** collect relayed funding invoices in the foreground ([39b5210](https://github.com/dvmkit/dvm-cli/commit/39b521017ec79ada63cee1778b4565cd5d8ed0a6))
+
+
+### Bug Fixes
+
+* **credit:** report timed-out drains with same-ID retry guidance ([42f0f81](https://github.com/dvmkit/dvm-cli/commit/42f0f81de266503d972c98f04180345a67552dd4))
+* make config pin preservation explicit ([f49d899](https://github.com/dvmkit/dvm-cli/commit/f49d899241a96618457cf124f05b2e6ad8cd4a37))
+* **messages:** retry gateway errors during job waits ([78032c0](https://github.com/dvmkit/dvm-cli/commit/78032c0178ce6e513a4fcd59197eac3e06042490))
+* **messages:** retry mandate guard reads during waits ([02345ee](https://github.com/dvmkit/dvm-cli/commit/02345ee7d70a75acf41efb6c50d4a58374ff236a))
+* **messages:** verify mandate payment links before warning ([2c7c981](https://github.com/dvmkit/dvm-cli/commit/2c7c981f03dedc3b70266a258f2864bf4b16ae4f))
+* **transport:** give failed status reads a safe retry hint ([23717e3](https://github.com/dvmkit/dvm-cli/commit/23717e3f5ace44e4602b77ac5271b56d5723f7e7))
+
 ## [0.21.0](https://github.com/dvmkit/dvm-cli/compare/v0.20.0...v0.21.0) (2026-11-17)
 
 
