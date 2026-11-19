@@ -105,6 +105,7 @@ it.each(["recovers", "reports stale status before recovering", "starts with two 
       const provider = { endpoint: job.endpoint };
       let accepted = false;
       let terminal = false;
+      let cancelInStream = false;
       let staleStatus = confirmation === "reports stale status before recovering";
       let consecutiveStaleReads = 0;
       const statusTimeouts: number[] = [];
@@ -120,6 +121,7 @@ it.each(["recovers", "reports stale status before recovering", "starts with two 
         }
         if (staleStatus) {
           staleStatus = false;
+          cancelInStream = true;
           return { jobId, status: "awaiting-input" };
         }
         terminal = true;
@@ -127,7 +129,7 @@ it.each(["recovers", "reports stale status before recovering", "starts with two 
       });
       const getMessages = vi.fn<Transport["getMessages"]>(async (_id, after) =>
         (terminal ? [request, cancel] : [request]).filter((message) => message.seq > after));
-      const stream = vi.fn<NonNullable<Transport["stream"]>>(async () => ({ messages: [request], reason: "yield" }));
+      const stream = vi.fn<NonNullable<Transport["stream"]>>(async () => ({ messages: cancelInStream ? [request, cancel] : [request], reason: "yield" }));
       const sendMessage = vi.fn<Transport["sendMessage"]>(async () => { accepted = true; });
       const transport = { status, getMessages, stream, sendMessage } as unknown as Transport;
       const until = confirmation === "keeps timing out" ? 3_000 : 8_000;
@@ -137,10 +139,10 @@ it.each(["recovers", "reports stale status before recovering", "starts with two 
       const result = await waiting;
 
       expect(sendMessage.mock.calls.map(([, message]) => message.type)).toEqual(["decline"]);
-      expect(stream).toHaveBeenCalledTimes(pendingCreditPayment ? 0 : 1);
       for (const [, , options] of status.mock.calls.slice(1)) expect(options?.jobToken).toBe(jobToken);
       expect(loadJob(jobId)).toMatchObject({ stopRequested: true, stopRequestedDisplay });
       if (confirmation === "keeps timing out") {
+        expect(stream).toHaveBeenCalledTimes(1);
         expect(result).toMatchObject({ nextAction: { type: "poll", hint: expect.stringContaining("wait limit (3s)") }, autoPayments: [] });
         expect(statusTimeouts).toEqual([1_500, 500]);
         expect(Date.now() - start).toBe(until);
@@ -158,31 +160,39 @@ it.each(["recovers", "reports stale status before recovering", "starts with two 
   },
 );
 
-it.each(["streamed ask", "saved credit authorization"])("watches for a later prompt after a standing-stop reply to a %s", async (source) => {
+it.each([
+  { reply: "standing stop", source: "streamed ask" },
+  { reply: "standing stop", source: "saved credit authorization" },
+  { reply: "plain decline", source: "streamed ask" },
+  { reply: "plain decline", source: "saved credit authorization" },
+])("watches for a later prompt after a $reply acknowledgment for a $source", async ({ reply, source }) => {
   vi.useFakeTimers();
   try {
     vi.setSystemTime(start);
-    const jobId = `standing-stop-${source.replaceAll(" ", "-")}`;
+    const jobId = `${reply}-${source}`.replaceAll(" ", "-");
+    const standingStop = reply === "standing stop";
     const pendingCreditPayment = source === "saved credit authorization" ? savedCreditPayment(jobId, 4) : undefined;
     saveJob({ ...job, id: jobId, policy, stopRequested: true, pendingCreditPayment });
     const request: Message = { seq: 4, from: "provider", timestamp: start / 1000, type: "payment-request", content: ask };
-    const prompt: Message = { seq: 5, from: "provider", timestamp: start / 1000 + 5, type: "prompt", content: { id: "next", text: "Continue?" } };
+    const decline: Message = { seq: 5, from: "requester", timestamp: start / 1000 + 1, type: "decline", content: {} };
+    const prompt: Message = { seq: 6, from: "provider", timestamp: start / 1000 + 2, type: "prompt", content: { id: "next", text: "Continue?" } };
     const display = "The job will stop at its next payment ask.";
     let stopAcknowledged = false;
     let readsAfterAck = 0;
     const sendMessage = vi.fn<Transport["sendMessage"]>(async () => {
       stopAcknowledged = true;
-      return { seq: 4, stop_requested: true, display };
+      return standingStop ? { seq: 4, stop_requested: true, display } : { seq: decline.seq };
     });
     const status = vi.fn<Transport["status"]>(async (_id, _provider, options) => {
-      if (stopAcknowledged && ++readsAfterAck === 1) {
+      if (stopAcknowledged && ++readsAfterAck === 1 && standingStop) {
         await new Promise((resolve) => setTimeout(resolve, options?.timeoutMs));
         throw new DvmError("timeout", "Status read timed out");
       }
       return { jobId, status: "awaiting-input" };
     });
+    const messages = standingStop ? [request, prompt] : [request, decline, prompt];
     const stream = vi.fn<NonNullable<Transport["stream"]>>(async (_id, after) => ({
-      messages: (readsAfterAck > 2 ? [request, prompt] : [request]).filter((message) => message.seq > after), reason: "yield",
+      messages: (readsAfterAck > (standingStop ? 2 : 1) ? messages : [request]).filter((message) => message.seq > after), reason: "yield",
     }));
     const getMessages = vi.fn<Transport["getMessages"]>().mockResolvedValue([request]);
     const transport = { status, getMessages, stream, sendMessage } as unknown as Transport;
@@ -190,9 +200,10 @@ it.each(["streamed ask", "saved credit authorization"])("watches for a later pro
       afterSeqExplicit: true, timeoutMs: 1_500 }, 12_000).catch((error: unknown) => ({ error }));
     await vi.runAllTimersAsync();
 
-    expect(await waiting).toMatchObject({ messages: [request, prompt], nextAction: { type: "respond", prompt_id: "next" }, autoPayments: [] });
+    expect(await waiting).toMatchObject({ messages, nextAction: { type: "respond", prompt_id: "next" }, autoPayments: [] });
     expect(sendMessage.mock.calls.map(([, message]) => message.type)).toEqual(["decline"]);
-    expect(loadJob(jobId)).toMatchObject({ stopRequested: true, stopRequestedDisplay: display });
+    expect(loadJob(jobId)).toMatchObject({ stopRequested: true });
+    if (standingStop) expect(loadJob(jobId)?.stopRequestedDisplay).toBe(display);
     expect(loadJob(jobId)?.pendingCreditPayment).toEqual(pendingCreditPayment);
     expect(loadJob(jobId)?.callerDeclined).toBeUndefined();
   } finally {

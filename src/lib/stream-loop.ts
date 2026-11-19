@@ -51,8 +51,8 @@ export interface StreamLoopOptions {
   timeoutMs?: number;
   /** Remaining wait budget, capped by the read timeout, for mandate guard reads. */
   mandateReadTimeoutMs?: () => number;
-  /** A standing-stop reply means the old ask closed. It may still appear in stale history. */
-  standingStopAcks?: ReadonlySet<number>;
+  /** Asks whose declines the provider has acknowledged during this wait. */
+  acknowledgedDeclineSeqs?: ReadonlySet<number>;
   /**
    * Whether messages, refund claims, and policy-driven payments may update local
    * state. Endpoint-overridden follow-ups set this false so one provider's
@@ -173,7 +173,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   }
   let pendingAction: NextAction = null;
   const pending = persistLocalState ? loadJob(jobId)?.pendingCreditPayment : undefined;
-  if (pending && policy && !opts.standingStopAcks?.has(pending.authorization.request_seq)) {
+  if (pending && policy && !opts.acknowledgedDeclineSeqs?.has(pending.authorization.request_seq)) {
     let result: PaymentResult | undefined;
     try {
       result = await handlePaymentRequest(jobId, pending.request, policy, transport, provider, {
@@ -312,7 +312,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       }
       const stopRequested = persistLocalState && loadJob(jobId)?.stopRequested === true;
       if (lastYield?.type === "payment-request" && lastYield.seq === pendingPayment?.seq &&
-          !opts.standingStopAcks?.has(lastYield.seq) && (policy || stopRequested) && !declined()) {
+          !opts.acknowledgedDeclineSeqs?.has(lastYield.seq) && (policy || stopRequested) && !declined()) {
         const req = lastYield.content;
         const activePolicy = (persistLocalState ? loadJob(jobId)?.policy ?? policy : policy) ?? { maxTotalMsats: 0, maxIncrementMsats: 0, autoPayBelowMsats: 0, maxPayments: 0 };
         if (

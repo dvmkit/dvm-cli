@@ -58,8 +58,9 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
   let paymentInFlight = false;
   // Whether any status read showed the job still open, which the wait-limit hint states.
   let seenRunning = false;
-  const standingStopAcks = new Set<number>();
+  const acknowledgedDeclineSeqs = new Set<number>();
   let declineConfirmationSeq: number | undefined;
+  let streamedTerminal = false;
   const idleTimeoutMs = opts.timeoutMs ?? JOB_READ_TIMEOUT_MS;
   async function waitBeforeRetry(): Promise<void> {
     const delay = Math.min(backoffMs, Math.max(0, deadline - now()));
@@ -85,7 +86,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     if (isTerminalJobStatus(snapshot.status)) {
       if (declineConfirmationSeq !== undefined) recordStoppedAskStatus(opts.jobId, declineConfirmationSeq, snapshot.status);
       result.providerStatus = snapshot;
-      result.nextAction = null;
+      result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
       const history = await readWithRetry(() => opts.transport.getMessages(opts.jobId, result.cursor, opts.provider, readOptions()));
       if (!history) break;
       if (result.cursor === 0 && snapshot.content_available !== false)
@@ -103,8 +104,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
       break;
     }
-    if (declineConfirmationSeq !== undefined) {
-      // A lagging status can still show the declined ask as open.
+    if (streamedTerminal) {
       await waitBeforeRetry();
       continue;
     }
@@ -182,7 +182,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       ...opts, onMessage, messageAppendSession, afterSeq: streamAfter, retryUnreachableReads: true,
       timeoutMs: readOptions().timeoutMs,
       mandateReadTimeoutMs: () => Math.min(idleTimeoutMs, deadline - now()),
-      standingStopAcks,
+      acknowledgedDeclineSeqs,
     });
     collectMessages(next.messages);
     result.autoPayments.push(...next.autoPayments);
@@ -191,14 +191,22 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     result.cursor = Math.min(next.cursor, cursorLimit);
     result.nextAction = next.nextAction;
     paymentInFlight = next.paymentInFlight === true;
-    if (hasUnsavedJobState() || next.nextAction?.type !== "poll") break;
-    if (progressed) backoffMs = 1000;
-    const decline = next.declineAcknowledgement;
-    if (decline && !decline.standingStop) {
-      declineConfirmationSeq = decline.requestSeq;
+    if (hasUnsavedJobState()) break;
+    if (declineConfirmationSeq !== undefined && next.messages.some((message) => message.type === "complete" || message.type === "cancel")) {
+      // A streamed cancel can also mean provider failure. Confirm the ending from status.
+      streamedTerminal = true;
       continue;
     }
-    if (decline) standingStopAcks.add(decline.requestSeq);
+    if (next.nextAction?.type !== "poll") break;
+    if (progressed) backoffMs = 1000;
+    const decline = next.declineAcknowledgement;
+    if (decline) {
+      acknowledgedDeclineSeqs.add(decline.requestSeq);
+      if (!decline.standingStop) {
+        declineConfirmationSeq = decline.requestSeq;
+        continue;
+      }
+    }
     await waitBeforeRetry();
   }
   if (opts.persistLocalState !== false) {
