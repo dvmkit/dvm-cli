@@ -51,19 +51,28 @@ beforeEach(() => {
     history.filter((message) => message.seq > after));
 });
 
-it("checks a long job's tail against cached asks and leaves unread messages available", async () => {
+it("checks only the tail of a long job after a permanently omitted sequence", async () => {
   const image = Buffer.alloc(192 * 1024, 7).toString("base64");
-  const artifacts = Array.from({ length: 28 }, (_, index) => artifact(index + 1, image));
-  const prompt: Message = { seq: 30, from: "provider", timestamp, type: "prompt",
+  const setup: Message = { seq: 1, from: "provider", timestamp, type: "prompt",
+    content: { id: "setup", text: "Start observing?" } };
+  // The provider used seq 2 for a rejected payment and omits it from every read.
+  const answer: Message = { seq: 3, from: "requester", timestamp, type: "response",
+    content: { prompt_id: "setup", text: "Yes" } };
+  const artifacts = Array.from({ length: 28 }, (_, index) => artifact(index + 4, image));
+  const prompt: Message = { seq: 33, from: "provider", timestamp, type: "prompt",
     content: { id: "continue", text: "Continue observing?" } };
-  const cache = [...artifacts, ask(29), prompt];
-  history = [...cache, payment(31, 29), payment(33, 32)];
-  seed(jobId, 30, cache);
+  const cache = [setup, answer, ...artifacts, ask(32), prompt];
+  seed(jobId, 33, cache);
   seed("full-read", 0);
+  history = cache;
   wire.status.mockImplementation(async (id: string) => ({ jobId: id, status: "awaiting-input", content_available: true }));
-
   await status(jobId, {});
-  expect(messageReads()).toEqual([[jobId, 30]]);
+  expect(messageReads()).toEqual([[jobId, 1]]);
+  wire.getMessages.mockClear();
+
+  history = [...cache, payment(34, 32), payment(36, 35)];
+  await status(jobId, {});
+  expect(messageReads()).toEqual([[jobId, 33]]);
   const incremental = output();
   expect(incremental).toMatchObject({
     next_action: { type: "respond", prompt_id: "continue" },
@@ -71,26 +80,26 @@ it("checks a long job's tail against cached asks and leaves unread messages avai
     overcharged: true,
     violated_limits: ["request_seq"],
     mandate_payments: [
-      { seq: 31, request_seq: 29, amount_msats: 8000, total_micro: 80_000, overcharged: false },
-      { seq: 33, request_seq: 32, amount_msats: 0, total_micro: 160_000, overcharged: true, violated_limits: ["request_seq"] },
+      { seq: 34, request_seq: 32, amount_msats: 8000, total_micro: 80_000, overcharged: false },
+      { seq: 36, request_seq: 35, amount_msats: 0, total_micro: 160_000, overcharged: true, violated_limits: ["request_seq"] },
     ],
   });
   expect(incremental).not.toHaveProperty("messages");
-  expect(loadJob(jobId)).toMatchObject({ messageCursor: 30, paidPaymentRequestSeqs: [29] });
+  expect(loadJob(jobId)).toMatchObject({ messageCursor: 33, paidPaymentRequestSeqs: [32] });
 
   await status("full-read", {});
   expect(messageReads().at(-1)).toEqual(["full-read", 0]);
   expect(output().mandate_payments).toEqual(incremental.mandate_payments);
 
   await status(jobId, {});
-  expect(messageReads().slice(2)).toEqual([[jobId, 31]]);
+  expect(messageReads().slice(2)).toEqual([[jobId, 34]]);
   expect(output().mandate_payments).toEqual(incremental.mandate_payments);
-  expect(loadJob(jobId)).toMatchObject({ messageCursor: 30, totalPaidMsats: 8000, paymentsHonoured: 2 });
+  expect(loadJob(jobId)).toMatchObject({ messageCursor: 33, totalPaidMsats: 8000, paymentsHonoured: 2 });
 
   await status(jobId, { messages: true });
-  expect(messageReads().slice(3)).toEqual([[jobId, 30]]);
-  expect(output()).toMatchObject({ cursor: 33, messages: [{ seq: 31 }, { seq: 33 }] });
-  expect(loadJob(jobId)?.messageCursor).toBe(33);
+  expect(messageReads().slice(3)).toEqual([[jobId, 33]]);
+  expect(output()).toMatchObject({ cursor: 36, messages: [{ seq: 34 }, { seq: 36 }] });
+  expect(loadJob(jobId)?.messageCursor).toBe(36);
 });
 
 it("backs up to the verified prefix of a legacy cache after a delivery cursor jump", async () => {
@@ -132,11 +141,11 @@ it("switches to the remaining prompt when a reply becomes visible below the newe
 });
 
 it("recovers the missing prefix when the cached log is truncated", async () => {
-  history = [ask(1), payment(2, 1), artifact(3)];
+  history = [ask(1), payment(2, 1), artifact(4)];
   seed(jobId, 0);
   await status(jobId, {});
   await status(jobId, {});
-  expect(messageReads()).toEqual([[jobId, 0], [jobId, 3]]);
+  expect(messageReads()).toEqual([[jobId, 0], [jobId, 4]]);
 
   writeFileSync(join(MESSAGES_DIR, `${jobId}.jsonl`), JSON.stringify(history[2]) + "\n");
   await status(jobId, {});
@@ -159,4 +168,24 @@ it("uses the same incremental history for terminal artifacts and an unanswered c
   expect(output()).toMatchObject({ artifact_count: 1, message: "Ask expired", next_action: null,
     unanswered_payment_request: { seq: 2, amount_msats: 8000, expires_at_ms: deadline } });
   expect(loadJob(jobId)?.messageCursor).toBe(2);
+});
+
+it("checks sparse history for a caller decline before attributing cancellation to an unpaid ask", async () => {
+  const cache = [artifact(1), ask(2)];
+  const later = artifact(4);
+  history = [...cache, later];
+  seed(jobId, 2, cache);
+  await status(jobId, {});
+  await status(jobId, {});
+  expect(messageReads()).toEqual([[jobId, 2], [jobId, 4]]);
+
+  history = [...cache, { seq: 3, from: "requester", timestamp: deadline / 1000 - 1, type: "decline",
+    content: { reason: "Stop" } }, later, { seq: 5, from: "provider", timestamp: deadline / 1000,
+    type: "cancel", content: { reason: "Ended" } }];
+  wire.status.mockResolvedValue({ jobId, status: "cancelled", content_available: true });
+  await status(jobId, {});
+
+  expect(output()).toMatchObject({ artifact_count: 2, status: "cancelled", next_action: null });
+  expect(output()).not.toHaveProperty("unanswered_payment_request");
+  expect(messageReads().at(-1)).toEqual([jobId, 2]);
 });
