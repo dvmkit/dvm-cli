@@ -58,6 +58,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
   let paymentInFlight = false;
   // Whether any status read showed the job still open, which the wait-limit hint states.
   let seenRunning = false;
+  const standingStopAcks = new Set<number>();
   let declineConfirmationSeq: number | undefined;
   const idleTimeoutMs = opts.timeoutMs ?? JOB_READ_TIMEOUT_MS;
   async function waitBeforeRetry(): Promise<void> {
@@ -181,6 +182,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       ...opts, onMessage, messageAppendSession, afterSeq: streamAfter, retryUnreachableReads: true,
       timeoutMs: readOptions().timeoutMs,
       mandateReadTimeoutMs: () => Math.min(idleTimeoutMs, deadline - now()),
+      standingStopAcks,
     });
     collectMessages(next.messages);
     result.autoPayments.push(...next.autoPayments);
@@ -189,9 +191,14 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     result.cursor = Math.min(next.cursor, cursorLimit);
     result.nextAction = next.nextAction;
     paymentInFlight = next.paymentInFlight === true;
-    declineConfirmationSeq = next.declineConfirmationSeq;
     if (hasUnsavedJobState() || next.nextAction?.type !== "poll") break;
     if (progressed) backoffMs = 1000;
+    const decline = next.declineAcknowledgement;
+    if (decline && !decline.standingStop) {
+      declineConfirmationSeq = decline.requestSeq;
+      continue;
+    }
+    if (decline) standingStopAcks.add(decline.requestSeq);
     await waitBeforeRetry();
   }
   if (opts.persistLocalState !== false) {

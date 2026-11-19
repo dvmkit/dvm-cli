@@ -59,32 +59,32 @@ export async function recoverMandateWinner(jobId: string, requestSeq: number, tr
 
 async function declineStoppedAsk(jobId: string, requestSeq: number, transport: Transport,
   provider: ProviderRef, jobToken?: string, waitReadTimeoutMs?: () => number): Promise<never> {
-  let accepted = false;
+  let acknowledgement: Awaited<ReturnType<Transport["sendMessage"]>> | null;
   try {
-    await transport.sendMessage(jobId, { type: "decline", content: {} }, provider, { jobToken });
-    accepted = true;
+    acknowledgement = await transport.sendMessage(jobId, { type: "decline", content: {} }, provider, { jobToken });
   } catch (error) {
     if (!(error instanceof DvmError) || !["no_open_ask", "job_terminal"].includes(error.code)) throw error;
+    acknowledgement = null;
   }
-  const retryConfirmation = accepted ? waitReadTimeoutMs : undefined;
-  const timeoutMs = retryConfirmation?.() ?? 60_000;
-  if (timeoutMs <= 0) throw new DeclineConfirmationPending(requestSeq);
-  let status: JobStatus;
-  try {
-    status = await transport.status(jobId, provider, { jobToken, timeoutMs });
-  } catch (error) {
-    // Only the status read may be retried after an accepted decline.
-    if (retryConfirmation && isTransientJobReadError(error)) throw new DeclineConfirmationPending(requestSeq, error);
-    throw error;
+  let standingStop = false;
+  if (acknowledgement && "stop_requested" in acknowledgement && acknowledgement.stop_requested === true) {
+    standingStop = true;
+    if ("display" in acknowledgement && typeof acknowledgement.display === "string")
+      rememberStandingStop(jobId, acknowledgement.display);
   }
-  recordStoppedAskStatus(jobId, requestSeq, status.status);
+  // Older transports resolve void on success. Only a refused send sets null.
+  if (waitReadTimeoutMs && acknowledgement !== null) throw new DeclineAcknowledged({ requestSeq, standingStop });
+  if (!standingStop) {
+    const status = await transport.status(jobId, provider, { jobToken, timeoutMs: 60_000 });
+    recordStoppedAskStatus(jobId, requestSeq, status.status);
+  }
   throw new DvmError("payment_request_not_pending", "The stop was recorded; no payment was sent.",
     "Keep watching the job for its final result.", { mandate_wait: true, ...standingStopOutput(loadJob(jobId)) });
 }
 
-export class DeclineConfirmationPending extends Error {
-  constructor(readonly requestSeq: number, cause?: unknown) {
-    super("The provider accepted the decline, and its status still needs to be read.", { cause });
+export class DeclineAcknowledged extends Error {
+  constructor(readonly acknowledgement: { requestSeq: number; standingStop: boolean }) {
+    super("The provider acknowledged the decline.");
   }
 }
 
