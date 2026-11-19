@@ -1,4 +1,4 @@
-import { DvmError, type PaymentRequestContent, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
+import { DvmError, type JobStatus, type PaymentRequestContent, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
 import { loadJob, markJobTerminal, mutateCreditPayment, updateObservedJob, type JobRecord } from "./job-store";
 import { appendMessages, loadMessages, maxSeq } from "./messages/index";
 import { mandateCredit, mandateDrawTotal, recordMandatePayments } from "./mandate-payments";
@@ -57,21 +57,44 @@ export async function recoverMandateWinner(jobId: string, requestSeq: number, tr
   return history.some((message) => mandateCredit(message)?.request_seq === requestSeq);
 }
 
-async function declineStoppedAsk(jobId: string, requestSeq: number, transport: Transport,
-  provider: ProviderRef, jobToken?: string): Promise<never> {
-  try { await transport.sendMessage(jobId, { type: "decline", content: {} }, provider, { jobToken }); }
-  catch (error) {
+async function declineStoppedAsk(jobId: string, requestSeq: number, historyThrough: number, transport: Transport,
+  provider: ProviderRef, jobToken?: string, waitReadTimeoutMs?: () => number): Promise<never> {
+  let acknowledgement: Awaited<ReturnType<Transport["sendMessage"]>> | null;
+  try {
+    acknowledgement = await transport.sendMessage(jobId, { type: "decline", content: {} }, provider, { jobToken });
+  } catch (error) {
     if (!(error instanceof DvmError) || !["no_open_ask", "job_terminal"].includes(error.code)) throw error;
+    acknowledgement = null;
   }
-  const status = await transport.status(jobId, provider, { jobToken, timeoutMs: 60_000 });
-  if (status.status === "completed" || status.status === "failed" || status.status === "cancelled") {
-    markJobTerminal(jobId, status.status, loadJob(jobId)?.completion ?? {}, status.status === "cancelled" ? { callerCancelled: true, callerDeclined: true } : {});
-    mutateCreditPayment(jobId, (job) => {
-      if (job.pendingCreditPayment?.authorization.request_seq === requestSeq) delete job.pendingCreditPayment;
-    });
+  let standingStop = false;
+  if (acknowledgement && "stop_requested" in acknowledgement && acknowledgement.stop_requested === true) {
+    standingStop = true;
+    if ("display" in acknowledgement && typeof acknowledgement.display === "string")
+      rememberStandingStop(jobId, acknowledgement.display);
+  }
+  // Older transports resolve void on success. Only a refused send sets null.
+  if (waitReadTimeoutMs && acknowledgement !== null)
+    throw new DeclineAcknowledged({ requestSeq, standingStop, historyThrough, messageSeq: acknowledgement?.seq });
+  if (!standingStop) {
+    const status = await transport.status(jobId, provider, { jobToken, timeoutMs: 60_000 });
+    recordStoppedAskStatus(jobId, requestSeq, status.status);
   }
   throw new DvmError("payment_request_not_pending", "The stop was recorded; no payment was sent.",
     "Keep watching the job for its final result.", { mandate_wait: true, ...standingStopOutput(loadJob(jobId)) });
+}
+
+export class DeclineAcknowledged extends Error {
+  constructor(readonly acknowledgement: { requestSeq: number; standingStop: boolean; historyThrough: number; messageSeq?: number }) {
+    super("The provider acknowledged the decline.");
+  }
+}
+
+export function recordStoppedAskStatus(jobId: string, requestSeq: number, status: JobStatus["status"]): void {
+  if (status !== "completed" && status !== "failed" && status !== "cancelled") return;
+  markJobTerminal(jobId, status, loadJob(jobId)?.completion ?? {}, status === "cancelled" ? { callerCancelled: true, callerDeclined: true } : {});
+  mutateCreditPayment(jobId, (job) => {
+    if (job.pendingCreditPayment?.authorization.request_seq === requestSeq) delete job.pendingCreditPayment;
+  });
 }
 
 export class MandateGuardReadError extends Error {
@@ -96,8 +119,9 @@ export async function guardMandatePayment(jobId: string, requestSeq: number, tra
     }
   }
   const history = await read((options) => transport.getMessages(jobId, 0, provider, options));
+  const historyThrough = maxSeq(history, 0);
   appendMessages(jobId, history);
-  recordMandatePayments(jobId, history, maxSeq(history, 0));
+  recordMandatePayments(jobId, history, historyThrough);
   const payment = history.find((message) => message.from === "requester" && message.type === "payment" &&
     message.content.credit?.request_seq === requestSeq);
   if (payment?.type === "payment") {
@@ -107,7 +131,7 @@ export async function guardMandatePayment(jobId: string, requestSeq: number, tra
         job.bookedCreditPayments?.some((entry) => entry.authorization.payment_id === id))) return;
     throw new DvmError("payment_already_sent", "This charge was already paid from credit. Do not pay again.");
   }
-  if (job.stopRequested) return declineStoppedAsk(jobId, requestSeq, transport, provider, jobToken);
+  if (job.stopRequested) return declineStoppedAsk(jobId, requestSeq, historyThrough, transport, provider, jobToken, waitReadTimeoutMs);
   // A saved authorization is a recovery, not a new payment. Never delay replay.
   if (job.pendingCreditPayment?.authorization.request_seq === requestSeq || job.unconfirmedPaymentSubmissions?.[requestSeq] ||
       job.inFlightPaymentRequestSeqs?.includes(requestSeq)) return;

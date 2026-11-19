@@ -12,6 +12,7 @@ import { formatDurationMs } from "./duration";
 import { guidanceJobArg } from "./provider-output";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "./stream-loop";
 import { createWaitPaymentLines, type WaitPaymentLineOptions } from "./wait-payment-lines";
+import { recordStoppedAskStatus } from "./mandate-wait";
 
 export interface WaitForJobResult extends StreamLoopResult {
   /** Highest sequence in a provider history read that started at zero. */
@@ -57,27 +58,49 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
   let paymentInFlight = false;
   // Whether any status read showed the job still open, which the wait-limit hint states.
   let seenRunning = false;
+  const acknowledgedDeclineSeqs = new Set<number>();
+  let declineConfirmation: StreamLoopResult["declineAcknowledgement"];
+  let streamedCancel = false;
   const idleTimeoutMs = opts.timeoutMs ?? JOB_READ_TIMEOUT_MS;
+  function observeDeclineHistory(messages: Message[]): void {
+    if (!declineConfirmation) return;
+    const { historyThrough } = declineConfirmation;
+    // An older transport can omit the acknowledgment sequence. The log can supply it.
+    const messageSeq = declineConfirmation.messageSeq ??= messages.find((message) =>
+      message.seq > historyThrough && message.from === "requester" && message.type === "decline")?.seq;
+    if (messageSeq === undefined) return;
+    const afterDecline = Math.max(historyThrough, messageSeq);
+    if (messages.some((message) => message.seq > afterDecline && message.from === "provider" &&
+      (message.type === "working" || message.type === "progress" || message.type === "prompt" || message.type === "payment-request")))
+      declineConfirmation = undefined;
+  }
+  async function waitBeforeRetry(): Promise<void> {
+    const delay = Math.min(backoffMs, Math.max(0, deadline - now()));
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    backoffMs = Math.min(backoffMs * 2, 30_000);
+  }
   async function readWithRetry<T>(read: () => Promise<T>): Promise<T | undefined> {
     while (now() < deadline) {
       try { return await read(); }
       catch (error) {
         if (!isTransientJobReadError(error)) throw error;
-        await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, Math.max(0, deadline - now()))));
-        backoffMs = Math.min(backoffMs * 2, 30_000);
+        await waitBeforeRetry();
       }
     }
     return undefined;
   }
   while (now() < deadline && !hasUnsavedJobState()) {
-    const readOptions = () => ({ jobToken: opts.jobToken, timeoutMs: Math.max(1, Math.min(idleTimeoutMs, deadline - now())) });
+    const jobToken = opts.jobToken ?? (acknowledgedDeclineSeqs.size ? loadJob(opts.jobId)?.jobToken : undefined);
+    const readOptions = () => ({ jobToken, timeoutMs: Math.max(1, Math.min(idleTimeoutMs, deadline - now())) });
     const snapshot: ContentStatus | undefined = await readWithRetry(() => opts.transport.status(opts.jobId, opts.provider, readOptions()));
     if (!snapshot) break;
     seenRunning = !isTerminalJobStatus(snapshot.status);
     if (isTerminalJobStatus(snapshot.status)) {
       result.providerStatus = snapshot;
-      result.nextAction = null;
+      result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
       const history = await readWithRetry(() => opts.transport.getMessages(opts.jobId, result.cursor, opts.provider, readOptions()));
+      if (history) observeDeclineHistory(history);
+      if (declineConfirmation) recordStoppedAskStatus(opts.jobId, declineConfirmation.requestSeq, snapshot.status);
       if (!history) break;
       if (result.cursor === 0 && snapshot.content_available !== false)
         result.fullHistoryThrough = maxSeq(history, 0);
@@ -93,6 +116,10 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       }
       result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
       break;
+    }
+    if (streamedCancel) {
+      await waitBeforeRetry();
+      continue;
     }
     // A previous command may have advanced the cursor past an unanswered yield.
     const inFlight = opts.persistLocalState === false ? [] : loadJob(opts.jobId)?.inFlightPaymentRequestSeqs ?? [];
@@ -127,6 +154,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
         history = await readWithRetry(() => opts.transport.getMessages(opts.jobId, 0, opts.provider, readOptions()));
       }
       if (!history) break;
+      observeDeclineHistory(history);
       messageAppendSession?.append(history);
       if (messageAppendSession && snapshot.content_available !== false)
         result.fullHistoryThrough = maxSeq(history, 0);
@@ -168,7 +196,9 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       ...opts, onMessage, messageAppendSession, afterSeq: streamAfter, retryUnreachableReads: true,
       timeoutMs: readOptions().timeoutMs,
       mandateReadTimeoutMs: () => Math.min(idleTimeoutMs, deadline - now()),
+      acknowledgedDeclineSeqs,
     });
+    observeDeclineHistory(next.messages);
     collectMessages(next.messages);
     result.autoPayments.push(...next.autoPayments);
     result.refunds.push(...next.refunds);
@@ -176,11 +206,25 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     result.cursor = Math.min(next.cursor, cursorLimit);
     result.nextAction = next.nextAction;
     paymentInFlight = next.paymentInFlight === true;
-    if (hasUnsavedJobState() || next.nextAction?.type !== "poll") break;
+    if (hasUnsavedJobState()) break;
+    if (declineConfirmation && next.messages.findLast((message) => message.type === "complete" || message.type === "cancel")?.type === "cancel") {
+      // A streamed cancel can also mean provider failure. Confirm the ending from status.
+      streamedCancel = true;
+      continue;
+    }
+    if (next.nextAction?.type !== "poll") break;
     if (progressed) backoffMs = 1000;
-    const delay = Math.min(backoffMs, Math.max(0, deadline - now()));
-    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-    backoffMs = Math.min(backoffMs * 2, 30_000);
+    const decline = next.declineAcknowledgement;
+    if (decline) {
+      acknowledgedDeclineSeqs.add(decline.requestSeq);
+      if (decline.standingStop) {
+        declineConfirmation = undefined;
+      } else {
+        declineConfirmation = { ...decline, historyThrough: Math.max(decline.requestSeq, decline.historyThrough, next.cursor) };
+        continue;
+      }
+    }
+    await waitBeforeRetry();
   }
   if (opts.persistLocalState !== false) {
     const remaining = loadJob(opts.jobId)?.inFlightPaymentRequestSeqs ?? [];
