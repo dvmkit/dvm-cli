@@ -174,6 +174,82 @@ describe("human-paid funding without waiting", () => {
     expect(sdk.loadAgentWallet()?.pending_mints[0]).not.toHaveProperty("expires_at");
   });
 
+  it("relays the invoice before polling and collects a payment observed on a later poll", async () => {
+    const fixture = mint();
+    const check = fixture.wallet.checkMintQuoteBolt11.getMockImplementation()!;
+    fixture.wallet.checkMintQuoteBolt11.mockImplementationOnce(async (quote) => {
+      expect(lastEvent()).toMatchObject({ status: "awaiting_payment", quote_id: quote, collection_state: "waiting" });
+      expect(sdk.loadAgentWallet()?.pending_mints).toMatchObject([{ quote_id: quote }]);
+      const unpaid = await check(quote);
+      fixture.states.set(quote, "PAID");
+      return unpaid;
+    });
+
+    await runFund(fundArgs("--collect-for", "10s"));
+
+    expect(lastEvent()).toMatchObject({ status: "minted", quote_id: "quote-1", sats_minted: 1000 });
+    expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledTimes(2);
+    expect(fixture.wallet.completeMint).toHaveBeenCalledTimes(1);
+    expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+  });
+
+  it("keeps wallet show from replacing journaled outputs while issuance is in flight", async () => {
+    const fixture = mint();
+    const issuing = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const complete = fixture.wallet.completeMint.getMockImplementation()!;
+    fixture.wallet.checkMintQuoteBolt11.mockImplementation(async (quote) => ({
+      quote, request: "lnbc10u1fake", expiry: fixture.expiry, state: "PAID",
+    }));
+    fixture.wallet.completeMint.mockImplementationOnce(async () => {
+      issuing.resolve();
+      await release.promise;
+      return complete();
+    });
+    const collecting = runFund(fundArgs("--collect-for", "10s"));
+    try {
+      await Promise.race([issuing.promise, collecting.then(() => { throw new Error("Collection stopped before issuance"); })]);
+      await walletShow({});
+      expect(lastEvent()).toMatchObject({
+        total_sats: 0,
+        sweep: { unchecked: [{ quote_id: "quote-1" }] },
+      });
+      expect(fixture.wallet.prepareMint).toHaveBeenCalledTimes(1);
+      expect(fixture.wallet.completeMint).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+      await collecting;
+    }
+    expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+  });
+
+  it.each(["duration_elapsed", "quote_expired"])("hands back the original invoice after %s", async (reason) => {
+    const fixture = mint(reason === "quote_expired" ? nowSec() - 1 : nowSec() + HOUR_SEC);
+
+    await runFund(fundArgs("--collect-for", reason === "quote_expired" ? "1h" : "1s"));
+
+    expect(lastEvent()).toMatchObject({
+      status: "collection_stopped", collection_state: "needs_wallet_show", reason,
+      quote_id: "quote-1", next_step: "dvm wallet show",
+      collect_before: new Date(fixture.expiry! * 1000).toISOString(),
+    });
+    expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledTimes(reason === "quote_expired" ? 0 : 1);
+    expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [{ quote_id: "quote-1" }], proofs: [] });
+  });
+
+  it.each([
+    { opts: { collectFor: "5m" }, code: "invalid_fund_options" },
+    { opts: { wait: false, collectFor: "0s" }, code: "invalid_arguments" },
+    { opts: { wait: false, collectFor: "10" }, code: "invalid_arguments" },
+    { opts: { wait: false, collectFor: "5m", rail: "x402" }, code: "invalid_flags_for_rail" },
+  ])("rejects unsupported collection options before opening a quote: $opts", async ({ opts, code }) => {
+    const fixture = mint();
+
+    await expect(walletFund("1000", { float: false, ...opts })).rejects.toMatchObject({ code });
+
+    expect(fixture.wallet.createLockedMintQuote).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("creates a second quote and names the earlier unpaid one in human=%s output", async (human) => {
     const fixture = mint();
     await runFund();

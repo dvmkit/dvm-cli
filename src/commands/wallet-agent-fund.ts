@@ -73,6 +73,7 @@ import {
 } from "../lib/funding-handoff";
 import { dvmFetch } from "../lib/http";
 import { drainStdin, StdinTimeoutError } from "../lib/byte-source";
+import { parseDurationMs } from "../lib/duration";
 import { defaultQrImagePath, renderQrPng, renderQrTerminal } from "../lib/qr";
 import { getSpotRate } from "../lib/spot-rate";
 import { fundTempoFromFaucet } from "../lib/tempo-faucet";
@@ -84,7 +85,8 @@ import {
   resolveFundingAmountSats,
 } from "../lib/wallet-agent/amount";
 import { loadMintFeeProfiles, summarizeMints } from "../lib/wallet-agent/balance";
-import { createPendingMintQuote, type FundOptions } from "../lib/wallet-agent/fund";
+import { collectPendingMint } from "../lib/wallet-agent/collect";
+import { createPendingMintQuote, type FundOptions, type FundResult } from "../lib/wallet-agent/fund";
 import { fundWithRecoverableWait } from "../lib/wallet-agent/fund-wait";
 import {
   reconcilePendingMelts,
@@ -150,8 +152,8 @@ export interface WalletFundOptions {
    * to `true`, which is what makes funding autonomous.
    */
   float?: boolean;
-  /** Set to false by --no-wait to persist and relay an invoice without polling. */
   wait?: boolean;
+  collectFor?: string;
 }
 
 export interface WalletShowOptions {
@@ -176,11 +178,12 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
       opts.sats ||
       opts.testSkipLightning ||
       opts.float === false ||
-      opts.wait === false
+      opts.wait === false ||
+      opts.collectFor !== undefined
     ) {
       throw new DvmError(
         "invalid_flags_for_rail",
-        "--mint, --timeout, --sats, --test-skip-lightning, --no-float, and --no-wait only apply to --rail cashu.",
+        "--mint, --timeout, --sats, --test-skip-lightning, --no-float, --no-wait, and --collect-for only apply to --rail cashu.",
         `Drop these flags when running \`dvm wallet fund --rail ${rail}\`.`
       );
     }
@@ -194,6 +197,17 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
       `Unknown rail: ${rail}.`,
       "Supported rails: cashu (default), tempo, x402."
     );
+  }
+
+  let collectForMs: number | undefined;
+  if (opts.collectFor !== undefined) {
+    if (opts.wait !== false) {
+      throw new DvmError("invalid_fund_options", "--collect-for requires --no-wait.");
+    }
+    collectForMs = parseDurationMs(opts.collectFor);
+    if (collectForMs === 0) {
+      throw new DvmError("invalid_arguments", "--collect-for requires a positive duration, such as 30s or 2m.");
+    }
   }
 
   if (opts.wait === false && opts.testSkipLightning) {
@@ -225,6 +239,7 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
       "Run `dvm wallet init` first to generate a lock keypair."
     );
   }
+  const lockPubkey = wallet.lock_pubkey;
 
   // Sweep first — catches a crash from the prior run before we open another
   // flow. Melts sweep too: a cash-out the mint never confirmed is money in
@@ -350,7 +365,9 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
       if (opts.wait === false) {
         info(`Quote ID: ${quote.quote}`);
         if (expiresAt) info(`Invoice expires: ${expiresAt}`);
-        info("After payment, run `dvm wallet show` to collect the sats and check the new balance.");
+        info(collectForMs === undefined
+          ? "After payment, run `dvm wallet show` to collect the sats and check the new balance."
+          : `Waiting up to ${opts.collectFor} to collect payment, subject to the quote expiry.`);
         info(`  ↳ ${collectDeadlineHint(expiresAt)}`);
       } else {
         info(
@@ -377,6 +394,7 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
         relay: { copy_text: invoice, standalone: true },
         expires_at: expiresAt,
         ...(opts.wait === false ? { collect_before: expiresAt } : {}),
+        ...(collectForMs === undefined ? {} : { collection_state: "waiting" }),
         lock_pubkey: wallet.lock_pubkey,
         display: `Pay ${sats} sats to the Lightning invoice to fund ${amountPhrase} into the agent wallet at ${mintUrl} (${selectionPhrase}). Scannable QR at ${qrImagePath}.`,
         ...(opts.wait === false ? {
@@ -385,16 +403,29 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
           sweep: summarizeSweep(sweep),
           melt_sweep: summarizeMeltSweep(meltSweep),
         } : {}),
-        hint: opts.wait === false
-          ? `Forward the QR PNG (or raw invoice) to a human. After payment, run \`dvm wallet show\` to collect the sats and check the new balance. ${collectDeadlineHint(expiresAt)} Funding is still pending.`
-          : "Forward the QR PNG (or raw invoice) to a human; the CLI will mint P2PK-locked Cashu proofs into ~/.dvm/wallet.json once paid.",
+        hint: collectForMs !== undefined
+          ? `Forward the QR PNG (or raw invoice) to a human now. This command is waiting for payment. ${collectDeadlineHint(expiresAt)}`
+          : opts.wait === false
+            ? `Forward the QR PNG (or raw invoice) to a human. After payment, run \`dvm wallet show\` to collect the sats and check the new balance. ${collectDeadlineHint(expiresAt)} Funding is still pending.`
+            : "Forward the QR PNG (or raw invoice) to a human; the CLI will mint P2PK-locked Cashu proofs into ~/.dvm/wallet.json once paid.",
       });
     }
   };
 
   if (opts.wait === false) {
-    const { quote } = await createPendingMintQuote(sats, { mintUrl });
+    const { quote, pending, cashuWallet } = await createPendingMintQuote(sats, { mintUrl });
     await onInvoice(quote.request, quote);
+    if (collectForMs !== undefined) {
+      const outcome = await collectPendingMint(pending, cashuWallet, collectForMs);
+      if (outcome.kind === "collected") {
+        reportMinted({
+          mint: mintUrl, amount_sats: sats, quote_id: quote.quote,
+          denominations: outcome.proofs.map((proof) => proof.amount), proofs: outcome.proofs,
+        });
+      } else {
+        reportCollectionOutcome(pending, outcome, human);
+      }
+    }
     return;
   }
 
@@ -476,34 +507,75 @@ export async function walletFund(amount: string, opts: WalletFundOptions): Promi
     onInvoice,
   });
 
-  const totalProofSats = result.proofs.reduce((sum, p) => sum + p.amount, 0);
+  reportMinted(result);
 
+  function reportMinted(result: FundResult): void {
+    const totalProofSats = result.proofs.reduce((sum, p) => sum + p.amount, 0);
+    if (human) {
+      info("");
+      info(
+        `Minted ${totalProofSats} sats at ${mintUrl} (${selectionPhrase}) across ${result.proofs.length} P2PK-locked proofs.`
+      );
+      info(`Smart denomination split: ${formatDenominations(result.denominations)}.`);
+      info(`Locked to lock pubkey: ${lockPubkey}`);
+    } else {
+      json({
+        status: "minted",
+        mint: mintUrl,
+        mint_selection: mintSelection,
+        amount_sats: sats,
+        ...amountSourceFields(amt),
+        sats_minted: totalProofSats,
+        proof_count: result.proofs.length,
+        denominations: result.denominations,
+        lock_pubkey: lockPubkey,
+        quote_id: result.quote_id,
+        ...(collectForMs === undefined ? {} : { collection_state: "collected" }),
+        sweep: summarizeSweep(sweep),
+        melt_sweep: summarizeMeltSweep(meltSweep),
+        ...(result.float_payment ? { float_payment: floatPaymentJson(result.float_payment) } : {}),
+        display: result.float_payment
+          ? `Topped up ${totalProofSats} sats from your Lightning wallet into the agent wallet at ${mintUrl} (${selectionPhrase}). ${floatPaymentDisplay(result.float_payment)} No action needed.`
+          : `Minted ${totalProofSats} sats at ${mintUrl} (${selectionPhrase}), locked to lock pubkey.`,
+        hint: "Inspect the resulting balance with `dvm wallet show`.",
+      });
+    }
+  }
+}
+
+function reportCollectionOutcome(
+  entry: PendingMint,
+  outcome: Exclude<Awaited<ReturnType<typeof collectPendingMint>>, { kind: "collected" }>,
+  human: boolean
+): void {
+  const expiryMs = entry.expires_at === undefined ? null : entry.expires_at * 1000;
+  const collectBefore = expiryMs === null ? null : new Date(expiryMs).toISOString();
+  const nextStep = "dvm wallet show";
+  const reason = outcome.kind === "stopped" ? outcome.reason : undefined;
+  const alreadyIssued = outcome.kind === "already_issued";
+  const display = alreadyIssued
+    ? `The mint reports quote ${entry.quote_id} was already issued.`
+    : `Collection ended for quote ${entry.quote_id}.`;
+  const stopPayment = reason === "quote_expired" || reason === "paid_uncollected" || reason === "no_longer_pending" ||
+    (expiryMs !== null && expiryMs <= Date.now());
+  const deadlineHint = collectBefore ? ` The mint named ${collectBefore} as the deadline.` : "";
+  const hint = alreadyIssued ? `Run \`${nextStep}\` to check the balance.`
+    : stopPayment ? `Run \`${nextStep}\` to check the wallet before taking further action.${deadlineHint} Do not pay this invoice now.`
+    : `Run \`${nextStep}\` after payment to collect or check for collection. ${collectDeadlineHint(collectBefore)}`;
   if (human) {
-    info("");
-    info(
-      `Minted ${totalProofSats} sats at ${mintUrl} (${selectionPhrase}) across ${result.proofs.length} P2PK-locked proofs.`
-    );
-    info(`Smart denomination split: ${formatDenominations(result.denominations)}.`);
-    info(`Locked to lock pubkey: ${wallet.lock_pubkey}`);
+    info(`${display} ${hint}`);
   } else {
     json({
-      status: "minted",
-      mint: mintUrl,
-      mint_selection: mintSelection,
-      amount_sats: sats,
-      ...amountSourceFields(amt),
-      sats_minted: totalProofSats,
-      proof_count: result.proofs.length,
-      denominations: result.denominations,
-      lock_pubkey: wallet.lock_pubkey,
-      quote_id: result.quote_id,
-      sweep: summarizeSweep(sweep),
-      melt_sweep: summarizeMeltSweep(meltSweep),
-      ...(result.float_payment ? { float_payment: floatPaymentJson(result.float_payment) } : {}),
-      display: result.float_payment
-        ? `Topped up ${totalProofSats} sats from your Lightning wallet into the agent wallet at ${mintUrl} (${selectionPhrase}). ${floatPaymentDisplay(result.float_payment)} No action needed.`
-        : `Minted ${totalProofSats} sats at ${mintUrl} (${selectionPhrase}), locked to lock pubkey.`,
-      hint: "Inspect the resulting balance with `dvm wallet show`.",
+      status: alreadyIssued ? "already_issued" : "collection_stopped",
+      collection_state: alreadyIssued ? "already_issued" : "needs_wallet_show",
+      ...(reason ? { reason } : {}),
+      quote_id: entry.quote_id,
+      mint: entry.mint,
+      amount_sats: entry.amount_sats,
+      collect_before: collectBefore,
+      next_step: nextStep,
+      display,
+      hint,
     });
   }
 }

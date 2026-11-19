@@ -4,14 +4,19 @@
  * covering a crash after issuance but before proofs reached disk.
  */
 
+import { createHash } from "node:crypto";
+import { setTimeout as sleepFor } from "node:timers/promises";
+
 import type { Wallet } from "@cashu/cashu-ts";
 import { MintQuoteState } from "@cashu/cashu-ts";
+import lockfile from "proper-lockfile";
 
+import { DvmError } from "@dvmkit/sdk/internal";
 import { getWallet } from "@dvmkit/sdk/internal";
 import { computeSmartDenominations } from "@dvmkit/sdk/internal";
 import { maxKeysetDenomination, prepareP2PKMint } from "@dvmkit/sdk/internal";
 import { retryMintQuoteOperation } from "@dvmkit/sdk/internal";
-import { restoreProofsFromOutputs, serializeOutputData } from "@dvmkit/sdk/internal";
+import { rehydrateOutputData, restoreProofsFromOutputs, serializeOutputData } from "@dvmkit/sdk/internal";
 import { toAgentProof } from "@dvmkit/sdk/internal";
 import {
   type AgentProof,
@@ -20,6 +25,7 @@ import {
   type PendingMint,
   type PendingMintMintingState,
   saveAgentWallet,
+  WALLET_FILE,
   withWalletLock,
 } from "@dvmkit/sdk/internal";
 
@@ -64,6 +70,15 @@ export interface SweepOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+type PendingMintOutcome = SweepEntryOutcome | { kind: "busy" } | { kind: "no_longer_pending" };
+
+interface PendingMintOptions extends SweepOptions {
+  /** Stop starting or retrying quote-status reads at this time. */
+  pollDeadlineMs?: number;
+  /** Bound wallet lock acquisition when collection has a caller deadline. */
+  deadlineMs?: number;
+}
+
 const DEFAULT_SWEEP_QUOTE_RETRY_TIMEOUT_MS = 10_000;
 
 /**
@@ -84,36 +99,13 @@ export async function sweepPendingMints(opts: SweepOptions = {}): Promise<SweepR
     return { outcomes: [], recovered_proofs: [], still_pending: [], refused: [], errors: [] };
   }
 
-  const now = opts.now ?? (() => Date.now());
-  const expiryGraceMs = opts.expiryGraceMs ?? MINT_QUOTE_EXPIRY_GRACE_MS;
-  const getWalletForMint = opts.getWalletForMint ?? getWallet;
-  const quoteRetryTimeoutMs =
-    opts.quoteRetryTimeoutMs ?? DEFAULT_SWEEP_QUOTE_RETRY_TIMEOUT_MS;
-
   const outcomes: SweepEntryOutcome[] = [];
   for (const entry of wallet.pending_mints) {
-    const outcome = await processEntry(wallet, entry, now(), expiryGraceMs, getWalletForMint, {
-      now,
-      sleep: opts.sleep,
-      timeoutMs: quoteRetryTimeoutMs,
-    });
-    outcomes.push(outcome);
-  }
-
-  if (
-    outcomes.some(
-      (o) =>
-        o.kind === "minted" ||
-        o.kind === "restored" ||
-        o.kind === "already_issued" ||
-        o.kind === "expired"
-    )
-  ) {
-    await withWalletLock(() => {
-      const fresh = loadAgentWallet() ?? wallet;
-      const updated = outcomes.reduce<AgentWallet>(applyOutcome, fresh);
-      saveAgentWallet(updated);
-    });
+    const outcome = await reconcilePendingMint(entry, opts);
+    if (outcome.kind === "no_longer_pending") continue;
+    outcomes.push(outcome.kind === "busy"
+      ? { kind: "error", entry, error: "Another command is checking this mint quote." }
+      : outcome);
   }
 
   return {
@@ -134,18 +126,86 @@ export async function sweepPendingMints(opts: SweepOptions = {}): Promise<SweepR
   };
 }
 
+export async function reconcilePendingMint(
+  entry: PendingMint,
+  opts: PendingMintOptions = {}
+): Promise<PendingMintOutcome> {
+  // A quote lock covers status, issuance and commit. Wallet writes still take
+  // the wallet lock, which stays available while the mint is answering.
+  const key = createHash("sha256").update(JSON.stringify([entry.mint, entry.quote_id])).digest("hex");
+  let release: () => Promise<void>;
+  try {
+    release = await lockfile.lock(`${WALLET_FILE}.mint-${key}`, { realpath: false, stale: 30_000, retries: 0 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ELOCKED") return { kind: "busy" };
+    return { kind: "error", entry, error: errorMessage(err) };
+  }
+
+  try {
+    const wallet = loadAgentWallet();
+    const current = wallet?.pending_mints.find((pending) => matchesPendingMint(pending, entry));
+    if (!wallet || !current) return { kind: "no_longer_pending" };
+
+    const outcome = await processEntry(wallet, current, opts);
+
+    if (outcome.kind === "minted" || outcome.kind === "restored" ||
+        outcome.kind === "already_issued" || outcome.kind === "expired") {
+      const committed = await withMintWriteLock(opts.deadlineMs, () => {
+        const fresh = currentMintWallet(wallet, current);
+        if (!fresh) return false;
+        const proofs = outcome.kind === "minted" || outcome.kind === "restored" ? outcome.proofs : [];
+        saveAgentWallet({
+          ...fresh,
+          pending_mints: fresh.pending_mints.filter((pending) => !matchesPendingMint(pending, current)),
+          proofs: [...fresh.proofs, ...proofs],
+        });
+        return true;
+      });
+      if (!committed) return { kind: "no_longer_pending" };
+    }
+    return outcome;
+  } catch (err) {
+    return { kind: "error", entry, error: errorMessage(err) };
+  } finally {
+    await release().catch(() => undefined);
+  }
+}
+
+function matchesPendingMint(left: PendingMint, right: PendingMint): boolean {
+  return left.mint === right.mint && left.quote_id === right.quote_id && left.requested_at === right.requested_at;
+}
+
+function currentMintWallet(wallet: AgentWallet, entry: PendingMint): AgentWallet | undefined {
+  const fresh = loadAgentWallet();
+  if (fresh?.lock_pubkey === wallet.lock_pubkey && fresh.pending_mints.some((pending) => matchesPendingMint(pending, entry))) {
+    return fresh;
+  }
+}
+
+async function withMintWriteLock<T>(deadlineMs: number | undefined, write: () => T): Promise<T> {
+  if (deadlineMs === undefined) return withWalletLock(write);
+  for (;;) {
+    try {
+      return await withWalletLock(write, { retries: 0 });
+    } catch (err) {
+      const remaining = deadlineMs - Date.now();
+      if (!(err instanceof DvmError && err.code === "wallet_locked") || remaining <= 0) throw err;
+      await sleepFor(Math.min(remaining, 50));
+    }
+  }
+}
+
 async function processEntry(
   wallet: AgentWallet,
   entry: PendingMint,
-  nowMs: number,
-  expiryGraceMs: number,
-  getWalletForMint: (mintUrl: string) => Promise<Wallet>,
-  retry: {
-    now: () => number;
-    sleep?: (ms: number) => Promise<void>;
-    timeoutMs: number;
+  opts: PendingMintOptions
+): Promise<SweepEntryOutcome | { kind: "no_longer_pending" }> {
+  const now = opts.now ?? Date.now;
+  const nowMs = now();
+  if (opts.pollDeadlineMs !== undefined && nowMs >= opts.pollDeadlineMs) {
+    return { kind: "still_pending", entry };
   }
-): Promise<SweepEntryOutcome> {
+  const getWalletForMint = opts.getWalletForMint ?? getWallet;
   let cashuWallet: Wallet;
   let quoteResponse;
   try {
@@ -156,10 +216,13 @@ async function processEntry(
         return { cashuWallet: candidate, quoteResponse: quote };
       },
       {
-        deadlineMs: retry.now() + retry.timeoutMs,
+        deadlineMs: Math.min(
+          opts.pollDeadlineMs ?? Infinity,
+          nowMs + (opts.quoteRetryTimeoutMs ?? DEFAULT_SWEEP_QUOTE_RETRY_TIMEOUT_MS)
+        ),
         quoteId: entry.quote_id,
-        now: retry.now,
-        sleep: retry.sleep,
+        now,
+        sleep: opts.sleep,
       }
     ));
   } catch (err) {
@@ -202,36 +265,47 @@ async function processEntry(
 
   if (state === MintQuoteState.PAID) {
     try {
-      const denominations = computeSmartDenominations(entry.amount_sats, {
-        maxDenomination: maxKeysetDenomination(cashuWallet),
-        includeTinyTail: false,
-      });
-      const preview = await prepareP2PKMint(
-        cashuWallet,
-        entry.amount_sats,
-        quoteResponse,
-        wallet.lock_privkey,
-        wallet.lock_pubkey,
-        denominations
-      );
-      // Persist the blinded outputs before completing the mint so a crash
-      // here is recoverable on the next sweep via the ISSUED+minting branch
-      // above. Mirrors the fund-flow ordering in `fundAgentWallet`. Lock-
-      // wrapped so a concurrent CLI run doesn't clobber other in-flight
-      // RMW cycles.
-      const minting: PendingMintMintingState = {
-        keyset_id: preview.keysetId,
-        outputs: serializeOutputData(preview.outputData),
-      };
-      await withWalletLock(() => {
-        const fresh = loadAgentWallet() ?? wallet;
-        saveAgentWallet({
-          ...fresh,
-          pending_mints: fresh.pending_mints.map((p) =>
-            p.quote_id === entry.quote_id ? { ...p, minting } : p
-          ),
+      let savedMinting = entry.minting;
+      if (savedMinting && cashuWallet.keyChain.getKeysets().some((keyset) =>
+        keyset.id === savedMinting?.keyset_id && keyset.isActive === false
+      )) {
+        // A retired keyset cannot sign new outputs. Check whether it signed
+        // the journaled ones before replacing them with active-keyset outputs.
+        await cashuWallet.ensureOperableKeysets([savedMinting.keyset_id]);
+        const proofs = await restoreFromMintingState(cashuWallet, savedMinting, wallet.lock_pubkey, entry.mint);
+        if (proofs.length > 0) return { kind: "restored", entry, proofs };
+        savedMinting = undefined;
+      }
+      // A prior attempt can still be in flight at the mint after a lost
+      // response. Reuse its blinded outputs even if the quote still says PAID.
+      const preview = savedMinting
+        ? await cashuWallet.prepareMint(
+            "bolt11", entry.amount_sats, quoteResponse,
+            { privkey: wallet.lock_privkey, keysetId: savedMinting.keyset_id },
+            { type: "custom", data: rehydrateOutputData(savedMinting.outputs) }
+          )
+        : await prepareP2PKMint(
+            cashuWallet, entry.amount_sats, quoteResponse, wallet.lock_privkey, wallet.lock_pubkey,
+            computeSmartDenominations(entry.amount_sats, {
+              maxDenomination: maxKeysetDenomination(cashuWallet), includeTinyTail: false,
+            })
+          );
+      if (!savedMinting) {
+        const minting: PendingMintMintingState = {
+          keyset_id: preview.keysetId,
+          outputs: serializeOutputData(preview.outputData),
+        };
+        const saved = await withMintWriteLock(opts.deadlineMs, () => {
+          const fresh = currentMintWallet(wallet, entry);
+          if (!fresh) return false;
+          saveAgentWallet({
+            ...fresh,
+            pending_mints: fresh.pending_mints.map((p) => matchesPendingMint(p, entry) ? { ...p, minting } : p),
+          });
+          return true;
         });
-      });
+        if (!saved) return { kind: "no_longer_pending" };
+      }
 
       const proofs = await cashuWallet.completeMint(preview);
       const agentProofs = proofs.map((p) => toAgentProof(p, entry.mint, wallet.lock_pubkey));
@@ -263,7 +337,7 @@ async function processEntry(
   if (nowMs <= expiredAtMs) {
     return { kind: "still_pending", entry };
   }
-  const dropAfterMs = expiredAtMs + expiryGraceMs;
+  const dropAfterMs = expiredAtMs + (opts.expiryGraceMs ?? MINT_QUOTE_EXPIRY_GRACE_MS);
   if (nowMs > dropAfterMs) {
     return finalAnswer(wallet, entry, "grace_elapsed", async () => cashuWallet);
   }
@@ -348,24 +422,6 @@ async function restoreFromMintingState(
 ): Promise<AgentProof[]> {
   const proofs = await restoreProofsFromOutputs(cashuWallet, minting.keyset_id, minting.outputs);
   return proofs.map((proof) => toAgentProof(proof, mintUrl, lockPubkey));
-}
-
-function applyOutcome(wallet: AgentWallet, outcome: SweepEntryOutcome): AgentWallet {
-  if (
-    outcome.kind === "still_pending" ||
-    outcome.kind === "paid_refused" ||
-    outcome.kind === "error"
-  ) {
-    return wallet;
-  }
-  const next: AgentWallet = {
-    ...wallet,
-    pending_mints: wallet.pending_mints.filter((p) => p.quote_id !== outcome.entry.quote_id),
-  };
-  if (outcome.kind === "minted" || outcome.kind === "restored") {
-    next.proofs = [...wallet.proofs, ...outcome.proofs];
-  }
-  return next;
 }
 
 function errorMessage(err: unknown): string {
