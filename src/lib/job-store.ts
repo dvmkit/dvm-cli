@@ -24,7 +24,6 @@ import type { JobReceipt as SignedJobReceipt } from "@dvmkit/sdk/internal";
 import type { DrawFundingReceipt } from "@dvmkit/sdk/internal";
 import type { ReceiptTrustAnchor } from "@dvmkit/sdk/internal";
 import type { ProviderRef, ReceiptParseError } from "@dvmkit/sdk/internal";
-import type { MessageHistoryCheckpoint } from "./messages/index";
 
 export type PaymentApproval = "auto" | "explicit";
 
@@ -211,8 +210,6 @@ export interface JobRecord {
   paidPaymentRequestSeqs?: number[];
   /** Last seen message sequence number for cursor-based polling */
   messageCursor?: number;
-  /** Provider history cached by status, independent of the cursor for message delivery. */
-  statusMessageHistory?: MessageHistoryCheckpoint;
   /**
    * Highest message seq a JSON `messages --wait` has written. The cursor can
    * stay behind it (an error exit, an ask kept for recovery), so a later wait
@@ -441,22 +438,6 @@ export function updateObservedJob(id: string, update: Partial<Omit<JobRecord, "i
     if (idx !== -1) {
       jobs[idx] = { ...jobs[idx], ...update };
       if (update.status && ["completed", "failed", "cancelled"].includes(update.status)) clearPaymentCreditRefusals(jobs[idx]);
-    }
-  }, true);
-}
-
-export function recordStatusMessageHistory(
-  id: string,
-  checkpoint: MessageHistoryCheckpoint,
-  previous?: MessageHistoryCheckpoint
-): void {
-  if (isDeepStrictEqual(checkpoint, previous)) return;
-  mutateJobs((jobs) => {
-    const job = jobs.find((entry) => entry.id === id);
-    if (!job) return;
-    const current = job.statusMessageHistory;
-    if (!current || checkpoint.through > current.through || isDeepStrictEqual(current, previous)) {
-      job.statusMessageHistory = checkpoint;
     }
   }, true);
 }

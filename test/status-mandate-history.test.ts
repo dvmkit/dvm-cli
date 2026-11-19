@@ -83,7 +83,7 @@ it("checks a long job's tail against cached asks and leaves unread messages avai
   expect(output().mandate_payments).toEqual(incremental.mandate_payments);
 
   await status(jobId, {});
-  expect(messageReads().slice(2)).toEqual([[jobId, 33]]);
+  expect(messageReads().slice(2)).toEqual([[jobId, 31]]);
   expect(output().mandate_payments).toEqual(incremental.mandate_payments);
   expect(loadJob(jobId)).toMatchObject({ messageCursor: 30, totalPaidMsats: 8000, paymentsHonoured: 2 });
 
@@ -107,12 +107,36 @@ it("backs up to the verified prefix of a legacy cache after a delivery cursor ju
   expect(loadJob(jobId)).toMatchObject({ messageCursor: 4, paidPaymentRequestSeqs: [2], totalPaidMsats: 8000 });
 });
 
-it("recovers the missing prefix when a checkpointed log is truncated", async () => {
-  history = [ask(1), payment(2, 1), artifact(4)];
+it("switches to the remaining prompt when a reply becomes visible below the newest sequence", async () => {
+  const prompts = [
+    { seq: 1, from: "provider", timestamp, type: "prompt", content: { id: "first", text: "First choice?" } },
+    { seq: 2, from: "provider", timestamp, type: "prompt", content: { id: "second", text: "Second choice?" } },
+  ] satisfies Message[];
+  const reply: Message = { seq: 3, from: "requester", timestamp, type: "response",
+    content: { prompt_id: "second", text: "Yes" } };
+  const later = artifact(4);
+  seed(jobId, 2, prompts);
+  wire.status.mockResolvedValue({ jobId, status: "awaiting-input", content_available: true });
+
+  history = [...prompts, later];
+  await status(jobId, {});
+  expect(output()).toMatchObject({ next_action: { type: "respond", prompt_id: "second" } });
+
+  history = [...prompts, reply, later];
+  await status(jobId, {});
+  expect(output()).toMatchObject({ next_action: { type: "respond", prompt_id: "first" } });
+  await status(jobId, {});
+  expect(output()).toMatchObject({ next_action: { type: "respond", prompt_id: "first" } });
+  expect(messageReads()).toEqual([[jobId, 2], [jobId, 2], [jobId, 4]]);
+  expect(loadJob(jobId)?.messageCursor).toBe(2);
+});
+
+it("recovers the missing prefix when the cached log is truncated", async () => {
+  history = [ask(1), payment(2, 1), artifact(3)];
   seed(jobId, 0);
   await status(jobId, {});
   await status(jobId, {});
-  expect(messageReads()).toEqual([[jobId, 0], [jobId, 4]]);
+  expect(messageReads()).toEqual([[jobId, 0], [jobId, 3]]);
 
   writeFileSync(join(MESSAGES_DIR, `${jobId}.jsonl`), JSON.stringify(history[2]) + "\n");
   await status(jobId, {});

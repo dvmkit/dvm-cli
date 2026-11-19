@@ -39,7 +39,6 @@ import {
   type JobRecord,
   loadJob,
   markJobTerminal,
-  recordStatusMessageHistory,
   updateObservedJob,
 } from "../lib/job-store";
 import {
@@ -60,7 +59,7 @@ import {
   resolveJobAccess,
   withJobTokenRedaction,
 } from "../lib/job-access";
-import { appendMessages, loadMessages, maxSeq, messageHistoryCheckpoint, verifiedMessageHistoryThrough } from "../lib/messages/index";
+import { appendMessages, loadMessages, maxSeq } from "../lib/messages/index";
 import { progressNotice } from "../lib/progress-notice";
 import { createDvmTransport } from "../lib/transport/index";
 import { dvmIdentity } from "./dvm-identity";
@@ -399,8 +398,10 @@ async function readStatusMessages(
   const deliveryAfter = stored?.messageCursor ?? 0;
   const useCache = !!stored?.mandate && contentAvailable !== false;
   const cached = useCache ? loadMessages(jobId) : [];
-  const checkpoint = stored?.statusMessageHistory;
-  const covered = verifiedMessageHistoryThrough(cached, checkpoint);
+  const sequences = new Set(cached.map((message) => message.seq));
+  let covered = 0;
+  // A higher sequence can be visible while an earlier reply awaits verification.
+  while (covered < Number.MAX_SAFE_INTEGER && sequences.has(covered + 1)) covered++;
   // A delivery cursor can skip messages the payment reconciler still needs.
   const after = deliver ? (useCache ? Math.min(deliveryAfter, covered) : deliveryAfter) : covered;
   const tail = await transport.getMessages(jobId, after, access.ref, readOptions);
@@ -411,11 +412,8 @@ async function readStatusMessages(
 
   if (!access.endpointOverridden) {
     appendMessages(jobId, tail);
-    const through = history === undefined ? undefined : Math.max(after, history.at(-1)?.seq ?? 0);
-    await settleRecordedPayments(jobId, through);
-    if (useCache && history && through !== undefined && through > 0) {
-      recordStatusMessageHistory(jobId, messageHistoryCheckpoint(through, history), checkpoint);
-    }
+    const fullHistoryThrough = history === undefined ? undefined : Math.max(after, history.at(-1)?.seq ?? 0);
+    await settleRecordedPayments(jobId, fullHistoryThrough);
   }
   const batch = deliver && after < deliveryAfter ? tail.filter((message) => message.seq > deliveryAfter) : tail;
   const cursor = deliver ? Math.max(deliveryAfter, maxSeq(batch, deliveryAfter)) : undefined;
