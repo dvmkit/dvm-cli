@@ -1,6 +1,6 @@
 import { DvmError, type PaymentRequestContent, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
 import { loadJob, markJobTerminal, mutateCreditPayment, updateObservedJob, type JobRecord } from "./job-store";
-import { appendMessages, loadMessages } from "./messages/index";
+import { appendMessages, loadMessages, maxSeq } from "./messages/index";
 import { mandateCredit, mandateDrawTotal, recordMandatePayments } from "./mandate-payments";
 import { guidanceJobArg } from "./provider-output";
 
@@ -52,7 +52,7 @@ export async function recoverMandateWinner(jobId: string, requestSeq: number, tr
   if (!loadJob(jobId)?.mandate) return false;
   const history = await transport.getMessages(jobId, 0, provider, { jobToken, timeoutMs: 60_000 });
   appendMessages(jobId, history);
-  recordMandatePayments(jobId, history);
+  recordMandatePayments(jobId, history, maxSeq(history, 0));
   return history.some((message) => mandateCredit(message)?.request_seq === requestSeq);
 }
 
@@ -79,7 +79,7 @@ export async function guardMandatePayment(jobId: string, requestSeq: number, tra
   if (!job?.mandate && !job?.stopRequested) return;
   const history = await transport.getMessages(jobId, 0, provider, { jobToken, timeoutMs: 60_000 });
   appendMessages(jobId, history);
-  recordMandatePayments(jobId, history);
+  recordMandatePayments(jobId, history, maxSeq(history, 0));
   const payment = history.find((message) => message.from === "requester" && message.type === "payment" &&
     message.content.credit?.request_seq === requestSeq);
   if (payment?.type === "payment") {
