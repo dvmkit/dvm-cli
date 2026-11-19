@@ -4,10 +4,9 @@
  *
  * The reconcile sweep never drops an unpaid quote on a local timer, because the
  * quote ID is the only handle that can mint a late payment. That leaves a quote
- * whose mint named no expiry pending until someone decides it is dead, and this
- * is the verb for that decision. It asks the mint first: forgetting a quote the
- * mint reports as paid, or one it could not report on, gives up money that
- * `dvm wallet show` could still collect, so both take a separate `--force`.
+ * whose mint named no expiry pending until someone decides to forget it.
+ * Paid quotes, unchecked quotes, and entries with saved outputs require
+ * `--force` because a wallet sweep may still recover a payment.
  */
 
 import { createInterface } from "node:readline";
@@ -31,7 +30,7 @@ export interface WalletForgetQuoteOptions {
   /** Skip the confirmation prompt. Required to forget non-interactively. */
   yes?: boolean;
   /**
-   * Forget a quote that is paid, or whose state the mint did not report.
+   * Forget a paid quote, a quote with saved outputs, or an unchecked quote.
    * Separate from `--yes` on purpose: `--yes` waives a prompt, this waives the
    * only record that can collect a payment.
    */
@@ -65,11 +64,11 @@ export async function walletForgetQuote(
     await confirmForget(entry, preview, opts);
   }
 
-  const standing = await withPendingMintLock(entry, async () => {
+  const { standing, hadSavedOutputs } = await withPendingMintLock(entry, async () => {
     const current = readPendingMint(entry, wallet.lock_pubkey);
     if (!current) throw quoteNotFound(quoteId);
     const checked = await quoteStanding(current.entry);
-    await withWalletLock(() => {
+    return withWalletLock(() => {
       const fresh = readPendingMint(entry, wallet.lock_pubkey);
       if (!fresh) throw quoteNotFound(quoteId);
       refuseIfCollectable(fresh.entry, checked, opts);
@@ -77,11 +76,11 @@ export async function walletForgetQuote(
         ...fresh.wallet,
         pending_mints: fresh.wallet.pending_mints.filter((pending) => pending !== fresh.entry),
       });
+      return { standing: checked, hadSavedOutputs: fresh.entry.minting !== undefined };
     });
-    return checked;
   });
 
-  const display = `Forgot mint quote ${quoteId} (${entry.amount_sats} sats at ${entry.mint}). ${forgottenConsequence(standing)}`;
+  const display = `Forgot mint quote ${quoteId} (${entry.amount_sats} sats at ${entry.mint}). ${forgottenConsequence(standing, hadSavedOutputs)}`;
   if (opts.human) {
     info(display);
     return;
@@ -129,23 +128,22 @@ function refuseIfCollectable(
   if (opts.force) return;
   const forced = `dvm wallet forget-quote ${shellQuoteArg(entry.quote_id)} --yes --force`;
 
-  // An issued quote with no saved outputs has nothing left to recover; one
-  // with them is a crash the next sweep restores from.
-  const collectable =
-    standing.state === "paid" || (standing.state === "issued" && entry.minting !== undefined);
-  if (collectable) {
-    throw new DvmError(
-      "mint_quote_collectable",
-      `Mint quote ${entry.quote_id} is paid: ${entry.amount_sats} sats at ${entry.mint} are waiting to be collected.`,
-      `Run \`dvm wallet show\` to collect them. Forgetting the quote gives up the only record that can; if the mint keeps refusing to issue and you accept that, add --force: ${forced}`
-    );
-  }
   if (standing.state === "unchecked") {
     throw new DvmError(
       "mint_quote_unchecked",
       `The mint did not say whether mint quote ${entry.quote_id} has been paid, so forgetting it could lose a payment.`,
       `Try again once the mint answers. To forget it without knowing, add --force: ${forced}`,
       { cause: standing.cause, retryable: standing.cause !== "unexpected" }
+    );
+  }
+  // The mint may retain signatures after its quote record expires or disappears.
+  if (standing.state === "paid" || entry.minting !== undefined) {
+    throw new DvmError(
+      "mint_quote_collectable",
+      standing.state === "paid"
+        ? `Mint quote ${entry.quote_id} is paid: ${entry.amount_sats} sats at ${entry.mint} are waiting to be collected.`
+        : `Mint quote ${entry.quote_id} has saved outputs that may still recover proofs for ${entry.amount_sats} sats at ${entry.mint}.`,
+      `Run \`dvm wallet show\` to collect the sats or restore any signed proofs. To discard the recovery record, run \`${forced}\`.`
     );
   }
 }
@@ -155,7 +153,7 @@ async function confirmForget(
   standing: QuoteStanding,
   opts: WalletForgetQuoteOptions
 ): Promise<void> {
-  const consequence = forgetConsequence(standing);
+  const consequence = forgetConsequence(standing, entry.minting !== undefined);
   if (opts.human && process.stdin.isTTY) {
     const rl = createInterface({ input: process.stdin, output: process.stderr });
     const answer = await new Promise<string>((resolve) => {
@@ -180,7 +178,10 @@ async function confirmForget(
   );
 }
 
-function forgetConsequence(standing: QuoteStanding): string {
+function forgetConsequence(standing: QuoteStanding, hasSavedOutputs: boolean): string {
+  if (hasSavedOutputs) {
+    return "removes the saved outputs needed to recover any proofs the mint signed, so this cannot be undone";
+  }
   switch (standing.state) {
     case "paid":
     case "issued":
@@ -194,7 +195,10 @@ function forgetConsequence(standing: QuoteStanding): string {
   }
 }
 
-function forgottenConsequence(standing: QuoteStanding): string {
+function forgottenConsequence(standing: QuoteStanding, hadSavedOutputs: boolean): string {
+  if (hadSavedOutputs) {
+    return "The saved outputs were removed. Any proofs the mint signed can no longer be recovered by this wallet.";
+  }
   switch (standing.state) {
     case "paid":
       return "The mint reported it as paid; that payment can no longer be collected by this wallet.";

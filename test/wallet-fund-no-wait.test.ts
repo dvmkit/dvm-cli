@@ -484,9 +484,12 @@ describe("human-paid funding without waiting", () => {
     expect(sdk.loadAgentWallet()?.pending_mints.map((entry) => entry.quote_id)).toEqual(["quote-1"]);
   });
 
-  it("forgets an unpaid quote on request, and only then", async () => {
-    mint(null);
+  it.each(["unpaid", "gone"] as const)("forgets a %s quote with no saved outputs on request", async (state) => {
+    const fixture = mint(null);
     await runFund();
+    if (state === "gone") {
+      fixture.wallet.checkMintQuoteBolt11.mockRejectedValue(mintError("quote not found", 0));
+    }
 
     await expect(walletForgetQuote("quote-1", {})).rejects.toMatchObject({ code: "confirmation_required" });
     await expect(walletForgetQuote("no-such-quote", { yes: true })).rejects.toMatchObject({ code: "mint_quote_not_found" });
@@ -495,7 +498,7 @@ describe("human-paid funding without waiting", () => {
     await expect(
       buildProgram().parseAsync(["wallet", "forget-quote", "quote-1", "--yes"], { from: "user" })
     ).rejects.toMatchObject({ code: 0 });
-    expect(lastEvent()).toMatchObject({ status: "forgotten", quote_id: "quote-1", mint_state: "unpaid", amount_sats: 1000 });
+    expect(lastEvent()).toMatchObject({ status: "forgotten", quote_id: "quote-1", mint_state: state, amount_sats: 1000 });
     expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
   });
 
@@ -525,9 +528,14 @@ describe("human-paid funding without waiting", () => {
     expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
   });
 
-  it.each(["issuance in progress", "mint reply lost"] as const)(
-    "protects the paid quote after an unpaid forget prompt when %s",
-    async (interruption) => {
+  it.each([
+    { situation: "issuance is in progress", replyLost: false, lookupError: undefined },
+    { situation: "the mint reply was lost", replyLost: true, lookupError: undefined },
+    { situation: "the quote expired after a lost reply", replyLost: true, lookupError: mintError("quote expired", 20007) },
+    { situation: "the mint forgot the quote after a lost reply", replyLost: true, lookupError: mintError("quote not found", 0) },
+  ])(
+    "protects the paid quote after an unpaid forget prompt when $situation",
+    async ({ replyLost, lookupError }) => {
       const fixture = mint();
       const quoteId = "quote-1";
       const polling = Promise.withResolvers<void>();
@@ -550,7 +558,7 @@ describe("human-paid funding without waiting", () => {
       fixture.wallet.completeMint.mockImplementationOnce(async () => {
         issuing.resolve();
         await finishIssuance.promise;
-        if (interruption === "mint reply lost") {
+        if (replyLost) {
           fixture.states.set(quoteId, "ISSUED");
           throw Object.assign(new Error("Mint reply lost"), { name: "NetworkError" });
         }
@@ -588,10 +596,11 @@ describe("human-paid funding without waiting", () => {
           issuing.promise,
           funding.then((error) => { throw error ?? new Error("Funding ended before issuance"); }),
         ]);
-        if (interruption === "mint reply lost") {
+        if (replyLost) {
           finishIssuance.resolve();
           expect(await funding).toMatchObject({ code: "fund_mint_interrupted" });
         }
+        if (lookupError) fixture.wallet.checkMintQuoteBolt11.mockRejectedValue(lookupError);
         confirm(quoteId);
         const forgetError = await forgetting;
         expect(sdk.loadAgentWallet()?.pending_mints[0]).toMatchObject({
@@ -599,12 +608,17 @@ describe("human-paid funding without waiting", () => {
           minting: { outputs: [{ blinded_message: { B_: blinded.B_ } }] },
         });
         expect(forgetError).toMatchObject({
-          code: interruption === "mint reply lost" ? "mint_quote_collectable" : "mint_quote_busy",
+          code: replyLost ? "mint_quote_collectable" : "mint_quote_busy",
         });
-        if (interruption === "issuance in progress") {
+        if (!replyLost) {
           finishIssuance.resolve();
           expect(await funding).toBeUndefined();
           expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+        }
+        if (lookupError) {
+          await walletForgetQuote(quoteId, { yes: true, force: true });
+          expect(lastEvent()).toMatchObject({ status: "forgotten", mint_state: "gone" });
+          expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
         }
       } finally {
         paid.resolve();
