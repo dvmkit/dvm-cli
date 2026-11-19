@@ -126,6 +126,7 @@ import {
   x402RequiredFromError,
 } from "@dvmkit/sdk/internal";
 import {
+  finalizedX402DepositExpiredUnused,
   x402VoucherPendingRefusal,
 } from "./x402/batch-client";
 import {
@@ -180,9 +181,11 @@ import {
   type PaymentRequirementsV2,
   X402_BATCH_SETTLEMENT_SCHEME,
   X402_EXACT_SCHEME,
+  X402_VERSION,
   x402NetworkToCaip2,
 } from "@dvmkit/sdk/internal";
 import type { X402Wallet } from "@dvmkit/sdk/internal";
+import { isCreditRefusalWithoutX402Receipt } from "./transport/https";
 import {
   loadX402Wallet,
 } from "./x402/wallet";
@@ -1844,8 +1847,8 @@ function selectExactRequirement(
 
 /**
  * The reusable stablecoin rail. A discovery POST obtains the server-authored
- * channel terms; the signed payment header is then journalled verbatim before
- * submission and retired only after its PAYMENT-RESPONSE advances storage.
+ * channel terms. The signed payment header is journalled verbatim before
+ * submission so an uncertain outcome can be replayed after a restart.
  */
 async function fundOverX402(
   args: FundCreditArgs,
@@ -2075,6 +2078,31 @@ async function fundOverX402(
     clearPendingX402Funding(pending);
     return outcome;
   } catch (err) {
+    const correction = err instanceof DvmError ? x402RequiredFromError(err) : undefined;
+    if (
+      err instanceof DvmError &&
+      err.code === "payment_invalid" &&
+      correction?.x402Version === X402_VERSION &&
+      correction.error === "requirements_mismatch"
+    ) {
+      // The server compares requirements before looking up prior attempts at this funding.
+      // A finalized block past expiry can establish that the earlier deposit never landed.
+      if (
+        !isCreditRefusalWithoutX402Receipt(err) ||
+        !(await finalizedX402DepositExpiredUnused(pending.paymentHeader, wallet.network).catch(() => false))
+      ) {
+        return pendingX402Refusal(base, err);
+      }
+      retirePendingX402Funding(pending);
+      return {
+        ...base,
+        status: "refused",
+        error: err,
+        display:
+          "The DVM changed its x402 payment requirements. The deposit authorization expired unused, so its header was retired from replay.",
+        hint: `Re-run the funding command to request the current requirements. ${x402RetiredVoucherResidual(pending)}`,
+      };
+    }
     if (
       !corrected &&
       err instanceof DvmError &&
@@ -2090,7 +2118,6 @@ async function fundOverX402(
         // Fail closed: retain the exact authorization unless onchain non-use is proven.
       }
     }
-    const correction = err instanceof DvmError ? x402RequiredFromError(err) : undefined;
     if (correction && !corrected) {
       try {
         const recovered = await processX402BatchCorrection({
@@ -2163,15 +2190,19 @@ async function fundOverX402(
         hint: "Re-run the same funding command to resend the signed payment header, and do not request a fresh quote.",
       };
     }
-    return {
-      ...base,
-      status: "refused",
-      error: err instanceof DvmError ? err : undefined,
-      display:
-        "Prepaid-credit funding through the reusable x402 channel did not acknowledge its signed voucher. The exact header remains journalled and will be retried without increasing the authorized amount.",
-      hint: "Re-run this funding after the DVM is reachable; do not create a replacement credit.",
-    };
+    return pendingX402Refusal(base, err);
   }
+}
+
+function pendingX402Refusal(base: X402FundBase, err: unknown): CreditFundOutcome {
+  return {
+    ...base,
+    status: "refused",
+    error: err instanceof DvmError ? err : undefined,
+    display:
+      "Prepaid-credit funding through the reusable x402 channel did not acknowledge its signed voucher. The exact header remains journalled and will be retried without increasing the authorized amount.",
+    hint: "Re-run this funding after the DVM is reachable; do not create a replacement credit.",
+  };
 }
 
 /**
