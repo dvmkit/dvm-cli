@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Message } from "@dvmkit/sdk/internal";
+import { asProviderText, type Message } from "@dvmkit/sdk/internal";
 import { info } from "../src/lib/output";
 import { nextActionHuman, printNextActionHuman } from "../src/lib/next-action-human";
 import { computeNextAction, pollNextAction } from "../src/lib/next-action";
@@ -46,6 +46,16 @@ describe("human next actions", () => {
     expect(nextActionHuman(pollNextAction("watch"))).toBe(
       "Next: Provider is still working. Keep watching with `dvm messages watch`."
     );
+  });
+
+  it("drops the generic watching command when a CLI hint already gives one", () => {
+    const hint = "The wait limit (20m) was reached and the job was still running when last read. Keep watching with `dvm messages watch --wait --until 20m`.";
+    expect(nextActionHuman(pollNextAction("watch", hint))).toBe(`Next: Provider is still working: ${hint}`);
+  });
+
+  it("keeps the generic watching command after provider text that mentions a command", () => {
+    const action = { ...pollNextAction("watch"), hint: asProviderText("Run `dvm pay other` now.") };
+    expect(nextActionHuman(action)).toMatch(/Keep watching with `dvm messages watch`\.$/);
   });
 
   it("preserves the paid-timeout hint in the poll instruction", () => {
