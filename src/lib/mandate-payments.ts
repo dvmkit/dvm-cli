@@ -1,6 +1,6 @@
 import { formatFiat } from "@dvmkit/sdk";
 import { type Message } from "@dvmkit/sdk/internal";
-import { loadJob, mutateCreditPayment, type JobRecord } from "./job-store";
+import { loadJob, mutateCreditPayment, recordAnsweredPaymentRequest, type JobRecord } from "./job-store";
 import { loadMessages } from "./messages/index";
 
 type CreditPayment = NonNullable<Extract<Message, { type: "payment" }>["content"]["credit"]> & { mandate?: boolean };
@@ -40,7 +40,7 @@ export function mandateDrawTotal(job: JobRecord, history: Message[]): number {
   return total;
 }
 
-export function mandatePaymentReports(job: JobRecord | null | undefined, history: Message[]) {
+export function mandatePaymentReports(job: JobRecord | null | undefined, history: Message[], fullHistoryThrough?: number) {
   const mandate = job?.mandate;
   const currency = safeCurrency(mandate?.currency);
   const seen = new Set<number>();
@@ -63,12 +63,17 @@ export function mandatePaymentReports(job: JobRecord | null | undefined, history
     }
     const total = job ? mandateDrawTotal(job, prefix) : 0;
     const ask = asks.get(paid.request_seq);
+    // A skipped sequence could contain the ask. A full read or an observed
+    // message at that sequence can establish that the payment has no ask.
+    const requestUnverified = !ask && !seen.has(paid.request_seq) &&
+      (fullHistoryThrough === undefined || message.seq > fullHistoryThrough);
     const violations: string[] = [];
     const reasons: string[] = [];
     const breach = (field: string, reason: string) => { violations.push(field); reasons.push(reason); };
     if (!validMicro(paid.amount_micro) || paid.amount_micro === 0) breach("amount_micro", "an invalid payment amount");
-    if (!ask) breach("request_seq", "a payment for a charge missing from the job's requests");
-    else if (!ask.content.credit) breach("ask_unpriced", "a payment for a charge with no credit price");
+    if (!ask) {
+      if (!requestUnverified) breach("request_seq", "a payment for a charge missing from the job's requests");
+    } else if (!ask.content.credit) breach("ask_unpriced", "a payment for a charge with no credit price");
     else {
       if (paid.amount_micro > ask.content.credit.amount_micro)
         breach("ask_amount_micro", `more than the provider requested for this charge (${money(ask.content.credit.amount_micro, currency)})`);
@@ -98,19 +103,29 @@ export function mandatePaymentReports(job: JobRecord | null | undefined, history
     const display = `${amount.display} paid from your credit under your standing limit. ` +
       (mandate ? `Running credit total ${money(total, currency)} of ${money(mandate.max_total_micro, currency)} budget.`
         : "The signed standing limit is not available locally, so its limits could not be checked.") +
+      (requestUnverified ? " The link to the payment request could not be verified from the available messages." : "") +
       (overchargeDisplay ? ` ${overchargeDisplay}` : "");
     reports.push({ amount_msats: ask?.content.amount_msats ?? 0, seq: message.seq,
       request_seq: paid.request_seq, mandate: true as const, amount, limits_checked: !!mandate,
+      ...(requestUnverified ? { request_seq_unverified: true as const } : {}),
       total_micro: total, budget_micro: mandate?.max_total_micro, currency,
       overcharged: violations.length > 0, violated_limits: violations, overcharge_display: overchargeDisplay, display });
   }
   return reports;
 }
 
-export function mandatePaymentSummary(job: JobRecord | null | undefined, messages: Message[]): {
-  mandate_payments?: ReturnType<typeof mandatePaymentReports>; overcharged?: boolean; violated_limits?: string[]; display?: string;
+export type MandatePaymentReport = ReturnType<typeof mandatePaymentReports>[number];
+
+export function readMandatePaymentReport(message: Message, jobId?: string): MandatePaymentReport | undefined {
+  if (!mandateCredit(message)) return undefined;
+  return mandatePaymentReports(jobId ? loadJob(jobId) : undefined,
+    [message, ...(jobId ? loadMessages(jobId) : [])]).find((entry) => entry.seq === message.seq);
+}
+
+export function mandatePaymentSummary(job: JobRecord | null | undefined, messages: Message[], fullHistoryThrough?: number): {
+  mandate_payments?: MandatePaymentReport[]; overcharged?: boolean; violated_limits?: string[]; display?: string;
 } {
-  const payments = mandatePaymentReports(job, messages);
+  const payments = mandatePaymentReports(job, messages, fullHistoryThrough);
   if (!payments.length) return {};
   const violated = [...new Set(payments.flatMap((payment) => payment.violated_limits))];
   return { mandate_payments: payments, ...(violated.length ? {
@@ -125,11 +140,14 @@ export function recordMandatePayments(jobId: string, history: Message[]): void {
     for (const message of history) {
       const credit = mandateCredit(message);
       if (!credit) continue;
+      const request = history.find((entry) => entry.seq === credit.request_seq);
+      const ask = request?.from === "provider" && request.type === "payment-request" ? request : undefined;
+      if ((!request || ask) && Number.isSafeInteger(credit.request_seq) && credit.request_seq >= 0 && credit.request_seq < message.seq)
+        recordAnsweredPaymentRequest(job, credit.request_seq);
       if (job.pendingCreditPayment?.authorization.request_seq === credit.request_seq)
         delete job.pendingCreditPayment;
       const booked = job.mandatePaymentSeqs?.includes(message.seq) === true;
-      const ask = history.find((entry) => entry.seq === credit.request_seq && entry.type === "payment-request");
-      const msats = ask?.type === "payment-request" ? ask.content.amount_msats : 0;
+      const msats = ask?.content.amount_msats ?? 0;
       const valuations = job.mandatePaymentMsats ??= {};
       const previous = valuations[message.seq] ?? 0;
       // A cursor can expose the payment before a full-history read recovers its ask.

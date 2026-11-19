@@ -1,10 +1,14 @@
-import { mandateCredit, mandatePaymentReports } from "./mandate-payments";
+import { mandateCredit, mandatePaymentReports, type MandatePaymentReport } from "./mandate-payments";
 import { loadJob } from "./job-store";
 import { asProviderText, type Message } from "@dvmkit/sdk/internal";
 import { loadMessages } from "./messages/index";
 import { observePaymentBookings, type PaymentBooking } from "./payment-bookings";
 import { paidConfirmationDisplay } from "./payment-copy";
 import type { AutoPayment, StreamLoopOptions } from "./stream-loop";
+
+export interface WaitPaymentLineOptions extends StreamLoopOptions {
+  onMessage?: (message: Message, mandateReport?: MandatePaymentReport) => void;
+}
 
 /**
  * Orders a waiting command's auto-payment reports against its message reports.
@@ -15,7 +19,7 @@ import type { AutoPayment, StreamLoopOptions } from "./stream-loop";
  * starting cursor, so the ask always comes first; anything still waiting is
  * reported when the command finishes, including on an error.
  */
-export function createWaitPaymentLines(opts: StreamLoopOptions) {
+export function createWaitPaymentLines(opts: WaitPaymentLineOptions) {
   const report = opts.onAutoPayment;
   const emitted = new Set<number>();
   const reported = new Set<string>();
@@ -38,16 +42,18 @@ export function createWaitPaymentLines(opts: StreamLoopOptions) {
   }) : () => undefined;
 
   return {
-    onMessage(message: Message): void {
-      opts.onMessage?.(message);
-      emitted.add(message.seq);
+    onMessage(message: Message, fullHistoryThrough?: number): void {
       observed.push(message);
-      if (opts.persistLocalState !== false && mandateCredit(message)) {
-        const history = [...loadMessages(opts.jobId), ...observed];
-        const payment = mandatePaymentReports(loadJob(opts.jobId), history).find((entry) => entry.seq === message.seq);
-        if (payment) write({ ...payment, rail: "credit",
-          reason: { _source: "provider", text: "" } }, payment.request_seq, true);
-      }
+      const useLocalState = opts.persistLocalState !== false;
+      const payment = mandateCredit(message) ? mandatePaymentReports(
+        useLocalState ? loadJob(opts.jobId) : undefined,
+        useLocalState ? [...observed, ...loadMessages(opts.jobId)] : observed,
+        fullHistoryThrough,
+      ).find((entry) => entry.seq === message.seq) : undefined;
+      opts.onMessage?.(message, payment);
+      emitted.add(message.seq);
+      if (useLocalState && payment) write({ ...payment, rail: "credit",
+        reason: { _source: "provider", text: "" } }, payment.request_seq, true);
       const pending = waiting.get(message.seq);
       if (pending) write(pending, message.seq);
     },

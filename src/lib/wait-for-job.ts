@@ -2,6 +2,7 @@ import { isTransientJobReadError } from "./job-read-error";
 import { hasUnsavedJobState } from "./job-persistence";
 import { withJobPaymentLock } from "./payment-lock";
 import { DvmError, type Message } from "@dvmkit/sdk/internal";
+import type { ContentStatus } from "./job-content";
 import { loadJob } from "./job-store";
 import { createMessageAppendSession, maxSeq } from "./messages/index";
 import { loadAnsweredYieldSeqs, answeredYieldSeqs, reconcilePaymentRequestHistory, settleRecordedPayments, JOB_READ_TIMEOUT_MS } from "./yield-state";
@@ -10,21 +11,27 @@ import { isTerminalJobStatus, paymentInFlightHint, pollNextAction, type NextActi
 import { formatDurationMs } from "./duration";
 import { guidanceJobArg } from "./provider-output";
 import { streamLoop, type StreamLoopOptions, type StreamLoopResult } from "./stream-loop";
-import { createWaitPaymentLines } from "./wait-payment-lines";
+import { createWaitPaymentLines, type WaitPaymentLineOptions } from "./wait-payment-lines";
 
-export async function waitForJob(opts: StreamLoopOptions, durationMs: number, now: () => number = Date.now): Promise<StreamLoopResult> {
+export interface WaitForJobResult extends StreamLoopResult {
+  /** Highest sequence in a provider history read that started at zero. */
+  fullHistoryThrough?: number;
+}
+
+export async function waitForJob(opts: WaitPaymentLineOptions, durationMs: number, now: () => number = Date.now): Promise<WaitForJobResult> {
   if (!opts.onAutoPayment) return waitAttached(opts, durationMs, now);
   const payments = createWaitPaymentLines(opts);
   try {
-    return await waitAttached({ ...opts, onMessage: payments.onMessage, onAutoPayment: payments.onAutoPayment }, durationMs, now);
+    return await waitAttached({ ...opts, onAutoPayment: payments.onAutoPayment }, durationMs, now, payments);
   } finally {
     payments.finish();
   }
 }
 
-async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: () => number): Promise<StreamLoopResult> {
+async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: () => number,
+  payments?: ReturnType<typeof createWaitPaymentLines>): Promise<WaitForJobResult> {
   const deadline = now() + durationMs;
-  const result: StreamLoopResult = {
+  const result: WaitForJobResult = {
     messages: [], autoPayments: [], refunds: [], cursor: opts.afterSeq,
     nextAction: pollNextAction(opts.jobId),
   };
@@ -39,7 +46,8 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
   const onMessage = (message: Message) => {
     if (emittedSeqs.has(message.seq)) return;
     emittedSeqs.add(message.seq);
-    opts.onMessage?.(message);
+    if (payments) payments.onMessage(message, result.fullHistoryThrough);
+    else opts.onMessage?.(message);
   };
   const messageAppendSession = opts.persistLocalState === false ? undefined
     : (opts.messageAppendSession ?? createMessageAppendSession(opts.jobId));
@@ -63,7 +71,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
   }
   while (now() < deadline && !hasUnsavedJobState()) {
     const readOptions = () => ({ jobToken: opts.jobToken, timeoutMs: Math.max(1, Math.min(idleTimeoutMs, deadline - now())) });
-    const snapshot = await readWithRetry(() => opts.transport.status(opts.jobId, opts.provider, readOptions()));
+    const snapshot: ContentStatus | undefined = await readWithRetry(() => opts.transport.status(opts.jobId, opts.provider, readOptions()));
     if (!snapshot) break;
     seenRunning = !isTerminalJobStatus(snapshot.status);
     if (isTerminalJobStatus(snapshot.status)) {
@@ -71,7 +79,9 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       result.nextAction = null;
       const history = await readWithRetry(() => opts.transport.getMessages(opts.jobId, result.cursor, opts.provider, readOptions()));
       if (!history) break;
-      const tail = history.filter((message) => message.seq > result.cursor);
+      if (result.cursor === 0 && snapshot.content_available !== false)
+        result.fullHistoryThrough = maxSeq(history, 0);
+      const tail = history.filter((message) => message.seq > result.cursor).sort((a, b) => a.seq - b.seq);
       collectMessages(tail);
       result.cursor = maxSeq(tail, result.cursor);
       for (const message of tail) onMessage(message);
@@ -118,6 +128,8 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       }
       if (!history) break;
       messageAppendSession?.append(history);
+      if (messageAppendSession && snapshot.content_available !== false)
+        result.fullHistoryThrough = maxSeq(history, 0);
       if (opts.persistLocalState !== false) await settleRecordedPayments(opts.jobId);
       const answered = opts.persistLocalState === false ? new Set<number>() : loadAnsweredYieldSeqs(opts.jobId);
       for (const seq of answeredYieldSeqs(history)) answered.add(seq);

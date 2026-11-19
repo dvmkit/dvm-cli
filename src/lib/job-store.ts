@@ -620,14 +620,17 @@ function clearPaymentCreditRefusals(job: JobRecord, requestSeq?: number): void {
 export function markPaymentRequestAnswered(jobId: string, requestSeq: number): void {
   mutateJobs((jobs) => {
     const job = jobs.find((entry) => entry.id === jobId);
-    if (!job) return;
-    clearPaymentCreditRefusals(job, requestSeq);
-    if (!job.paidPaymentRequestSeqs?.includes(requestSeq))
-      (job.paidPaymentRequestSeqs ??= []).push(requestSeq);
-    job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs?.filter((seq) => seq !== requestSeq);
-    if (!job.inFlightPaymentRequestSeqs?.length) delete job.inFlightPaymentRequestSeqs;
-    clearPaymentRequestStartTime(job, requestSeq);
+    if (job) recordAnsweredPaymentRequest(job, requestSeq);
   }, true);
+}
+
+export function recordAnsweredPaymentRequest(job: JobRecord, requestSeq: number): void {
+  clearPaymentCreditRefusals(job, requestSeq);
+  if (!job.paidPaymentRequestSeqs?.includes(requestSeq))
+    (job.paidPaymentRequestSeqs ??= []).push(requestSeq);
+  job.inFlightPaymentRequestSeqs = job.inFlightPaymentRequestSeqs?.filter((seq) => seq !== requestSeq);
+  if (!job.inFlightPaymentRequestSeqs?.length) delete job.inFlightPaymentRequestSeqs;
+  clearPaymentRequestStartTime(job, requestSeq);
 }
 
 /** Stop re-sending a held payment; it is no longer in flight, but still held. */

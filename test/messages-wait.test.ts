@@ -48,8 +48,18 @@ import { loadJob, saveJob, bookCreditPayment, markPaymentRequestInFlight, markPa
 import { createWaitPaymentLines } from "../src/lib/wait-payment-lines";
 const provider = { endpoint: "https://dvm.example" };
 const policy: JobPolicy = { maxTotalMsats: 100_000, autoPayBelowMsats: 2000, maxIncrementMsats: 0, maxPayments: 5 };
+const mandate = { max_total_micro: 4000, max_ask_micro: 2000, expires_at_ms: 60_000,
+  credit_id: "credit", draw_id: "draw", currency: "usd", signed_data: {} };
 function msg(seq: number, type: string, content: unknown = {}): Message {
   return { seq, from: "provider", timestamp: seq, type, content } as Message;
+}
+function mandateAsk(seq: number): Message {
+  return msg(seq, "payment-request", { amount_msats: 1000, reason: "Next piece",
+    credit: { amount_micro: 1000, currency: "usd" } });
+}
+function mandatePayment(seq: number, requestSeq: number): Message {
+  return { ...msg(seq, "payment", { credit: { mandate: true, credit_id: "credit", draw_id: "draw",
+    request_seq: requestSeq, payment_id: `mandate:${seq}`, amount_micro: 1000, currency: "usd" } }), from: "requester" };
 }
 // Like the HTTPS transport, the fake reports each message through onMessage as it reads it.
 function transport(batches: Message[][], status = "processing") {
@@ -507,6 +517,70 @@ describe("messages wait", () => {
     expect(output()).toMatchObject({ event: "result", wallet_remaining: walletRemaining });
     expect(seams.lines[0]).not.toHaveProperty("wallet_remaining");
   });
+
+  it("reports and records every mandate-paid ask when asks and payments share stream batches", async () => {
+    vi.useFakeTimers();
+    const jobId = "wait-mandate-batches";
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, mandate });
+    transport([
+      [mandateAsk(1), mandatePayment(2, 1), msg(3, "working")],
+      [mandateAsk(4), mandatePayment(5, 4), mandateAsk(6), mandatePayment(7, 6), msg(8, "complete")],
+    ]);
+
+    const pending = messages(jobId, { wait: true, until: "10s" });
+    await vi.runAllTimersAsync();
+    await pending;
+
+    const reports = [1, 4, 6].map((request_seq) => expect.objectContaining({ request_seq,
+      amount_msats: 1000, overcharged: false, violated_limits: [] }));
+    expect(streamed("message").filter((line) => line.type === "payment")).toEqual(reports);
+    expect(streamed("payment")).toEqual(reports);
+    expect(output().mandate_payments).toEqual(reports);
+    expect(JSON.stringify(seams.lines)).not.toContain("Provider overcharge");
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([1, 4, 6]);
+    expect(seams.pay).not.toHaveBeenCalled();
+  });
+
+  it("marks a mandate ask link unverified when wait resumes after an uncached ask", async () => {
+    const jobId = "wait-mandate-resume";
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, mandate });
+    const stream = transport([[mandatePayment(2, 1), msg(3, "complete")]]);
+
+    await messages(jobId, { wait: true, after: "1" });
+
+    expect(stream.mock.calls[0][1]).toBe(1);
+    expect(streamedSeqs()).toEqual([2, 3]);
+    const report = expect.objectContaining({ request_seq: 1, request_seq_unverified: true, overcharged: false,
+      violated_limits: [], display: expect.stringContaining("could not be verified") });
+    expect(streamed("message")[0]).toEqual(report);
+    expect(streamed("payment")).toEqual([report]);
+    expect(output().mandate_payments).toEqual([report]);
+    expect(JSON.stringify(seams.lines)).not.toContain("Provider overcharge");
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([1]);
+  });
+
+  it.each(["batch", "wait", "human"])("reports a mandate payment whose ask is absent from full provider history (%s)",
+    async (mode) => {
+      const jobId = `mandate-missing-ask-${mode}`;
+      saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, mandate });
+      transport([], "completed");
+      vi.mocked(seams.transport.getMessages).mockResolvedValue([mandatePayment(2, 1), msg(3, "complete")]);
+
+      await messages(jobId, mode === "wait" ? { wait: true } : { stream: false, human: mode === "human" });
+
+      expect(vi.mocked(seams.transport.getMessages).mock.calls[0][1]).toBe(0);
+      if (mode === "human") {
+        expect(seams.info).toHaveBeenCalledWith(expect.stringContaining("Provider overcharge"));
+        return;
+      }
+      const report = expect.objectContaining({ request_seq: 1, overcharged: true, violated_limits: ["request_seq"],
+        display: expect.stringContaining("Provider overcharge") });
+      expect(output()).toMatchObject({ overcharged: true, violated_limits: ["request_seq"], mandate_payments: [report] });
+      const paymentMessage = mode === "wait" ? streamed("message")[0] : output().messages[0];
+      expect(paymentMessage).toEqual(report);
+      expect(paymentMessage).not.toHaveProperty("request_seq_unverified");
+      if (mode === "wait") expect(streamed("payment")).toEqual([report]);
+    });
 
   it.each([["--after 0", { after: "0" }, undefined], ["the stored cursor", {}, 4]] as const)(
     "writes a recovered credit payment after its ask (%s)", async (_label, flags, messageCursor) => {

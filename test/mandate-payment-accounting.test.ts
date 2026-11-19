@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import type { Message } from "@dvmkit/sdk/internal";
-import { loadJob, saveJob } from "../src/lib/job-store";
+import { loadJob, markPaymentRequestInFlight, saveJob } from "../src/lib/job-store";
 import { mandatePaymentReports, recordMandatePayments } from "../src/lib/mandate-payments";
 
 const job = { id: "accounted", endpoint: "https://provider.example", status: "processing" as const, submittedAt: 1,
@@ -17,10 +17,28 @@ const paid: Message = { seq: 4, from: "requester", timestamp: 1000, type: "payme
 it("backfills a mandate payment's missing ask valuation without counting the payment or its dollars twice", () => {
   saveJob(job);
   recordMandatePayments(job.id, [paid]);
+  expect(loadJob(job.id)?.paidPaymentRequestSeqs).toEqual([3]);
   recordMandatePayments(job.id, [ask(3, 200_000), paid]);
   recordMandatePayments(job.id, [ask(3, 200_000), paid]);
   expect(loadJob(job.id)).toMatchObject({ paymentsHonoured: 2, totalPaidMsats: 300_000,
-    paidUsdMicro: 300_000, paidUsdMsats: 300_000 });
+    paidUsdMicro: 300_000, paidUsdMsats: 300_000, paidPaymentRequestSeqs: [3] });
+});
+
+it("repairs a previously booked mandate payment without consuming a held submission", () => {
+  const older = { ...job, id: "accounted-older", mandatePaymentSeqs: [4], mandatePaymentMsats: { 4: 200_000 },
+    paidPaymentRequestSeqs: [2], totalPaidMsats: 300_000, paymentsHonoured: 2, paidUsdMicro: 300_000 };
+  const submission = { rail: "x402" as const, content: { x402_payment: "signed" }, requestAmountMsats: 200_000,
+    amountMsats: 200_000, btcRate: 100_000 };
+  saveJob(older);
+  markPaymentRequestInFlight(older.id, 3, submission);
+
+  recordMandatePayments(older.id, [paid, paid]);
+
+  const saved = loadJob(older.id);
+  expect(saved).toMatchObject({ paidPaymentRequestSeqs: [2, 3], paymentsHonoured: 2, totalPaidMsats: 300_000,
+    paidUsdMicro: 300_000, unconfirmedPaymentSubmissions: { 3: submission } });
+  expect(saved?.inFlightPaymentRequestSeqs).toBeUndefined();
+  expect(saved?.inFlightPaymentRequestStartedAtMs).toBeUndefined();
 });
 
 it("counts only the bound credit draw, including upfront, against the mandate budget", () => {
@@ -32,14 +50,22 @@ it("counts only the bound credit draw, including upfront, against the mandate bu
 });
 
 
+const progress: Message = { seq: 3, from: "provider", timestamp: 1000, type: "working", content: {} };
 it.each([
   { limit: "ask_amount_micro", messages: [ask(3, 100_000), paid] },
   { limit: "duplicate_request_seq", messages: [ask(3, 200_000), paid, { ...paid, seq: 5 }] },
-  { limit: "request_seq", messages: [paid] },
+  { limit: "request_seq", messages: [progress, paid] },
 ])("reports the mandate payment's own ask contract: $limit", ({ limit, messages }) => {
   const reports = mandatePaymentReports(job, messages as Message[]);
   expect(reports.at(-1)).toMatchObject({ overcharged: true, violated_limits: expect.arrayContaining([limit]) });
   expect(reports.at(-1)?.display).not.toContain(limit);
+});
+
+it("reports a signed-limit breach when the payment request link is unverified", () => {
+  const limited = { ...job, mandate: { ...job.mandate, max_ask_micro: 100_000 } };
+  expect(mandatePaymentReports(limited, [paid])).toMatchObject([{
+    request_seq_unverified: true, limits_checked: true, overcharged: true, violated_limits: ["max_ask_micro"],
+  }]);
 });
 
 it("does not put an untrusted provider denomination into relayable payment text", () => {

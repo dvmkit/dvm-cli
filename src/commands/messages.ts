@@ -1,4 +1,4 @@
-import { mandateCredit, mandatePaymentReports, mandatePaymentSummary } from "../lib/mandate-payments";
+import { mandateCredit, mandatePaymentSummary, readMandatePaymentReport, type MandatePaymentReport } from "../lib/mandate-payments";
 import { observedSettlementFields, renderSettlementHuman } from "../lib/receipt-capture";
 import { readUnansweredPaymentRequest } from "../lib/unanswered-payment";
 import { providerCurrency } from "../lib/provider-currency";
@@ -42,7 +42,7 @@ import {
 } from "../lib/save-artifact";
 import { parseDurationMs } from "../lib/duration";
 import { loadAnsweredYieldSeqs, settleRecordedPayments } from "../lib/yield-state";
-import { waitForJob } from "../lib/wait-for-job";
+import { waitForJob, type WaitForJobResult } from "../lib/wait-for-job";
 import { streamLoop, type AutoPayment } from "../lib/stream-loop";
 import { persistStreamOutcome, streamTerminalStatus } from "../lib/stream-outcome";
 import { createDvmTransport } from "../lib/transport/index";
@@ -77,6 +77,15 @@ async function messagesWithAccess(
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
   const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);
+
+  function mandateOutput(batch: Message[], fullHistoryThrough?: number) {
+    const bySeq = new Map<number, MandatePaymentReport>();
+    if ((opts.human || access.endpointOverridden) && !batch.some(mandateCredit)) return { summary: {}, bySeq };
+    const summary = mandatePaymentSummary(access.endpointOverridden ? undefined : loadJob(jobId),
+      access.endpointOverridden ? batch : [...batch, ...loadMessages(jobId)], fullHistoryThrough);
+    for (const report of summary.mandate_payments ?? []) bySeq.set(report.seq, report);
+    return { summary: access.endpointOverridden ? {} : summary, bySeq };
+  }
 
   function actionFromMessages(batch: Message[]): NextAction {
     return readNextAction(jobId, batch, { ignoreLocalState: access.endpointOverridden, context: stored ?? undefined });
@@ -166,6 +175,7 @@ async function messagesWithAccess(
     });
     transport.close();
 
+    const mandate = mandateOutput(msgs, after === 0 && providerStatus?.content_available !== false ? newCursor : undefined);
     if (opts.human) {
       renderSettlementHuman(settlement);
       if (unanswered) info(unanswered.display);
@@ -174,7 +184,7 @@ async function messagesWithAccess(
         info("No new messages.");
       } else {
         for (const msg of msgs) {
-          formatMessageHuman(msg, jobId, artifactSession);
+          formatMessageHuman(msg, jobId, artifactSession, mandate.bySeq.get(msg.seq));
         }
         finalizeProgressLine();
       }
@@ -184,9 +194,9 @@ async function messagesWithAccess(
         jobId,
         ...content,
         ...settlement,
-        ...(!access.endpointOverridden ? mandatePaymentSummary(loadJob(jobId), loadMessages(jobId)) : {}),
+        ...mandate.summary,
         ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
-        messages: msgs.map((msg) => serialize(msg, access.endpointOverridden ? undefined : jobId)),
+        messages: msgs.map((msg) => serialize(msg, mandate.bySeq.get(msg.seq))),
         cursor: newCursor,
         next_action: resolvedAction,
         ...(await refundJsonField(refunds)),
@@ -226,11 +236,11 @@ async function messagesWithAccess(
       },
     }),
     ...(streamEvents && {
-      onMessage: (msg: Message) => {
+      onMessage: (msg: Message, mandateReport?: MandatePaymentReport) => {
         // An ask is repeated while it may still need an answer; anything else already written is not.
         if (msg.seq <= skipThrough && !((msg.type === "payment-request" || msg.type === "prompt") &&
           !loadAnsweredYieldSeqs(jobId).has(msg.seq))) return;
-        jsonEvent({ event: "message", ...serialize(msg, access.endpointOverridden ? undefined : jobId) });
+        jsonEvent({ event: "message", ...serialize(msg, mandateReport) });
         messageLines++;
         lastDelivered = Math.max(lastDelivered, msg.seq);
       },
@@ -241,7 +251,7 @@ async function messagesWithAccess(
     }),
   };
   const waitDeadline = waitDuration === undefined ? undefined : Date.now() + waitDuration;
-  let result;
+  let result: WaitForJobResult;
   try {
     result = opts.wait
       ? await waitForJob(streamOptions, waitDuration!)
@@ -289,6 +299,7 @@ async function messagesWithAccess(
   });
   transport.close();
 
+  const mandate = mandateOutput(result.messages, result.fullHistoryThrough);
   if (opts.human) {
     renderSettlementHuman(settlement);
     if (unanswered) info(unanswered.display);
@@ -298,7 +309,7 @@ async function messagesWithAccess(
     } else {
       for (const msg of result.messages) {
         if (msg.type === "progress") continue; // already rendered live
-        formatMessageHuman(msg, jobId, artifactSession);
+        formatMessageHuman(msg, jobId, artifactSession, mandate.bySeq.get(msg.seq));
       }
       finalizeProgressLine();
     }
@@ -309,7 +320,7 @@ async function messagesWithAccess(
       jobId,
       ...content,
       ...settlement,
-      ...(!access.endpointOverridden ? mandatePaymentSummary(loadJob(jobId), loadMessages(jobId)) : {}),
+      ...mandate.summary,
       ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
       message_count: messageLines,
       auto_payment_count: paymentLines,
@@ -322,9 +333,9 @@ async function messagesWithAccess(
       jobId,
       ...content,
       ...settlement,
-      ...(!access.endpointOverridden ? mandatePaymentSummary(loadJob(jobId), loadMessages(jobId)) : {}),
+      ...mandate.summary,
       ...(unanswered ? { unanswered_payment_request: unanswered } : {}),
-      messages: result.messages.map((msg) => serialize(msg, access.endpointOverridden ? undefined : jobId)),
+      messages: result.messages.map((msg) => serialize(msg, mandate.bySeq.get(msg.seq))),
       cursor: result.cursor,
       next_action: resolvedAction,
       ...(result.autoPayments.length > 0 ? { auto_payments: result.autoPayments } : {}),
@@ -344,10 +355,10 @@ export function serializeMessageForOutput(msg: Message): Record<string, unknown>
 }
 
 export function serializeJobMessageForOutput(msg: Message, jobId?: string): Record<string, unknown> {
-  return serialize(msg, jobId);
+  return serialize(msg, readMandatePaymentReport(msg, jobId));
 }
 
-function serialize(msg: Message, jobId?: string): Record<string, unknown> {
+function serialize(msg: Message, mandateReport?: MandatePaymentReport): Record<string, unknown> {
   const fromProvider = !isCallerMessage(msg);
   const base = providerFields({ seq: msg.seq, from: msg.from, timestamp: msg.timestamp, type: msg.type, content: msg.content },
     ["seq", "from", "timestamp", ...(fromProvider ? ["type", "content"] : [])]);
@@ -398,11 +409,8 @@ function serialize(msg: Message, jobId?: string): Record<string, unknown> {
       };
     }
     case "payment": {
-      if (mandateCredit(msg)) {
-        const report = mandatePaymentReports(jobId ? loadJob(jobId) : undefined,
-          [...(jobId ? loadMessages(jobId) : []), msg]).find((entry) => entry.seq === msg.seq);
-        if (report) return { ...base, ...report, content: { ...msg.content } };
-      }
+      const report = mandateReport ?? readMandatePaymentReport(msg);
+      if (report) return { ...base, ...report, content: { ...msg.content } };
       // Requester payments must not borrow provider refund/change wording.
       const amount = paymentAmount(msg);
       const display = msg.from === "provider"
