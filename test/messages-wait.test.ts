@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { HttpsTransport } from "../src/lib/transport/https";
+import { nextActionHuman } from "../src/lib/next-action-human";
 import { DvmError, type JobPolicy, type Message, type Transport } from "@dvmkit/sdk/internal";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1167,6 +1168,11 @@ it("names the wait limit when --until expires on a running job with nothing in f
   expect(action.hint).toContain("wait limit (30s)");
   expect(action.hint).toContain(`dvm messages ${jobId} --wait`);
   expect(action.hint).not.toMatch(/payment|finalising|pay again/i);
+  // The human line gives one command: the --wait one, not also a bare poll.
+  const human = nextActionHuman(action) ?? "";
+  expect(human.match(/Keep watching with/g)).toHaveLength(1);
+  expect(human).toContain(`\`dvm messages ${jobId} --wait --until 30s\``);
+  expect(human).not.toContain(`\`dvm messages ${jobId}\``);
 });
 
 // Figures from a USD budget converted once at submit: 961 sats paid, a 69-sat ask,

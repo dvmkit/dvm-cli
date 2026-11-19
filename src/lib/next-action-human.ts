@@ -35,6 +35,10 @@ export function nextActionHuman(action: NextAction): string | null {
       const sentence = detail
         ? `Provider is still working: ${detail}${/[.!?]$/.test(detail) ? "" : "."}`
         : "Provider is still working.";
+      // A CLI-authored hint that already gives a command is the one to run; a
+      // second, weaker command after it would be the one an agent copies.
+      // Provider text never suppresses the CLI's own guidance.
+      if (typeof action.hint === "string" && /`dvm [^`]+`/.test(detail)) return `Next: ${sentence}`;
       return `Next: ${sentence} Keep watching with \`dvm messages ${shellQuoteArg(action.job_id)}\`.`;
     }
     case "refund":
