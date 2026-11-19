@@ -70,7 +70,11 @@ export interface SweepOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
-type PendingMintOutcome = SweepEntryOutcome | { kind: "busy" } | { kind: "no_longer_pending" };
+type PendingMintOutcome =
+  | Exclude<SweepEntryOutcome, { kind: "error" }>
+  | { kind: "error"; entry: PendingMint; cause: unknown }
+  | { kind: "busy" }
+  | { kind: "no_longer_pending" };
 
 interface PendingMintOptions extends SweepOptions {
   /** Stop starting or retrying quote-status reads at this time. */
@@ -103,9 +107,13 @@ export async function sweepPendingMints(opts: SweepOptions = {}): Promise<SweepR
   for (const entry of wallet.pending_mints) {
     const outcome = await reconcilePendingMint(entry, opts);
     if (outcome.kind === "no_longer_pending") continue;
-    outcomes.push(outcome.kind === "busy"
-      ? { kind: "error", entry, error: "Another command is checking this mint quote." }
-      : outcome);
+    if (outcome.kind === "busy") {
+      outcomes.push({ kind: "error", entry, error: "Another command is checking this mint quote." });
+    } else if (outcome.kind === "error") {
+      outcomes.push({ kind: "error", entry: outcome.entry, error: errorMessage(outcome.cause) });
+    } else {
+      outcomes.push(outcome);
+    }
   }
 
   return {
@@ -138,7 +146,7 @@ export async function reconcilePendingMint(
     release = await lockfile.lock(`${WALLET_FILE}.mint-${key}`, { realpath: false, stale: 30_000, retries: 0 });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ELOCKED") return { kind: "busy" };
-    return { kind: "error", entry, error: errorMessage(err) };
+    return { kind: "error", entry, cause: err };
   }
 
   try {
@@ -165,7 +173,7 @@ export async function reconcilePendingMint(
     }
     return outcome;
   } catch (err) {
-    return { kind: "error", entry, error: errorMessage(err) };
+    return { kind: "error", entry, cause: err };
   } finally {
     await release().catch(() => undefined);
   }
@@ -199,7 +207,7 @@ async function processEntry(
   wallet: AgentWallet,
   entry: PendingMint,
   opts: PendingMintOptions
-): Promise<SweepEntryOutcome | { kind: "no_longer_pending" }> {
+): Promise<Exclude<PendingMintOutcome, { kind: "busy" }>> {
   const now = opts.now ?? Date.now;
   const nowMs = now();
   if (opts.pollDeadlineMs !== undefined && nowMs >= opts.pollDeadlineMs) {
@@ -232,7 +240,7 @@ async function processEntry(
         getWalletForMint(entry.mint)
       );
     }
-    return { kind: "error", entry, error: errorMessage(err) };
+    return { kind: "error", entry, cause: err };
   }
 
   const state: MintQuoteState = quoteResponse.state;
@@ -259,7 +267,7 @@ async function processEntry(
       }
       return { kind: "restored", entry, proofs: restoredProofs };
     } catch (err) {
-      return { kind: "error", entry, error: errorMessage(err) };
+      return { kind: "error", entry, cause: err };
     }
   }
 
@@ -316,7 +324,7 @@ async function processEntry(
       if (mintQuoteRefusal(err) === "expired") {
         return { kind: "paid_refused", entry, reason: "quote_expired" };
       }
-      return { kind: "error", entry, error: errorMessage(err) };
+      return { kind: "error", entry, cause: err };
     }
   }
 
@@ -359,7 +367,7 @@ async function finalAnswer(
   entry: PendingMint,
   reason: MintQuoteDropReason,
   getCashuWallet: () => Promise<Wallet>
-): Promise<SweepEntryOutcome> {
+): Promise<Extract<PendingMintOutcome, { kind: "expired" | "restored" | "paid_refused" | "error" }>> {
   if (!entry.minting) return { kind: "expired", entry, reason };
   try {
     const restored = await restoreFromMintingState(
@@ -370,13 +378,13 @@ async function finalAnswer(
     );
     if (restored.length > 0) return { kind: "restored", entry, proofs: restored };
   } catch (err) {
-    return { kind: "error", entry, error: errorMessage(err) };
+    return { kind: "error", entry, cause: err };
   }
   if (reason === "mint_expired") return { kind: "paid_refused", entry, reason: "quote_expired" };
   return {
     kind: "error",
     entry,
-    error:
+    cause:
       reason === "mint_unknown"
         ? "The mint reported this quote paid earlier and no longer knows it; nothing could be restored, so the quote is kept."
         : "The mint reported this quote paid earlier and now reports it unpaid; nothing could be restored, so the quote is kept.",
