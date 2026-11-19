@@ -242,6 +242,24 @@ describe("client upgrade responses", () => {
     expect(error.data).toBeUndefined();
   });
 
+  it("reports a credit timeout when the 426 response stalls mid-body", async () => {
+    globalThis.fetch = vi.fn(async (_input, init) => {
+      const signal = init?.signal;
+      if (!signal) throw new Error("Expected a credit request deadline");
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"error":'));
+          signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+        },
+      });
+      return new Response(body, { status: 426 });
+    });
+
+    await expect(new HttpsTransport().credit(
+      { endpoint: "https://service.example" }, { op: "drain" }, undefined, { timeoutMs: 50 }
+    )).rejects.toMatchObject({ code: "timeout", message: "Credit operation timed out." });
+  });
+
   it("renders human guidance only from validated public requirement fields", () => {
     expect(
       clientUpgradeHumanGuidance({
