@@ -90,6 +90,18 @@ export type PaymentResult =
   | "over-budget"
   | "payment-cap-exceeded";
 
+interface PaymentRequestOptions {
+  jobToken?: string;
+  rail?: RailFlag;
+  maxCashuPrincipalSats?: number;
+  requestSeq?: number;
+  approval?: PaymentApproval;
+  creditRecoveryOnly?: boolean;
+  budget?: string;
+  useStoredPolicy?: boolean;
+  mandateReadTimeoutMs?: () => number;
+}
+
 export async function handlePaymentRequest(
   jobId: string,
   request: PaymentRequestContent,
@@ -98,7 +110,7 @@ export async function handlePaymentRequest(
   provider: ProviderRef,
   // `jobToken` is the anonymous-flow per-job token threaded into
   // every `payment` `sendMessage`.
-  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean; budget?: string; useStoredPolicy?: boolean }
+  opts?: PaymentRequestOptions
 ): Promise<PaymentResult> {
   const seq = opts?.requestSeq;
   // An explicit `dvm pay` on an ask blocked from automatic payment is a
@@ -251,7 +263,7 @@ async function handleLockedPaymentRequest(
   policy: JobBudgetPolicy,
   transport: Transport,
   provider: ProviderRef,
-  opts?: { jobToken?: string; rail?: RailFlag; maxCashuPrincipalSats?: number; requestSeq?: number; approval?: PaymentApproval; creditRecoveryOnly?: boolean; budget?: string; useStoredPolicy?: boolean },
+  opts?: PaymentRequestOptions,
   beforeNewPayment?: () => void
 ): Promise<PaymentResult> {
   if (hasPendingAcceptedJobAccess(jobId, provider.endpoint)) throw new DvmError("local_job_state_unsaved",
@@ -273,7 +285,7 @@ async function handleLockedPaymentRequest(
       `Read \`dvm status ${shellQuoteArg(jobId)}\` before sending a new payment.`);
   }
   if (job?.stopRequested && opts?.requestSeq !== undefined && provider.endpoint && sameEndpoint(job.endpoint, provider.endpoint))
-    await guardMandatePayment(jobId, opts.requestSeq, transport, provider, opts.jobToken ?? job.jobToken);
+    await guardMandatePayment(jobId, opts.requestSeq, transport, provider, opts.jobToken ?? job.jobToken, opts.mandateReadTimeoutMs);
   if (job && hasUnknownUpfrontRail(job))
     throw new DvmError("upfront_rail_unknown", "The original upfront rail charge is unknown or conflicting.",
       "Recover the original job price before authorizing more payments.");
@@ -298,7 +310,7 @@ async function handleLockedPaymentRequest(
       job.creditBinding.creditId !== job.creditOnly || opts?.rail !== undefined))
     throw new DvmError("credit_only_unavailable", "This job may spend only its original prepaid credit.");
   if (matchingEndpoint && opts?.requestSeq !== undefined)
-    await guardMandatePayment(jobId, opts.requestSeq, transport, provider, jobToken);
+    await guardMandatePayment(jobId, opts.requestSeq, transport, provider, jobToken, opts.mandateReadTimeoutMs);
   let balanceRefused = false;
   const booked = matchingEndpoint ? bookedCreditPayment(jobId, opts?.requestSeq) : undefined;
   if (booked && (booked.request.amount_msats !== request.amount_msats ||
