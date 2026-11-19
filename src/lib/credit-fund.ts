@@ -126,6 +126,7 @@ import {
   x402RequiredFromError,
 } from "@dvmkit/sdk/internal";
 import {
+  finalizedX402DepositExpiredUnused,
   x402VoucherPendingRefusal,
 } from "./x402/batch-client";
 import {
@@ -2085,10 +2086,10 @@ async function fundOverX402(
       correction.error === "requirements_mismatch"
     ) {
       // The server compares requirements before looking up prior attempts at this funding.
-      // Expiry and an unused on-chain nonce establish that the earlier deposit cannot land.
+      // A finalized block past expiry can establish that the earlier deposit never landed.
       if (
         !isCreditRefusalWithoutX402Receipt(err) ||
-        !(await canReplaceExpiredX402Deposit({ wallet, paymentHeader: pending.paymentHeader }).catch(() => false))
+        !(await finalizedX402DepositExpiredUnused(pending.paymentHeader, wallet.network).catch(() => false))
       ) {
         return pendingX402Refusal(base, err);
       }

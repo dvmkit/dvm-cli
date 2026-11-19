@@ -1,8 +1,90 @@
-import { DvmError } from "@dvmkit/sdk/internal";
+import {
+  DvmError,
+  type PendingX402Funding,
+  resolveRpcHttpTransportOptions,
+  resolveX402ChannelRpc,
+  X402_BATCH_SETTLEMENT_SCHEME,
+  X402_VERSION,
+  x402NetworkByCaip2,
+  type X402VoucherPendingState,
+  x402VoucherPendingState,
+} from "@dvmkit/sdk/internal";
+import { eip3009ABI, isBatchSettlementDepositPayload } from "@x402/evm";
+import { createPublicClient, encodeAbiParameters, http, isAddress, isHash, keccak256 } from "viem";
+import * as chains from "viem/chains";
 
-import { type PendingX402Funding } from "@dvmkit/sdk/internal";
+export async function finalizedX402DepositExpiredUnused(
+  paymentHeader: string,
+  walletNetwork: string
+): Promise<boolean> {
+  const payment = JSON.parse(Buffer.from(paymentHeader, "base64").toString("utf8")) as {
+    x402Version?: number;
+    accepted?: { scheme?: string; network?: string; asset?: string };
+    payload?: unknown;
+  };
+  const { accepted, payload } = payment;
+  if (
+    payment.x402Version !== X402_VERSION ||
+    accepted?.scheme !== X402_BATCH_SETTLEMENT_SCHEME ||
+    typeof accepted.network !== "string" ||
+    !isBatchSettlementDepositPayload(payload)
+  ) {
+    return false;
+  }
 
-import { type X402VoucherPendingState, x402VoucherPendingState } from "@dvmkit/sdk/internal";
+  const { payer, token } = payload.channelConfig;
+  const { channelId } = payload.voucher;
+  const authorization = payload.deposit.authorization.erc3009Authorization;
+  const network = x402NetworkByCaip2(accepted.network);
+  if (
+    !network ||
+    accepted.asset?.toLowerCase() !== network.usdc.toLowerCase() ||
+    token?.toLowerCase() !== network.usdc.toLowerCase() ||
+    !isAddress(payer, { strict: false }) ||
+    !isHash(channelId) ||
+    !authorization ||
+    !isHash(authorization.salt) ||
+    typeof authorization.validBefore !== "string" ||
+    !/^\d+$/.test(authorization.validBefore)
+  ) {
+    return false;
+  }
+
+  const chain = chains[network.viemChain as keyof typeof chains];
+  const rpc = resolveX402ChannelRpc(accepted.network, walletNetwork, chain.rpcUrls.default.http[0]);
+  const client = createPublicClient({
+    chain,
+    transport: http(
+      rpc.url,
+      resolveRpcHttpTransportOptions(rpc.source, process.env.DVM_X402_RPC_HEADERS_JSON)
+    ),
+  });
+  if ((await client.getChainId()) !== chain.id) return false;
+
+  // Expiry and non-use must hold in the same finalized block. A read at the
+  // head can miss a deposit that lands before the chain reaches its deadline.
+  const block = await client.getBlock({ blockTag: "finalized" });
+  if (
+    !block.hash ||
+    !isHash(block.hash) ||
+    typeof block.timestamp !== "bigint" ||
+    block.timestamp <= BigInt(authorization.validBefore)
+  ) {
+    return false;
+  }
+  const nonce = keccak256(encodeAbiParameters(
+    [{ type: "bytes32" }, { type: "uint256" }],
+    [channelId, BigInt(authorization.salt)]
+  ));
+  return (await client.readContract({
+    address: network.usdc,
+    abi: eip3009ABI,
+    functionName: "authorizationState",
+    args: [payer, nonce],
+    blockHash: block.hash,
+    requireCanonical: true,
+  })) === false;
+}
 
 /** Compatibility adapter retaining caller commands until consumer migration. */
 export function x402VoucherPendingRefusal(

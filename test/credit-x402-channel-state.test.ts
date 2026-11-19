@@ -1,8 +1,9 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { decodePaymentSignatureHeader, encodePaymentResponseHeader } from "@x402/core/http";
 import type { PaymentRequired } from "@x402/core/types";
+import { isBatchSettlementDepositPayload } from "@x402/evm";
 import { computeChannelId } from "@x402/evm/batch-settlement/client";
-import { keccak256, toBytes } from "viem";
+import { concatHex, keccak256, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -24,11 +25,14 @@ import {
 } from "@dvmkit/sdk/internal";
 
 const external = vi.hoisted(() => ({
-  credit: vi.fn(), describe: vi.fn(), close: vi.fn(), readContract: vi.fn(),
+  credit: vi.fn(), describe: vi.fn(), close: vi.fn(),
+  getBlock: vi.fn(), getChainId: vi.fn(), readContract: vi.fn(),
 }));
 vi.mock("viem", async (original) => ({
   ...await original<typeof import("viem")>(),
-  createPublicClient: () => ({ readContract: external.readContract }),
+  createPublicClient: () => ({
+    getBlock: external.getBlock, getChainId: external.getChainId, readContract: external.readContract,
+  }),
 }));
 vi.mock("../src/lib/transport", () => ({ createDvmTransport: () => external }));
 vi.mock("../src/lib/x402/wallet", async (original) => ({
@@ -152,6 +156,7 @@ afterEach(() => {
 
 describe("x402 funding with changed requirements", () => {
   const scope = { endpoint, callerPubkey: signer.pubkey, creditId };
+  const finalizedBlockHash = `0x${"ab".repeat(32)}`;
   const previous = required("200000");
   const fresh = {
     ...previous,
@@ -168,7 +173,7 @@ describe("x402 funding with changed requirements", () => {
     });
   }
 
-  async function journalDeposit(expired: boolean) {
+  async function journalDeposit(expired: boolean, finalizedOffset = expired ? 1n : -1n) {
     const { scheme: _scheme, ...payment } = await createX402BatchPayment({
       wallet, paymentRequired: previous, ...scope, depositMicro: 200_000,
     });
@@ -177,8 +182,13 @@ describe("x402 funding with changed requirements", () => {
       requestedAt: Date.now(),
     };
     recordPendingX402Funding(pending);
+    const deadline = BigInt(payment.authorizationValidBefore!);
+    external.getChainId.mockResolvedValue(84532);
+    external.getBlock.mockResolvedValue({
+      hash: finalizedBlockHash, number: 123n, timestamp: deadline + finalizedOffset,
+    });
     if (expired) {
-      vi.spyOn(Date, "now").mockReturnValue((Number(payment.authorizationValidBefore) + 2) * 1000);
+      vi.spyOn(Date, "now").mockReturnValue(Number(deadline + 2n) * 1000);
     }
     return pending;
   }
@@ -212,8 +222,16 @@ describe("x402 funding with changed requirements", () => {
 
     await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
 
-    expect(external.readContract).toHaveBeenCalledWith(expect.objectContaining({
+    const { payload } = decodePaymentSignatureHeader(pending.paymentHeader);
+    if (!isBatchSettlementDepositPayload(payload) || !payload.deposit.authorization.erc3009Authorization) {
+      throw new Error("Expected a signed USDC deposit");
+    }
+    const { salt } = payload.deposit.authorization.erc3009Authorization;
+    expect(external.getBlock).toHaveBeenCalledExactlyOnceWith({ blockTag: "finalized" });
+    expect(external.readContract).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       address: config.token, functionName: "authorizationState",
+      args: [account.address, keccak256(concatHex([channelId, salt]))],
+      blockHash: finalizedBlockHash, requireCanonical: true,
     }));
     expect(loadResumableX402Funding(scope)).toBeUndefined();
     expect(listPendingX402FundingsForChannel(channelId)).toEqual([
@@ -236,14 +254,18 @@ describe("x402 funding with changed requirements", () => {
 
   it.each([
     { name: "an unexpired deposit", expired: false },
+    { name: "a chain still before the deadline despite the CLI clock", expired: true, finalizedOffset: -1n },
+    { name: "a finalized block at the deadline", expired: true, finalizedOffset: 0n },
     { name: "a consumed nonce", expired: true, consumed: true },
     { name: "an unavailable chain", expired: true, chainUnavailable: true },
+    { name: "an RPC on the wrong chain", expired: true, wrongChain: true },
     { name: "a settlement response", expired: true, settlementHeader: "PAYMENT-RESPONSE" },
     { name: "a legacy settlement response", expired: true, settlementHeader: "X-PAYMENT-RESPONSE" },
     { name: "a server failure", expired: true, status: 503 },
     { name: "a transport failure", expired: true, transportFailure: true },
-  ])("keeps the journal for $name", async ({ expired, consumed, chainUnavailable, settlementHeader, status, transportFailure }) => {
-    const pending = await journalDeposit(expired);
+  ])("keeps the journal for $name", async ({ expired, finalizedOffset, consumed, chainUnavailable, wrongChain, settlementHeader, status, transportFailure }) => {
+    const pending = await journalDeposit(expired, finalizedOffset);
+    if (wrongChain) external.getChainId.mockResolvedValue(8453);
     if (chainUnavailable) external.readContract.mockRejectedValue(new Error("Chain unavailable"));
     else external.readContract.mockResolvedValue(consumed ?? false);
     const fetch = vi.fn<typeof globalThis.fetch>();
