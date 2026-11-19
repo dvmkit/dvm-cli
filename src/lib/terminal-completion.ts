@@ -1,4 +1,4 @@
-import { shellQuoteArg, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
+import { shellQuoteArg, type Message, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
 import {
   buildCompletionHintFields, completionFromMessages, completionSnapshot,
   type JobCompletion, nextStepHint,
@@ -15,6 +15,7 @@ export async function readTerminalCompletion(args: {
   ref: ProviderRef;
   jobToken?: string;
   timeoutMs?: number;
+  readMessages?: () => Promise<Message[]>;
 }): Promise<JobCompletion> {
   const { jobId, status, saved, transport, ref, jobToken } = args;
   let completion = completionSnapshot(status);
@@ -24,7 +25,7 @@ export async function readTerminalCompletion(args: {
     delete completion.payloadIn;
     try {
       // Inspect the full log without consuming output owed to a later messages read.
-      const messages = await transport.getMessages(jobId, 0, ref, {
+      const messages = args.readMessages ? await args.readMessages() : await transport.getMessages(jobId, 0, ref, {
         jobToken, timeoutMs: args.timeoutMs ?? 5000,
       });
       const derived = messages.length === 0 && saved?.hasArtifacts !== undefined

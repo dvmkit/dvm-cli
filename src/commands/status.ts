@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { rememberStandingStop, standingStopOutput } from "../lib/mandate-wait";
 import { storedMandateSummary } from "../lib/mandate-payments";
 import { readTerminalCompletion, terminalCompletionOutput } from "../lib/terminal-completion";
@@ -11,7 +12,7 @@ import { finalizeProgressLine } from "../lib/progress-bar";
 import { createArtifactSaveSession } from "../lib/save-artifact";
 import { type PaymentPolicyContext, isTerminalJobStatus, type NextAction, pollNextAction } from "../lib/next-action";
 import { readNextAction } from "../lib/read-next-action";
-import { settleRecordedPayments } from "../lib/yield-state";
+import { answeredYieldSeqs, settleRecordedPayments } from "../lib/yield-state";
 import { completionSnapshot, type JobCompletion } from "../lib/completion-hints";
 import {
   type JobStatus,
@@ -37,8 +38,10 @@ import {
 } from "../lib/output";
 import {
   type JobRecord,
+  type StatusMessageHistory,
   loadJob,
   markJobTerminal,
+  recordStatusMessageHistory,
   updateObservedJob,
 } from "../lib/job-store";
 import {
@@ -46,6 +49,7 @@ import {
 } from "../lib/receipt-verify";
 
 import { type ContentStatus, jobContentFields } from "../lib/job-content";
+import { isTransientJobReadError } from "../lib/job-read-error";
 import { takeCreditNoticeFields } from "../lib/credit-notice";
 import { settleCreditAfterRead } from "../lib/credit-topup";
 import { providerCurrency } from "../lib/provider-currency";
@@ -59,11 +63,13 @@ import {
   resolveJobAccess,
   withJobTokenRedaction,
 } from "../lib/job-access";
-import { appendMessages, maxSeq } from "../lib/messages/index";
+import { appendMessages, loadMessages, maxSeq } from "../lib/messages/index";
 import { progressNotice } from "../lib/progress-notice";
-import { createDvmTransport } from "../lib/transport/index";
+import { createDvmTransport, type HttpsTransport } from "../lib/transport/index";
 import { dvmIdentity } from "./dvm-identity";
 import { serializeJobMessageForOutput } from "./messages";
+
+const MAX_STATUS_GAP_PROBES = 2;
 
 export interface StatusOptions extends JobAccessOptions {
   human?: boolean;
@@ -83,6 +89,8 @@ async function statusWithAccess(
   access: ResolvedJobAccess
 ): Promise<void> {
   const { stored, ref, jobToken } = access;
+  const timeout = opts.timeout ? Number(opts.timeout) * 1000 : 5000;
+  const readOptions = { timeoutMs: timeout, jobToken };
 
   // Replay terminal evidence locally. Legacy failed/cancelled snapshots may
   // backfill artifact counts; --messages still explicitly fetches unread output.
@@ -126,7 +134,13 @@ async function statusWithAccess(
     if (terminalStatus !== "completed" && completion.hasArtifacts === undefined && content?.content_available !== false) {
       completion = await readTerminalCompletion({
         jobId, status: { ...completion, ...content, status: terminalStatus },
-        transport, ref, jobToken,
+        transport, ref, ...readOptions,
+        ...(stored.mandate && { readMessages: async () => {
+          const { batch, history } = await readStatusMessages(jobId, access, transport, {
+            ...readOptions, status: terminalStatus,
+          });
+          return history ?? batch;
+        } }),
       });
       markJobTerminal(jobId, terminalStatus, completion);
     }
@@ -140,33 +154,25 @@ async function statusWithAccess(
     return;
   }
 
-  const timeout = opts.timeout ? Number(opts.timeout) * 1000 : 5000;
-
   const transport = createDvmTransport();
 
   progressNotice("Checking job status...", opts.human);
 
   // thread the per-job opaque token (issued for anonymous callers
   // at create-time) into status / messages reads as `X-Job-Token`.
-  const result: ContentStatus = await transport.status(jobId, ref, { timeoutMs: timeout, jobToken });
+  const result: ContentStatus = await transport.status(jobId, ref, readOptions);
   if (stored && !access.endpointOverridden) captureDrawFundingReceipts(jobId, result.drawFundingReceipts, { endpoint: ref.endpoint });
 
   if (!access.endpointOverridden && result.stop_requested) rememberStandingStop(jobId, result.display);
-  let msgs: Message[] = [];
-  let newCursor: number | undefined;
-  if (opts.messages || (stored?.mandate && !access.endpointOverridden)) {
-    const after = access.endpointOverridden || !opts.messages ? 0 : (stored?.messageCursor ?? 0);
-    msgs = await transport.getMessages(jobId, after, ref, { timeoutMs: timeout, jobToken });
-    if (!access.endpointOverridden) {
-      appendMessages(jobId, msgs);
-      await settleRecordedPayments(jobId, after === 0 && result.content_available !== false ? maxSeq(msgs, 0) : undefined);
-    }
-    if (opts.messages) newCursor = maxSeq(msgs, after);
-  }
+  const { batch: msgs, history, cursor: newCursor } = opts.messages || (stored?.mandate && !access.endpointOverridden)
+    ? await readStatusMessages(jobId, access, transport, {
+      ...readOptions, status: result.status, deliver: opts.messages, contentAvailable: result.content_available,
+      hasArtifacts: result.hasArtifacts,
+    })
+    : { batch: [] };
 
-  const nextAction = await resolveNextAction(jobId, result.status, msgs, transport, ref, {
-    timeoutMs: timeout,
-    jobToken,
+  const nextAction = await resolveNextAction(jobId, result.status, msgs, history, transport, ref, {
+    ...readOptions,
     context: access.endpointOverridden ? undefined : stored ?? undefined,
     ignoreLocalState: access.endpointOverridden,
   });
@@ -179,7 +185,8 @@ async function statusWithAccess(
   if (reasonUnavailable && (result.status === "failed" || result.status === "cancelled")) {
     const savedReason = !access.endpointOverridden && stored?.status === result.status
       ? stored.completion?.message : undefined;
-    const terminal = msgs.findLast((message) => message.type === "complete" || message.type === "cancel" || message.type === "decline");
+    const terminal = (history ?? msgs).findLast((message) =>
+      message.type === "complete" || message.type === "cancel" || message.type === "decline");
     const reason = savedReason ?? (terminal?.type === "cancel" || terminal?.type === "decline" ? terminal.content.reason : undefined);
     if (reason !== undefined) completion.message = reason;
   }
@@ -187,6 +194,7 @@ async function statusWithAccess(
     completion = await readTerminalCompletion({
       jobId, status: { ...result, ...completion }, transport, ref, jobToken, timeoutMs: timeout,
       saved: !access.endpointOverridden && stored?.status === result.status ? stored.completion : undefined,
+      ...(history && { readMessages: async () => history }),
     });
   }
   let receipt: ReceiptCapture | undefined;
@@ -245,7 +253,8 @@ async function statusWithAccess(
   }
 
   const unanswered = await readUnansweredPaymentRequest(jobId, result.status, access, transport, {
-    messages: msgs, timeoutMs: timeout, localOnly: result.content_available === false,
+    messages: history ?? msgs, fullHistory: history !== undefined,
+    timeoutMs: timeout, localOnly: result.content_available === false,
   });
   transport.close();
 
@@ -386,31 +395,133 @@ async function renderStatus(
   providerJobJson(output, !!stored);
 }
 
-/**
- * Derive `next_action` from a status snapshot — always a value,
- * `null` only on a terminal job.
- *
- * The snapshot says *that* the job is waiting on the caller but not *what for*,
- * so `awaiting-input` falls back to the message log to build the faithful
- * `respond` / `pay` action — the `--messages` batch when it already carries the
- * pending yield, else a fresh read from seq 0 (the yield may predate the
- * caller's cursor). That read deliberately neither appends nor advances the
- * stored cursor — it would swallow messages a later `dvm messages` must return.
- */
+async function readStatusMessages(
+  jobId: string,
+  access: ResolvedJobAccess,
+  transport: HttpsTransport,
+  { status, deliver, contentAvailable, hasArtifacts, ...readOptions }: {
+    status: string; timeoutMs: number; jobToken?: string; deliver?: boolean;
+    contentAvailable?: boolean; hasArtifacts?: boolean;
+  }
+): Promise<{ batch: Message[]; history?: Message[]; cursor?: number }> {
+  const stored = access.endpointOverridden ? null : access.stored;
+  const deliveryAfter = stored?.messageCursor ?? 0;
+  const useCache = !!stored?.mandate && contentAvailable !== false;
+  const cached = useCache ? loadMessages(jobId) : [];
+  const checkpoint = stored?.statusMessageHistory;
+  // Cancellation evidence and legacy terminal snapshots can still need a full history read.
+  const useSparseHistory = !isTerminalJobStatus(status) || (status === "completed" && typeof hasArtifacts === "boolean");
+  const covered = statusHistoryCursor(cached, useSparseHistory ? checkpoint : undefined);
+  // A delivery cursor can skip messages the payment reconciler still needs.
+  const after = deliver ? (useCache ? Math.min(deliveryAfter, covered) : deliveryAfter) : covered;
+  const deadline = performance.now() + readOptions.timeoutMs;
+  const tail = await transport.getMessages(jobId, after, access.ref, readOptions);
+  const recovered: Message[] = [];
+  let promptGapScan = checkpoint?.promptGapScan;
+  if (useCache && status === "awaiting-input" && checkpoint) {
+    const gaps = openPromptGaps([...cached, ...tail], after);
+    const previousScan = promptGapScan;
+    const remaining = previousScan
+      ? gaps.filter((gap) => gap.after > previousScan.after && gap.after < previousScan.through)
+      : [];
+    // Keep each scan's endpoint fixed so new gaps cannot postpone revisiting older ones.
+    const through = remaining.length && previousScan ? previousScan.through : after;
+    for (const gap of (remaining.length ? remaining : gaps).slice(0, MAX_STATUS_GAP_PROBES)) {
+      const timeoutMs = readOptions.timeoutMs > 0 ? Math.floor(deadline - performance.now()) : readOptions.timeoutMs;
+      if (readOptions.timeoutMs > 0 && timeoutMs < 1) break;
+      try {
+        const messages = await transport.getMessages(jobId, gap.after, access.ref, {
+          ...readOptions, timeoutMs, beforeSeq: gap.before,
+        });
+        for (const message of messages) recovered.push(message);
+      } catch (error) {
+        if (!isTransientJobReadError(error)) throw error;
+      }
+      // A transient failure gets another turn on the next scan.
+      promptGapScan = { after: gap.after, through };
+    }
+  }
+  const history = contentAvailable !== false && (useCache || after === 0)
+    ? [...new Map([...cached.filter((message) => message.seq <= after), ...recovered, ...tail]
+      .map((message) => [message.seq, message])).values()].sort((a, b) => a.seq - b.seq)
+    : undefined;
+
+  if (!access.endpointOverridden) {
+    appendMessages(jobId, [...recovered, ...tail]);
+    const fullHistoryThrough = history === undefined ? undefined : Math.max(after, history.at(-1)?.seq ?? 0);
+    await settleRecordedPayments(jobId, fullHistoryThrough);
+    if (useCache && !isTerminalJobStatus(status) && history && fullHistoryThrough && Number.isSafeInteger(fullHistoryThrough)) {
+      recordStatusMessageHistory(jobId, {
+        through: fullHistoryThrough, sequenceDigest: historySequenceDigest(history, fullHistoryThrough),
+        ...(promptGapScan && { promptGapScan }),
+      }, checkpoint);
+    }
+  }
+  const batch = deliver && after < deliveryAfter ? tail.filter((message) => message.seq > deliveryAfter) : tail;
+  const cursor = deliver ? Math.max(deliveryAfter, maxSeq(batch, deliveryAfter)) : undefined;
+  return { batch, history, cursor };
+}
+
+function statusHistoryCursor(cached: Message[], checkpoint?: StatusMessageHistory): number {
+  const sequences = new Set(cached.map((message) => message.seq));
+  const contiguous = contiguousSequenceThrough(sequences, 0);
+  if (!checkpoint || !Number.isSafeInteger(checkpoint.through) ||
+    checkpoint.through <= contiguous || !sequences.has(checkpoint.through) ||
+    checkpoint.sequenceDigest !== historySequenceDigest(cached, checkpoint.through)) return contiguous;
+
+  return contiguousSequenceThrough(sequences, checkpoint.through);
+}
+
+function openPromptGaps(cached: Message[], through: number): Array<{ after: number; before: number }> {
+  // Pending payments hold newer SDK history back. A later sequence can be visible while
+  // a reply awaits verification, so recheck gaps that could answer an open prompt.
+  const answered = answeredYieldSeqs(cached);
+  let previous = through;
+  for (const message of cached) {
+    if (message.from === "provider" && message.type === "prompt" && !answered.has(message.seq)) {
+      previous = Math.min(previous, message.seq);
+    }
+  }
+  if (previous >= through) return [];
+
+  const sequences = [...new Set(cached.map((message) => message.seq)
+    .filter((seq) => seq > previous && seq <= through))].sort((a, b) => a - b);
+  if (sequences.at(-1) !== through) sequences.push(through + 1);
+  const gaps = [];
+  for (const seq of sequences) {
+    if (seq > previous + 1) gaps.push({ after: previous, before: seq });
+    previous = seq;
+  }
+  return gaps;
+}
+
+function contiguousSequenceThrough(sequences: Set<number>, after: number): number {
+  while (after < Number.MAX_SAFE_INTEGER && sequences.has(after + 1)) after++;
+  return after;
+}
+
+function historySequenceDigest(messages: Message[], through: number): string {
+  const sequences = [...new Set(messages.map((message) => message.seq).filter((seq) => seq <= through))].sort((a, b) => a - b);
+  return createHash("sha256").update(JSON.stringify(sequences)).digest("hex");
+}
+
 async function resolveNextAction(
   jobId: string,
   status: string,
   fetched: Message[],
+  history: Message[] | undefined,
   transport: Transport,
   ref: ProviderRef,
   opts: { timeoutMs: number; jobToken?: string; context?: PaymentPolicyContext; ignoreLocalState: boolean }
 ): Promise<NextAction> {
   if (isTerminalJobStatus(status)) return null;
   if (status === "awaiting-input") {
+    // An unanswered prompt or charge can predate the delivery cursor.
+    if (history) return readNextAction(jobId, history, opts) ?? pollNextAction(jobId);
     const fromBatch = readNextAction(jobId, fetched, opts);
     if (fromBatch) return fromBatch;
-    const history = await transport.getMessages(jobId, 0, ref, opts);
-    return readNextAction(jobId, history, opts) ?? pollNextAction(jobId);
+    const fullLog = await transport.getMessages(jobId, 0, ref, opts);
+    return readNextAction(jobId, fullLog, opts) ?? pollNextAction(jobId);
   }
   return pollNextAction(jobId);
 }

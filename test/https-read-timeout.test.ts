@@ -16,6 +16,15 @@ const reads = [
     expected: [],
   },
   {
+    name: "message snapshot",
+    message: "Message poll timed out.",
+    invoke: (endpoint: string, timeoutMs?: number) =>
+      new HttpsTransport().getMessages("job-1", 0, { endpoint }, { timeoutMs, idleTimeout: true }),
+    bodies: [{ label: "messages JSON", statusCode: 200, partialBody: '{"messages":[' }],
+    completed: '{"messages":[]}',
+    expected: [],
+  },
+  {
     name: "status",
     message: "Status check timed out.",
     invoke: (endpoint: string, timeoutMs?: number) =>
@@ -87,6 +96,90 @@ describe.each(reads)("HTTPS $name deadlines", (read) => {
     release?.();
     await expect(result).resolves.toEqual(read.expected);
   });
+});
+
+it("downloads a snapshot whose body keeps making progress past the idle timeout", async () => {
+  const artifact = { seq: 8, from: "provider", timestamp: 1, type: "artifact",
+    content: { name: "résultat.bin", data: "abcd".repeat(65_536) } };
+  const body = Buffer.from(JSON.stringify({ messages: [artifact] }));
+  vi.useFakeTimers();
+  try {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, options) => new Response(new ReadableStream({
+      start(controller) {
+        const first = body.indexOf(Buffer.from("é")) + 1;
+        const chunkSize = Math.ceil((body.length - first) / 9);
+        let offset = first;
+        controller.enqueue(body.subarray(0, first));
+        const send = setInterval(() => {
+          const end = offset + chunkSize;
+          controller.enqueue(body.subarray(offset, end));
+          offset = end;
+          if (end >= body.length) {
+            clearInterval(send);
+            controller.close();
+          }
+        }, 100);
+        options?.signal?.addEventListener("abort", () => {
+          clearInterval(send);
+          controller.error(options.signal?.reason);
+        }, { once: true });
+      },
+    })));
+    const snapshot = new HttpsTransport().getMessages("job-1", 0, { endpoint: "https://provider.invalid" },
+      { timeoutMs: 500, idleTimeout: true });
+    await Promise.all([
+      expect(snapshot).resolves.toEqual([artifact]),
+      vi.advanceTimersByTimeAsync(1_000),
+    ]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("stops a bounded message read at the cached sequence and cancels the stream", async () => {
+  const reply = { seq: 3, from: "requester", timestamp: 1, type: "response",
+    content: { prompt_id: "question", text: "Yes" } };
+  const cached = { seq: 4, from: "provider", timestamp: 1, type: "artifact",
+    content: { name: "cached.bin", data: "abcd" } };
+  const frames = [reply, cached].map((message) => Buffer.from(`data: ${JSON.stringify(message)}\n\n`));
+  let pulled = 0;
+  const cancel = vi.fn();
+  const body = new ReadableStream({
+    pull(controller) {
+      const frame = frames[pulled++];
+      if (frame) controller.enqueue(frame);
+      else controller.error(new Error("Read beyond the cached sequence"));
+    },
+    cancel,
+  }, { highWaterMark: 0 });
+  const endpoint = "https://provider.invalid";
+  const fetch = vi.spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(new Response(body, { headers: { "Content-Type": "text/event-stream" } }))
+    .mockRejectedValue(new Error("Unexpected extra request"));
+
+  await expect(new HttpsTransport().getMessages("job-1", 2, { endpoint }, { beforeSeq: 4, timeoutMs: 500 }))
+    .resolves.toEqual([reply]);
+  expect(fetch).toHaveBeenCalledExactlyOnceWith(`${endpoint}/v1/job/job-1/messages?after=2`, expect.anything());
+  expect(new Headers(fetch.mock.lastCall?.[1]?.headers).get("accept")).toBe("text/event-stream");
+  expect(pulled).toBe(2);
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it.each([
+  { name: "ends early", stream: (frame: string) => new Response(frame, { headers: { "Content-Type": "text/event-stream" } }) },
+  { name: "is refused", stream: () => new Response("Not acceptable", { status: 406 }) },
+])("uses a snapshot for a bounded message read if the event stream $name", async ({ stream }) => {
+  const prompt = { seq: 3, from: "provider", timestamp: 1, type: "prompt", content: { id: "choice", text: "Pick one" } };
+  const reply = { seq: 4, from: "requester", timestamp: 1, type: "response",
+    content: { prompt_id: "choice", text: "First" } };
+  const cached = { seq: 5, from: "provider", timestamp: 1, type: "working", content: {} };
+  const fetch = vi.spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(stream(`data: ${JSON.stringify(prompt)}\n\n`))
+    .mockResolvedValueOnce(Response.json({ messages: [prompt, reply, cached] }));
+
+  await expect(new HttpsTransport().getMessages("job-1", 2, { endpoint: "https://provider.invalid" },
+    { beforeSeq: 5, timeoutMs: 500 })).resolves.toEqual([prompt, reply]);
+  expect(fetch).toHaveBeenCalledTimes(2);
 });
 
 describe("HTTPS refused read connections", () => {

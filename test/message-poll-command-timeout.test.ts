@@ -44,7 +44,7 @@ describe("message poll command deadlines", () => {
       "job-1",
       0,
       { endpoint: "https://dvm.example" },
-      { timeoutMs: 1_250, jobToken: "ab".repeat(32) }
+      { timeoutMs: 1_250, jobToken: "ab".repeat(32), idleTimeout: true }
     );
   });
 
