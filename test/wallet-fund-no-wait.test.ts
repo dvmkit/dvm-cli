@@ -219,12 +219,15 @@ describe("human-paid funding without waiting", () => {
     expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
   });
 
-  it("collects a payment from the last poll interval before a strict mint expires", async () => {
+  it.each([
+    { description: "before a strict mint expires", paymentLeadMs: 750, strictExpiry: true, expectedStates: ["UNPAID", "PAID"] },
+    { description: "at expiry when the mint still issues", paymentLeadMs: 250, strictExpiry: false, expectedStates: ["UNPAID", "UNPAID", "PAID"] },
+  ])("collects a payment from the last poll interval $description", async ({ paymentLeadMs, strictExpiry, expectedStates }) => {
     const realNow = Date.now;
     const expiry = Math.ceil(realNow() / 1000) + 1;
     const expiresAt = expiry * 1000;
     const initialPollAt = expiresAt - 1_500;
-    const paidAt = expiresAt - 750;
+    const paidAt = expiresAt - paymentLeadMs;
     let firstPollStarted: number | undefined;
     vi.spyOn(Date, "now").mockImplementation(() => initialPollAt + (firstPollStarted === undefined ? 0 : realNow() - firstPollStarted));
     const fixture = mint(expiry);
@@ -236,15 +239,18 @@ describe("human-paid funding without waiting", () => {
       return { quote, request: "lnbc10u1fake", expiry, state };
     });
     const finish = fixture.wallet.completeMint.getMockImplementation()!;
+    let issuanceAt: number | undefined;
     fixture.wallet.completeMint.mockImplementation(async () => {
-      if (Date.now() >= expiresAt) throw mintError("quote is expired", 20007);
+      issuanceAt = Date.now();
+      if (strictExpiry && issuanceAt >= expiresAt) throw mintError("quote is expired", 20007);
       return finish();
     });
 
     await runFund(fundArgs("--collect-for", "10s"));
 
     expect(lastEvent()).toMatchObject({ status: "minted", quote_id: "quote-1", sats_minted: 1000 });
-    expect(observed).toEqual(["UNPAID", "PAID"]);
+    expect(observed).toEqual(expectedStates);
+    if (!strictExpiry) expect(issuanceAt).toBeGreaterThanOrEqual(expiresAt);
     expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
   });
 
