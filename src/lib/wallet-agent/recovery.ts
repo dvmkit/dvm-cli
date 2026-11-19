@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import { setTimeout as sleepFor } from "node:timers/promises";
 
-import type { Wallet } from "@cashu/cashu-ts";
+import type { MintQuoteBolt11Response, Proof, Wallet } from "@cashu/cashu-ts";
 import { MintQuoteState } from "@cashu/cashu-ts";
 import lockfile from "proper-lockfile";
 
@@ -29,9 +29,20 @@ import {
   withWalletLock,
 } from "@dvmkit/sdk/internal";
 
+export interface WalletPendingMint extends PendingMint {
+  reserve?: {
+    lock_pubkey: string;
+    refund_pubkey: string;
+    reserved_for: string;
+    locktime_seconds: number;
+    /** Set with the blinded outputs so replay preserves the original locktime. */
+    t_expire_ms?: number;
+  };
+}
+
 export type SweepEntryOutcome =
-  | { kind: "minted"; entry: PendingMint; proofs: AgentProof[] }
-  | { kind: "restored"; entry: PendingMint; proofs: AgentProof[] }
+  | { kind: "minted"; entry: WalletPendingMint; proofs: AgentProof[]; denominations: number[] }
+  | { kind: "restored"; entry: WalletPendingMint; proofs: AgentProof[] }
   | { kind: "already_issued"; entry: PendingMint }
   | { kind: "expired"; entry: PendingMint; reason: MintQuoteDropReason }
   | { kind: "still_pending"; entry: PendingMint; past_expiry?: PastExpiry }
@@ -77,6 +88,8 @@ type PendingMintOutcome =
   | { kind: "no_longer_pending" };
 
 interface PendingMintOptions extends SweepOptions {
+  /** A foreground payment poll already saw PAID. Recheck if outputs are on disk. */
+  paidQuote?: MintQuoteBolt11Response;
   /** Stop starting or retrying quote-status reads at this time. */
   pollDeadlineMs?: number;
   /** Bound wallet lock acquisition when collection has a caller deadline. */
@@ -205,7 +218,7 @@ async function withMintWriteLock<T>(deadlineMs: number | undefined, write: () =>
 
 async function processEntry(
   wallet: AgentWallet,
-  entry: PendingMint,
+  entry: WalletPendingMint,
   opts: PendingMintOptions
 ): Promise<Exclude<PendingMintOutcome, { kind: "busy" }>> {
   const now = opts.now ?? Date.now;
@@ -220,7 +233,9 @@ async function processEntry(
     ({ cashuWallet, quoteResponse } = await retryMintQuoteOperation(
       async () => {
         const candidate = await getWalletForMint(entry.mint);
-        const quote = await candidate.checkMintQuoteBolt11(entry.quote_id);
+        const quote = opts.paidQuote && !entry.minting
+          ? opts.paidQuote
+          : await candidate.checkMintQuoteBolt11(entry.quote_id);
         return { cashuWallet: candidate, quoteResponse: quote };
       },
       {
@@ -256,8 +271,8 @@ async function processEntry(
       const restoredProofs = await restoreFromMintingState(
         cashuWallet,
         entry.minting,
-        wallet.lock_pubkey,
-        entry.mint
+        wallet,
+        entry
       );
       if (restoredProofs.length === 0) {
         // Mint claims it never signed our outputs (e.g. quote was already
@@ -280,10 +295,21 @@ async function processEntry(
         // A retired keyset cannot sign new outputs. Check whether it signed
         // the journaled ones before replacing them with active-keyset outputs.
         await cashuWallet.ensureOperableKeysets([savedMinting.keyset_id]);
-        const proofs = await restoreFromMintingState(cashuWallet, savedMinting, wallet.lock_pubkey, entry.mint);
+        const proofs = await restoreFromMintingState(cashuWallet, savedMinting, wallet, entry);
         if (proofs.length > 0) return { kind: "restored", entry, proofs };
         savedMinting = undefined;
       }
+      const terms = entry.reserve;
+      const reserve = terms && {
+        ...terms,
+        t_expire_ms: terms.t_expire_ms ?? (Math.floor(now() / 1_000) + terms.locktime_seconds) * 1_000,
+      };
+      const denominations = savedMinting
+        ? savedMinting.outputs.map((output) => output.blinded_message.amount)
+        : computeSmartDenominations(entry.amount_sats, {
+            maxDenomination: maxKeysetDenomination(cashuWallet),
+            includeTinyTail: reserve !== undefined,
+          });
       // A prior attempt can still be in flight at the mint after a lost
       // response. Reuse its blinded outputs even if the quote still says PAID.
       const preview = savedMinting
@@ -293,22 +319,29 @@ async function processEntry(
             { type: "custom", data: rehydrateOutputData(savedMinting.outputs) }
           )
         : await prepareP2PKMint(
-            cashuWallet, entry.amount_sats, quoteResponse, wallet.lock_privkey, wallet.lock_pubkey,
-            computeSmartDenominations(entry.amount_sats, {
-              maxDenomination: maxKeysetDenomination(cashuWallet), includeTinyTail: false,
-            })
+            cashuWallet, entry.amount_sats, quoteResponse, wallet.lock_privkey,
+            reserve?.lock_pubkey ?? wallet.lock_pubkey, denominations,
+            reserve
+              ? { locktimeUnixSec: reserve.t_expire_ms / 1_000, refundKeys: [reserve.refund_pubkey] }
+              : undefined
           );
+      let journaled = entry;
       if (!savedMinting) {
         const minting: PendingMintMintingState = {
           keyset_id: preview.keysetId,
           outputs: serializeOutputData(preview.outputData),
+        };
+        journaled = {
+          ...entry,
+          minting,
+          ...(reserve ? { reserve } : {}),
         };
         const saved = await withMintWriteLock(opts.deadlineMs, () => {
           const fresh = currentMintWallet(wallet, entry);
           if (!fresh) return false;
           saveAgentWallet({
             ...fresh,
-            pending_mints: fresh.pending_mints.map((p) => matchesPendingMint(p, entry) ? { ...p, minting } : p),
+            pending_mints: fresh.pending_mints.map((p) => matchesPendingMint(p, entry) ? journaled : p),
           });
           return true;
         });
@@ -316,12 +349,16 @@ async function processEntry(
       }
 
       const proofs = await cashuWallet.completeMint(preview);
-      const agentProofs = proofs.map((p) => toAgentProof(p, entry.mint, wallet.lock_pubkey));
-      return { kind: "minted", entry, proofs: agentProofs };
+      return {
+        kind: "minted",
+        entry: journaled,
+        proofs: proofs.map((proof) => toPendingMintProof(proof, wallet, journaled)),
+        denominations,
+      };
     } catch (err) {
-      // The mint took the payment and will not issue for it. Keeping the entry
-      // is the only record of that money, and a later sweep asks again.
-      if (mintQuoteRefusal(err) === "expired") {
+      // The sweep reports an expired paid quote separately and keeps it for
+      // later retries. Foreground funding presents the original mint failure.
+      if (!opts.paidQuote && mintQuoteRefusal(err) === "expired") {
         return { kind: "paid_refused", entry, reason: "quote_expired" };
       }
       return { kind: "error", entry, cause: err };
@@ -364,7 +401,7 @@ async function processEntry(
  */
 async function finalAnswer(
   wallet: AgentWallet,
-  entry: PendingMint,
+  entry: WalletPendingMint,
   reason: MintQuoteDropReason,
   getCashuWallet: () => Promise<Wallet>
 ): Promise<Extract<PendingMintOutcome, { kind: "expired" | "restored" | "paid_refused" | "error" }>> {
@@ -373,8 +410,8 @@ async function finalAnswer(
     const restored = await restoreFromMintingState(
       await getCashuWallet(),
       entry.minting,
-      wallet.lock_pubkey,
-      entry.mint
+      wallet,
+      entry
     );
     if (restored.length > 0) return { kind: "restored", entry, proofs: restored };
   } catch (err) {
@@ -425,11 +462,18 @@ export function mintQuoteRefusal(err: unknown): "unknown" | "expired" | undefine
 async function restoreFromMintingState(
   cashuWallet: Wallet,
   minting: PendingMintMintingState,
-  lockPubkey: string,
-  mintUrl: string
+  wallet: AgentWallet,
+  entry: WalletPendingMint
 ): Promise<AgentProof[]> {
   const proofs = await restoreProofsFromOutputs(cashuWallet, minting.keyset_id, minting.outputs);
-  return proofs.map((proof) => toAgentProof(proof, mintUrl, lockPubkey));
+  return proofs.map((proof) => toPendingMintProof(proof, wallet, entry));
+}
+
+function toPendingMintProof(proof: Proof, wallet: AgentWallet, entry: WalletPendingMint): AgentProof {
+  return toAgentProof(proof, entry.mint, entry.reserve?.lock_pubkey ?? wallet.lock_pubkey, {
+    reservedFor: entry.reserve?.reserved_for,
+    tExpireMs: entry.reserve?.t_expire_ms,
+  });
 }
 
 function errorMessage(err: unknown): string {

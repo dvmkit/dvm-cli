@@ -118,9 +118,13 @@ function makeMockWallet(overrides: Partial<MockedCashuWallet> = {}): MockedCashu
   };
 }
 
+let walletOnDisk: AgentWallet;
+
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.mocked(loadAgentWallet).mockReturnValue({ ...baseWallet, pending_mints: [], proofs: [] });
+  walletOnDisk = { ...baseWallet, pending_mints: [], proofs: [] };
+  vi.mocked(loadAgentWallet).mockImplementation(() => walletOnDisk);
+  vi.mocked(saveAgentWallet).mockImplementation((wallet) => { walletOnDisk = wallet; });
 });
 
 describe("fundAgentWallet", () => {
@@ -212,19 +216,18 @@ describe("fundAgentWallet", () => {
       locked_to_pubkey: baseWallet.lock_pubkey,
       status: "valid" as const,
     };
-    vi.mocked(loadAgentWallet)
-      .mockReturnValueOnce({ ...baseWallet, pending_mints: [], proofs: [] })
-      .mockReturnValue({
-        ...baseWallet,
-        pending_mints: [otherPending],
-        proofs: [otherProof],
-      });
-
     await fundAgentWallet(5, {
       mintUrl: "https://mint.example",
       pollIntervalMs: 0,
       timeoutMs: 1_000_000,
       getWalletForMint: vi.fn().mockResolvedValue(cashu),
+      onInvoice: () => {
+        walletOnDisk = {
+          ...walletOnDisk,
+          pending_mints: [...walletOnDisk.pending_mints, otherPending],
+          proofs: [...walletOnDisk.proofs, otherProof],
+        };
+      },
     });
 
     const calls = vi.mocked(saveAgentWallet).mock.calls;

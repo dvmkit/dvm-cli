@@ -101,6 +101,7 @@ import {
 import {
   MINT_QUOTE_EXPIRY_GRACE_MS,
   type MintQuoteDropReason,
+  type WalletPendingMint,
 } from "../lib/wallet-agent/recovery";
 import {
   describePendingSubmissions,
@@ -969,7 +970,7 @@ export async function walletShow(opts: WalletShowOptions): Promise<void> {
       // else — the timestamp is here so an agent reads it as a live snapshot
       // rather than durable state about the mint.
       mints_checked_at: mintsCheckedAt,
-      pending_mints: post.pending_mints,
+      pending_mints: post.pending_mints.map(({ reserve: _reserve, ...entry }: WalletPendingMint) => entry),
       // sats that left the wallet but no DVM has confirmed. Excluded
       // from `total_sats` by construction (the proofs are locked to the DVM),
       // so without this block the balance just drops with nothing to point at.

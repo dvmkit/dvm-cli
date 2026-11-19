@@ -123,7 +123,9 @@ function makeMockWallet() {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.mocked(loadAgentWallet).mockReturnValue({ ...baseWallet, pending_mints: [], proofs: [] });
+  let walletOnDisk: AgentWallet = { ...baseWallet, pending_mints: [], proofs: [] };
+  vi.mocked(loadAgentWallet).mockImplementation(() => walletOnDisk);
+  vi.mocked(saveAgentWallet).mockImplementation((wallet) => { walletOnDisk = wallet; });
 });
 
 describe("reserveAgentWallet", () => {

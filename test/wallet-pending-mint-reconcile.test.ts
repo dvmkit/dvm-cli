@@ -1,9 +1,23 @@
-import type { Wallet } from "@cashu/cashu-ts";
+import {
+  createBlindSignature,
+  createNewMintKeys,
+  MintQuoteState,
+  OutputData,
+  parseSecret,
+  pointFromHex,
+  serializeMintKeys,
+  type MintPreview,
+  type OutputType,
+  type SerializedBlindedMessage,
+  type SerializedBlindedSignature,
+  type Wallet,
+} from "@cashu/cashu-ts";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProviderInfo } from "@dvmkit/sdk/internal";
 
 const MINT = "https://mint.invalid";
 /** What the mint says for itself. It must never reach the CLI's output. */
@@ -17,8 +31,11 @@ const seams = vi.hoisted(() => ({
 
 // Output and the mint are the only seams: the sweep, the classification and the
 // wallet file all run the shipped SDK against an isolated config dir.
-vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({ ...(await importOriginal<typeof import("@dvmkit/sdk/internal")>()),
-getWallet: seams.getWallet }));
+vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@dvmkit/sdk/internal")>()),
+  getWallet: seams.getWallet,
+  checkMintHealth: vi.fn(async () => ({ ok: true, mintUrl: MINT, latencyMs: 0 })),
+}));
 vi.mock("../src/lib/output", async () => ({ ...(await vi.importActual<typeof import("../src/lib/output")>("../src/lib/output")), info: seams.info,
 json: seams.json }));
 
@@ -59,6 +76,8 @@ let configRoot: string;
 let originalConfigRoot: string | undefined;
 let sdk: typeof import("@dvmkit/sdk/internal");
 let walletShow: (typeof import("../src/commands/wallet-agent-fund"))["walletShow"];
+let walletFund: (typeof import("../src/commands/wallet-agent-fund"))["walletFund"];
+let reserveAgentWallet: (typeof import("../src/lib/wallet-agent/reserve"))["reserveAgentWallet"];
 let reconcilePendingMints: (typeof import("../src/lib/wallet-agent/mint-sweep"))["reconcilePendingMints"];
 
 function pendingMint(quoteId: string, minting?: Record<string, unknown>) {
@@ -97,14 +116,15 @@ function writeWalletWithPendingMint(minting?: Record<string, unknown>): void {
   writeWalletWithPendingMints([pendingMint("quote-1", minting)]);
 }
 
-describe("pending-mint reconcile against a mint that won't answer", () => {
+describe("pending-mint reconciliation", () => {
   beforeAll(async () => {
     configRoot = mkdtempSync(join(tmpdir(), "dvm-cli-mint-reconcile-"));
     originalConfigRoot = process.env.DVM_CONFIG_DIR;
     process.env.DVM_CONFIG_DIR = configRoot;
     vi.resetModules();
     sdk = await import("@dvmkit/sdk/internal");
-    ({ walletShow } = await import("../src/commands/wallet-agent-fund"));
+    ({ walletFund, walletShow } = await import("../src/commands/wallet-agent-fund"));
+    ({ reserveAgentWallet } = await import("../src/lib/wallet-agent/reserve"));
     ({ reconcilePendingMints } = await import("../src/lib/wallet-agent/mint-sweep"));
   });
 
@@ -121,6 +141,130 @@ describe("pending-mint reconcile against a mint that won't answer", () => {
     if (originalConfigRoot === undefined) delete process.env.DVM_CONFIG_DIR;
     else process.env.DVM_CONFIG_DIR = originalConfigRoot;
   });
+
+  it.each(["fund", "reserve"] as const)(
+    "restores the outputs signed during overlapping %s and wallet show",
+    async (flow) => {
+      writeWalletWithPendingMints([]);
+      const keys = createNewMintKeys(11, new Uint8Array(32).fill(1));
+      const keyset = { id: keys.keysetId, keys: serializeMintKeys(keys.pubKeys) };
+      const quote = { quote: "quote-race", request: "lnbc10n1fake", expiry: null };
+      const builderKey = "02c6047f9441ed7d6d3045406e95c07cd85a778e4b8cef3ca7abac09b95c709ee5";
+      const locktimeSeconds = 86_400;
+      const startSeconds = Math.floor(Date.now() / 1_000);
+      const foregroundPolling = Promise.withResolvers<void>();
+      const releaseForegroundPoll = Promise.withResolvers<void>();
+      const issuanceStarted = Promise.withResolvers<void>();
+      const loseResponse = Promise.withResolvers<void>();
+      const attempts: string[][] = [];
+      const signed = new Map<string, SerializedBlindedSignature>();
+      let reads = 0;
+      let issued = false;
+      const mint = {
+        createLockedMintQuote: async () => ({ ...quote, state: MintQuoteState.UNPAID }),
+        checkMintQuoteBolt11: async (quoteId: string) => {
+          expect(quoteId).toBe(quote.quote);
+          if (++reads === 1) {
+            foregroundPolling.resolve();
+            await releaseForegroundPoll.promise;
+          }
+          return { ...quote, state: issued ? MintQuoteState.ISSUED : MintQuoteState.PAID };
+        },
+        prepareMint: async (_method: string, amount: number, mintQuote: typeof quote, _config: unknown, output: OutputType) => {
+          const outputData = output.type === "p2pk"
+            ? OutputData.createP2PKData(output.options, amount, keyset, output.denominations)
+            : output.type === "custom" ? output.data : [];
+          return { keysetId: keyset.id, quote: mintQuote, outputData };
+        },
+        completeMint: async (preview: MintPreview) => {
+          const messages = preview.outputData.map((output) => output.blindedMessage);
+          attempts.push(messages.map((message) => message.B_));
+          if (attempts.length > 1) throw new Error("Quote issuance already in progress");
+          issuanceStarted.resolve();
+          await loseResponse.promise;
+          for (const message of messages) {
+            const signature = createBlindSignature(
+              pointFromHex(message.B_), keys.privKeys[message.amount.toNumber()], keyset.id
+            );
+            signed.set(message.B_, { amount: message.amount, C_: signature.C_.toHex(true), id: keyset.id });
+          }
+          issued = true;
+          throw httpError("NetworkError", 503);
+        },
+        keyChain: { getKeysets: () => [], getKeyset: () => keyset },
+        mint: {
+          restore: async ({ outputs }: { outputs: SerializedBlindedMessage[] }) => {
+            const matched = outputs.filter((output) => signed.has(output.B_));
+            return { outputs: matched, signatures: matched.map((output) => signed.get(output.B_)!) };
+          },
+        },
+      };
+      seams.getWallet.mockResolvedValue(mint);
+
+      const foreground = (flow === "fund"
+        ? walletFund("1000", { sats: true, mint: MINT, float: false, qrImage: join(configRoot, "invoice.png") })
+        : reserveAgentWallet(1000, {
+            mintUrl: MINT, builderHandle: "builder.invalid", locktimeSeconds,
+            providerInfo: {
+              cashu: { lock_pubkeys: [builderKey], mints: [MINT], canonical_id: "42" },
+            } as ProviderInfo,
+            readMnemonic: () => "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+          })
+      ).then(() => undefined, (error: unknown) => error);
+      let show: Promise<void> | undefined;
+      let foregroundError: unknown;
+      try {
+        await Promise.race([
+          foregroundPolling.promise,
+          foreground.then((error) => { throw error ?? new Error("Foreground ended before polling"); }),
+        ]);
+        show = walletShow({});
+        await Promise.race([
+          issuanceStarted.promise,
+          show.then(() => { throw new Error("Wallet show ended before issuance"); }),
+        ]);
+        releaseForegroundPoll.resolve();
+        foregroundError = await foreground;
+      } finally {
+        releaseForegroundPoll.resolve();
+        loseResponse.resolve();
+        await show;
+      }
+
+      expect(seams.json.mock.lastCall?.[0].pending_mints[0]).not.toHaveProperty("reserve");
+      const journal = sdk.loadAgentWallet()?.pending_mints[0]?.minting?.outputs.map((o) => o.blinded_message.B_);
+      await walletShow({});
+      const recovered = sdk.loadAgentWallet()?.proofs ?? [];
+      expect(recovered.reduce((sum, proof) => sum + proof.amount, 0)).toBe(1000);
+      expect(new Set(recovered.map((proof) => proof.secret)).size).toBe(recovered.length);
+      expect(attempts).toEqual([[...signed.keys()]]);
+      expect(journal).toEqual([...signed.keys()]);
+      expect(foregroundError).toMatchObject({ code: "mint_quote_busy" });
+      expect(seams.json.mock.lastCall?.[0].sweep.collected).toMatchObject([
+        { quote_id: quote.quote, sats_collected: 1000 },
+      ]);
+      for (const proof of recovered) {
+        if (flow === "fund") {
+          expect(proof.locked_to_pubkey).toBe(sdk.loadAgentWallet()?.lock_pubkey);
+          expect(proof.reserved_for).toBeUndefined();
+        } else {
+          expect(proof).toMatchObject({ locked_to_pubkey: builderKey, reserved_for: "builder/builder.invalid" });
+          const expiry = proof.t_expire! / 1_000;
+          expect(expiry).toBeGreaterThanOrEqual(startSeconds + locktimeSeconds);
+          expect(expiry).toBeLessThanOrEqual(Math.floor(Date.now() / 1_000) + locktimeSeconds);
+          expect(parseSecret(proof.secret)).toEqual(["P2PK", expect.objectContaining({
+            data: builderKey,
+            tags: expect.arrayContaining([
+              ["locktime", String(expiry)],
+              ["refund", "02a3e7f5e3a1ef088c5c0b8d23c0ccfeaa5efd0dd6031907bcae4bdce520d5b8b5"],
+            ]),
+          })]);
+        }
+      }
+      await walletShow({});
+      expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: recovered });
+    }
+  );
 
   it("mints the invoice on the next reconcile once the mint answers again", async () => {
     const mint = fakeMint(() => httpError("RateLimitError", 429, 5_000));

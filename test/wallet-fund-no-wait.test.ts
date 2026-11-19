@@ -539,7 +539,9 @@ describe("human-paid funding without waiting", () => {
       quote, request: "lnbc10u1fake", expiry: fixture.expiry, state: "PAID",
     }));
     await runFund(fundArgs().filter((arg) => arg !== "--no-wait"));
-    expect(lastEvent()).toMatchObject({ status: "minted", sats_minted: 1000 });
+    expect(lastEvent()).toMatchObject({
+      status: "minted", sats_minted: 1000, denominations: [8, 32, 64, 128, 256, 512],
+    });
     expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledExactlyOnceWith("quote-1");
     expect(sdk.loadAgentWallet()?.pending_mints).toEqual([]);
   });
