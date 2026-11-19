@@ -28,6 +28,7 @@ const control = {
   feeSettled: true,
   /** Paid fund requests whose response the front forwards to the DVM and then drops. */
   dropPaidResponses: 0,
+  stallDrainResponses: 0,
 };
 const calls = [];
 const intents = new Map();
@@ -37,6 +38,7 @@ const keyBySpt = new Map();
 const refunds = new Map();
 const refundByKey = new Map();
 const jobs = [];
+let stalledDrain;
 
 /** Stripe's US card fee on a charge of `amount` cents: 2.9% + 30 cents. */
 const cardFee = (amount) => Math.round(amount * 0.029) + 30;
@@ -166,6 +168,14 @@ const mppSetupFile = readdirSync(join(sdkDist, "..")).find((name) => /^mpp-setup
 if (!mppSetupFile) throw new Error("The installed @dvmkit/sdk no longer ships mpp-setup; update this fixture.");
 const { createMppFromOpts } = await import(pathToFileURL(join(sdkDist, "..", mppSetupFile)).href);
 const ledger = new MemoryCreditLedger();
+const drainPosts = [];
+const drainCreations = [];
+const requestDrain = ledger.requestDrain.bind(ledger);
+ledger.requestDrain = async (args) => {
+  const result = await requestDrain(args);
+  if (!result.replayed) drainCreations.push({ creditId: args.creditId, drainId: args.drainId });
+  return result;
+};
 const sdk = await createDVMServer(descriptor, {
   env: {},
   store: new MemoryKVStore(),
@@ -198,14 +208,18 @@ const sdk = await createDVMServer(descriptor, {
 const server = createServer(async (incoming, outgoing) => {
   const chunks = [];
   for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
-  const paid = incoming.method === "POST" && incoming.url === "/v1/credit" && typeof incoming.headers.authorization === "string";
-  const response = await sdk.app.fetch(
-    new Request(`http://127.0.0.1${incoming.url}`, {
-      method: incoming.method,
-      headers: incoming.headers,
-      ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
-    })
-  );
+  const creditPost = incoming.method === "POST" && incoming.url === "/v1/credit";
+  const paid = creditPost && typeof incoming.headers.authorization === "string";
+  const request = new Request(`http://127.0.0.1${incoming.url}`, {
+    method: incoming.method,
+    headers: incoming.headers,
+    ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
+  });
+  if (creditPost) {
+    const body = await request.clone().json().catch(() => undefined);
+    if (body?.op === "drain") drainPosts.push({ creditId: body.credit_id, drainId: body.drain?.drain_id });
+  }
+  const response = await sdk.app.fetch(request);
   if (paid && control.dropPaidResponses > 0) {
     // The DVM has charged and booked; the caller never hears about it.
     control.dropPaidResponses -= 1;
@@ -213,7 +227,17 @@ const server = createServer(async (incoming, outgoing) => {
     return;
   }
   outgoing.writeHead(response.status, Object.fromEntries(response.headers));
-  outgoing.end(Buffer.from(await response.arrayBuffer()));
+  const body = Buffer.from(await response.arrayBuffer());
+  if (control.stallDrainResponses > 0 && response.ok && creditPost) {
+    const result = JSON.parse(body.toString("utf8"));
+    if (result.op === "drain") {
+      control.stallDrainResponses -= 1;
+      stalledDrain = result.drain;
+      outgoing.write(body.subarray(0, 1));
+      return;
+    }
+  }
+  outgoing.end(body);
 });
 await new Promise((done) => server.listen(0, "127.0.0.1", done));
 const address = server.address();
@@ -234,6 +258,9 @@ process.on("message", async (message) => {
       chargeAttempts: calls.filter((c) => c.method === "POST" && c.path === "/v1/payment_intents").length,
       intents: [...intents.values()].map((i) => ({ id: i.id, amount: i.amount, refunded: i.refunded })),
       refundCreates: calls.filter((c) => c.method === "POST" && c.path === "/v1/refunds").length,
+      drainPosts,
+      drainCreations,
+      stalledDrain,
       jobs: jobs.length,
       credits,
     });

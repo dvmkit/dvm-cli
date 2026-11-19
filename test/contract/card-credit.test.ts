@@ -17,10 +17,18 @@ const binary = join(repositoryRoot, "dist", "dvm.js");
 const IDENTITY = "0d".repeat(32);
 const SLOW = 60_000;
 
+interface DrainBinding {
+  creditId: string;
+  drainId: string;
+}
+
 interface Snapshot {
   chargeAttempts: number;
   intents: Array<{ id: string; amount: number; refunded: number }>;
   refundCreates: number;
+  drainPosts: DrainBinding[];
+  drainCreations: DrainBinding[];
+  stalledDrain?: { drain_id: string; credit_id: string; status: string; refund_ids: string[] };
   jobs: number;
 }
 
@@ -47,7 +55,7 @@ afterAll(async () => {
 let configRoot: string;
 afterEach(async () => {
   // Every test runs on its own state and resets the fake back to a clean card.
-  await control({ charge: "succeed", lostChargeResponses: 0, feeSettled: true, dropPaidResponses: 0 });
+  await control({ charge: "succeed", lostChargeResponses: 0, feeSettled: true, dropPaidResponses: 0, stallDrainResponses: 0 });
 });
 
 function freshCaller(): string {
@@ -209,6 +217,50 @@ describe("an interrupted card top-up", () => {
 });
 
 describe("card refund drain", () => {
+  it("reports a stalled drain response as unknown and replays the saved drain exactly once", async () => {
+    startTest();
+    const funding = await dvm(["credit", "fund", endpoint, "--amount", "$1", "--over-trust", "--spt", spt]);
+    expect(funding.code, funding.stdout + funding.stderr).toBe(0);
+    const creditId: string = JSON.parse(funding.stdout).credit_id;
+    const before = await snapshot();
+    await control({ stallDrainResponses: 1 });
+
+    const timedOut = await dvm(["credit", "drain", endpoint, "--method", "stripe"]);
+    expect(timedOut.code).toBe(1);
+    const afterTimeout = await snapshot();
+    const posted = afterTimeout.drainPosts.slice(before.drainPosts.length);
+    expect(posted).toEqual([{ creditId, drainId: expect.any(String) }]);
+    const { drainId } = posted[0]!;
+    expect(afterTimeout.drainCreations.slice(before.drainCreations.length)).toEqual([{ creditId, drainId }]);
+    expect(afterTimeout.refundCreates - before.refundCreates).toBe(1);
+    expect(afterTimeout.stalledDrain).toMatchObject({
+      credit_id: creditId, drain_id: drainId, status: "sent", refund_ids: [expect.stringMatching(/^re_test_/)],
+    });
+    const command = `dvm credit drain ${endpoint} --credit-id ${creditId} --drain-id ${drainId} --method stripe`;
+    const { error } = JSON.parse(timedOut.stdout);
+    expect(error).toMatchObject({
+      code: "drain_outcome_unknown",
+      message: expect.stringContaining("refund outcome is unknown"),
+      status: "unknown",
+      retryable: true,
+      credit_id: creditId,
+      drain_id: drainId,
+      next_command: command,
+      hint: expect.stringContaining(command),
+    });
+
+    const retried = await dvm(error.next_command.split(" ").slice(1));
+    expect(retried.code, retried.stdout + retried.stderr).toBe(0);
+    expect(JSON.parse(retried.stdout)).toMatchObject({
+      drain: { credit_id: creditId, drain_id: drainId, status: "sent" },
+      refund_ids: afterTimeout.stalledDrain!.refund_ids,
+    });
+    const afterRetry = await snapshot();
+    expect(afterRetry.drainPosts.slice(afterTimeout.drainPosts.length)).toEqual([{ creditId, drainId }]);
+    expect(afterRetry.drainCreations).toEqual(afterTimeout.drainCreations);
+    expect(afterRetry.refundCreates).toBe(afterTimeout.refundCreates);
+  }, SLOW);
+
   it("reports a refund Stripe hasn't finished as pending, then sent on a later poll", async () => {
     startTest();
     expect((await dvm(["credit", "fund", endpoint, "--amount", "$1", "--over-trust", "--spt", spt])).code).toBe(0);

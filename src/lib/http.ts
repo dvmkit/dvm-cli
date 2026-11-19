@@ -16,6 +16,8 @@
  * corrective on Node >=26, while keeping compression's bandwidth win via `br`.
  */
 
+import { isAbortError } from "@dvmkit/sdk/internal";
+
 import { clientCompatibilityError, withDvmClientHeaders } from "./client-compatibility";
 
 /** `Accept-Encoding` value listing only codecs `fetch` decompresses on Node 22-26. */
@@ -112,7 +114,8 @@ async function readBoundedBody(response: Response, limit: number): Promise<strin
       }
       body += decoder.decode(value, { stream: true });
     }
-  } catch {
+  } catch (err) {
+    if (isAbortError(err)) throw err;
     return undefined;
   } finally {
     reader.releaseLock();
