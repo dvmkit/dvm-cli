@@ -39,6 +39,7 @@ vi.mock("../src/lib/job-access", () => ({
 }));
 
 import { messages } from "../src/commands/messages";
+import { status } from "../src/commands/status";
 import { catchErrors } from "../src/lib/error-handler";
 import { pay } from "../src/commands/pay";
 import { message } from "../src/commands/message";
@@ -538,6 +539,7 @@ describe("messages wait", () => {
     expect(output().mandate_payments).toEqual(reports);
     expect(JSON.stringify(seams.lines)).not.toContain("Provider overcharge");
     expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([1, 4, 6]);
+    expect(seams.transport.getMessages).not.toHaveBeenCalled();
     expect(seams.pay).not.toHaveBeenCalled();
   });
 
@@ -557,6 +559,7 @@ describe("messages wait", () => {
     expect(output().mandate_payments).toEqual([report]);
     expect(JSON.stringify(seams.lines)).not.toContain("Provider overcharge");
     expect(loadJob(jobId)?.paidPaymentRequestSeqs).toEqual([1]);
+    expect(seams.transport.getMessages).not.toHaveBeenCalled();
   });
 
   it.each(["batch", "wait", "human"])("reports a mandate payment whose ask is absent from full provider history (%s)",
@@ -569,6 +572,7 @@ describe("messages wait", () => {
       await messages(jobId, mode === "wait" ? { wait: true } : { stream: false, human: mode === "human" });
 
       expect(vi.mocked(seams.transport.getMessages).mock.calls[0][1]).toBe(0);
+      expect(loadJob(jobId)?.paidPaymentRequestSeqs ?? []).not.toContain(1);
       if (mode === "human") {
         expect(seams.info).toHaveBeenCalledWith(expect.stringContaining("Provider overcharge"));
         return;
@@ -581,6 +585,47 @@ describe("messages wait", () => {
       expect(paymentMessage).not.toHaveProperty("request_seq_unverified");
       if (mode === "wait") expect(streamed("payment")).toEqual([report]);
     });
+
+  it.each(["absent", "recovered", "unavailable"])("checks an unresolved mandate link when the live stream completes (%s)",
+    async (outcome) => {
+      const jobId = `wait-mandate-confirm-${outcome}`;
+      saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, mandate });
+      const batch = [mandatePayment(2, 1), msg(3, "complete", { summary: "Done" })];
+      transport([batch]);
+      const getMessages = vi.mocked(seams.transport.getMessages);
+      if (outcome === "unavailable") getMessages.mockRejectedValue(new DvmError("timeout", "History timed out"));
+      else getMessages.mockResolvedValue(outcome === "recovered" ? [mandateAsk(1), ...batch] : batch);
+
+      await messages(jobId, { wait: true });
+
+      expect(getMessages).toHaveBeenCalledTimes(1);
+      expect(getMessages.mock.calls[0][1]).toBe(0);
+      expect(streamedSeqs()).toEqual([2, 3]);
+      expect(streamed("message")[0]).toMatchObject({ overcharged: false, request_seq_unverified: true });
+      expect(output()).toMatchObject({ next_action: null, mandate_payments: [expect.objectContaining({
+        amount_msats: outcome === "recovered" ? 1000 : 0, overcharged: outcome === "absent",
+        violated_limits: outcome === "absent" ? ["request_seq"] : [],
+      })] });
+      expect(output().mandate_payments[0].request_seq_unverified).toBe(outcome === "unavailable" ? true : undefined);
+      expect(loadJob(jobId)?.paidPaymentRequestSeqs ?? []).toEqual(outcome === "absent" ? [] : [1]);
+    });
+
+  it("uses the full mandate history read by status to report a missing ask", async () => {
+    const jobId = "status-mandate-missing-ask";
+    saveJob({ id: jobId, endpoint: provider.endpoint, status: "processing", submittedAt: 0, mandate });
+    markPaymentRequestInFlight(jobId, 1);
+    transport([]);
+    const getMessages = vi.mocked(seams.transport.getMessages);
+    getMessages.mockResolvedValue([mandatePayment(2, 1)]);
+
+    await status(jobId, { messages: true });
+
+    expect(getMessages).toHaveBeenCalledTimes(1);
+    expect(getMessages.mock.calls[0][1]).toBe(0);
+    const report = expect.objectContaining({ request_seq: 1, overcharged: true, violated_limits: ["request_seq"] });
+    expect(output()).toMatchObject({ overcharged: true, mandate_payments: [report], messages: [report] });
+    expect(loadJob(jobId)?.paidPaymentRequestSeqs ?? []).not.toContain(1);
+  });
 
   it.each([["--after 0", { after: "0" }, undefined], ["the stored cursor", {}, 4]] as const)(
     "writes a recovered credit payment after its ask (%s)", async (_label, flags, messageCursor) => {

@@ -1,4 +1,4 @@
-import { recordMandatePayments } from "./mandate-payments";
+import { mandateCredit, recordMandatePayments } from "./mandate-payments";
 import { DvmError, isAbortError, shellQuoteArg, type Message, type MessagePollOptions, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
 import { bookCreditPayment, clearPaymentRequestInFlight, loadJob, markPaymentRequestAnswered, type UnconfirmedPaymentSubmission } from "./job-store";
 import { settleTakenPayment } from "./taken-payment";
@@ -162,12 +162,13 @@ export async function reconcilePaymentRequestHistory(
  * including one the job has moved past, and apply any sweep verdict for a
  * held token. Only payment messages count here, never a decline.
  */
-export async function settleRecordedPayments(jobId: string): Promise<void> {
+export async function settleRecordedPayments(jobId: string, fullHistoryThrough?: number): Promise<void> {
   await applySubmissionVerdicts().catch(() => undefined);
   const job = loadJob(jobId);
   const recorded = job?.mandate || job?.pendingCreditPayment ? loadMessages(jobId) : [];
-  if (job?.mandate) recordMandatePayments(jobId, recorded);
-  const pending = loadJob(jobId)?.pendingCreditPayment;
+  if (job?.mandate) recordMandatePayments(jobId, recorded, fullHistoryThrough);
+  const reconciled = loadJob(jobId);
+  const pending = reconciled?.pendingCreditPayment;
   if (pending && recorded.some((message) => {
     const credit = message.type === "payment" && message.from === "requester" ? message.content.credit : undefined;
     const expected = pending.authorization;
@@ -181,7 +182,11 @@ export async function settleRecordedPayments(jobId: string): Promise<void> {
   if (held.size === 0) return;
   const history = loadMessages(jobId);
   const answers = paymentAnswers(history);
-  for (const seq of held) if (answers.has(seq)) await settleAnsweredAsk(jobId, seq, history);
+  for (const seq of held) {
+    const payments = answers.get(seq);
+    if (payments?.some((payment) => !mandateCredit(payment) || !reconciled?.mandateMissingAskSeqs?.includes(seq)))
+      await settleAnsweredAsk(jobId, seq, history);
+  }
 }
 
 function settleUntilMs(jobId: string, requestSeq: number, now: number): number {

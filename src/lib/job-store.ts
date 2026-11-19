@@ -93,6 +93,8 @@ export interface JobRecord {
   stopRequestedDisplay?: string;
   mandatePaymentSeqs?: number[];
   mandatePaymentMsats?: Record<number, number>;
+  /** Request sequences referenced by mandate payments and confirmed absent from provider history. */
+  mandateMissingAskSeqs?: number[];
   mandateAskObservedAtMs?: Record<number, number>;
   /** A successful local cancel send; legacy terminal statuses do not establish caller intent. */
   callerCancelled?: true;

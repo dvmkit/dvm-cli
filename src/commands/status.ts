@@ -159,7 +159,7 @@ async function statusWithAccess(
     msgs = await transport.getMessages(jobId, after, ref, { timeoutMs: timeout, jobToken });
     if (!access.endpointOverridden) {
       appendMessages(jobId, msgs);
-      await settleRecordedPayments(jobId);
+      await settleRecordedPayments(jobId, after === 0 && result.content_available !== false ? maxSeq(msgs, 0) : undefined);
     }
     if (opts.messages) newCursor = maxSeq(msgs, after);
   }

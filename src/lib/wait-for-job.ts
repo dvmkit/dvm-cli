@@ -88,7 +88,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       if (opts.persistLocalState !== false) {
         messageAppendSession?.append(tail);
         // A job can finish on a payment whose answer was lost; book it now.
-        await settleRecordedPayments(opts.jobId);
+        await settleRecordedPayments(opts.jobId, result.fullHistoryThrough);
         result.refunds.push(...await claimInboundPayments(opts.jobId, tail));
       }
       result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
@@ -130,7 +130,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       messageAppendSession?.append(history);
       if (messageAppendSession && snapshot.content_available !== false)
         result.fullHistoryThrough = maxSeq(history, 0);
-      if (opts.persistLocalState !== false) await settleRecordedPayments(opts.jobId);
+      if (opts.persistLocalState !== false) await settleRecordedPayments(opts.jobId, result.fullHistoryThrough);
       const answered = opts.persistLocalState === false ? new Set<number>() : loadAnsweredYieldSeqs(opts.jobId);
       for (const seq of answeredYieldSeqs(history)) answered.add(seq);
       const pending = history.findLast((msg: Message) => msg.from === "provider" &&

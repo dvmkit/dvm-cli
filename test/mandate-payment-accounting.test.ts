@@ -41,6 +41,20 @@ it("repairs a previously booked mandate payment without consuming a held submiss
   expect(saved?.inFlightPaymentRequestStartedAtMs).toBeUndefined();
 });
 
+it("does not restore a disputed paid marker when cached mandate payments replay", () => {
+  const id = "accounted-missing-ask";
+  saveJob({ ...job, id, paidPaymentRequestSeqs: [1] });
+  recordMandatePayments(id, [paid]);
+  expect(loadJob(id)?.paidPaymentRequestSeqs).toEqual([1, 3]);
+
+  recordMandatePayments(id, [paid], paid.seq);
+  recordMandatePayments(id, [paid]);
+
+  const saved = loadJob(id);
+  expect(saved).toMatchObject({ paidPaymentRequestSeqs: [1], paymentsHonoured: 2, paidUsdMicro: 300_000 });
+  expect(mandatePaymentReports(saved, [paid])).toMatchObject([{ overcharged: true, violated_limits: ["request_seq"] }]);
+});
+
 it("counts only the bound credit draw, including upfront, against the mandate budget", () => {
   const rail: Message = { seq: 2, from: "requester", timestamp: 1000, type: "payment", content: { amount_msats: 100_000, cashu_token: "token" } };
   const reports = mandatePaymentReports(job, [ask(1, 100_000), rail, ask(3, 200_000), paid, paid]);

@@ -150,13 +150,12 @@ async function messagesWithAccess(
       }
       throw err;
     }
-    if (!access.endpointOverridden) {
-      appendMessages(jobId, msgs);
-      await settleRecordedPayments(jobId);
-    }
+    if (!access.endpointOverridden) appendMessages(jobId, msgs);
     const newCursor = maxSeq(msgs, after);
     const providerStatus = await observeJobContent(jobId, transport, ref, { timeoutMs: timeout, jobToken });
+    const fullHistoryThrough = after === 0 && providerStatus?.content_available !== false ? newCursor : undefined;
     if (!access.endpointOverridden) {
+      await settleRecordedPayments(jobId, fullHistoryThrough);
       persistStreamOutcome({ jobId, messages: msgs, cursor: newCursor, afterSeq: after, providerStatus });
     }
 
@@ -175,7 +174,7 @@ async function messagesWithAccess(
     });
     transport.close();
 
-    const mandate = mandateOutput(msgs, after === 0 && providerStatus?.content_available !== false ? newCursor : undefined);
+    const mandate = mandateOutput(msgs, fullHistoryThrough);
     if (opts.human) {
       renderSettlementHuman(settlement);
       if (unanswered) info(unanswered.display);
@@ -274,6 +273,25 @@ async function messagesWithAccess(
         : Math.max(1, Math.min(streamOptions.timeoutMs, waitDeadline - Date.now())),
       jobToken,
     });
+  const observed: ContentStatus | undefined = providerStatus ?? result.providerStatus;
+  let mandate = mandateOutput(result.messages, result.fullHistoryThrough);
+  if (waitDeadline !== undefined && after === 0 && streamTerminalStatus(result.messages) &&
+      observed?.content_available !== false && result.messages.some((message) => mandate.bySeq.get(message.seq)?.request_seq_unverified)) {
+    const remainingMs = waitDeadline - Date.now();
+    if (remainingMs > 0) {
+      const history = await transport.getMessages(jobId, 0, ref, {
+        timeoutMs: Math.min(streamOptions.timeoutMs, remainingMs), jobToken,
+      }).catch(() => undefined);
+      if (history) {
+        const fullHistoryThrough = Math.max(result.fullHistoryThrough ?? 0, maxSeq(history, 0));
+        if (!access.endpointOverridden) {
+          appendMessages(jobId, history);
+          await settleRecordedPayments(jobId, fullHistoryThrough);
+        }
+        mandate = mandateOutput([...history, ...result.messages], fullHistoryThrough);
+      }
+    }
+  }
   if (!access.endpointOverridden) {
     persistStreamOutcome({
       jobId,
@@ -285,7 +303,6 @@ async function messagesWithAccess(
   }
   const content = jobContentFields(jobId, providerStatus, opts.human);
   const resolvedAction = await resolveNextAction(result.nextAction, result.messages, providerStatus?.status ?? result.providerStatus?.status);
-  const observed: ContentStatus | undefined = providerStatus ?? result.providerStatus;
   const currency = access.endpointOverridden
     ? await providerCurrency({ receipt: observed?.receipt, status: observed, messages: result.messages, transport, ref }) : undefined;
   const settlement = await observedSettlementFields(jobId, observed, !access.endpointOverridden, currency);
@@ -299,7 +316,6 @@ async function messagesWithAccess(
   });
   transport.close();
 
-  const mandate = mandateOutput(result.messages, result.fullHistoryThrough);
   if (opts.human) {
     renderSettlementHuman(settlement);
     if (unanswered) info(unanswered.display);

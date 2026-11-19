@@ -40,6 +40,13 @@ export function mandateDrawTotal(job: JobRecord, history: Message[]): number {
   return total;
 }
 
+function confirmedMissingAsk(
+  job: JobRecord | null | undefined, paymentSeq: number, requestSeq: number, fullHistoryThrough?: number
+): boolean {
+  return (fullHistoryThrough !== undefined && paymentSeq <= fullHistoryThrough) ||
+    job?.mandateMissingAskSeqs?.includes(requestSeq) === true;
+}
+
 export function mandatePaymentReports(job: JobRecord | null | undefined, history: Message[], fullHistoryThrough?: number) {
   const mandate = job?.mandate;
   const currency = safeCurrency(mandate?.currency);
@@ -66,7 +73,7 @@ export function mandatePaymentReports(job: JobRecord | null | undefined, history
     // A skipped sequence could contain the ask. A full read or an observed
     // message at that sequence can establish that the payment has no ask.
     const requestUnverified = !ask && !seen.has(paid.request_seq) &&
-      (fullHistoryThrough === undefined || message.seq > fullHistoryThrough);
+      !confirmedMissingAsk(job, message.seq, paid.request_seq, fullHistoryThrough);
     const violations: string[] = [];
     const reasons: string[] = [];
     const breach = (field: string, reason: string) => { violations.push(field); reasons.push(reason); };
@@ -134,16 +141,26 @@ export function mandatePaymentSummary(job: JobRecord | null | undefined, message
   } : {}) };
 }
 
-export function recordMandatePayments(jobId: string, history: Message[]): void {
+export function recordMandatePayments(jobId: string, history: Message[], fullHistoryThrough?: number): void {
   if (!loadJob(jobId)?.mandate || !history.some(mandateCredit)) return;
   mutateCreditPayment(jobId, (job) => {
     for (const message of history) {
       const credit = mandateCredit(message);
       if (!credit) continue;
-      const request = history.find((entry) => entry.seq === credit.request_seq);
+      const requestSeq = credit.request_seq;
+      const request = history.find((entry) => entry.seq === requestSeq);
       const ask = request?.from === "provider" && request.type === "payment-request" ? request : undefined;
-      if ((!request || ask) && Number.isSafeInteger(credit.request_seq) && credit.request_seq >= 0 && credit.request_seq < message.seq)
-        recordAnsweredPaymentRequest(job, credit.request_seq);
+      if (Number.isSafeInteger(requestSeq) && requestSeq >= 0 && requestSeq < message.seq) {
+        if (!ask && (request || confirmedMissingAsk(job, message.seq, requestSeq, fullHistoryThrough))) {
+          if (!job.mandateMissingAskSeqs?.includes(requestSeq)) (job.mandateMissingAskSeqs ??= []).push(requestSeq);
+          if (job.paidPaymentRequestSeqs?.includes(requestSeq))
+            job.paidPaymentRequestSeqs = job.paidPaymentRequestSeqs.filter((seq) => seq !== requestSeq);
+        } else {
+          if (ask && job.mandateMissingAskSeqs?.includes(requestSeq))
+            job.mandateMissingAskSeqs = job.mandateMissingAskSeqs.filter((seq) => seq !== requestSeq);
+          recordAnsweredPaymentRequest(job, requestSeq);
+        }
+      }
       if (job.pendingCreditPayment?.authorization.request_seq === credit.request_seq)
         delete job.pendingCreditPayment;
       const booked = job.mandatePaymentSeqs?.includes(message.seq) === true;
