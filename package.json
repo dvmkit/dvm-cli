@@ -69,15 +69,15 @@
   },
   "dependencies": {
     "@cashu/cashu-ts": "4.10.2",
-    "@dvmkit/sdk": "0.41.0",
+    "@dvmkit/sdk": "0.42.0",
     "@scure/base": "2.0.0",
-    "@x402/evm": "2.21.0",
+    "@x402/evm": "2.31.0",
     "commander": "14.0.3",
     "mppx": "0.8.15",
     "nostr-tools": "2.23.3",
     "proper-lockfile": "4.1.2",
     "qrcode": "1.5.4",
-    "zod": "4.4.3"
+    "zod": "4.6.7"
   },
   "optionalDependencies": {
     "viem": "2.55.11"

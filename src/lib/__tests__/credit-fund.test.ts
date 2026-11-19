@@ -573,6 +573,20 @@ describe("fundCredit over x402 batch settlement", () => {
     expect(clearPendingX402Funding).toHaveBeenCalledWith(pending);
   });
 
+  it("passes the journalled payment header to the wallet on resumed settlement", async () => {
+    const paymentHeader = "journalled-payment-signature";
+    const paymentResponse = "settled-response";
+    vi.mocked(loadResumableX402Funding).mockReturnValue(journalled({ paymentHeader }));
+    mockCreditOp.mockResolvedValueOnce({ ...fundedResponse(), x402PaymentResponse: paymentResponse });
+
+    const outcome = await fundCredit(args({ creditId: "credit-1", rail: "x402" }));
+
+    expect(outcome).toMatchObject({ status: "funded", fundId: "fund-original" });
+    expect(processX402BatchResponseForWallet).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ paymentHeader, paymentResponse })
+    );
+  });
+
   it("leaves a forced rail for a different credit alone", async () => {
     vi.mocked(listPendingX402Fundings).mockReturnValue([journalled()]);
     vi.mocked(prepareAgentSpend).mockImplementation(preparedSpend());
