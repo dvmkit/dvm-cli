@@ -34,7 +34,10 @@ const artifact = (seq: number, data = "dGVzdA=="): Message => ({ seq, from: "pro
 
 let history: Message[];
 const output = () => wire.json.mock.lastCall?.[0];
-const messageReads = () => wire.getMessages.mock.calls.map(([id, after]) => [id, after]);
+const messageReads = () => wire.getMessages.mock.calls
+  .filter(([, , , options]) => options.beforeSeq === undefined).map(([id, after]) => [id, after]);
+const gapReads = () => wire.getMessages.mock.calls
+  .filter(([, , , options]) => options.beforeSeq !== undefined).map(([id, after, , options]) => [id, after, options.beforeSeq]);
 
 function seed(id: string, messageCursor: number, cache: Message[] = []) {
   saveJob({ id, endpoint, submittedAt: 1, status: "processing", messageCursor, mandate });
@@ -47,21 +50,19 @@ beforeEach(() => {
   writeFileSync(join(root, "config.json"), JSON.stringify({ credit: { posture: "off" }, feedback: { posture: "off" } }));
   history = [];
   wire.status.mockImplementation(async (id: string) => ({ jobId: id, status: "processing", content_available: true }));
-  wire.getMessages.mockImplementation(async (_id: string, after: number) =>
-    history.filter((message) => message.seq > after));
+  wire.getMessages.mockImplementation(async (_id: string, after: number, _provider, { beforeSeq = Infinity } = {}) =>
+    history.filter((message) => message.seq > after && message.seq < beforeSeq));
 });
 
-it("checks only the tail of a long job after a permanently omitted sequence", async () => {
+it("bounds reads at a permanent gap after an open prompt in a long job", async () => {
   const image = Buffer.alloc(192 * 1024, 7).toString("base64");
   const setup: Message = { seq: 1, from: "provider", timestamp, type: "prompt",
     content: { id: "setup", text: "Start observing?" } };
   // The provider used seq 2 for a rejected payment and omits it from every read.
-  const answer: Message = { seq: 3, from: "requester", timestamp, type: "response",
-    content: { prompt_id: "setup", text: "Yes" } };
-  const artifacts = Array.from({ length: 28 }, (_, index) => artifact(index + 4, image));
+  const artifacts = Array.from({ length: 29 }, (_, index) => artifact(index + 3, image));
   const prompt: Message = { seq: 33, from: "provider", timestamp, type: "prompt",
     content: { id: "continue", text: "Continue observing?" } };
-  const cache = [setup, answer, ...artifacts, ask(32), prompt];
+  const cache = [setup, ...artifacts, ask(32), prompt];
   seed(jobId, 33, cache);
   seed("full-read", 0);
   history = cache;
@@ -73,6 +74,7 @@ it("checks only the tail of a long job after a permanently omitted sequence", as
   history = [...cache, payment(34, 32), payment(36, 35)];
   await status(jobId, {});
   expect(messageReads()).toEqual([[jobId, 33]]);
+  expect(gapReads()).toEqual([[jobId, 1, 3]]);
   const incremental = output();
   expect(incremental).toMatchObject({
     next_action: { type: "respond", prompt_id: "continue" },
@@ -92,7 +94,8 @@ it("checks only the tail of a long job after a permanently omitted sequence", as
   expect(output().mandate_payments).toEqual(incremental.mandate_payments);
 
   await status(jobId, {});
-  expect(messageReads().slice(2)).toEqual([[jobId, 34]]);
+  expect(messageReads().slice(2)).toEqual([[jobId, 36]]);
+  expect(gapReads().slice(1)).toEqual([[jobId, 1, 3], [jobId, 34, 36]]);
   expect(output().mandate_payments).toEqual(incremental.mandate_payments);
   expect(loadJob(jobId)).toMatchObject({ messageCursor: 33, totalPaidMsats: 8000, paymentsHonoured: 2 });
 
@@ -136,7 +139,8 @@ it("switches to the remaining prompt when a reply becomes visible below the newe
   expect(output()).toMatchObject({ next_action: { type: "respond", prompt_id: "first" } });
   await status(jobId, {});
   expect(output()).toMatchObject({ next_action: { type: "respond", prompt_id: "first" } });
-  expect(messageReads()).toEqual([[jobId, 2], [jobId, 2], [jobId, 4]]);
+  expect(messageReads()).toEqual([[jobId, 2], [jobId, 4], [jobId, 4]]);
+  expect(gapReads()).toEqual([[jobId, 2, 4]]);
   expect(loadJob(jobId)?.messageCursor).toBe(2);
 });
 
@@ -188,4 +192,24 @@ it("checks sparse history for a caller decline before attributing cancellation t
   expect(output()).toMatchObject({ artifact_count: 2, status: "cancelled", next_action: null });
   expect(output()).not.toHaveProperty("unanswered_payment_request");
   expect(messageReads().at(-1)).toEqual([jobId, 2]);
+});
+
+it("uses the sparse cache when the provider reports completion with artifact metadata", async () => {
+  history = [artifact(1), artifact(3), ask(4)];
+  seed(jobId, 4, history);
+  await status(jobId, {});
+  expect(messageReads()).toEqual([[jobId, 1]]);
+
+  history = [...history, payment(5, 4)];
+  wire.status.mockResolvedValue({ jobId, status: "completed", content_available: true,
+    hasArtifacts: true, artifactCount: 2, summary: "Finished", payloadIn: "messages" });
+  await status(jobId, {});
+  expect(messageReads()).toEqual([[jobId, 1], [jobId, 4]]);
+  expect(gapReads()).toEqual([]);
+  expect(output()).toMatchObject({ status: "completed", source: "provider", summary: "Finished", artifact_count: 2,
+    mandate_payments: [{ seq: 5, amount_msats: 8000 }], next_action: null });
+  expect(loadJob(jobId)?.status).toBe("completed");
+  await status(jobId, {});
+  expect(output()).toMatchObject({ status: "completed", source: "local", artifact_count: 2 });
+  expect(messageReads()).toHaveLength(2);
 });

@@ -64,7 +64,7 @@ import {
 } from "../lib/job-access";
 import { appendMessages, loadMessages, maxSeq } from "../lib/messages/index";
 import { progressNotice } from "../lib/progress-notice";
-import { createDvmTransport } from "../lib/transport/index";
+import { createDvmTransport, type HttpsTransport } from "../lib/transport/index";
 import { dvmIdentity } from "./dvm-identity";
 import { serializeJobMessageForOutput } from "./messages";
 
@@ -164,6 +164,7 @@ async function statusWithAccess(
   const { batch: msgs, history, cursor: newCursor } = opts.messages || (stored?.mandate && !access.endpointOverridden)
     ? await readStatusMessages(jobId, access, transport, {
       ...readOptions, status: result.status, deliver: opts.messages, contentAvailable: result.content_available,
+      hasArtifacts: result.hasArtifacts,
     })
     : { batch: [] };
 
@@ -394,9 +395,10 @@ async function renderStatus(
 async function readStatusMessages(
   jobId: string,
   access: ResolvedJobAccess,
-  transport: Transport,
-  { status, deliver, contentAvailable, ...readOptions }: {
-    status: string; timeoutMs: number; jobToken?: string; deliver?: boolean; contentAvailable?: boolean;
+  transport: HttpsTransport,
+  { status, deliver, contentAvailable, hasArtifacts, ...readOptions }: {
+    status: string; timeoutMs: number; jobToken?: string; deliver?: boolean;
+    contentAvailable?: boolean; hasArtifacts?: boolean;
   }
 ): Promise<{ batch: Message[]; history?: Message[]; cursor?: number }> {
   const stored = access.endpointOverridden ? null : access.stored;
@@ -404,17 +406,30 @@ async function readStatusMessages(
   const useCache = !!stored?.mandate && contentAvailable !== false;
   const cached = useCache ? loadMessages(jobId) : [];
   const checkpoint = stored?.statusMessageHistory;
-  const covered = statusHistoryCursor(cached, status, checkpoint);
+  // Cancellation evidence and legacy terminal snapshots can still need a full history read.
+  const useSparseHistory = !isTerminalJobStatus(status) || (status === "completed" && typeof hasArtifacts === "boolean");
+  const covered = statusHistoryCursor(cached, useSparseHistory ? checkpoint : undefined);
   // A delivery cursor can skip messages the payment reconciler still needs.
   const after = deliver ? (useCache ? Math.min(deliveryAfter, covered) : deliveryAfter) : covered;
+  const recovered: Message[] = [];
+  if (useCache && status === "awaiting-input" && checkpoint) {
+    const deadline = Date.now() + readOptions.timeoutMs;
+    for (const gap of openPromptGaps(cached, after)) {
+      const timeoutMs = readOptions.timeoutMs > 0 ? Math.max(1, deadline - Date.now()) : readOptions.timeoutMs;
+      const messages = await transport.getMessages(jobId, gap.after, access.ref, {
+        ...readOptions, timeoutMs, beforeSeq: gap.before,
+      });
+      for (const message of messages) recovered.push(message);
+    }
+  }
   const tail = await transport.getMessages(jobId, after, access.ref, readOptions);
   const history = contentAvailable !== false && (useCache || after === 0)
-    ? [...new Map([...cached.filter((message) => message.seq <= after), ...tail]
+    ? [...new Map([...cached.filter((message) => message.seq <= after), ...recovered, ...tail]
       .map((message) => [message.seq, message])).values()].sort((a, b) => a.seq - b.seq)
     : undefined;
 
   if (!access.endpointOverridden) {
-    appendMessages(jobId, tail);
+    appendMessages(jobId, [...recovered, ...tail]);
     const fullHistoryThrough = history === undefined ? undefined : Math.max(after, history.at(-1)?.seq ?? 0);
     await settleRecordedPayments(jobId, fullHistoryThrough);
     if (useCache && !isTerminalJobStatus(status) && history && fullHistoryThrough && Number.isSafeInteger(fullHistoryThrough)) {
@@ -428,31 +443,41 @@ async function readStatusMessages(
   return { batch, history, cursor };
 }
 
-function statusHistoryCursor(cached: Message[], status: string, checkpoint?: StatusMessageHistory): number {
+function statusHistoryCursor(cached: Message[], checkpoint?: StatusMessageHistory): number {
   const sequences = new Set(cached.map((message) => message.seq));
   const contiguous = contiguousSequenceThrough(sequences, 0);
-  // The terminal snapshot also needs cancellation evidence that may have landed in a gap.
-  if (isTerminalJobStatus(status) || !checkpoint || !Number.isSafeInteger(checkpoint.through) ||
+  if (!checkpoint || !Number.isSafeInteger(checkpoint.through) ||
     checkpoint.through <= contiguous || !sequences.has(checkpoint.through) ||
     checkpoint.sequenceDigest !== historySequenceDigest(cached, checkpoint.through)) return contiguous;
 
-  const covered = contiguousSequenceThrough(sequences, checkpoint.through);
-  if (status !== "awaiting-input") return covered;
+  return contiguousSequenceThrough(sequences, checkpoint.through);
+}
 
+function openPromptGaps(cached: Message[], through: number): Array<{ after: number; before: number }> {
   // Pending payments hold newer SDK history back. A later sequence can be visible while
   // a reply awaits verification, so recheck gaps that could answer an open prompt.
   const answered = answeredYieldSeqs(cached);
-  let firstOpenPrompt = covered;
+  let previous = through;
   for (const message of cached) {
     if (message.from === "provider" && message.type === "prompt" && !answered.has(message.seq)) {
-      firstOpenPrompt = Math.min(firstOpenPrompt, message.seq);
+      previous = Math.min(previous, message.seq);
     }
   }
-  return contiguousSequenceThrough(sequences, Math.max(contiguous, firstOpenPrompt), covered);
+  if (previous >= through) return [];
+
+  const sequences = [...new Set(cached.map((message) => message.seq)
+    .filter((seq) => seq > previous && seq <= through))].sort((a, b) => a - b);
+  if (sequences.at(-1) !== through) sequences.push(through + 1);
+  const gaps = [];
+  for (const seq of sequences) {
+    if (seq > previous + 1) gaps.push({ after: previous, before: seq });
+    previous = seq;
+  }
+  return gaps;
 }
 
-function contiguousSequenceThrough(sequences: Set<number>, after: number, limit = Number.MAX_SAFE_INTEGER): number {
-  while (after < limit && sequences.has(after + 1)) after++;
+function contiguousSequenceThrough(sequences: Set<number>, after: number): number {
+  while (after < Number.MAX_SAFE_INTEGER && sequences.has(after + 1)) after++;
   return after;
 }
 

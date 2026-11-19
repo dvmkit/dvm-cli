@@ -724,7 +724,7 @@ export class HttpsTransport implements Transport {
     jobId: string,
     after: number,
     provider?: ProviderRef,
-    options?: MessagePollOptions & { idleTimeout?: boolean }
+    options?: MessagePollOptions & { idleTimeout?: boolean; beforeSeq?: number }
   ): Promise<Message[]> {
     const endpoint = provider?.endpoint;
     if (!endpoint) {
@@ -741,16 +741,34 @@ export class HttpsTransport implements Transport {
     }, timeoutMs);
     const signal = download?.signal ?? (timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined);
 
-    try {
-      let res: Response;
+    const fetchMessages = async (stream = false): Promise<Response> => {
       try {
-        res = await dvmFetch(url, {
-          headers: jobTokenHeader(options?.jobToken),
+        return await dvmFetch(url, {
+          headers: {
+            ...jobTokenHeader(options?.jobToken),
+            ...(stream && { Accept: "text/event-stream" }),
+          },
           signal,
         });
       } catch (err) {
         if (err instanceof DvmError || isAbortError(err)) throw err;
         throw jobReadUnreachable(jobId);
+      }
+    };
+
+    try {
+      const beforeSeq = options?.beforeSeq;
+      let res = await fetchMessages(beforeSeq !== undefined);
+      if (beforeSeq !== undefined && res.status === 406) {
+        res.body?.cancel().catch(() => undefined);
+        res = await fetchMessages();
+      }
+      if (beforeSeq !== undefined && res.ok && res.headers.get("content-type")?.includes("text/event-stream")) {
+        const result = await parseSSEStream(res, undefined, callerMessageRecognizer(jobId, endpoint), beforeSeq);
+        if (result.reason !== "error") return result.messages;
+        if (signal?.aborted) throw signal.reason;
+        // Some streams close at a yield before the cached sequence is reached.
+        res = await fetchMessages();
       }
 
       if (!res.ok) {
@@ -771,7 +789,8 @@ export class HttpsTransport implements Transport {
         })));
       }
       const data = (await readJobResponse(() => body.json(), jobId)) as { messages: Message[] };
-      return data.messages.map(callerMessageRecognizer(jobId, endpoint));
+      const messages = beforeSeq === undefined ? data.messages : data.messages.filter((message) => message.seq < beforeSeq);
+      return messages.map(callerMessageRecognizer(jobId, endpoint));
     } catch (err) {
       if (download?.signal.aborted || isAbortError(err)) {
         throw new DvmError(
@@ -1221,7 +1240,9 @@ function x402RequiredUsdcMicro(required: PaymentRequired | undefined): string | 
 /** Message types that signal the end of a provider's turn (yield points). */
 const YIELD_TYPES = new Set(["prompt", "payment-request", "working", "complete", "cancel"]);
 
-async function parseSSEStream(res: Response, options?: StreamOptions, recognize = (message: Message) => message): Promise<StreamResult> {
+async function parseSSEStream(
+  res: Response, options?: StreamOptions, recognize = (message: Message) => message, beforeSeq?: number
+): Promise<StreamResult> {
   const messages: Message[] = [];
 
   if (!res.body) {
@@ -1231,7 +1252,7 @@ async function parseSSEStream(res: Response, options?: StreamOptions, recognize 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let lastReason: StreamResult["reason"] = "yield";
+  let lastReason: StreamResult["reason"] = beforeSeq === undefined ? "yield" : "error";
 
   try {
     for (;;) {
@@ -1256,10 +1277,14 @@ async function parseSSEStream(res: Response, options?: StreamOptions, recognize 
         const json = dataLine.slice("data:".length).trim();
         try {
           const msg = recognize(JSON.parse(json) as Message);
+          if (beforeSeq !== undefined && msg.seq >= beforeSeq) {
+            reader.cancel().catch(() => undefined);
+            return { messages, reason: "yield" };
+          }
           messages.push(msg);
           options?.onMessage?.(msg);
 
-          if (YIELD_TYPES.has(msg.type)) {
+          if (beforeSeq === undefined && YIELD_TYPES.has(msg.type)) {
             if (msg.type === "complete") lastReason = "complete";
             else if (msg.type === "cancel") lastReason = "cancel";
             else lastReason = "yield";
