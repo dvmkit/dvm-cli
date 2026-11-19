@@ -194,6 +194,57 @@ describe("sweepPendingMints", () => {
     expect(final.proofs[0].mint).toBe("https://mint.example");
   });
 
+  it("replays the journaled blinded messages when an interrupted quote still reports paid", async () => {
+    const outputs = persistedOutputs();
+    outputs[0].blinded_message.B_ = "02BBFF";
+    vi.mocked(loadAgentWallet).mockReturnValue({
+      ...baseWallet,
+      pending_mints: [{ ...pending("interrupted", FRESH), minting: { keyset_id: "k1", outputs } }],
+    });
+    const cashu = makeMockWallet("PAID");
+    const finish = cashu.completeMint.getMockImplementation()!;
+    const preview = await cashu.prepareMint.getMockImplementation()!();
+    cashu.prepareMint.mockImplementation(async (_method, _amount, quote, _config, outputType) => ({
+      ...preview, quote, outputData: outputType.type === "custom" ? outputType.data : preview.outputData,
+    }));
+    cashu.completeMint.mockImplementation(async (request) => {
+      expect(request.outputData.map((output: InstanceType<typeof FakeOutputData>) => output.blindedMessage.B_)).toEqual([
+        "02BBFF", "02BB32", "02BB04",
+      ]);
+      expect(saveAgentWallet).not.toHaveBeenCalled();
+      return finish();
+    });
+
+    const result = await sweepPendingMints({ now: () => NOW, getWalletForMint: vi.fn().mockResolvedValue(cashu) });
+
+    expect(result.outcomes[0].kind).toBe("minted");
+    expect(cashu.completeMint).toHaveBeenCalledTimes(1);
+  });
+
+  it("checks saved outputs from a retired keyset before minting with an active keyset", async () => {
+    const outputs = persistedOutputs();
+    vi.mocked(loadAgentWallet).mockReturnValue({
+      ...baseWallet,
+      pending_mints: [{ ...pending("interrupted", FRESH), minting: { keyset_id: "retired", outputs } }],
+    });
+    const cashu = { ...makeMockWallet("PAID"), ensureOperableKeysets: vi.fn(async () => undefined) };
+    cashu.keyChain.getKeysets.mockReturnValue([{ id: "retired", isActive: false }]);
+    cashu.mint.restore.mockResolvedValue({ outputs: [], signatures: [] });
+    const finish = cashu.completeMint.getMockImplementation()!;
+    cashu.completeMint.mockImplementation(async () => {
+      expect(cashu.mint.restore).toHaveBeenCalledWith({ outputs: outputs.map(({ blinded_message }) => ({
+        ...blinded_message, amount: expect.anything(),
+      })) });
+      expect(vi.mocked(saveAgentWallet).mock.lastCall?.[0].pending_mints[0].minting?.keyset_id).toBe("k1");
+      return finish();
+    });
+
+    const result = await sweepPendingMints({ now: () => NOW, getWalletForMint: vi.fn().mockResolvedValue(cashu) });
+
+    expect(result.outcomes[0].kind).toBe("minted");
+    expect(cashu.completeMint).toHaveBeenCalledTimes(1);
+  });
+
   it("ISSUED with no minting sub-state → drops entry without re-minting (legacy fallback)", async () => {
     vi.mocked(loadAgentWallet).mockReturnValue({
       ...baseWallet,

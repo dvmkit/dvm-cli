@@ -323,13 +323,18 @@ describe("pending-mint reconcile against a mint that won't answer", () => {
   });
 
   it("publishes the classified block from `dvm wallet show`, and no mint prose", async () => {
-    const mint = fakeMint(() => httpError("RateLimitError", 429, 5_000));
+    const firstPoll = Promise.withResolvers<void>();
+    const mint = fakeMint(() => {
+      firstPoll.resolve();
+      return httpError("RateLimitError", 429, 5_000);
+    });
     seams.getWallet.mockResolvedValue(mint.wallet);
     seams.json.mockClear();
     vi.useFakeTimers();
 
     const show = walletShow({});
-    await vi.runAllTimersAsync();
+    await firstPoll.promise;
+    await vi.advanceTimersByTimeAsync(10_000);
     await show;
 
     const [event] = seams.json.mock.calls.at(-1) as [Record<string, unknown>];
@@ -391,13 +396,18 @@ describe("pending-mint reconcile against a mint that won't answer", () => {
   });
 
   it("says why a pending mint could not be checked in human mode", async () => {
-    const mint = fakeMint(() => httpError("RateLimitError", 429, 5_000));
+    const firstPoll = Promise.withResolvers<void>();
+    const mint = fakeMint(() => {
+      firstPoll.resolve();
+      return httpError("RateLimitError", 429, 5_000);
+    });
     seams.getWallet.mockResolvedValue(mint.wallet);
     seams.info.mockClear();
     vi.useFakeTimers();
 
     const show = walletShow({ human: true });
-    await vi.runAllTimersAsync();
+    await firstPoll.promise;
+    await vi.advanceTimersByTimeAsync(10_000);
     await show;
 
     const lines = seams.info.mock.calls.map(([line]) => String(line));

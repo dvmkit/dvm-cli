@@ -1,4 +1,4 @@
-import type { Wallet } from "@cashu/cashu-ts";
+import { Amount, OutputData, type Wallet } from "@cashu/cashu-ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,7 +42,7 @@ function mint(expiry: number | null = Math.floor(Date.now() / 1000) + 3600) {
     checkMintQuoteBolt11: vi.fn(async (quote: string) => ({
       quote, request: "lnbc10u1fake", expiry, state: states.get(quote) ?? "UNPAID",
     })),
-    prepareMint: vi.fn(async () => ({ keysetId: "01ab", outputData: [] })),
+    prepareMint: vi.fn(async (): Promise<{ keysetId: string; outputData: OutputData[] }> => ({ keysetId: "01ab", outputData: [] })),
     completeMint: vi.fn(async () => [{ amount: 1000, secret: "proof-secret", C: `02${"c".repeat(64)}`, id: "01ab" }]),
     keyChain: { getKeysets: () => [] },
   };
@@ -172,6 +172,143 @@ describe("human-paid funding without waiting", () => {
     await runFund();
     expect(lastEvent()).toMatchObject({ expires_at: null, collect_before: null, quote_id: "quote-1" });
     expect(sdk.loadAgentWallet()?.pending_mints[0]).not.toHaveProperty("expires_at");
+  });
+
+  it("relays the invoice before polling and collects a payment observed on a later poll", async () => {
+    const fixture = mint();
+    const check = fixture.wallet.checkMintQuoteBolt11.getMockImplementation()!;
+    fixture.wallet.checkMintQuoteBolt11.mockImplementationOnce(async (quote) => {
+      expect(lastEvent()).toMatchObject({ status: "awaiting_payment", quote_id: quote, collection_state: "waiting" });
+      expect(sdk.loadAgentWallet()?.pending_mints).toMatchObject([{ quote_id: quote }]);
+      const unpaid = await check(quote);
+      fixture.states.set(quote, "PAID");
+      return unpaid;
+    });
+
+    await runFund(fundArgs("--collect-for", "10s"));
+
+    expect(lastEvent()).toMatchObject({ status: "minted", quote_id: "quote-1", sats_minted: 1000 });
+    expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledTimes(2);
+    expect(fixture.wallet.completeMint).toHaveBeenCalledTimes(1);
+    expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+  });
+
+  it("retries transient issuance with the original blinded outputs", async () => {
+    const fixture = mint();
+    const blindedMessage = { amount: Amount.from(1000), B_: `02${"a".repeat(64)}`, id: "01ab" };
+    fixture.wallet.prepareMint.mockResolvedValueOnce({
+      keysetId: "01ab", outputData: [new OutputData(blindedMessage, 5n, new TextEncoder().encode("saved-secret"))],
+    });
+    fixture.wallet.checkMintQuoteBolt11.mockImplementation(async (quote) => ({
+      quote, request: "lnbc10u1fake", expiry: fixture.expiry, state: "PAID",
+    }));
+    fixture.wallet.completeMint.mockImplementationOnce(async () => {
+      expect(sdk.loadAgentWallet()?.pending_mints[0].minting?.outputs[0].blinded_message.B_).toBe(blindedMessage.B_);
+      throw Object.assign(new Error("Mint temporarily unavailable"), { name: "HttpResponseError", status: 503 });
+    });
+
+    await runFund(fundArgs("--collect-for", "10s"));
+
+    expect(lastEvent()).toMatchObject({ status: "minted", quote_id: "quote-1", sats_minted: 1000 });
+    expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledTimes(2);
+    expect(fixture.wallet.prepareMint).toHaveBeenNthCalledWith(2, "bolt11", 1000, expect.anything(),
+      { privkey: PRIVATE_KEY, keysetId: "01ab" }, {
+        type: "custom", data: [expect.objectContaining({ blindedMessage, blindingFactor: 5n })],
+      });
+    expect(fixture.wallet.completeMint).toHaveBeenCalledTimes(2);
+    expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+  });
+
+  it.each([
+    { description: "before a strict mint expires", paymentLeadMs: 750, strictExpiry: true, expectedStates: ["UNPAID", "PAID"] },
+    { description: "at expiry when the mint still issues", paymentLeadMs: 250, strictExpiry: false, expectedStates: ["UNPAID", "UNPAID", "PAID"] },
+  ])("collects a payment from the last poll interval $description", async ({ paymentLeadMs, strictExpiry, expectedStates }) => {
+    const realNow = Date.now;
+    const expiry = Math.ceil(realNow() / 1000) + 1;
+    const expiresAt = expiry * 1000;
+    const initialPollAt = expiresAt - 1_500;
+    const paidAt = expiresAt - paymentLeadMs;
+    let firstPollStarted: number | undefined;
+    vi.spyOn(Date, "now").mockImplementation(() => initialPollAt + (firstPollStarted === undefined ? 0 : realNow() - firstPollStarted));
+    const fixture = mint(expiry);
+    const observed: string[] = [];
+    fixture.wallet.checkMintQuoteBolt11.mockImplementation(async (quote) => {
+      firstPollStarted ??= realNow();
+      const state = Date.now() < paidAt ? "UNPAID" : "PAID";
+      observed.push(state);
+      return { quote, request: "lnbc10u1fake", expiry, state };
+    });
+    const finish = fixture.wallet.completeMint.getMockImplementation()!;
+    let issuanceAt: number | undefined;
+    fixture.wallet.completeMint.mockImplementation(async () => {
+      issuanceAt = Date.now();
+      if (strictExpiry && issuanceAt >= expiresAt) throw mintError("quote is expired", 20007);
+      return finish();
+    });
+
+    await runFund(fundArgs("--collect-for", "10s"));
+
+    expect(lastEvent()).toMatchObject({ status: "minted", quote_id: "quote-1", sats_minted: 1000 });
+    expect(observed).toEqual(expectedStates);
+    if (!strictExpiry) expect(issuanceAt).toBeGreaterThanOrEqual(expiresAt);
+    expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+  });
+
+  it("keeps wallet show from replacing journaled outputs while issuance is in flight", async () => {
+    const fixture = mint();
+    const issuing = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const complete = fixture.wallet.completeMint.getMockImplementation()!;
+    fixture.wallet.checkMintQuoteBolt11.mockImplementation(async (quote) => ({
+      quote, request: "lnbc10u1fake", expiry: fixture.expiry, state: "PAID",
+    }));
+    fixture.wallet.completeMint.mockImplementationOnce(async () => {
+      issuing.resolve();
+      await release.promise;
+      return complete();
+    });
+    const collecting = runFund(fundArgs("--collect-for", "10s"));
+    try {
+      await Promise.race([issuing.promise, collecting.then(() => { throw new Error("Collection stopped before issuance"); })]);
+      await walletShow({});
+      expect(lastEvent()).toMatchObject({
+        total_sats: 0,
+        sweep: { unchecked: [{ quote_id: "quote-1" }] },
+      });
+      expect(fixture.wallet.prepareMint).toHaveBeenCalledTimes(1);
+      expect(fixture.wallet.completeMint).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+      await collecting;
+    }
+    expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [], proofs: [{ amount: 1000 }] });
+  });
+
+  it.each(["duration_elapsed", "quote_expired"])("hands back the original invoice after %s", async (reason) => {
+    const fixture = mint(reason === "quote_expired" ? nowSec() - 1 : nowSec() + HOUR_SEC);
+
+    await runFund(fundArgs("--collect-for", reason === "quote_expired" ? "1h" : "1s"));
+
+    expect(lastEvent()).toMatchObject({
+      status: "collection_stopped", collection_state: "needs_wallet_show", reason,
+      quote_id: "quote-1", next_step: "dvm wallet show",
+      collect_before: new Date(fixture.expiry! * 1000).toISOString(),
+    });
+    expect(fixture.wallet.checkMintQuoteBolt11).toHaveBeenCalledTimes(reason === "quote_expired" ? 0 : 1);
+    expect(sdk.loadAgentWallet()).toMatchObject({ pending_mints: [{ quote_id: "quote-1" }], proofs: [] });
+  });
+
+  it.each([
+    { opts: { collectFor: "5m" }, code: "invalid_fund_options" },
+    { opts: { wait: false, collectFor: "0s" }, code: "invalid_arguments" },
+    { opts: { wait: false, collectFor: "10" }, code: "invalid_arguments" },
+    { opts: { wait: false, collectFor: "5m", rail: "x402" }, code: "invalid_flags_for_rail" },
+  ])("rejects unsupported collection options before opening a quote: $opts", async ({ opts, code }) => {
+    const fixture = mint();
+
+    await expect(walletFund("1000", { float: false, ...opts })).rejects.toMatchObject({ code });
+
+    expect(fixture.wallet.createLockedMintQuote).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("creates a second quote and names the earlier unpaid one in human=%s output", async (human) => {

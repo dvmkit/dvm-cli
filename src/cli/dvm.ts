@@ -1052,6 +1052,10 @@ Docs:
       "Print a human-paid Lightning invoice and exit; collect after payment with 'dvm wallet show'. Cashu only; use --no-float if a float is connected."
     )
     .option(
+      "--collect-for <duration>",
+      "With --no-wait, print the invoice and stay open to collect for up to this long (e.g. 30s or 2m)."
+    )
+    .option(
       "--test-skip-lightning",
       "Skip Lightning — for test mints that auto-pay invoices (FakeWallet). Cashu rail only."
     )
