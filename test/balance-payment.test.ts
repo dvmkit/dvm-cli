@@ -595,13 +595,14 @@ it("waits for mandate settlement rather than posting a second payment for a fres
   expect(loadJob("job-a")?.mandateAskObservedAtMs?.[4]).toEqual(expect.any(Number));
 });
 
-it("pays a still-open mandate fallback through --wait within the existing policy after the settlement window", async () => {
+it("pays a still-open mandate fallback once after the settlement window and a guard history timeout", async () => {
   updateJob("job-a", { mandate: standingLimits(), mandateAskObservedAtMs: { 4: Date.now() - 90_000 } });
   const transport = new HttpsTransport();
-  const result = await waitForJob({ jobId: "job-a", transport, provider: { endpoint }, policy, afterSeq: 0,
-    jobToken: token }, 3000);
-  transport.close();
+  const history = vi.spyOn(transport, "getMessages").mockRejectedValueOnce(new DvmError("timeout", "Message poll timed out"));
+  const result = await waitForJob({ jobId: "job-a", transport, provider: { endpoint }, policy, afterSeq: 3,
+    afterSeqExplicit: true, jobToken: token }, 4000).finally(() => transport.close());
   expect(result.nextAction).toBeNull();
+  expect(history.mock.calls.map(([, after]) => after)).toEqual([0, 0]);
   expect(received).toHaveLength(1);
   expect(received[0]).toMatchObject({ request_seq: 4, amount_micro: 1500, signature: expect.any(String) });
   expect(charged.size).toBe(1);

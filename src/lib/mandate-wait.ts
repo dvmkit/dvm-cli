@@ -3,6 +3,7 @@ import { loadJob, markJobTerminal, mutateCreditPayment, updateObservedJob, type 
 import { appendMessages, loadMessages, maxSeq } from "./messages/index";
 import { mandateCredit, mandateDrawTotal, recordMandatePayments } from "./mandate-payments";
 import { guidanceJobArg } from "./provider-output";
+import { isTransientJobReadError } from "./job-read-error";
 
 // SDK 0.41.0 job-manager.ts: 10 s mandate-resume grace, then up to 60 s
 // for the default stale-job sweep tick. Add 10 s for settlement/read latency.
@@ -73,11 +74,28 @@ async function declineStoppedAsk(jobId: string, requestSeq: number, transport: T
     "Keep watching the job for its final result.", { mandate_wait: true, ...standingStopOutput(loadJob(jobId)) });
 }
 
+export class MandateGuardReadError extends Error {
+  constructor(cause?: unknown) {
+    super("The mandate guard could not confirm the charge within its read budget.", { cause });
+  }
+}
+
 export async function guardMandatePayment(jobId: string, requestSeq: number, transport: Transport,
-  provider: ProviderRef, jobToken?: string): Promise<void> {
+  provider: ProviderRef, jobToken?: string, waitReadTimeoutMs?: () => number): Promise<void> {
   const job = loadJob(jobId);
   if (!job?.mandate && !job?.stopRequested) return;
-  const history = await transport.getMessages(jobId, 0, provider, { jobToken, timeoutMs: 60_000 });
+  // Only mark reads that precede a send so the wait can reconnect safely.
+  async function read<T>(request: (options: { jobToken?: string; timeoutMs: number }) => Promise<T>): Promise<T> {
+    const timeoutMs = waitReadTimeoutMs?.() ?? 60_000;
+    if (timeoutMs <= 0) throw new MandateGuardReadError();
+    try {
+      return await request({ jobToken, timeoutMs });
+    } catch (error) {
+      if (waitReadTimeoutMs && isTransientJobReadError(error)) throw new MandateGuardReadError(error);
+      throw error;
+    }
+  }
+  const history = await read((options) => transport.getMessages(jobId, 0, provider, options));
   appendMessages(jobId, history);
   recordMandatePayments(jobId, history, maxSeq(history, 0));
   const payment = history.find((message) => message.from === "requester" && message.type === "payment" &&
@@ -100,7 +118,7 @@ export async function guardMandatePayment(jobId: string, requestSeq: number, tra
       { mandate_wait: true, display: action.display, retry_at_ms: action.retry_at_ms });
   }
   const latestAsk = history.findLast((message) => message.from === "provider" && message.type === "payment-request");
-  const status = await transport.status(jobId, provider, { jobToken, timeoutMs: 60_000 });
+  const status = await read((options) => transport.status(jobId, provider, options));
   if (latestAsk?.seq !== requestSeq || status.status !== "awaiting-input")
     throw new DvmError("payment_request_not_pending", "The provider moved past this charge. Keep watching; no payment was sent.",
       undefined, { mandate_wait: true, display: "The provider is updating this job; no payment was sent by this CLI." });

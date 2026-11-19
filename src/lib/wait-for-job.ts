@@ -167,6 +167,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     const next = await streamLoop({
       ...opts, onMessage, messageAppendSession, afterSeq: streamAfter, retryUnreachableReads: true,
       timeoutMs: readOptions().timeoutMs,
+      mandateReadTimeoutMs: () => Math.min(idleTimeoutMs, deadline - now()),
     });
     collectMessages(next.messages);
     result.autoPayments.push(...next.autoPayments);

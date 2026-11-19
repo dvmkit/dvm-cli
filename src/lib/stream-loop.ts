@@ -1,5 +1,5 @@
 import { paymentCreditChoice, type CreditedPaymentResult } from "./payment-credit";
-import { mandateWindowAction } from "./mandate-wait";
+import { MandateGuardReadError, mandateWindowAction } from "./mandate-wait";
 import { isTransientJobReadError } from "./job-read-error";
 import { hasUnsavedJobState } from "./job-persistence";
 import { sameEndpoint } from "./provider-endpoint";
@@ -49,6 +49,8 @@ export interface StreamLoopOptions {
   onAutoPayment?: (payment: AutoPayment, requestSeq: number) => void;
   /** Timeout in milliseconds. If exceeded, returns whatever has been collected. */
   timeoutMs?: number;
+  /** Remaining wait budget, capped by the read timeout, checked before each mandate guard read. */
+  mandateReadTimeoutMs?: () => number;
   /**
    * Whether messages, refund claims, and policy-driven payments may update local
    * state. Endpoint-overridden follow-ups set this false so one provider's
@@ -141,6 +143,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   // and the payment-rail helpers (payWithLightning / payWithCashu) reach the
   // token without manually threading it down four call levels.
   const jobToken = opts.jobToken ?? loadJob(jobId)?.jobToken;
+  const paymentOptions = { jobToken, useStoredPolicy: true, mandateReadTimeoutMs: opts.mandateReadTimeoutMs };
   // A decline the provider confirmed ended the job, even when its message is not in this batch.
   const declined = () => persistLocalState && loadJob(jobId)?.callerDeclined === true;
   async function recordAutoPayment(result: PaidPaymentResult | CreditedPaymentResult, request: PaymentRequestContent, seq: number): Promise<void> {
@@ -171,9 +174,11 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     let result: PaymentResult | undefined;
     try {
       result = await handlePaymentRequest(jobId, pending.request, policy, transport, provider, {
-        jobToken, requestSeq: pending.authorization.request_seq, useStoredPolicy: true,
+        ...paymentOptions, requestSeq: pending.authorization.request_seq,
       });
     } catch (error) {
+      if (error instanceof MandateGuardReadError)
+        return { messages: [], autoPayments, refunds, cursor, nextAction: pollNextAction(jobId) };
       if (error instanceof DvmError && error.code === "payment_already_sent") answeredSeqs.add(pending.authorization.request_seq);
       else if (error instanceof DvmError && ["payment_settling", "payment_request_not_pending"].includes(error.code))
         return { messages: [], autoPayments, refunds, cursor, paymentInFlight: true,
@@ -311,15 +316,21 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
           let result: PaymentResult;
           try {
             result = await handlePaymentRequest(jobId, req, activePolicy, transport, provider, {
-              jobToken, requestSeq: lastYield.seq, useStoredPolicy: true,
+              ...paymentOptions, requestSeq: lastYield.seq,
             });
             // A landing is not a refusal by the bound credit. The durable rail
             // guard lets this follow-up try credit without another rail spend.
             if (typeof result === "object" && result.status === "credited" && result.credit.ask_open)
               result = await handlePaymentRequest(jobId, req, activePolicy, transport, provider, {
-                jobToken, requestSeq: lastYield.seq, useStoredPolicy: true,
+                ...paymentOptions, requestSeq: lastYield.seq,
               });
           } catch (error) {
+            if (error instanceof MandateGuardReadError) {
+              // Reconnect behind the ask so the guard can recheck it after releasing the payment lock.
+              paymentWaitAction = pollNextAction(jobId);
+              cursor = Math.min(cursor, lastYield.seq - 1);
+              break;
+            }
             if (error instanceof DvmError && error.code === "payment_credit_choice_required") {
               creditChoiceAction = paymentCreditChoice(jobId, lastYield.seq, req, false) ?? null;
               cursor = Math.min(cursor, lastYield.seq - 1);
@@ -436,7 +447,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     }
   }
 
-  if (paymentUnresolved) nextAction = paymentWaitAction ?? pollNextAction(jobId, paymentInFlightHint(jobId, heldJob,
+  if (paymentWaitAction || paymentUnresolved) nextAction = paymentWaitAction ?? pollNextAction(jobId, paymentInFlightHint(jobId, heldJob,
     lastYield?.type === "payment-request" ? lastYield.seq : undefined));
   if (!paymentUnresolved && nextAction?.type === "pay" && lastYield?.type === "payment-request" && persistLocalState)
     nextAction = mandateWindowAction(jobId, lastYield.content, lastYield.seq) ?? nextAction;
