@@ -59,9 +59,21 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
   // Whether any status read showed the job still open, which the wait-limit hint states.
   let seenRunning = false;
   const acknowledgedDeclineSeqs = new Set<number>();
-  let declineConfirmationSeq: number | undefined;
-  let streamedTerminal = false;
+  let declineConfirmation: StreamLoopResult["declineAcknowledgement"];
+  let streamedCancel = false;
   const idleTimeoutMs = opts.timeoutMs ?? JOB_READ_TIMEOUT_MS;
+  function observeDeclineHistory(messages: Message[]): void {
+    if (!declineConfirmation) return;
+    const { historyThrough } = declineConfirmation;
+    // An older transport can omit the acknowledgment sequence. The log can supply it.
+    const messageSeq = declineConfirmation.messageSeq ??= messages.find((message) =>
+      message.seq > historyThrough && message.from === "requester" && message.type === "decline")?.seq;
+    if (messageSeq === undefined) return;
+    const afterDecline = Math.max(historyThrough, messageSeq);
+    if (messages.some((message) => message.seq > afterDecline && message.from === "provider" &&
+      (message.type === "working" || message.type === "progress" || message.type === "prompt" || message.type === "payment-request")))
+      declineConfirmation = undefined;
+  }
   async function waitBeforeRetry(): Promise<void> {
     const delay = Math.min(backoffMs, Math.max(0, deadline - now()));
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
@@ -78,16 +90,17 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     return undefined;
   }
   while (now() < deadline && !hasUnsavedJobState()) {
-    const jobToken = opts.jobToken ?? (declineConfirmationSeq === undefined ? undefined : loadJob(opts.jobId)?.jobToken);
+    const jobToken = opts.jobToken ?? (acknowledgedDeclineSeqs.size ? loadJob(opts.jobId)?.jobToken : undefined);
     const readOptions = () => ({ jobToken, timeoutMs: Math.max(1, Math.min(idleTimeoutMs, deadline - now())) });
     const snapshot: ContentStatus | undefined = await readWithRetry(() => opts.transport.status(opts.jobId, opts.provider, readOptions()));
     if (!snapshot) break;
     seenRunning = !isTerminalJobStatus(snapshot.status);
     if (isTerminalJobStatus(snapshot.status)) {
-      if (declineConfirmationSeq !== undefined) recordStoppedAskStatus(opts.jobId, declineConfirmationSeq, snapshot.status);
       result.providerStatus = snapshot;
       result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
       const history = await readWithRetry(() => opts.transport.getMessages(opts.jobId, result.cursor, opts.provider, readOptions()));
+      if (history) observeDeclineHistory(history);
+      if (declineConfirmation) recordStoppedAskStatus(opts.jobId, declineConfirmation.requestSeq, snapshot.status);
       if (!history) break;
       if (result.cursor === 0 && snapshot.content_available !== false)
         result.fullHistoryThrough = maxSeq(history, 0);
@@ -104,7 +117,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       result.nextAction = withRefundNextAction(opts.jobId, null, result.refunds);
       break;
     }
-    if (streamedTerminal) {
+    if (streamedCancel) {
       await waitBeforeRetry();
       continue;
     }
@@ -141,6 +154,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
         history = await readWithRetry(() => opts.transport.getMessages(opts.jobId, 0, opts.provider, readOptions()));
       }
       if (!history) break;
+      observeDeclineHistory(history);
       messageAppendSession?.append(history);
       if (messageAppendSession && snapshot.content_available !== false)
         result.fullHistoryThrough = maxSeq(history, 0);
@@ -184,6 +198,7 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
       mandateReadTimeoutMs: () => Math.min(idleTimeoutMs, deadline - now()),
       acknowledgedDeclineSeqs,
     });
+    observeDeclineHistory(next.messages);
     collectMessages(next.messages);
     result.autoPayments.push(...next.autoPayments);
     result.refunds.push(...next.refunds);
@@ -192,9 +207,9 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     result.nextAction = next.nextAction;
     paymentInFlight = next.paymentInFlight === true;
     if (hasUnsavedJobState()) break;
-    if (declineConfirmationSeq !== undefined && next.messages.some((message) => message.type === "complete" || message.type === "cancel")) {
+    if (declineConfirmation && next.messages.findLast((message) => message.type === "complete" || message.type === "cancel")?.type === "cancel") {
       // A streamed cancel can also mean provider failure. Confirm the ending from status.
-      streamedTerminal = true;
+      streamedCancel = true;
       continue;
     }
     if (next.nextAction?.type !== "poll") break;
@@ -202,8 +217,10 @@ async function waitAttached(opts: StreamLoopOptions, durationMs: number, now: ()
     const decline = next.declineAcknowledgement;
     if (decline) {
       acknowledgedDeclineSeqs.add(decline.requestSeq);
-      if (!decline.standingStop) {
-        declineConfirmationSeq = decline.requestSeq;
+      if (decline.standingStop) {
+        declineConfirmation = undefined;
+      } else {
+        declineConfirmation = { ...decline, historyThrough: Math.max(decline.requestSeq, decline.historyThrough, next.cursor) };
         continue;
       }
     }

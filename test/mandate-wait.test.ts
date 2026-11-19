@@ -211,6 +211,77 @@ it.each([
   }
 });
 
+it.each(["timeout", "provider_error"])("returns streamed completion when another status read would fail with %s", async (code) => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(start);
+    const jobId = `decline-completion-${code}`;
+    saveJob({ ...job, id: jobId, policy, stopRequested: true });
+    const request: Message = { seq: 4, from: "provider", timestamp: start / 1000, type: "payment-request", content: ask };
+    const complete: Message = { seq: 6, from: "provider", timestamp: start / 1000 + 1, type: "complete", content: { summary: "Finished" } };
+    const status = vi.fn<Transport["status"]>(async (_id, _provider, options) => {
+      if (code === "timeout") await new Promise((resolve) => setTimeout(resolve, options?.timeoutMs));
+      throw new DvmError(code, "Status unavailable");
+    }).mockResolvedValueOnce({ jobId, status: "awaiting-input" }).mockResolvedValueOnce({ jobId, status: "processing" });
+    const stream = vi.fn<NonNullable<Transport["stream"]>>()
+      .mockResolvedValueOnce({ messages: [request], reason: "yield" })
+      .mockResolvedValueOnce({ messages: [complete], reason: "complete" });
+    const sendMessage = vi.fn<Transport["sendMessage"]>().mockResolvedValue({ seq: 5 });
+    const getMessages = vi.fn<Transport["getMessages"]>().mockResolvedValue([request]);
+    const transport = { status, getMessages, stream, sendMessage } as unknown as Transport;
+    const waiting = waitForJob({ jobId, transport, provider: { endpoint: job.endpoint }, policy, afterSeq: 2,
+      afterSeqExplicit: true, timeoutMs: 1_500 }, 8_000).catch((error: unknown) => ({ error }));
+    await vi.runAllTimersAsync();
+
+    expect(await waiting).toMatchObject({ messages: [request, complete], cursor: 6, nextAction: null, autoPayments: [] });
+    expect(status).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls.map(([, message]) => message.type)).toEqual(["decline"]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it.each(["after the decline in the stream", "after the decline in terminal history", "after an echoed decline", "before the decline"])(
+  "attributes cancellation using the position of working messages %s", async (workPosition) => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(start);
+      const jobId = `decline-working-${workPosition.replaceAll(" ", "-")}`;
+      const pendingCreditPayment = savedCreditPayment(jobId, 4);
+      saveJob({ ...job, id: jobId, policy, stopRequested: true, pendingCreditPayment });
+      const request: Message = { seq: 4, from: "provider", timestamp: start / 1000, type: "payment-request", content: ask };
+      const decline: Message = { seq: 6, from: "requester", timestamp: start / 1000 + 1, type: "decline", content: {} };
+      const workBeforeDecline = workPosition === "before the decline";
+      const working: Message = { seq: workBeforeDecline ? 5 : 7, from: "provider", timestamp: start / 1000 + 1, type: "working", content: {} };
+      const cancel: Message = { seq: 8, from: "provider", timestamp: start / 1000 + 2, type: "cancel", content: { reason: "Cancelled" } };
+      const liveMessages = workBeforeDecline ? [request, working, decline] : [request, decline, working];
+      const sendMessage = vi.fn<Transport["sendMessage"]>().mockResolvedValue(workPosition === "after an echoed decline" ? undefined : { seq: decline.seq });
+      const status = vi.fn<Transport["status"]>().mockResolvedValue({ jobId, status: "cancelled" })
+        .mockResolvedValueOnce({ jobId, status: "awaiting-input" });
+      if (workPosition !== "after the decline in terminal history") status.mockResolvedValueOnce({ jobId, status: "processing" });
+      const stream = vi.fn<NonNullable<Transport["stream"]>>(async (_id, after) => ({
+        messages: liveMessages.filter((message) => message.seq > after), reason: "yield",
+      }));
+      const getMessages = vi.fn<Transport["getMessages"]>(async (_id, after) =>
+        [...liveMessages, cancel].filter((message) => message.seq > after)).mockResolvedValueOnce([request]);
+      const transport = { status, getMessages, stream, sendMessage } as unknown as Transport;
+      const waiting = waitForJob({ jobId, transport, provider: { endpoint: job.endpoint }, policy, afterSeq: 2,
+        afterSeqExplicit: true, timeoutMs: 1_500 }, 8_000).catch((error: unknown) => ({ error }));
+      await vi.runAllTimersAsync();
+
+      expect(await waiting).toMatchObject({ messages: [...liveMessages, cancel], providerStatus: { status: "cancelled" }, nextAction: null, autoPayments: [] });
+      expect(sendMessage.mock.calls.map(([, message]) => message.type)).toEqual(["decline"]);
+      const saved = loadJob(jobId);
+      expect(saved?.callerDeclined).toBe(workBeforeDecline ? true : undefined);
+      expect(saved?.callerCancelled).toBe(workBeforeDecline ? true : undefined);
+      expect(saved?.pendingCreditPayment).toEqual(workBeforeDecline ? undefined : pendingCreditPayment);
+      expect(saved?.stopRequested).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
 it("surfaces a timeout in the decline send without retrying it or reading confirmation", async () => {
   const jobId = "decline-send-timeout";
   saveJob({ ...job, id: jobId, stopRequested: true });
