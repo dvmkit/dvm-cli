@@ -112,7 +112,7 @@ async function messagesWithAccess(
       if (action && (action.type !== "poll" ||
         messages.some((message) => ["prompt", "payment-request", "working"].includes(message.type)))) return action;
       if (snapshot.status === "awaiting-input") {
-        const history = await transport.getMessages(jobId, 0, ref, readOptions);
+        const history = await transport.getMessages(jobId, 0, ref, { ...readOptions, ...(opts.stream === false && { idleTimeout: true }) });
         return actionFromMessages(history) ?? pollNextAction(jobId);
       }
       return action ?? pollNextAction(jobId);
@@ -140,7 +140,7 @@ async function messagesWithAccess(
     progressNotice("Fetching messages...", opts.human);
     let msgs: Message[];
     try {
-      msgs = await transport.getMessages(jobId, after, ref, { timeoutMs: timeout, jobToken });
+      msgs = await transport.getMessages(jobId, after, ref, { timeoutMs: timeout, jobToken, idleTimeout: true });
     } catch (err) {
       if (
         err instanceof DvmError &&

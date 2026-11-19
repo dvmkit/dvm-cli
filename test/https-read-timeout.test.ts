@@ -16,6 +16,15 @@ const reads = [
     expected: [],
   },
   {
+    name: "message snapshot",
+    message: "Message poll timed out.",
+    invoke: (endpoint: string, timeoutMs?: number) =>
+      new HttpsTransport().getMessages("job-1", 0, { endpoint }, { timeoutMs, idleTimeout: true }),
+    bodies: [{ label: "messages JSON", statusCode: 200, partialBody: '{"messages":[' }],
+    completed: '{"messages":[]}',
+    expected: [],
+  },
+  {
     name: "status",
     message: "Status check timed out.",
     invoke: (endpoint: string, timeoutMs?: number) =>
@@ -87,6 +96,44 @@ describe.each(reads)("HTTPS $name deadlines", (read) => {
     release?.();
     await expect(result).resolves.toEqual(read.expected);
   });
+});
+
+it("downloads a snapshot whose body keeps making progress past the idle timeout", async () => {
+  const artifact = { seq: 8, from: "provider", timestamp: 1, type: "artifact",
+    content: { name: "résultat.bin", data: "abcd".repeat(65_536) } };
+  const body = Buffer.from(JSON.stringify({ messages: [artifact] }));
+  vi.useFakeTimers();
+  try {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, options) => new Response(new ReadableStream({
+      start(controller) {
+        const first = body.indexOf(Buffer.from("é")) + 1;
+        const chunkSize = Math.ceil((body.length - first) / 9);
+        let offset = first;
+        controller.enqueue(body.subarray(0, first));
+        const send = setInterval(() => {
+          const end = offset + chunkSize;
+          controller.enqueue(body.subarray(offset, end));
+          offset = end;
+          if (end >= body.length) {
+            clearInterval(send);
+            controller.close();
+          }
+        }, 100);
+        options?.signal?.addEventListener("abort", () => {
+          clearInterval(send);
+          controller.error(options.signal?.reason);
+        }, { once: true });
+      },
+    })));
+    const snapshot = new HttpsTransport().getMessages("job-1", 0, { endpoint: "https://provider.invalid" },
+      { timeoutMs: 500, idleTimeout: true });
+    await Promise.all([
+      expect(snapshot).resolves.toEqual([artifact]),
+      vi.advanceTimersByTimeAsync(1_000),
+    ]);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 describe("HTTPS refused read connections", () => {

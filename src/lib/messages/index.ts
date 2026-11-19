@@ -4,7 +4,10 @@ export {
   createMessageAppendSession,
   getHighestSeq,
   loadMessages,
+  messageHistoryCheckpoint,
+  verifiedMessageHistoryThrough,
   type MessageAppendSession,
+  type MessageHistoryCheckpoint,
 } from "./store";
 export type {
   ApprovalContent,

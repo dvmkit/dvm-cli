@@ -677,7 +677,7 @@ export function buildProgram(): Command {
     .option("--human", "Human-readable output instead of JSON")
     .option("--wait", "Stay attached until the job needs input or ends; JSON output is one line per event")
     .option("--until <duration>", "Wait limit with --wait (default: 12h; e.g. 30s, 5m, 12h, 1h30m)")
-    .option("--timeout <sec>", "Read timeout (default: 5s, or 60s with --wait)")
+    .option("--timeout <sec>", "Read timeout (default: 5s, or 60s with --wait). With --no-stream, the download times out after this long without data.")
     .action((jobId: string, opts: MessagesOptions) => {
       // --wait streams JSON lines, so its error is the last event of that stream.
       return catchErrors(() => messages(jobId, opts), opts.human, opts.wait && !opts.human ? { event: "error" } : undefined);

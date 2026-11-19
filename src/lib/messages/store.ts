@@ -1,4 +1,5 @@
 import { ensureConfigSubdir, type Message, MESSAGES_DIR } from "@dvmkit/sdk/internal";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   closeSync,
@@ -171,6 +172,31 @@ export function loadMessages(jobId: string, after?: number): Message[] {
     }
   }
   return messages;
+}
+
+export interface MessageHistoryCheckpoint {
+  through: number;
+  sequenceDigest: string;
+}
+
+export function messageHistoryCheckpoint(through: number, messages: Message[]): MessageHistoryCheckpoint {
+  return { through, sequenceDigest: sequenceDigest(through, new Set(messages.map((message) => message.seq))) };
+}
+
+export function verifiedMessageHistoryThrough(messages: Message[], checkpoint?: MessageHistoryCheckpoint): number {
+  const sequences = new Set(messages.map((message) => message.seq));
+  // Only a provider read can establish coverage across a gap. Check that the
+  // corresponding cached prefix is still present after truncation or eviction.
+  let through = checkpoint && Number.isSafeInteger(checkpoint.through) && checkpoint.through > 0 &&
+    sequences.has(checkpoint.through) && checkpoint.sequenceDigest === sequenceDigest(checkpoint.through, sequences)
+    ? checkpoint.through : 0;
+  while (through < Number.MAX_SAFE_INTEGER && sequences.has(through + 1)) through++;
+  return through;
+}
+
+function sequenceDigest(through: number, sequences: Set<number>): string {
+  const prefix = [...sequences].filter((seq) => seq <= through).sort((a, b) => a - b);
+  return createHash("sha256").update(JSON.stringify(prefix)).digest("hex");
 }
 
 export function getHighestSeq(jobId: string): number {

@@ -724,7 +724,7 @@ export class HttpsTransport implements Transport {
     jobId: string,
     after: number,
     provider?: ProviderRef,
-    options?: MessagePollOptions
+    options?: MessagePollOptions & { idleTimeout?: boolean }
   ): Promise<Message[]> {
     const endpoint = provider?.endpoint;
     if (!endpoint) {
@@ -734,10 +734,12 @@ export class HttpsTransport implements Transport {
       );
     }
     const url = `${endpoint}/v1/job/${jobId}/messages?after=${after}`;
-    const signal =
-      options?.timeoutMs && options.timeoutMs > 0
-        ? AbortSignal.timeout(options.timeoutMs)
-        : undefined;
+    const timeoutMs = options?.timeoutMs ?? 0;
+    const download = options?.idleTimeout && timeoutMs > 0 ? new AbortController() : undefined;
+    const idleTimer = download && setTimeout(() => {
+      download.abort(new DOMException("Message poll timed out.", "TimeoutError"));
+    }, timeoutMs);
+    const signal = download?.signal ?? (timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined);
 
     try {
       let res: Response;
@@ -758,11 +760,20 @@ export class HttpsTransport implements Transport {
         throw jobReadHttpError(res.status, `getMessages failed (${res.status}): ${text}`, { message: "provider" });
       }
 
-      const data = (await readJobResponse(() => res.json(), jobId)) as { messages: Message[] };
+      let body = res;
+      if (idleTimer && res.body) {
+        idleTimer.refresh();
+        body = new Response(res.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            if (chunk.byteLength > 0) idleTimer.refresh();
+            controller.enqueue(chunk);
+          },
+        })));
+      }
+      const data = (await readJobResponse(() => body.json(), jobId)) as { messages: Message[] };
       return data.messages.map(callerMessageRecognizer(jobId, endpoint));
     } catch (err) {
-      if (err instanceof DvmError) throw err;
-      if (isAbortError(err)) {
+      if (download?.signal.aborted || isAbortError(err)) {
         throw new DvmError(
           "timeout",
           "Message poll timed out.",
@@ -770,6 +781,8 @@ export class HttpsTransport implements Transport {
         );
       }
       throw err;
+    } finally {
+      clearTimeout(idleTimer);
     }
   }
 
