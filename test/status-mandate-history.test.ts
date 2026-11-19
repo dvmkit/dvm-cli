@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { MESSAGES_DIR, type Message } from "@dvmkit/sdk/internal";
+import { DvmError, MESSAGES_DIR, type Message } from "@dvmkit/sdk/internal";
 import { beforeEach, expect, it, vi } from "vitest";
 import { status } from "../src/commands/status";
 import { loadJob, saveJob } from "../src/lib/job-store";
@@ -142,6 +142,71 @@ it("switches to the remaining prompt when a reply becomes visible below the newe
   expect(messageReads()).toEqual([[jobId, 2], [jobId, 4], [jobId, 4]]);
   expect(gapReads()).toEqual([[jobId, 2, 4]]);
   expect(loadJob(jobId)?.messageCursor).toBe(2);
+});
+
+it("bounds gap probes and revisits older gaps as the provider history grows", async () => {
+  const prompts = [
+    { seq: 1, from: "provider", timestamp, type: "prompt", content: { id: "first", text: "First choice?" } },
+    { seq: 2, from: "provider", timestamp, type: "prompt", content: { id: "second", text: "Second choice?" } },
+  ] satisfies Message[];
+  history = [...prompts, ...[5, 7, 9, 11, 13].map((seq) => artifact(seq))];
+  seed(jobId, 2, history);
+  await status(jobId, {});
+  wire.status.mockResolvedValue({ jobId, status: "awaiting-input", content_available: true });
+  history.push({ seq: 12, from: "requester", timestamp, type: "response", content: { prompt_id: "second", text: "Yes" } });
+
+  const polls = [
+    { newest: 15, gaps: [[2, 5], [5, 7]], action: { type: "respond", prompt_id: "second" } },
+    { newest: 17, gaps: [[7, 9], [9, 11]], action: { type: "respond", prompt_id: "second" } },
+    { newest: 19, gaps: [[11, 13]], action: { type: "respond", prompt_id: "first" } },
+    { newest: 21, gaps: [[2, 5], [5, 7]], action: { type: "poll" } },
+  ];
+  for (const { newest, gaps, action } of polls) {
+    wire.getMessages.mockClear();
+    history.push(artifact(newest));
+    if (newest === 21) {
+      history.push({ seq: 3, from: "requester", timestamp, type: "response", content: { prompt_id: "first", text: "Yes" } });
+    }
+    await status(jobId, {});
+    expect(gapReads()).toEqual(gaps.map(([after, before]) => [jobId, after, before]));
+    expect(wire.getMessages.mock.calls[0]?.slice(0, 2)).toEqual([jobId, newest - 2]);
+    expect(output()).toMatchObject({ next_action: action });
+  }
+});
+
+it("keeps the fresh payment summary when a gap read uses up the poll budget", async () => {
+  const prompt: Message = { seq: 1, from: "provider", timestamp, type: "prompt",
+    content: { id: "choice", text: "Continue observing?" } };
+  history = [prompt, artifact(3), artifact(5), ask(7)];
+  seed(jobId, 1, history);
+  await status(jobId, {});
+  wire.getMessages.mockClear();
+  history.push(payment(8, 7));
+  wire.status.mockResolvedValue({ jobId, status: "awaiting-input", content_available: true });
+  let now = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+  wire.getMessages.mockImplementation(async (_id: string, after: number, _provider, { beforeSeq } = {}) => {
+    if (beforeSeq !== undefined) {
+      now = 100;
+      throw new DvmError("timeout", "Message poll timed out.");
+    }
+    now = 85;
+    return history.filter((message) => message.seq > after);
+  });
+
+  await status(jobId, { timeout: "0.1" });
+
+  expect(wire.getMessages.mock.calls[0]?.slice(0, 2)).toEqual([jobId, 7]);
+  expect(gapReads()).toEqual([[jobId, 1, 3]]);
+  expect(wire.getMessages.mock.lastCall?.[3].timeoutMs).toBe(15);
+  expect(output()).toMatchObject({ mandate_payments: [{ seq: 8, amount_msats: 8000 }], spend: { total_msats: 8000 } });
+
+  wire.getMessages.mockClear().mockImplementation(async (_id: string, after: number, _provider, { beforeSeq = Infinity } = {}) =>
+    history.filter((message) => message.seq > after && message.seq < beforeSeq));
+  history.push({ seq: 4, from: "requester", timestamp, type: "response", content: { prompt_id: "choice", text: "Yes" } });
+  await status(jobId, {});
+  expect(gapReads()).toEqual([[jobId, 3, 5], [jobId, 5, 7]]);
+  expect(output()).toMatchObject({ next_action: { type: "poll" } });
 });
 
 it("recovers the missing prefix when the cached log is truncated", async () => {

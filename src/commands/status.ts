@@ -49,6 +49,7 @@ import {
 } from "../lib/receipt-verify";
 
 import { type ContentStatus, jobContentFields } from "../lib/job-content";
+import { isTransientJobReadError } from "../lib/job-read-error";
 import { takeCreditNoticeFields } from "../lib/credit-notice";
 import { settleCreditAfterRead } from "../lib/credit-topup";
 import { providerCurrency } from "../lib/provider-currency";
@@ -67,6 +68,8 @@ import { progressNotice } from "../lib/progress-notice";
 import { createDvmTransport, type HttpsTransport } from "../lib/transport/index";
 import { dvmIdentity } from "./dvm-identity";
 import { serializeJobMessageForOutput } from "./messages";
+
+const MAX_STATUS_GAP_PROBES = 2;
 
 export interface StatusOptions extends JobAccessOptions {
   human?: boolean;
@@ -411,18 +414,33 @@ async function readStatusMessages(
   const covered = statusHistoryCursor(cached, useSparseHistory ? checkpoint : undefined);
   // A delivery cursor can skip messages the payment reconciler still needs.
   const after = deliver ? (useCache ? Math.min(deliveryAfter, covered) : deliveryAfter) : covered;
+  const deadline = performance.now() + readOptions.timeoutMs;
+  const tail = await transport.getMessages(jobId, after, access.ref, readOptions);
   const recovered: Message[] = [];
+  let promptGapScan = checkpoint?.promptGapScan;
   if (useCache && status === "awaiting-input" && checkpoint) {
-    const deadline = Date.now() + readOptions.timeoutMs;
-    for (const gap of openPromptGaps(cached, after)) {
-      const timeoutMs = readOptions.timeoutMs > 0 ? Math.max(1, deadline - Date.now()) : readOptions.timeoutMs;
-      const messages = await transport.getMessages(jobId, gap.after, access.ref, {
-        ...readOptions, timeoutMs, beforeSeq: gap.before,
-      });
-      for (const message of messages) recovered.push(message);
+    const gaps = openPromptGaps([...cached, ...tail], after);
+    const previousScan = promptGapScan;
+    const remaining = previousScan
+      ? gaps.filter((gap) => gap.after > previousScan.after && gap.after < previousScan.through)
+      : [];
+    // Keep each scan's endpoint fixed so new gaps cannot postpone revisiting older ones.
+    const through = remaining.length && previousScan ? previousScan.through : after;
+    for (const gap of (remaining.length ? remaining : gaps).slice(0, MAX_STATUS_GAP_PROBES)) {
+      const timeoutMs = readOptions.timeoutMs > 0 ? Math.floor(deadline - performance.now()) : readOptions.timeoutMs;
+      if (readOptions.timeoutMs > 0 && timeoutMs < 1) break;
+      try {
+        const messages = await transport.getMessages(jobId, gap.after, access.ref, {
+          ...readOptions, timeoutMs, beforeSeq: gap.before,
+        });
+        for (const message of messages) recovered.push(message);
+      } catch (error) {
+        if (!isTransientJobReadError(error)) throw error;
+      }
+      // A transient failure gets another turn on the next scan.
+      promptGapScan = { after: gap.after, through };
     }
   }
-  const tail = await transport.getMessages(jobId, after, access.ref, readOptions);
   const history = contentAvailable !== false && (useCache || after === 0)
     ? [...new Map([...cached.filter((message) => message.seq <= after), ...recovered, ...tail]
       .map((message) => [message.seq, message])).values()].sort((a, b) => a.seq - b.seq)
@@ -435,6 +453,7 @@ async function readStatusMessages(
     if (useCache && !isTerminalJobStatus(status) && history && fullHistoryThrough && Number.isSafeInteger(fullHistoryThrough)) {
       recordStatusMessageHistory(jobId, {
         through: fullHistoryThrough, sequenceDigest: historySequenceDigest(history, fullHistoryThrough),
+        ...(promptGapScan && { promptGapScan }),
       }, checkpoint);
     }
   }

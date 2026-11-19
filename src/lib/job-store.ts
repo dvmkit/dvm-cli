@@ -30,6 +30,8 @@ export type PaymentApproval = "auto" | "explicit";
 export interface StatusMessageHistory {
   through: number;
   sequenceDigest: string;
+  /** Last attempted gap and the fixed endpoint of its scan. */
+  promptGapScan?: { after: number; through: number };
 }
 
 export interface CreditPaymentIntent {
@@ -455,8 +457,13 @@ export function recordStatusMessageHistory(id: string, next: StatusMessageHistor
     const job = jobs.find((entry) => entry.id === id);
     if (!job) return;
     const current = job.statusMessageHistory;
-    if (!current || next.through > current.through || isDeepStrictEqual(current, previous)) {
+    if (!current || isDeepStrictEqual(current, previous)) {
       job.statusMessageHistory = next;
+    } else if (next.through > current.through) {
+      const { promptGapScan, ...coverage } = next;
+      const scan = isDeepStrictEqual(current.promptGapScan, previous?.promptGapScan)
+        ? promptGapScan : current.promptGapScan;
+      job.statusMessageHistory = { ...coverage, ...(scan && { promptGapScan: scan }) };
     }
   }, true);
 }
