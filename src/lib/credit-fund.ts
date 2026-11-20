@@ -118,14 +118,12 @@ import {
 import {
   acknowledgeReplayedX402Payment,
   assertX402RequirementDescribesChannel,
-  createX402BatchPayment,
   processX402BatchCorrection,
-  processX402BatchResponse,
   processX402BatchResponseForWallet,
   x402RequiredFromError,
 } from "@dvmkit/sdk/internal";
 import {
-  assertRetiredX402FundingReady,
+  createX402BatchPayment,
   finalizedX402DepositExpiredUnused,
   isVoucherOnlyX402Funding,
   x402RetiredDepositExpiresAt,
@@ -1909,7 +1907,6 @@ async function fundOverX402(
 
   let btcRate = 100_000;
   let pending = resumed;
-  let scheme: Awaited<ReturnType<typeof createX402BatchPayment>>["scheme"] | undefined;
   if (!pending) {
     // Cheap local pre-check for the case that dominates: another credit at this
     // same DVM still owes a signed voucher. `createX402BatchPayment` gates the
@@ -1986,7 +1983,6 @@ async function fundOverX402(
       }
     }
     try {
-      await assertRetiredX402FundingReady(wallet, required);
       const payment = await createX402BatchPayment({
         wallet,
         paymentRequired: required,
@@ -1995,7 +1991,6 @@ async function fundOverX402(
         creditId: args.creditId,
         depositMicro: args.maxDepositMicro ?? args.amountMicro,
       });
-      scheme = payment.scheme;
       pending = {
         endpoint: args.ref.endpoint,
         callerPubkey: args.signing.pubkey,
@@ -2037,8 +2032,6 @@ async function fundOverX402(
     });
     if (!result.x402PaymentResponse && result.replayed) {
       await acknowledgeReplayedX402Payment(pending.paymentHeader);
-    } else if (scheme) {
-      await processX402BatchResponse(scheme, result.x402PaymentResponse, pending.channelId);
     } else {
       await processX402BatchResponseForWallet({
         wallet,
@@ -4163,8 +4156,8 @@ function tempoChargePendingOutcome(
 }
 
 /**
- * Check the endpoint journal before discovery. Lifting a retired deposit's local
- * cutoff still leaves the channel-specific finalized proof check before signing.
+ * Check the endpoint journal for holds that can be decided locally. The signer
+ * checks retired deposits against finalized state once discovery identifies the channel.
  */
 function otherCreditPendingX402(args: FundCreditArgs): PendingX402Funding | undefined {
   return listPendingX402Fundings({
@@ -4172,9 +4165,9 @@ function otherCreditPendingX402(args: FundCreditArgs): PendingX402Funding | unde
     callerPubkey: args.signing.pubkey,
   })
     .filter(
-      (entry) =>
-        x402PendingUnsettled(entry) &&
-        (entry.creditId !== args.creditId || x402PendingRetired(entry))
+      (entry) => x402PendingRetired(entry)
+        ? isVoucherOnlyX402Funding(entry) && x402PendingUnsettled(entry)
+        : entry.creditId !== args.creditId
     )
     .sort((a, b) => a.requestedAt - b.requestedAt)[0];
 }

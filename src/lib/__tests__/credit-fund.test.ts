@@ -1,5 +1,9 @@
 vi.mock("../payment-rails/tempo-credential", () => ({ buildTempoCredential: vi.fn() }));
 vi.mock("../x402/wallet", async () => ({ ...(await vi.importActual<typeof import("../x402/wallet")>("../x402/wallet")), loadX402Wallet: vi.fn(() => null) }));
+vi.mock("../x402/batch-client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../x402/batch-client")>()),
+  createX402BatchPayment: vi.fn(),
+}));
 vi.mock("../x402/client", async () => ({ ...(await vi.importActual<typeof import("../x402/client")>("../x402/client")), tryX402Payment: vi.fn() }));
 vi.mock("../payment-rails/tempo-wallet", async () => ({ ...(await vi.importActual<typeof import("../payment-rails/tempo-wallet")>("../payment-rails/tempo-wallet")), connectedTempoAccount: vi.fn(() => Promise.resolve(null)) }));
 vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({ ...(await importOriginal<typeof import("@dvmkit/sdk/internal")>()),
@@ -33,9 +37,7 @@ retirePendingX402Funding: vi.fn(),
 withX402ChannelLock: vi.fn((operation: () => Promise<unknown>) => operation()),
 acknowledgeReplayedX402Payment: vi.fn(() => Promise.resolve()),
 assertX402RequirementDescribesChannel: vi.fn(),
-createX402BatchPayment: vi.fn(),
 processX402BatchCorrection: vi.fn(),
-processX402BatchResponse: vi.fn(() => Promise.resolve()),
 processX402BatchResponseForWallet: vi.fn(() => Promise.resolve()),
 x402RequiredFromError: vi.fn((err: DvmError) => err.data?.x402_payment_required),
 tryX402Payment: vi.fn(),
@@ -159,12 +161,11 @@ import { TEMPO_SESSION_UPDATED_REASON } from "@dvmkit/sdk/internal";
 import type { CreditMenu, ProviderInfo, Transport } from "@dvmkit/sdk/internal";
 import { loadAgentWallet } from "@dvmkit/sdk/internal";
 import { abandonPendingSubmission, prepareAgentSpend } from "../wallet-agent/spend";
+import { createX402BatchPayment, x402VoucherPendingRefusal } from "../x402/batch-client";
 
 import {
   acknowledgeReplayedX402Payment,
   assertX402RequirementDescribesChannel,
-  createX402BatchPayment,
-  processX402BatchResponse,
   processX402BatchResponseForWallet,
 } from "@dvmkit/sdk/internal";
 import {
@@ -477,7 +478,6 @@ describe("fundCredit over x402 batch settlement", () => {
     vi.mocked(createX402BatchPayment).mockResolvedValue({
       paymentHeader: "verbatim-signed-header",
       channelId: `0x${"44".repeat(32)}`,
-      scheme: {} as never,
       maxClaimableMicro: "400000",
       depositMicro: "400000",
       authorizationValidBefore: "1900000000",
@@ -530,9 +530,11 @@ describe("fundCredit over x402 batch settlement", () => {
         commitment: "345ea049de6dd25b06ff6c802b4ae4748d243995937cf503fa5a2ba87f451459",
       },
     });
-    expect(processX402BatchResponse).toHaveBeenCalledWith(
-      expect.anything(), "settled-response", `0x${"44".repeat(32)}`
-    );
+    expect(processX402BatchResponseForWallet).toHaveBeenCalledWith(expect.objectContaining({
+      channelId: `0x${"44".repeat(32)}`,
+      paymentHeader: "verbatim-signed-header",
+      paymentResponse: "settled-response",
+    }));
     expect(acknowledgeX402ChannelOwner).toHaveBeenCalledWith({
       channelId: `0x${"44".repeat(32)}`,
       endpoint: ENDPOINT,
@@ -884,13 +886,19 @@ describe("fundCredit over x402 batch settlement", () => {
     expect(recordPendingX402Funding).not.toHaveBeenCalled();
   });
 
-  it("refuses a same-credit re-fund while the refused deposit is still submittable", async () => {
+  it("reports the retired-deposit guard as a deferral without sending a payment", async () => {
     const refused = {
       ...journalled(),
       authorizationValidBefore: String(Math.floor(Date.now() / 1000) + 600),
       refusedAt: Date.now(),
     };
     vi.mocked(listPendingX402Fundings).mockReturnValue([refused]);
+    mockCreditOp.mockRejectedValueOnce(
+      new DvmError("payment_required", "Channel payment required.", undefined, {
+        x402_payment_required: required,
+      })
+    );
+    vi.mocked(createX402BatchPayment).mockRejectedValueOnce(x402VoucherPendingRefusal(refused));
 
     const outcome = await fundCredit(args({ creditId: "credit-1", rail: "x402", menu: X402_MENU }));
 
@@ -904,8 +912,9 @@ describe("fundCredit over x402 batch settlement", () => {
       hint: expect.stringContaining("the chain finalizes a block") });
     expect(notice).not.toHaveProperty("spent_sats");
     expect(notice).not.toHaveProperty("spent_micro");
-    expect(createX402BatchPayment).not.toHaveBeenCalled();
-    expect(mockCreditOp).not.toHaveBeenCalled();
+    expect(recordPendingX402Funding).not.toHaveBeenCalled();
+    expect(mockCreditOp).toHaveBeenCalledTimes(1);
+    expect(mockCreditOp.mock.calls[0][2]).toBeUndefined();
   });
 
   it("treats a DVM with no batch channel on this chain as a rail miss, not a refusal", async () => {
@@ -1253,7 +1262,6 @@ describe("fundCredit over exact x402", () => {
     vi.mocked(createX402BatchPayment).mockResolvedValue({
       paymentHeader: "verbatim-signed-header",
       channelId: `0x${"44".repeat(32)}`,
-      scheme: {} as never,
       maxClaimableMicro: "400000",
       depositMicro: "400000",
       authorizationValidBefore: "1900000000",
@@ -1514,7 +1522,6 @@ describe("x402 instrument binding", () => {
     vi.mocked(createX402BatchPayment).mockResolvedValue({
       paymentHeader: "verbatim-signed-header",
       channelId: `0x${"44".repeat(32)}`,
-      scheme: {} as never,
       maxClaimableMicro: "400000",
       depositMicro: "400000",
       authorizationValidBefore: "1900000000",
@@ -5366,7 +5373,6 @@ describe("funding mode", () => {
       vi.mocked(createX402BatchPayment).mockResolvedValue({
         paymentHeader: "verbatim-signed-header",
         channelId: `0x${"44".repeat(32)}`,
-        scheme: {} as never,
         maxClaimableMicro: "400000",
         depositMicro: "400000",
         authorizationValidBefore: "1900000000",
