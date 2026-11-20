@@ -1,4 +1,5 @@
 import { assertX402WalletIdle } from "../lib/x402/lifecycle";
+import { isVoucherOnlyX402Funding, x402RetiredDepositExpiresAt } from "../lib/x402/batch-client";
 import {
   assertX402ChannelPayer,
   chainIdFromCaip2,
@@ -28,7 +29,6 @@ import {
   x402ChannelReservation,
   x402NetworkByCaip2,
   x402PendingBlockExpiresAt,
-  x402PendingDepositExpiresAt,
   x402PendingFundingJson,
   x402PendingRetired,
   x402PendingStale,
@@ -368,23 +368,9 @@ async function walletX402ClearPendingLocked(opts: WalletX402ClearPendingOptions)
   // timed exit has no expiry, so nothing else will ever free that hold and
   // nothing will ever prove it safe to.
   if (refused.length > 0 && !opts.force) {
-    // Whether a refused entry still blocks funding is the deposit's clock, not
-    // the refusal's — inside that window it very much does block, which is the
-    // hazard this whole change exists for, so the sentence has to ask.
-    const blocking = refused.filter((entry) => x402PendingUnsettled(entry));
-    const blockedUntil =
-      blocking.length > 0
-        ? new Date(Math.max(...blocking.map(x402PendingBlockExpiresAt))).toISOString()
-        : undefined;
-    const blocks =
-      blockedUntil === undefined
-        ? `no longer ${refused.length === 1 ? "blocks" : "block"} funding`
-        : blocking.length < refused.length
-          ? `${String(blocking.length)} of them still block new funding until ${blockedUntil}`
-          : `still ${refused.length === 1 ? "blocks" : "block"} new funding until ${blockedUntil}`;
     throw new DvmError(
       "x402_voucher_reserved",
-      `${describeCount(refused.length)} ${refused.length === 1 ? "was" : "were"} refused by the DVM and ${blocks}, and ${refused.length === 1 ? "its" : "their"} signed claim never expires at all.`,
+      `${describeCount(refused.length)} ${refused.length === 1 ? "was" : "were"} refused by the DVM. The signed ${refused.length === 1 ? "claim has" : "claims have"} no expiry.`,
       `Pass --force to retire ${refused.length === 1 ? "it" : "them"}, raise the guaranteed figure reported by 'dvm wallet x402-withdraw-initiate', and remove ${refused.length === 1 ? "it" : "them"} from the cooperative drain's at-risk report. The signed claim may still be taken, so retire ${refused.length === 1 ? "it" : "them"} only once you accept that exposure.`,
       { pending_fundings: refused.map(x402PendingFundingJson) }
     );
@@ -1314,7 +1300,7 @@ function renderPendingList(
   const hint =
     entries.length === 0
       ? "Nothing to retire."
-      : `Retry a funding with 'dvm credit fund <dvm> --credit-id <id>', or retire one with 'dvm wallet x402-clear-pending --credit-id <id>' (--force while it is under a day old).${refused.length > 0 ? " A refused funding cannot be retried and stops blocking on the deadline shown against it, but its claim never expires: it stays reserved from the timed exit until --force retires it." : ""}`;
+      : `Retry an unacknowledged funding with 'dvm credit fund <dvm> --credit-id <id>', or clear a voucher with 'dvm wallet x402-clear-pending --credit-id <id>' (--force while it is under a day old).${refused.length > 0 ? " A refused deposit requires a finalized nonce check before the channel can sign again. The original funding stays unresolved and its claim stays reserved until you explicitly clear the voucher with --force." : ""}`;
   if (opts.human) {
     info(display);
     for (const entry of entries) {
@@ -1330,13 +1316,16 @@ function renderPendingList(
 
 function describeState(entry: PendingX402Funding): string {
   if (!x402PendingRetired(entry)) return x402PendingStale(entry) ? " (looks abandoned)" : "";
-  if (!x402PendingUnsettled(entry)) {
-    return " (refused by the DVM; blocks no funding, and its claim never expires)";
+  const refusal = `funding ${entry.fundId} refused by the DVM`;
+  if (isVoucherOnlyX402Funding(entry)) {
+    const cutoff = new Date(x402PendingBlockExpiresAt(entry)).toISOString();
+    return x402PendingUnsettled(entry)
+      ? ` (${refusal}. Voucher-only funding hold until ${cutoff}. The claim has no expiry.)`
+      : ` (${refusal}. The voucher-only waiting period has elapsed. The claim has no expiry.)`;
   }
-  const until = new Date(x402PendingBlockExpiresAt(entry)).toISOString();
-  return x402PendingDepositExpiresAt(entry) !== undefined
-    ? ` (refused by the DVM; its deposit is submittable until ${until}, and its claim never expires)`
-    : ` (refused by the DVM; it names no deposit deadline, so funding stays blocked until ${until}, and its claim never expires)`;
+  const deadline = x402RetiredDepositExpiresAt(entry);
+  const until = deadline === undefined ? "its deadline" : new Date(deadline).toISOString();
+  return ` (${refusal}. New funding requires finalized proof past ${until}. The claim has no expiry.)`;
 }
 
 function describeCount(count: number): string {
