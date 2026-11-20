@@ -11,7 +11,6 @@ import {
   X402_BATCH_SETTLEMENT_SCHEME,
   X402_VERSION,
   x402NetworkByCaip2,
-  x402NetworkLabel,
   x402PendingBlockExpiresAt,
   x402PendingDepositExpiresAt,
   x402PendingRetired,
@@ -32,6 +31,7 @@ import { BatchSettlementEvmScheme, computeChannelId } from "@x402/evm/batch-sett
 import { createPublicClient, encodeAbiParameters, http, isAddress, isHash, keccak256, parseAbi, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import * as chains from "viem/chains";
+import { x402NetworkLabel } from "./networks";
 
 const permit2NonceAbi = parseAbi(["function nonceBitmap(address owner, uint256 wordPos) view returns (uint256)"]);
 
