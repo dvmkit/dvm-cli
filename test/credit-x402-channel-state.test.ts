@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { decodePaymentSignatureHeader, encodePaymentResponseHeader } from "@x402/core/http";
 import type { PaymentRequired } from "@x402/core/types";
-import { isBatchSettlementDepositPayload } from "@x402/evm";
+import { isBatchSettlementDepositPayload, PERMIT2_ADDRESS } from "@x402/evm";
 import { computeChannelId } from "@x402/evm/batch-settlement/client";
 import { concatHex, keccak256, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -18,6 +18,7 @@ import {
   recordFundResponse,
   recordPendingX402Funding,
   recordX402ChannelMetadata,
+  retirePendingX402Funding,
   type CreditMenu,
   type CreditOpResult,
   type ProviderInfo,
@@ -131,6 +132,9 @@ beforeEach(async () => {
   vi.mocked(loadX402Wallet).mockReturnValue(wallet);
   external.credit.mockReset();
   external.describe.mockResolvedValue(provider);
+  external.getBlock.mockReset();
+  external.getChainId.mockReset();
+  external.readContract.mockReset();
   external.readContract.mockResolvedValue([200_000n, 10_000n]);
   vi.stubEnv("DVM_IDENTITY_KEY", signer.privkey);
   vi.stubGlobal("fetch", unexpectedFetch);
@@ -163,27 +167,49 @@ describe("x402 funding recovery", () => {
     ...previous,
     accepts: previous.accepts.map((terms) => ({ ...terms, maxTimeoutSeconds: 90 })),
   };
+  const permit2Terms = {
+    ...previous,
+    accepts: previous.accepts.map((terms) => ({
+      ...terms, extra: { ...terms.extra, assetTransferMethod: "permit2" },
+    })),
+  };
   const mismatch = encodePaymentRequiredHeader({ ...fresh, error: "requirements_mismatch" });
 
-  function fund() {
+  function fund(providerEndpoint = endpoint, requestedCreditId = creditId) {
     return fundCredit({
-      transport: new HttpsTransport(), ref: { endpoint }, signing: signer,
-      creditId, fundId: "fund-new", amountMicro: 200_000, targetMicro: 200_000,
+      transport: new HttpsTransport(), ref: { endpoint: providerEndpoint }, signing: signer,
+      creditId: requestedCreditId, fundId: "fund-new", amountMicro: 200_000, targetMicro: 200_000,
       menu, providerInfo: provider, rail: "x402", float: null, tempoAccount: null,
       signBody: (_key, body) => body,
     });
   }
 
-  async function journalDeposit(expired: boolean, finalizedOffset = expired ? 1n : -1n) {
+  async function journalFunding(legacy = false, terms = previous) {
     const { scheme: _scheme, ...payment } = await createX402BatchPayment({
-      wallet, paymentRequired: previous, ...scope, depositMicro: 200_000,
+      wallet, paymentRequired: terms, ...scope, depositMicro: 200_000,
     });
     const pending = {
-      ...scope, ...payment, fundId: "fund-original", amountMicro: 200_000, targetMicro: 200_000,
-      requestedAt: Date.now(),
+      ...scope, channelId: payment.channelId, paymentHeader: payment.paymentHeader,
+      fundId: "fund-original", amountMicro: 200_000, targetMicro: 200_000, requestedAt: Date.now(),
+      ...(legacy ? {} : {
+        maxClaimableMicro: payment.maxClaimableMicro,
+        depositMicro: payment.depositMicro,
+        authorizationValidBefore: payment.authorizationValidBefore,
+      }),
     };
     recordPendingX402Funding(pending);
-    const deadline = BigInt(payment.authorizationValidBefore!);
+    return pending;
+  }
+
+  async function journalDeposit(
+    expired: boolean,
+    finalizedOffset = expired ? 1n : -1n,
+    legacy = false,
+    terms = previous
+  ) {
+    const pending = await journalFunding(legacy, terms);
+    const authorization = signedDeposit(pending.paymentHeader);
+    const deadline = BigInt(authorization.permit2Authorization?.deadline ?? authorization.erc3009Authorization!.validBefore);
     external.getChainId.mockResolvedValue(84532);
     external.getBlock.mockResolvedValue({
       hash: finalizedBlockHash, number: 123n, timestamp: deadline + finalizedOffset,
@@ -217,8 +243,10 @@ describe("x402 funding recovery", () => {
     });
   }
 
-  function fundedDeposit() {
-    return Response.json({ op: "fund", funded_micro: 200_000, credit: credit(200_000) }, {
+  function fundedDeposit(fundedCreditId = creditId) {
+    return Response.json({
+      op: "fund", funded_micro: 200_000, credit: { ...credit(200_000), credit_id: fundedCreditId },
+    }, {
       headers: { "PAYMENT-RESPONSE": response({
         channelId, balance: "200000", totalClaimed: "0", chargedCumulativeAmount: "200000",
       }, "200000") },
@@ -233,19 +261,217 @@ describe("x402 funding recovery", () => {
     };
   }
 
-  function expectFinalizedNonceRead(paymentHeader: string) {
+  function signedDeposit(paymentHeader: string) {
     const { payload } = decodePaymentSignatureHeader(paymentHeader);
-    if (!isBatchSettlementDepositPayload(payload) || !payload.deposit.authorization.erc3009Authorization) {
-      throw new Error("Expected a signed USDC deposit");
-    }
-    const { salt } = payload.deposit.authorization.erc3009Authorization;
+    if (!isBatchSettlementDepositPayload(payload)) throw new Error("Expected a signed deposit");
+    return payload.deposit.authorization;
+  }
+
+  function expectFinalizedNonceRead(paymentHeader: string) {
+    const authorization = signedDeposit(paymentHeader);
     expect(external.getBlock).toHaveBeenCalledExactlyOnceWith({ blockTag: "finalized" });
+    if (authorization.permit2Authorization) {
+      expect(external.readContract).toHaveBeenCalledWith(expect.objectContaining({
+        address: PERMIT2_ADDRESS, functionName: "nonceBitmap",
+        args: [account.address, BigInt(authorization.permit2Authorization.nonce) / 256n],
+        blockHash: finalizedBlockHash, requireCanonical: true,
+      }));
+      return;
+    }
+    const { salt } = authorization.erc3009Authorization;
     expect(external.readContract).toHaveBeenCalledWith(expect.objectContaining({
       address: config.token, functionName: "authorizationState",
       args: [account.address, keccak256(concatHex([channelId, salt]))],
       blockHash: finalizedBlockHash, requireCanonical: true,
     }));
   }
+
+  it.each([
+    { name: "the chain is behind the deadline", finalizedOffset: -1n },
+    { name: "the chain is exactly at the deadline", finalizedOffset: 0n },
+    { name: "the finalized block is unavailable", blockUnavailable: true },
+    { name: "the nonce cannot be read", nonceUnavailable: true },
+    { name: "the RPC is on another chain", wrongChain: true },
+    { name: "a legacy deposit has no deadline in journal metadata", finalizedOffset: -1n, legacy: true },
+  ])("keeps a retired deposit's signing hold when $name", async ({
+    finalizedOffset, blockUnavailable, nonceUnavailable, wrongChain, legacy,
+  }) => {
+    const pending = await journalDeposit(true, finalizedOffset, legacy);
+    retirePendingX402Funding(pending);
+    if (blockUnavailable) external.getBlock.mockRejectedValue(new Error("Finalized block unavailable"));
+    if (wrongChain) external.getChainId.mockResolvedValue(8453);
+    external.readContract.mockImplementation(async ({ functionName }) => {
+      if (functionName !== "authorizationState") return [0n, 0n];
+      if (nonceUnavailable) throw new Error("Nonce unavailable");
+      return false;
+    });
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_request, init) =>
+      submittedFunding(init).paymentHeader ? fundedDeposit() : challengeResponse()
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    const outcome = await fund();
+
+    expect(fetch.mock.calls).toHaveLength(1);
+    expect(submittedFunding(fetch.mock.calls[0][1]).paymentHeader).toBeNull();
+    expect(outcome).toMatchObject({ status: "unavailable", error: { code: "x402_voucher_pending" } });
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([
+      { ...pending, refusedAt: expect.any(Number) },
+    ]);
+  });
+
+  it.each([
+    { name: "a pre-metadata ERC-3009 deposit", legacy: true, terms: previous },
+    { name: "a Permit2 deposit", legacy: false, terms: permit2Terms },
+  ])("signs again after finalized unused proof for $name within the first day", async ({ legacy, terms }) => {
+    const pending = await journalDeposit(true, 1n, legacy, terms);
+    retirePendingX402Funding(pending);
+    const permit = signedDeposit(pending.paymentHeader).permit2Authorization;
+    const nonceBit = permit ? BigInt(permit.nonce) % 256n : undefined;
+    external.readContract.mockImplementation(async ({ functionName }) => {
+      if (functionName === "nonceBitmap") return nonceBit === 0n ? 2n : 1n;
+      if (functionName === "authorizationState") return false;
+      return [0n, 0n];
+    });
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_request, init) =>
+      submittedFunding(init).paymentHeader ? fundedDeposit() : challengeResponse(terms)
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(fund()).resolves.toMatchObject({ status: "funded", fundId: "fund-new" });
+
+    expectFinalizedNonceRead(pending.paymentHeader);
+    expect(fetch.mock.calls.map(([, init]) => submittedFunding(init))).toEqual([
+      { paymentHeader: null, fundId: "fund-new" },
+      { paymentHeader: expect.any(String), fundId: "fund-new" },
+    ]);
+    expect(submittedFunding(fetch.mock.calls[1][1]).paymentHeader).not.toBe(pending.paymentHeader);
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([
+      { ...pending, refusedAt: expect.any(Number) },
+    ]);
+  });
+
+  it("holds a shared channel after a permanent refusal until the finalized nonce is unused past expiry", async () => {
+    const pending = await journalDeposit(true, -1n);
+    const secondCredit = "credit-2";
+    const otherEndpoint = "https://shared.example";
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_request, init) => {
+      const { paymentHeader } = submittedFunding(init);
+      if (paymentHeader === pending.paymentHeader) {
+        return Response.json({ error: "credit_over_max", message: "Credit exceeds maximum." }, { status: 400 });
+      }
+      return paymentHeader ? fundedDeposit(secondCredit) : challengeResponse();
+    });
+    vi.stubGlobal("fetch", fetch);
+    external.readContract.mockImplementation(async ({ functionName }) =>
+      functionName === "authorizationState" ? false : [0n, 0n]
+    );
+    await expect(fund(otherEndpoint, secondCredit)).resolves.toMatchObject({
+      status: "unavailable", error: { code: "x402_voucher_pending" },
+    });
+    expect(external.getBlock).not.toHaveBeenCalled();
+    await expect(fund()).resolves.toMatchObject({ status: "refused", fundId: pending.fundId });
+
+    await expect(fund(otherEndpoint, secondCredit)).resolves.toMatchObject({
+      status: "unavailable", error: { code: "x402_voucher_pending" },
+    });
+    expect(fetch.mock.calls.map(([, init]) => submittedFunding(init).paymentHeader)).toEqual([
+      null, pending.paymentHeader, null,
+    ]);
+
+    external.getBlock.mockClear();
+    external.getBlock.mockResolvedValue({
+      hash: finalizedBlockHash, number: 124n, timestamp: BigInt(pending.authorizationValidBefore!) + 1n,
+    });
+    await expect(fund(otherEndpoint, secondCredit)).resolves.toMatchObject({
+      status: "funded", creditId: secondCredit, fundId: "fund-new",
+    });
+    expectFinalizedNonceRead(pending.paymentHeader);
+    expect(fetch.mock.calls.slice(3).map(([, init]) => submittedFunding(init))).toEqual([
+      { paymentHeader: null, fundId: "fund-new" },
+      { paymentHeader: expect.any(String), fundId: "fund-new" },
+    ]);
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([
+      { ...pending, refusedAt: expect.any(Number) },
+    ]);
+  });
+
+  it.each([
+    { name: "ERC-3009", terms: previous },
+    { name: "Permit2", terms: permit2Terms },
+  ])("uses refreshed escrow after $name nonce consumption and preserves the refused voucher", async ({ terms }) => {
+    const pending = await journalDeposit(true, 1n, false, terms);
+    retirePendingX402Funding(pending);
+    const permit = signedDeposit(pending.paymentHeader).permit2Authorization;
+    const bitmap = permit ? 2n ** (BigInt(permit.nonce) % 256n) : 0n;
+    await storage.set(channelId, { balance: "0", totalClaimed: "0", chargedCumulativeAmount: "25000" });
+    external.readContract.mockImplementation(async ({ functionName }) => {
+      if (functionName === "authorizationState") return true;
+      if (functionName === "nonceBitmap") return bitmap;
+      throw new Error("Escrow unavailable");
+    });
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_request, init) => {
+      const { paymentHeader } = submittedFunding(init);
+      if (!paymentHeader) return challengeResponse(terms);
+      await expect(storage.get(channelId)).resolves.toMatchObject({
+        balance: "450000", totalClaimed: "12500", chargedCumulativeAmount: "25000",
+      });
+      expect(decodePaymentSignatureHeader(paymentHeader).payload).toMatchObject({
+        type: "voucher", voucher: { channelId, maxClaimableAmount: "225000" },
+      });
+      return fundedDeposit();
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const held = await fund();
+    expect(fetch.mock.calls).toHaveLength(1);
+    expect(submittedFunding(fetch.mock.calls[0][1]).paymentHeader).toBeNull();
+    expect(held).toMatchObject({ status: "unavailable", error: { code: "x402_voucher_pending" } });
+    expectFinalizedNonceRead(pending.paymentHeader);
+    expect(external.readContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: "channels", args: [channelId],
+    }));
+
+    external.readContract.mockImplementation(async ({ functionName }) => {
+      if (functionName === "authorizationState") return true;
+      if (functionName === "nonceBitmap") return bitmap;
+      return [450_000n, 12_500n];
+    });
+    await expect(fund()).resolves.toMatchObject({ status: "funded", fundId: "fund-new" });
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([
+      { ...pending, refusedAt: expect.any(Number) },
+    ]);
+  });
+
+  it("keeps the local waiting period for a retired voucher-only funding", async () => {
+    await storage.set(channelId, { balance: "450000", totalClaimed: "0", chargedCumulativeAmount: "0" });
+    const pending = await journalFunding();
+    expect(decodePaymentSignatureHeader(pending.paymentHeader).payload).toMatchObject({ type: "voucher" });
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_request, init) => {
+      const { paymentHeader, fundId } = submittedFunding(init);
+      if (fundId === pending.fundId) {
+        return Response.json({ error: "credit_over_max", message: "Credit exceeds maximum." }, { status: 400 });
+      }
+      return paymentHeader ? fundedDeposit() : challengeResponse();
+    });
+    vi.stubGlobal("fetch", fetch);
+    await expect(fund()).resolves.toMatchObject({
+      status: "refused", hint: expect.stringContaining("voucher-only"),
+    });
+
+    const now = vi.spyOn(Date, "now").mockReturnValue(pending.requestedAt + 86_400_000);
+    await expect(fund()).resolves.toMatchObject({
+      status: "unavailable", error: { code: "x402_voucher_pending" },
+    });
+    expect(fetch.mock.calls).toHaveLength(1);
+
+    now.mockReturnValue(pending.requestedAt + 86_400_001);
+    await expect(fund()).resolves.toMatchObject({ status: "funded", fundId: "fund-new" });
+    expect(external.getBlock).not.toHaveBeenCalled();
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([
+      { ...pending, refusedAt: expect.any(Number) },
+    ]);
+  });
 
   it("retires an expired unused deposit and signs the current requirements on the next funding", async () => {
     const pending = await journalDeposit(true);

@@ -118,14 +118,15 @@ import {
 import {
   acknowledgeReplayedX402Payment,
   assertX402RequirementDescribesChannel,
-  createX402BatchPayment,
   processX402BatchCorrection,
-  processX402BatchResponse,
   processX402BatchResponseForWallet,
   x402RequiredFromError,
 } from "@dvmkit/sdk/internal";
 import {
+  createX402BatchPayment,
   finalizedX402DepositExpiredUnused,
+  isVoucherOnlyX402Funding,
+  x402RetiredDepositExpiresAt,
   x402VoucherPendingRefusal,
 } from "./x402/batch-client";
 import {
@@ -146,7 +147,6 @@ import {
   type StoredX402ChannelMetadata,
   withX402ChannelLock,
   x402PendingBlockExpiresAt,
-  x402PendingDepositExpiresAt,
   x402PendingRetired,
   x402PendingUnsettled,
 } from "@dvmkit/sdk/internal";
@@ -1907,7 +1907,6 @@ async function fundOverX402(
 
   let btcRate = 100_000;
   let pending = resumed;
-  let scheme: Awaited<ReturnType<typeof createX402BatchPayment>>["scheme"] | undefined;
   if (!pending) {
     // Cheap local pre-check for the case that dominates: another credit at this
     // same DVM still owes a signed voucher. `createX402BatchPayment` gates the
@@ -1992,7 +1991,6 @@ async function fundOverX402(
         creditId: args.creditId,
         depositMicro: args.maxDepositMicro ?? args.amountMicro,
       });
-      scheme = payment.scheme;
       pending = {
         endpoint: args.ref.endpoint,
         callerPubkey: args.signing.pubkey,
@@ -2034,8 +2032,6 @@ async function fundOverX402(
     });
     if (!result.x402PaymentResponse && result.replayed) {
       await acknowledgeReplayedX402Payment(pending.paymentHeader);
-    } else if (scheme) {
-      await processX402BatchResponse(scheme, result.x402PaymentResponse, pending.channelId);
     } else {
       await processX402BatchResponseForWallet({
         wallet,
@@ -2148,14 +2144,7 @@ async function fundOverX402(
         status: "refused",
         error: err,
         display: copy.display,
-        // The block window leads, because the fix it gates is a channel funding
-        // in three of the four shapes: an agent that acts on "top credit-X up
-        // instead" first walks straight into `otherCreditPendingX402` and gets
-        // a second refusal it can do nothing with. Scoped to the channel rather
-        // than to x402 at large — the journal gates this leg only, so an exact
-        // funding here is untouched — and to this DVM's endpoint, which is what
-        // the gate keys on.
-        hint: `${x402RetiredDepositWindow(pending)}, so no funding over this DVM's reusable x402 channel — this credit's or any other credit's — can be signed until then. Funding over another rail is unaffected. ${copy.hint} ${x402RetiredVoucherResidual(pending)}`,
+        hint: `${x402RetiredFundingHold(pending)} ${copy.hint} ${x402RetiredVoucherResidual(pending)}`,
       };
     }
     // A refusal the DVM will repeat forever retires the journal, as it does on
@@ -2176,7 +2165,7 @@ async function fundOverX402(
         status: "refused",
         error: err,
         display: `The DVM refused this funding outright (${err.code}), so its signed voucher was retired from funding rather than left blocking the channel.`,
-        hint: `Nothing was credited. ${x402RetiredDepositWindow(pending)}, so fund again with an amount this DVM accepts after that. ${x402RetiredVoucherResidual(pending)}`,
+        hint: `${x402RetiredFundingHold(pending)} Then retry with an amount this DVM accepts. ${x402RetiredVoucherResidual(pending)}`,
       };
     }
     if (
@@ -2208,15 +2197,16 @@ function pendingX402Refusal(base: X402FundBase, err: unknown): CreditFundOutcome
   };
 }
 
-/**
- * Retired deposit authority still blocks this channel until its signed expiry; voucher-only
- * payloads use the conservative journal backstop.
- */
-function x402RetiredDepositWindow(pending: PendingX402Funding): string {
-  const until = new Date(x402PendingBlockExpiresAt(pending)).toISOString();
-  return x402PendingDepositExpiresAt(pending) !== undefined
-    ? `The deposit it signed can still be submitted until ${until}`
-    : `It signed no deposit authorization with a deadline of its own, so this channel is held from funding until ${until} — a conservative cutoff this CLI picks, not one the DVM agreed to`;
+function x402RetiredFundingHold(pending: PendingX402Funding): string {
+  if (isVoucherOnlyX402Funding(pending)) {
+    const until = new Date(x402PendingBlockExpiresAt(pending)).toISOString();
+    return `The CLI holds new funding on this reusable x402 channel until ${until} after a voucher-only refusal.`;
+  }
+  const deadline = x402RetiredDepositExpiresAt(pending);
+  const until = deadline === undefined
+    ? "after the signed deposit's deadline"
+    : `after the signed deposit's deadline of ${new Date(deadline).toISOString()}`;
+  return `New funding on this reusable x402 channel requires a finalized nonce check ${until}. If the nonce was used, the CLI must refresh the channel's escrow before signing again.`;
 }
 
 /**
@@ -2240,9 +2230,6 @@ function voucherPendingOutcome(
   blocking: PendingX402Funding,
   display: string
 ): CreditFundOutcome {
-  // The refused flavour writes its own sentences: "retry that funding" is
-  // advice an auto-refill would loop on forever, since the DVM already gave its
-  // final answer and only the authorization's clock releases the block.
   if (x402PendingRetired(blocking)) {
     const error = x402VoucherPendingRefusal(blocking);
     return {
@@ -4169,11 +4156,8 @@ function tempoChargePendingOutcome(
 }
 
 /**
- * The oldest signed intent at this DVM that would stand between this funding
- * and a fresh signature: another credit's live voucher, or any credit's refused
- * one whose deposit authorization has not expired yet. A refused entry counts
- * against its *own* credit too, because nothing replays it — the same reason
- * `assertNoRivalVoucher` stopped exempting the same credit.
+ * Check the endpoint journal for holds that can be decided locally. The signer
+ * checks retired deposits against finalized state once discovery identifies the channel.
  */
 function otherCreditPendingX402(args: FundCreditArgs): PendingX402Funding | undefined {
   return listPendingX402Fundings({
@@ -4181,9 +4165,9 @@ function otherCreditPendingX402(args: FundCreditArgs): PendingX402Funding | unde
     callerPubkey: args.signing.pubkey,
   })
     .filter(
-      (entry) =>
-        x402PendingUnsettled(entry) &&
-        (entry.creditId !== args.creditId || x402PendingRetired(entry))
+      (entry) => x402PendingRetired(entry)
+        ? isVoucherOnlyX402Funding(entry) && x402PendingUnsettled(entry)
+        : entry.creditId !== args.creditId
     )
     .sort((a, b) => a.requestedAt - b.requestedAt)[0];
 }
