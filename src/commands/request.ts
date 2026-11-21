@@ -8,6 +8,7 @@ import { terminalSettlementReport } from "../lib/job-settlement";
 import { autoPayWarnings } from "../lib/auto-pay-warning";
 import { addOutputWarnings, withOutputWarnings } from "../lib/output";
 import { guidanceJobArg, providerFields } from "../lib/provider-output";
+import { isTempoBroadcastOutcome, sendTempoCredential, tempoBroadcastOutcome } from "../lib/payment-rails/tempo-broadcast";
 import { buildTempoCredential } from "../lib/payment-rails/tempo-credential";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { parseBudget } from "../lib/currency";
@@ -2397,7 +2398,7 @@ async function tryTempoPayment(args: RailAttemptArgs): Promise<boolean> {
   return true;
 }
 
-async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): Promise<void> {
+export async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): Promise<void> {
   const { transport, ref, envelope, chosen, opts, identity, policy, account, btcRate } = args;
   const dvmFields = dvmIdentity(identity.dvmId, identity.capability);
   // USDC is dollar-pegged; render the spend in USD/USDC, not sats — sats has
@@ -2433,11 +2434,13 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
   // the moment this POST lands. Never abort it on a deadline sliver.
   let receipt;
   try {
-    receipt = await transport.submit(
-      ref,
-      envelope,
-      { mppCredential: credential },
-      { timeoutMs: paidSubmitTimeoutMs(args.deadlineMs) }
+    receipt = await sendTempoCredential(() =>
+      transport.submit(
+        ref,
+        envelope,
+        { mppCredential: credential },
+        { timeoutMs: paidSubmitTimeoutMs(args.deadlineMs) }
+      )
     );
   } catch (err) {
     const unconfirmed = (key: string | undefined) =>
@@ -2448,6 +2451,12 @@ async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): 
         endpoint: ref.endpoint,
         capability: identity.capability,
       });
+    const tempoOutcome = tempoBroadcastOutcome(err);
+    if (isTempoBroadcastOutcome(tempoOutcome)) {
+      // The transfer may still land, so the ledger keeps it as spent.
+      unconfirmed(unconfirmedSpendKey(opts, tempoOutcome as DvmError));
+      throw tempoOutcome;
+    }
     if (!isIdentityFailure(err)) {
       if (leavesOutcomeUnknown(raisedAfterPayment(err))) {
         unconfirmed(unconfirmedSpendKey(opts, err as DvmError));

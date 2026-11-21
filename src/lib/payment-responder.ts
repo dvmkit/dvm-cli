@@ -9,6 +9,7 @@ import { finishBookedSubmission, midJobSpendLabel } from "./taken-payment";
 import { sameEndpoint } from "./job-access";
 import { unknownUpfrontCreditError } from "./upfront-credit-error";
 import { bookedCreditPayment, sendCreditPayment, tryCreditPayment } from "./credit-payment";
+import { sendTempoCredential, tempoBroadcastOutcome, tempoBroadcastRefusal } from "./payment-rails/tempo-broadcast";
 import { buildTempoCredential } from "./payment-rails/tempo-credential";
 import {
   DvmError,
@@ -993,7 +994,8 @@ async function sendRailPayment(
   if (requestSeq !== undefined) markPaymentRequestInFlight(jobId, requestSeq, submission);
   let result: Awaited<ReturnType<Transport["sendMessage"]>>;
   try {
-    result = await transport.sendMessage(jobId, message, provider, options);
+    const send = () => transport.sendMessage(jobId, message, provider, options);
+    result = await (submission?.rail === "tempo" ? sendTempoCredential(send) : send());
   } catch (error) {
     // A failure after deposit acceptance can still carry signed funding evidence.
     if (error instanceof DvmError && error.data) capture(error.data);
@@ -1001,16 +1003,18 @@ async function sendRailPayment(
     if (accepted && submission) result = { seq: 0, credit: accepted } as CreditMessageResult;
     else {
       const outcome = sendOutcome(error, submission, redelivery);
+      // The agent reads this error, so it names the payment as possibly settled.
+      const surfaced = submission?.rail === "tempo" ? tempoBroadcastOutcome(error) : error;
       if (requestSeq === undefined) {
         if (outcome.kind === "taken" && error instanceof DvmError && error.code === "replay_rejected") return { tracked: false };
-        throw error;
+        throw surfaced;
       }
       if (outcome.kind === "taken") return { tracked: true, booked: markPaymentRequestPaid(jobId, requestSeq) };
       if (outcome.kind === "blocked") blockHeldPayment(jobId, requestSeq, outcome.blocked);
       else if (outcome.kind === "refused") clearPaymentRequestInFlight(jobId, requestSeq);
       else if (outcome.kind === "not_sent") clearPaymentRequestInFlight(jobId, requestSeq, { keepSubmission: true });
       else markPaymentRequestInFlight(jobId, requestSeq);
-      throw error;
+      throw surfaced;
     }
   }
   const credit = (result as CreditMessageResult | undefined)?.credit;
@@ -1059,6 +1063,10 @@ type SendOutcome =
 function sendOutcome(error: unknown, submission: UnconfirmedPaymentSubmission | undefined, redelivery: boolean | undefined): SendOutcome {
   if (!(error instanceof DvmError)) return { kind: requestNeverSent(error) ? "not_sent" : "unknown" };
   if (error.code === "replay_rejected") return { kind: "taken" };
+  // The signed transfer may still land, so the ask stays held and no new
+  // credential is signed for it.
+  if (submission?.rail === "tempo" && tempoBroadcastRefusal(error))
+    return { kind: "blocked", blocked: { reason: "not_resendable", detail: (tempoBroadcastOutcome(error) as DvmError).display ?? "The Tempo payment may still settle." } };
   const status = error.data?.http_status;
   if (typeof status !== "number" || status < 400 || status >= 500) return { kind: "unknown" };
   // A code the transport filled in for a body that named none proves nothing.

@@ -558,6 +558,62 @@ describe("mid-job payment rail selection", () => {
     expect(transport.sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  describe("Tempo broadcast refusals", () => {
+    const refusal = (reason: string | undefined, retryable?: boolean) => new DvmError(
+      "payment_invalid", "Provider prose.", "Provider hint.",
+      { http_status: 402, rail: "tempo", ...(reason ? { reason } : {}), ...(retryable === undefined ? {} : { retryable }) });
+    const tempoPay = async (label: string) => {
+      const harness = await setup(label);
+      const ask = railAsk(); walletPrep(ask);
+      const pay = () => handlePaymentRequest(harness.jobId, ask, policy, harness.transport, provider, { rail: "tempo", requestSeq: 5 });
+      return { ...harness, pay };
+    };
+
+    it("resends not_broadcast once with the identical message and signs no second credential", async () => {
+      const { store, jobId, transport, pay } = await tempoPay("tempo-not-broadcast-once");
+      transport.sendMessage.mockRejectedValueOnce(refusal("not_broadcast", true));
+      await expect(pay()).resolves.toMatchObject({ status: "paid", rail: "tempo" });
+      expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+      expect(transport.sendMessage.mock.calls[1]).toEqual(transport.sendMessage.mock.calls[0]);
+      expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
+      expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
+    });
+
+    it("holds the ask after a second not_broadcast instead of freeing it for a new payment", async () => {
+      const { store, jobId, transport, pay } = await tempoPay("tempo-not-broadcast-twice");
+      transport.sendMessage.mockRejectedValue(refusal("not_broadcast", true));
+      await expect(pay()).rejects.toMatchObject({ code: "tempo_not_broadcast", hint: expect.stringContaining("Do not pay again") });
+      expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+      expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({ rail: "tempo", blocked: { reason: "not_resendable" } });
+      await expect(pay()).rejects.toMatchObject({ code: "payment_unconfirmed" });
+      expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+      expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops at settlement_unconfirmed without a resend and holds the ask", async () => {
+      const { store, jobId, transport, pay } = await tempoPay("tempo-settlement-unconfirmed");
+      transport.sendMessage.mockRejectedValue(refusal("settlement_unconfirmed", false));
+      await expect(pay()).rejects.toMatchObject({
+        code: "tempo_settlement_unconfirmed",
+        display: expect.stringContaining("Do not pay again"),
+        hint: expect.stringContaining("Do not pay again"),
+      });
+      expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+      expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({ rail: "tempo", blocked: { reason: "not_resendable" } });
+      await expect(pay()).rejects.toMatchObject({ code: "payment_unconfirmed" });
+      expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+      expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
+    });
+
+    it("still treats a reason-less first-delivery payment_invalid as a refusal", async () => {
+      const { store, jobId, transport, pay } = await tempoPay("tempo-reasonless");
+      transport.sendMessage.mockRejectedValue(refusal(undefined));
+      await expect(pay()).rejects.toMatchObject({ code: "payment_invalid" });
+      expect(transport.sendMessage).toHaveBeenCalledTimes(1);
+      expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
+    });
+  });
+
   it("holds an expired x402 authorization answered payment_invalid and names its expiry", async () => {
     const { store, jobId, ask, transport } = await setup("expired-x402");
     const expiredAt = Math.floor(Date.now() / 1000) - 60;
