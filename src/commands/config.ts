@@ -383,9 +383,8 @@ async function withStrandingChecked<T>(
   }
   if (!leaving.has("x402")) return commit();
 
-  const { withX402ChannelLock, listPendingX402Fundings, x402PendingUnsettled } =
-    await import("@dvmkit/sdk/internal");
-  const { assertX402WalletIdle } = await import("../lib/x402/lifecycle");
+  const { withX402ChannelLock } = await import("@dvmkit/sdk/internal");
+  const { assertX402WalletIdle, listX402FundingsHoldingKey } = await import("../lib/x402/lifecycle");
   const { ensureAddress } = await import("@dvmkit/sdk/internal");
   const { loadX402Wallet } = await import("../lib/x402/wallet");
   // Channel lock outside, config lock inside — the tree-wide order that keeps
@@ -393,7 +392,9 @@ async function withStrandingChecked<T>(
   // between the check and the moment the key it signed with stops being the
   // configured one.
   return withX402ChannelLock(async () => {
-    const unsettled = listPendingX402Fundings().filter((entry) => x402PendingUnsettled(entry));
+    const wallet = loadX402Wallet();
+    const addressed = wallet ? await ensureAddress(wallet) : undefined;
+    const unsettled = await listX402FundingsHoldingKey(addressed);
     if (unsettled.length > 0) {
       throw new DvmError(
         "x402_pending_fundings",
@@ -405,9 +406,7 @@ async function withStrandingChecked<T>(
         }
       );
     }
-    const wallet = loadX402Wallet();
-    if (wallet) {
-      const addressed = await ensureAddress(wallet);
+    if (addressed) {
       await assertX402WalletIdle(
         { address: addressed.address, network: addressed.network },
         "disconnect"

@@ -1,4 +1,4 @@
-import { assertX402WalletIdle } from "../lib/x402/lifecycle";
+import { assertX402WalletIdle, listX402FundingsHoldingKey } from "../lib/x402/lifecycle";
 import { isVoucherOnlyX402Funding, x402RetiredDepositExpiresAt } from "../lib/x402/batch-client";
 import {
   assertX402ChannelPayer,
@@ -246,12 +246,12 @@ export async function walletX402Disconnect(opts: WalletX402DisconnectOptions): P
   const config = loadConfig();
   if (!config) throw new DvmError("no_config", "No config found.", "Run: dvm init");
   const { address, pending } = await withX402ChannelLock(async () => {
-    const journalled = listPendingX402Fundings().filter((entry) => x402PendingUnsettled(entry));
+    const existing = loadX402Wallet();
+    const addressed = existing ? await ensureAddress(existing) : undefined;
+    const journalled = await listX402FundingsHoldingKey(addressed);
     if (journalled.length > 0 && !opts.withPending) {
       throw pendingFundingsError(journalled, "disconnect");
     }
-    const existing = loadX402Wallet();
-    const addressed = existing ? await ensureAddress(existing) : undefined;
     if (addressed) {
       await assertX402WalletIdle(
         { address: addressed.address, network: addressed.network },
@@ -842,7 +842,7 @@ function walletExistsError(address: string, network: string): DvmError {
  * pending` is the one command that discards a signed voucher on purpose.
  */
 async function assertReplaceable(existing: { address: string; network: string }): Promise<void> {
-  const pending = listPendingX402Fundings().filter((entry) => x402PendingUnsettled(entry));
+  const pending = await listX402FundingsHoldingKey(existing);
   if (pending.length > 0) throw pendingFundingsError(pending, "replace");
   await assertX402WalletIdle({ address: existing.address, network: existing.network }, "replace");
 }
@@ -853,9 +853,9 @@ async function assertReplaceable(existing: { address: string; network: string })
  * only disconnect has an "accept the loss" flag to name.
  *
  * Scoped by the caller to entries that can still put money into a channel: a
- * live voucher, or a refused one whose deposit authorization has not expired
- * Past that point a refused entry strands nothing this key is
- * needed for, and `assertX402WalletIdle` is the check that still matters.
+ * live voucher, or a refused one whose deposit authorization the chain has not
+ * yet shown can no longer land. Past that point a refused entry strands nothing
+ * this key is needed for, and `assertX402WalletIdle` is the check that still matters.
  */
 function pendingFundingsError(
   pending: PendingX402Funding[],
@@ -879,12 +879,21 @@ function pendingFundingsError(
     retriable.length > 0
       ? `Retry ${retriable.length === 1 ? "that funding" : "those fundings"} (${retries}), retire ${one ? "it" : "them"} with ${clear}${escape}.`
       : `Retire ${one ? "it" : "them"} with ${clear}${escape}.`;
+  const now = Date.now();
+  const waiting = refused.filter((entry) => x402PendingBlockExpiresAt(entry) >= now);
+  const unproven = refused.filter((entry) => x402PendingBlockExpiresAt(entry) < now);
   const waitOut =
-    refused.length > 0
-      ? ` ${refused.length === 1 ? "One was" : `${String(refused.length)} were`} refused by the DVM and cannot be retried; this refusal lifts for ${refused.length === 1 ? "it" : "them"} at ${new Date(
-          Math.max(...refused.map(x402PendingBlockExpiresAt))
-        ).toISOString()}.`
-      : "";
+    (refused.length > 0
+      ? ` ${refused.length === 1 ? "One was" : `${String(refused.length)} were`} refused by the DVM and cannot be retried.`
+      : "") +
+    (waiting.length > 0
+      ? ` The local waiting period for ${waiting.length === 1 ? "it" : "them"} ends at ${new Date(
+          Math.max(...waiting.map(x402PendingBlockExpiresAt))
+        ).toISOString()}, after which the chain must still confirm the deposit can no longer land.`
+      : "") +
+    (unproven.length > 0
+      ? ` ${unproven.length === 1 ? "One is" : `${String(unproven.length)} are`} past the local deadline, but the key stays until a finalized block on the deposit's chain is past it with the deposit unused or already consumed. Retry once the chain is reachable and has finalized one.`
+      : "");
   return new DvmError(
     "x402_pending_fundings",
     `${describeCount(pending.length)} still awaiting acknowledgement, and this key is the only one that can settle or exit ${one ? "it" : "them"}.`,
