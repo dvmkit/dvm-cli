@@ -656,8 +656,18 @@ export async function walletX402WithdrawFinalize(opts: WalletX402WithdrawalOptio
   const readyAt = pending[1] + metadata.config.withdrawDelay;
   const journalled = listPendingX402FundingsForChannel(metadata.channelId);
   const figures = withdrawalFigures(channel, local, acknowledgedCumulativeAmount, journalled);
-  const now = Math.floor(Date.now() / 1000);
-  if (now < readyAt) {
+  const blockTimestamp = await onChain(
+    ctx,
+    "Reading the latest block timestamp",
+    READ_CONSEQUENCE,
+    publicClient.getBlock({ blockTag: "latest" }).then(({ timestamp }) => {
+      if (typeof timestamp !== "bigint" || timestamp < 0n) {
+        throw new Error("The latest block has an invalid timestamp.");
+      }
+      return timestamp;
+    })
+  );
+  if (blockTimestamp < BigInt(readyAt)) {
     throw new DvmError(
       "x402_withdrawal_not_ready",
       `The channel withdrawal is still inside its ${withdrawalWindow(metadata.config.withdrawDelay)} window until ${new Date(readyAt * 1000).toISOString()}.`,
