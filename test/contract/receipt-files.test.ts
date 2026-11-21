@@ -43,6 +43,33 @@ function run(root: string, args: string[], env: NodeJS.ProcessEnv = {}) {
   });
 }
 
+it.each(["fetch rejection", "HTTP error"])("keeps descriptor text out of CLI output on %s", async (failure) => {
+  const { root } = seed();
+  const preload = join(root, "fail-descriptor.mjs");
+  const secretFragment = "0123456789abcdef";
+  const foreignText = `Upstream detail: ${secretFragment.repeat(4)}`;
+  const fail = failure === "fetch rejection"
+    ? `throw new Error(${JSON.stringify(foreignText)});`
+    : `return new Response(${JSON.stringify(foreignText)}, { status: 503 });`;
+  writeFileSync(preload, `globalThis.fetch = async () => { ${fail} };\n`);
+
+  const args = ["--endpoint", "https://provider.example"];
+  const env = { NODE_OPTIONS: `--import="${preload}"` };
+  const json = await run(root, args, env);
+  const human = await run(root, [...args, "--human"], env);
+
+  expect(json.code).toBe(1);
+  expect(JSON.parse(json.stdout)).toMatchObject({ error: {
+    code: "endpoint_unreachable", hint: expect.stringContaining("Drop --endpoint"),
+  } });
+  expect(human.code).toBe(1);
+  expect(human.stderr).toContain("Drop --endpoint");
+  for (const output of [json.stdout, json.stderr, human.stdout, human.stderr]) {
+    expect(output).not.toContain(secretFragment);
+    expect(output).not.toContain("Upstream detail");
+  }
+});
+
 it("checks repeated files offline and rejects one changed byte with a non-zero exit", async () => {
   const { root, path } = seed();
   const changed = join(root, "changed.txt");

@@ -458,23 +458,18 @@ function summaryLine(
  * Re-read a DVM's `/v1/info` for a fresh trust anchor. Only reached via
  * `--endpoint`, because the *stored* anchor is what was live when the job ran —
  * a rotated key today doesn't retroactively invalidate a receipt from before it.
- *
- * A read that fails is reported as `endpoint_unreachable` rather than as
- * whatever the transport raised (a bare fetch `TypeError` surfacing as
- * `internal`, or `provider_error` on a non-2xx): the caller asked for one
- * specific thing and the actionable fact is that they can't have it. The
- * underlying message is kept on the hint so the cause isn't lost.
  */
 async function refetchAnchor(endpointOrAlias: string): Promise<ReceiptTrustAnchor | undefined> {
   const endpoint = resolveEndpoint(endpointOrAlias);
   const transport = createDvmTransport();
   try {
     return receiptTrustFields(await transport.describe({ endpoint })).builderAnchor;
-  } catch (err) {
+  } catch {
+    // Transport errors can carry dependency messages or provider response bodies.
     throw new DvmError(
       "endpoint_unreachable",
       `Could not read /v1/info from ${endpoint}.`,
-      `${err instanceof Error ? err.message : String(err)}. Drop --endpoint to verify against the anchor stored when the job ran, which is the anchor this receipt should chain to anyway.`
+      "Drop --endpoint to verify against the anchor stored when the job ran."
     );
   } finally {
     transport.close();
