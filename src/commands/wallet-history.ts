@@ -566,7 +566,10 @@ function resolveWindow(
 
 function parseSince(raw: string, now: Date): number {
   if (isDuration(raw)) {
-    return now.getTime() - parseDurationMs(raw);
+    return now.getTime() - parseDurationMs(
+      raw,
+      "For a longer history window, pass an ISO date such as --since 2025-01-01.",
+    );
   }
   const parsed = Date.parse(raw);
   if (Number.isNaN(parsed)) {
