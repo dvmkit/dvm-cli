@@ -162,6 +162,25 @@ export async function finalizedX402DepositExpiredUnused(
   return deposit !== undefined && (await readFinalizedDeposit(deposit, walletNetwork))?.consumed === false;
 }
 
+/**
+ * Whether a retired funding can no longer put a deposit into a channel the
+ * given key controls. Local expiry is not proof: the authorization's own chain
+ * must have finalized a block past its deadline, so a wrong local clock cannot
+ * release the only key that could sign for a deposit that may still land.
+ * Unreadable authority or an unavailable chain keeps the hold. A consumed
+ * deposit is released here, because its escrow is the channel checks' concern.
+ */
+export async function x402RetiredDepositCannotLand(
+  pending: PendingX402Funding,
+  wallet: { address: string; network: string }
+): Promise<boolean> {
+  if (isVoucherOnlyX402Funding(pending)) return true;
+  const deposit = readDepositAuthorization(pending.paymentHeader);
+  if (!deposit) return false;
+  if (deposit.payer.toLowerCase() !== wallet.address.toLowerCase()) return true;
+  return (await readFinalizedDeposit(deposit, wallet.network).catch(() => undefined)) !== undefined;
+}
+
 export function isVoucherOnlyX402Funding(pending: PendingX402Funding): boolean {
   const payload = readBatchFundingHeader(pending.paymentHeader)?.payload;
   return pending.depositMicro === undefined &&

@@ -1,4 +1,14 @@
-import { DvmError, formatUsdcMicrounits, listX402Channels, readX402ChannelGuardFacts, type X402ChannelClient } from "@dvmkit/sdk/internal";
+import {
+  DvmError,
+  formatUsdcMicrounits,
+  listPendingX402Fundings,
+  listX402Channels,
+  type PendingX402Funding,
+  readX402ChannelGuardFacts,
+  x402PendingUnsettled,
+  type X402ChannelClient,
+} from "@dvmkit/sdk/internal";
+import { x402RetiredDepositCannotLand } from "./batch-client";
 
 /** What the caller is about to do to the configured key — drives the remedy copy. */
 export type X402WalletIntent = "replace" | "disconnect";
@@ -9,6 +19,27 @@ export interface X402WalletIdentity {
   address: string;
   /** CAIP-2 chain the wallet is pinned to — the one `DVM_X402_RPC_URL` speaks for. */
   network: string;
+}
+
+/**
+ * Journalled fundings whose signing key must not be removed automatically.
+ *
+ * A retired funding that is past its deadline by the local clock still holds
+ * the key until the chain finalizes a block past that deadline without the
+ * deposit having landed (or shows it consumed, which the channel checks then
+ * cover). Without a wallet there is no key whose channels could be affected, so
+ * the local rule alone applies.
+ */
+export async function listX402FundingsHoldingKey(
+  wallet?: X402WalletIdentity
+): Promise<PendingX402Funding[]> {
+  const holding: PendingX402Funding[] = [];
+  for (const entry of listPendingX402Fundings()) {
+    if (x402PendingUnsettled(entry) || (wallet && !(await x402RetiredDepositCannotLand(entry, wallet)))) {
+      holding.push(entry);
+    }
+  }
+  return holding;
 }
 
 /**
