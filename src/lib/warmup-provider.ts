@@ -35,7 +35,6 @@ const MAX_BACKOFF_MS = 4_000;
  * idempotent) with no money at stake. A protocol mismatch or missing descriptor
  * is terminal; retrying cannot resolve either. A genuinely dead endpoint
  * still fails fast (attempts are bounded) with the same `endpoint_unreachable`.
- * The wrapped error messages match the single-shot behaviour they replace.
  */
 export async function warmupProvider(
   transport: Transport,
@@ -83,7 +82,7 @@ export async function warmupProvider(
   }
   throw new DvmError(
     "endpoint_unreachable",
-    `Could not reach provider at ${endpoint}: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+    `Could not reach provider at ${endpoint}.`,
     "Check the endpoint URL and your network connection."
   );
 }
