@@ -190,9 +190,12 @@ it("separates active recovery and completed outcomes from funding and draw total
     "refund completed: 2 eur · refunded · rail tempo · fee unknown",
   );
 });
-it("refuses an oversized --since duration before it can create a negative history window", () => {
-  expect(() => walletHistory({ since: "99999999999999999999999d" }, new Date(timestamp)))
-    .toThrow(expect.objectContaining({ code: "invalid_arguments" }));
+it.each(["400d", "99999999999999999999999d"])("refuses --since %s and suggests an ISO date", (since) => {
+  expect(() => walletHistory({ since }, new Date(timestamp)))
+    .toThrow(expect.objectContaining({
+      code: "invalid_arguments",
+      hint: expect.stringMatching(/ISO date.*--since 2025-01-01/),
+    }));
   expect(output.json).not.toHaveBeenCalled();
 });
 

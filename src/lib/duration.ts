@@ -18,7 +18,10 @@ export function isDuration(input: string): boolean {
  * milliseconds. Throws `invalid_arguments` on anything else, including clock
  * times and ISO timestamps.
  */
-export function parseDurationMs(input: string): number {
+export function parseDurationMs(
+  input: string,
+  dateHint = "A clock time or date is not accepted; work out how long until then.",
+): number {
   const match = isDuration(input) ? DURATION_PATTERN.exec(input.trim()) : null;
   const components = match?.slice(1).map((count, index) => Number(count ?? 0) * Object.values(UNIT_MS)[index]) ?? [];
   const total = components.reduce((sum, component) => sum + component, 0);
@@ -27,7 +30,7 @@ export function parseDurationMs(input: string): number {
     throw new DvmError(
       "invalid_arguments",
       `Invalid duration "${input}"; use e.g. 30s, 5m, 2h, 1d or 1h30m`,
-      "Give a length of time from now as whole numbers with units d, h, m, s, largest first: 30s, 45m, 12h, 1d or 1h30m. The maximum duration is 365d. A clock time or date is not accepted; work out how long until then."
+      `Give a length of time from now as whole numbers with units d, h, m, s, largest first: 30s, 45m, 12h, 1d or 1h30m. The maximum duration is 365d. ${dateHint}`,
     );
   }
   return total;
