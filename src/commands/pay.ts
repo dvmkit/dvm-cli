@@ -4,6 +4,7 @@ import { observeJobContent } from "../lib/job-content";
 import { providerJobJson } from "../lib/provider-output";
 import { type PaymentRailKey, paymentRailLabel } from "../lib/rail-labels";
 import { formatPaymentAmount } from "../lib/currency";
+import { formatMicro } from "../lib/piece-settlement";
 import { buildCompletionHintFields, completionFromMessages, nextStepHint } from "../lib/completion-hints";
 import {
   asProviderText,
@@ -56,6 +57,8 @@ import { formatMessageHuman, serializeMessageForOutput } from "./messages";
 
 export interface PayOptions extends JobAccessOptions {
   human?: boolean;
+  auto?: boolean;
+  seq?: string;
   /** Human-approved replacement for the job's total spending cap. */
   budget?: string;
   /** Timeout in seconds for streaming (default: 30) */
@@ -81,6 +84,11 @@ async function payWithAccess(
   opts: PayOptions,
   access: ResolvedStoredJobAccess
 ): Promise<void> {
+  const requestedSeq = opts.seq === undefined ? undefined : Number(opts.seq);
+  if (opts.seq !== undefined && (!/^\d+$/.test(opts.seq) || !Number.isSafeInteger(requestedSeq)))
+    throw new DvmError("invalid_arguments", "Pass a valid payment request sequence.");
+  if (opts.auto && opts.budget !== undefined)
+    throw new DvmError("invalid_arguments", "--auto cannot approve a new budget.");
   const rail = parseForcedRail(opts.rail);
   const maxCashuPrincipalSats = parsePositiveCashuSats(opts.maxCashuPrincipalSats);
   if (maxCashuPrincipalSats !== undefined && rail !== "cashu") {
@@ -92,6 +100,9 @@ async function payWithAccess(
   }
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const { stored, ref, jobToken } = access;
+  if (stored.mandate?.approvedCaps && opts.budget !== undefined && requestedSeq === undefined)
+    throw new DvmError("invalid_arguments", "A new budget on this job requires a specific payment request sequence.");
+
   const json = (data: Record<string, unknown>) => providerJobJson(data, !!stored);
 
   const msgs = loadMessages(jobId);
@@ -134,6 +145,11 @@ async function payWithAccess(
   }
   const paymentReq = pending?.request ?? (paymentMessage?.type === "payment-request" ? paymentMessage.content : undefined);
   const requestSeq = pending?.authorization.request_seq ?? paymentMessage?.seq;
+  if (requestedSeq !== undefined && requestedSeq !== requestSeq) {
+    transport.close();
+    throw new DvmError("payment_request_not_pending", `Charge ${requestedSeq} is no longer the open payment request.`,
+      "Check dvm messages before approving a different charge.");
+  }
   if (!paymentReq) {
     transport.close();
     throw new DvmError(
@@ -164,7 +180,9 @@ async function payWithAccess(
 
   // Explicit pay approves this ask; the locally priced native debit must still
   // fit the hard increment/total caps rather than the provider's msat proxy.
-  const payPolicy = { ...stored.policy, autoPayBelowMsats: stored.policy.maxTotalMsats };
+  const approval = opts.auto || (stored.mandate?.approvedCaps && requestedSeq === undefined)
+    ? "auto" : "explicit";
+  const payPolicy = approval === "explicit" ? { ...stored.policy, autoPayBelowMsats: stored.policy.maxTotalMsats } : stored.policy;
 
   // No cost anchor: the caller reached `dvm pay` by deciding this charge was
   // worth it, so "fraction of a cent" here is noise rather than orientation.
@@ -178,14 +196,14 @@ async function payWithAccess(
     rail,
     maxCashuPrincipalSats,
     requestSeq,
-    approval: "explicit",
+    approval,
     creditRecoveryOnly: pending !== undefined,
     budget: opts.budget,
     useStoredPolicy: true,
   });
   if (typeof result === "object" && result.status === "credited" && result.credit.ask_open)
     result = await handlePaymentRequest(jobId, paymentReq, payPolicy, transport, ref, {
-      jobToken, requestSeq, approval: "explicit", useStoredPolicy: true,
+      jobToken, requestSeq, approval, useStoredPolicy: true,
     });
 
   if (result === "over-budget") {
@@ -220,7 +238,7 @@ async function payWithAccess(
     throw await buildNeedsApprovalError(paymentReq, rail, !stored.creditBinding && !!paymentReq.credit);
   }
 
-  const paid = result.status === "credited" ? result.credit : paymentConfirmation(result, paymentReq.reason, paymentReq.fiat_amount);
+  const paid = result.status === "credited" ? result.credit : paymentConfirmation(result, paymentReq.reason, paymentReq.fiat_amount, requestSeq);
 
   const timeoutMs = opts.timeout ? Number(opts.timeout) * 1000 : undefined;
   const afterSeq = access.endpointOverridden ? 0 : (stored.messageCursor ?? 0);
@@ -229,6 +247,7 @@ async function payWithAccess(
     transport,
     provider: ref,
     policy: loadJob(jobId)?.policy ?? stored.policy,
+    confirmedPaymentSeq: result.status === "paid" ? requestSeq : undefined,
     afterSeq,
     timeoutMs,
     jobToken,
@@ -239,10 +258,12 @@ async function payWithAccess(
 
   // Provider status distinguishes cancellation from the generic stream event.
   // The responder already booked the payment; snapshot only the job outcome.
-  const streamedTerminal =
-    streamResult.nextAction === null ? streamTerminalStatus(streamResult.messages, { providerStatus, callerCancelled: !access.endpointOverridden && loadJob(jobId)?.callerCancelled }) : undefined;
+  const terminal = streamTerminalStatus(streamResult.messages, {
+    providerStatus, callerCancelled: !access.endpointOverridden && loadJob(jobId)?.callerCancelled,
+  });
+  const nextAction = terminal && streamResult.nextAction?.type === "pay" ? null : streamResult.nextAction;
   const completion = access.endpointOverridden
-    ? streamedTerminal
+    ? terminal
       ? completionFromMessages(streamResult.messages)
       : undefined
     : persistStreamOutcome({
@@ -254,12 +275,12 @@ async function payWithAccess(
       });
   // a payment that runs the handler through to `complete` ends the
   // job right here, so this is a job-terminal emission like the request arcs.
-  if (streamedTerminal && !access.endpointOverridden) {
+  if (terminal && !access.endpointOverridden) {
     noteFeedbackAfterTerminal({
       jobId,
       dvmId: stored.dvmId,
       endpoint: stored.endpoint,
-      status: streamedTerminal,
+      status: terminal,
       human: opts.human,
     });
   }
@@ -278,6 +299,8 @@ async function payWithAccess(
       // without it `formatMessageHuman` prints the label and drops the bytes.
       formatMessageHuman(msg, jobId, artifactSession);
     }
+    if (nextAction?.type === "pay" && nextAction.code === "mandate_payment_approval_required")
+      info(`${nextAction.display} ${nextAction.hint}`);
     if (completion) {
       const hint = nextStepHint(jobId, completion.payloadIn, completion.artifactCount, true);
       if (hint) info(`📎 ${hint}`);
@@ -287,6 +310,7 @@ async function payWithAccess(
     json({
       jobId,
       ...dvmIdentity(stored.dvmId, stored.capability),
+      ...(terminal && { status: terminal }),
       ...(result.status === "credited" ? { credit_landing: paid, display: paid.display } : { paid }),
       ...settlement,
       messages: streamResult.messages.map(serializeMessageForOutput),
@@ -295,7 +319,7 @@ async function payWithAccess(
       ...(completion ? buildCompletionHintFields(jobId, completion) : {}),
       ...takeCreditNoticeFields(),
       ...takeFeedbackNoticeFields(),
-      next_action: streamResult.nextAction,
+      next_action: nextAction,
       ...(streamResult.autoPayments.length > 0 ? { auto_payments: streamResult.autoPayments } : {}),
     });
   }
@@ -304,15 +328,23 @@ async function payWithAccess(
 function paymentConfirmation(
   result: PaidPaymentResult,
   reason: string,
-  fiat?: { amount: number; currency: string }
+  fiat: { amount: number; currency: string } | undefined,
+  seq?: number
 ): {
   msats: number;
   rail: PaidPaymentResult["rail"];
   reason: ReturnType<typeof asProviderText>;
   amount_usdc_microunits?: string;
+  seq?: number;
+  amount?: { amount_micro: number; currency: string; display: string };
+  receipt?: PaidPaymentResult["creditReceipt"];
   display: string;
 } {
+  const receipt = result.creditReceipt;
   return {
+    ...(seq !== undefined && { seq }),
+    ...(receipt && { receipt, amount: { amount_micro: receipt.amount_micro, currency: receipt.currency,
+      display: formatMicro(receipt.amount_micro, receipt.currency) } }),
     msats: result.amountMsats,
     rail: result.rail,
     reason: asProviderText(reason),

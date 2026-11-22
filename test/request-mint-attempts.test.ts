@@ -256,7 +256,7 @@ describe("accepted job payment refusal recovery", () => {
     });
 
     const error = await request({ endpoint, input: "Echo", autoPay: true, budget: "100000", autoPayBelow: "100000",
-      maxCashuFeeSats: "1", requestId: "paid-request" }).catch((err: unknown) => err);
+      maxPayments: "2", maxCashuFeeSats: "1", requestId: "paid-request" }).catch((err: unknown) => err);
     expect(error).toMatchObject({
       code: "cashu_fee_cap_exceeded", data: { job_id: "job",
         next_action: { hint: expect.stringContaining(intentState === "present" ? "dvm request-result paid-request" : "dvm status job") } },

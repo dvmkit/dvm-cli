@@ -34,7 +34,9 @@ export async function walletRecoverSubmission(
     // `provider_unreachable`.
     fetchImpl: dvmFetch,
   });
+  const lookupHint = "Use read-only receipt and job lookup for the original request.";
   if (opts.human) {
+    if (result.redirect) info(`${result.redirect.display} ${lookupHint}`);
     info(
       result.jobId
         ? `Recovered request ${result.requestId} as job ${result.jobId}.`
@@ -47,9 +49,10 @@ export async function walletRecoverSubmission(
     request_id: result.requestId,
     recovery_attempts: result.attemptCount,
     job_id: result.jobId,
+    ...(result.redirect && { diagnostic: result.redirect }),
     next_action:
       result.jobId !== null
         ? { type: "verify_receipt", job_id: result.jobId }
-        : { type: "lookup_receipt", request_id: result.requestId },
+        : { type: "lookup_receipt", request_id: result.requestId, ...(result.redirect && { hint: lookupHint }) },
   });
 }

@@ -1,5 +1,5 @@
 import { sameEndpoint } from "./provider-endpoint";
-import { recoverMandateWinner } from "./mandate-wait";
+import { assertApprovedMandatePayment, mandatePaymentApprovalRequired, recoverMandateWinner } from "./mandate-wait";
 import { randomUUID } from "node:crypto";
 import { type PaymentContent } from "@dvmkit/sdk";
 import {
@@ -47,7 +47,12 @@ export async function sendCreditPayment(
   transport: Transport,
   provider: ProviderRef,
   jobToken?: string,
+  automatic = false,
 ): Promise<boolean> {
+  const checkApproval = () => {
+    if (automatic) assertApprovedMandatePayment(loadJob(jobId), { ...intent.request, credit: intent.authorization }, intent.authorization.request_seq);
+  };
+  checkApproval();
   // Renew only the envelope. The owner, audience and complete monetary intent
   // stay pinned even if the selected identity or provider advertisement changed.
   if (intent.authorization.timestamp < Math.floor(Date.now() / 1000) - 120) {
@@ -66,6 +71,7 @@ export async function sendCreditPayment(
       });
     }
   }
+  checkApproval();
   try {
     await transport.sendMessage(jobId, { type: "payment", content: { credit: intent.authorization } }, provider, { jobToken });
   } catch (error) {
@@ -109,7 +115,7 @@ export async function tryCreditPayment(args: {
   provider: ProviderRef;
   jobToken?: string;
   policy: JobBudgetPolicy;
-}): Promise<number | false> {
+}): Promise<CreditPaymentIntent | false> {
   const { jobId, request, requestSeq, transport, provider, jobToken } = args;
   const job = loadJob(jobId);
   if (job && hasUnknownUpfrontRail(job))
@@ -166,6 +172,11 @@ export async function tryCreditPayment(args: {
       (explicitIncrement || budget.unit !== "usd")) || !budget.fits)
     throw new DvmError("over_budget", "The exact balance charge would exceed this job's budget.");
   if (amountMsats > args.policy.autoPayBelowMsats) return false;
+  if (job.mandate?.approvedCaps && args.approval !== "explicit") {
+    if (binding.creditId !== job.mandate.credit_id || binding.drawId !== job.mandate.draw_id)
+      throw mandatePaymentApprovalRequired(jobId, requestSeq, "The available credit differs from the approved draw.");
+    assertApprovedMandatePayment(loadJob(jobId), request, requestSeq);
+  }
   const selectedBinding = binding;
   const domain = signedRequestDomain({ provider: info, endpoint: provider.endpoint!, method: "POST",
     path: `v1/job/${jobId}/messages`, capability: null });
@@ -190,5 +201,5 @@ export async function tryCreditPayment(args: {
       ...("unbound" in job.creditBinding! ? { selectedUnbound: true as const } : {}) };
     return current.pendingCreditPayment;
   });
-  return await sendCreditPayment(jobId, intent, transport, provider, jobToken) ? (intent.amountMsats ?? intent.request.amount_msats) : false;
+  return await sendCreditPayment(jobId, intent, transport, provider, jobToken, args.approval !== "explicit") ? intent : false;
 }

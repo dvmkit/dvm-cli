@@ -32,6 +32,8 @@ export interface NextActionRespond {
 
 export interface NextActionPay {
   requires_approval?: boolean;
+  code?: "mandate_payment_approval_required";
+  request_seq?: number;
   type: "pay";
   job_id: string;
   /** Provisional: provider-requested msats; not a rail-neutral debit amount. */

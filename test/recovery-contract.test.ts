@@ -118,7 +118,7 @@ describe("recovery JSON compatibility", () => {
     expect(loadAgentWallet()?.pending_submissions).toEqual([entry]);
   });
 
-  it.each(["recovered", "unknown"])("emits the exact strict recovery action when %s", async (outcome) => {
+  it.each(["recovered", "unknown", "redirect"])("emits the exact strict recovery action when %s", async (outcome) => {
     const entry = submission();
     const context: PendingSubmissionContext = { submit_body: { input: "Work", capability: "echo", data: { request_id: requestId } },
       dvm_id: "provider", capability: "echo", pinned_mint: entry.mint, strict_per_call: true,
@@ -131,6 +131,8 @@ describe("recovery JSON compatibility", () => {
     const fetch = vi.fn(async () => {
       expect(loadAgentWallet()?.pending_submissions[0].attempts).toBe(1);
       if (outcome === "unknown") throw new Error("Reply lost");
+      if (outcome === "redirect") return new Response(null, { status: 307,
+        headers: { location: "https://elsewhere.example/v1/job" } });
       return new Response(JSON.stringify({ job_id: "job-original" }), { status: 202, headers: { [JOB_IDENTITY_HEADER]: "job-original" } });
     });
     vi.stubGlobal("fetch", fetch);
@@ -140,7 +142,13 @@ describe("recovery JSON compatibility", () => {
       next_action: outcome === "recovered" ? expect.objectContaining({ type: "verify_receipt", job_id: "job-original" })
         : expect.objectContaining({ type: "lookup_receipt", request_id: journalId }) }));
     expect(loadAgentWallet()?.pending_submissions.find((saved) => saved.request_id === other.request_id)).toEqual(other);
-    if (outcome === "unknown") {
+    if (outcome === "redirect") expect(json).toHaveBeenLastCalledWith(expect.objectContaining({
+      status: "pending",
+      diagnostic: { code: "protected_post_redirect", from_origin: endpoint, to_origin: "https://elsewhere.example",
+        display: expect.stringContaining("The CLI stopped at the original origin.") },
+      next_action: { type: "lookup_receipt", request_id: journalId, hint: expect.stringContaining("read-only receipt") },
+    }));
+    if (outcome !== "recovered") {
       await expect(walletRecoverSubmission(journalId, { bindingFingerprint: fingerprint })).rejects.toMatchObject({ code: "submission_recovery_exhausted" });
     }
     expect(fetch).toHaveBeenCalledTimes(1);

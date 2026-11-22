@@ -49,6 +49,7 @@ import {
   SUPPORTED_PROTOCOL_VERSION,
   type Transport,
   usdToMsats,
+  unsignRequestData,
   X402_BATCH_SETTLEMENT_SCHEME,
   X402_V1_VERSION,
   X402_VERSION,
@@ -69,10 +70,15 @@ import {
 } from "../job-identity";
 
 import { dvmFetch } from "../http";
+import { sameOriginPost } from "../protected-post";
 import { requestRecoveryPath } from "../request-recovery-path";
 import { envelopeToPayload } from "../job-envelope";
 import { assertConfiguredTempoChallengeNetwork } from "../tempo-network";
 import { jobReadHttpError } from "../job-read-error";
+
+function jobPost(job: JobEnvelope, payment?: Payment) {
+  return payment || unsignRequestData(job.data)?.body.mandate ? sameOriginPost : dvmFetch;
+}
 
 /**
  * build the `X-Job-Token` header object for a per-job opaque token,
@@ -221,7 +227,7 @@ export class HttpsTransport implements Transport {
     const body = JSON.stringify(envelopeToPayload(job));
     const signal = options?.timeoutMs && options.timeoutMs > 0
       ? AbortSignal.timeout(options.timeoutMs) : undefined;
-    const res = await dvmFetch(url, {
+    const res = await jobPost(job)(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
@@ -297,7 +303,7 @@ export class HttpsTransport implements Transport {
 
     let res: Response;
     try {
-      res = await dvmFetch(url, { method: "POST", headers, body, signal });
+      res = await jobPost(job, payment)(url, { method: "POST", headers, body, signal });
     } catch (err) {
       if (err instanceof DvmError) throw err;
       if (isAbortError(err)) {
@@ -494,7 +500,7 @@ export class HttpsTransport implements Transport {
     signedJob: JobEnvelope
   ): Promise<JobReceipt> {
     const url = `${provider.endpoint}/${requestRecoveryPath("request-result", requestId)}`;
-    const res = await dvmFetch(url, {
+    const res = await sameOriginPost(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(envelopeToPayload(signedJob)),
@@ -543,7 +549,7 @@ export class HttpsTransport implements Transport {
         : undefined;
     let res: Response;
     try {
-      res = await dvmFetch(url, {
+      res = await sameOriginPost(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(envelopeToPayload(signedJob)),
@@ -594,7 +600,7 @@ export class HttpsTransport implements Transport {
 
     let res: Response;
     try {
-      res = await dvmFetch(url, {
+      res = await (payment ? sameOriginPost : dvmFetch)(url, {
         method: "POST",
         headers,
         body: JSON.stringify(signedBody),
@@ -857,7 +863,7 @@ export class HttpsTransport implements Transport {
     }
     const url = `${endpoint}/v1/job/${jobId}/messages`;
     const body = JSON.stringify({ type: message.type, content: message.content });
-    const res = await dvmFetch(url, {
+    const res = await (message.type === "payment" ? sameOriginPost : dvmFetch)(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...jobTokenHeader(options?.jobToken) },
       body, signal,
@@ -1015,7 +1021,7 @@ export class HttpsTransport implements Transport {
   async probeMppChallenges(provider: ProviderRef, job: JobEnvelope): Promise<MppxChallenge[]> {
     const url = `${provider.endpoint}/v1/job`;
     const body = JSON.stringify(envelopeToPayload(job));
-    const res = await dvmFetch(url, {
+    const res = await jobPost(job)(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,

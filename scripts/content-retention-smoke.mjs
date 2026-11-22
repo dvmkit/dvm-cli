@@ -47,7 +47,7 @@ export { computeResultHash, signReceipt, receiptPubkeyFromSecret } from "@dvmkit
   const store = new MemoryJobStore();
   const activity = Date.now();
   const deadline = activity + 730 * 86_400_000;
-  const base = { tags: [], capability: "work", input: "private input", params: {}, requesterId: "dev-anonymous", requesterTokenHash: createHash("sha256").update(token).digest("hex"), status: "completed", summary: "saved outcome", messages: [], seq: 0, paidMsats: 0, receivedProofs: [], stepCache: [], state: {}, createdAt: activity, lastActivityAt: activity };
+  const base = { tags: [], capability: "work", input: "private input", params: {}, requesterId: "dev-anonymous", requesterTokenHash: createHash("sha256").update(token).digest("hex"), status: "completed", summary: "saved outcome", messages: [], seq: 0, paidMsats: 0, stepCache: [], state: {}, createdAt: activity, lastActivityAt: activity };
   for (const id of ["future", "held", "redacted", "batch"]) {
     await store.save({ ...base, id, seq: 2, messages: [
       { seq: 1, from: "provider", timestamp: new Date(activity).toISOString(), type: "artifact", content: { name: "result.txt", mime_type: "text/plain", data: "saved artifact" } },

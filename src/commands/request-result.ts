@@ -101,7 +101,7 @@ async function requestResultWithWarnings(argument: string, opts: RequestResultOp
   try {
     try { receipt = await transport.requestResult({ endpoint: intent.endpoint }, requestId, envelope); }
     catch (error) {
-      if (!(error instanceof DvmError) || !["invalid_mandate", "request_not_found"].includes(error.code) || !intent.mandate) throw error;
+      if (!(error instanceof DvmError) || !["invalid_mandate", "request_not_found"].includes(error.code) || !intent.mandate || intent.mandate.approvedCaps) throw error;
       receipt = await transport.requestResult({ endpoint: intent.endpoint }, requestId,
         signedIntentEnvelope(intent, signer.privkey, requestRecoveryPath("request-result", requestId), true));
       reduced = true;

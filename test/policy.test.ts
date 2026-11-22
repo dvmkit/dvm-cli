@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../src/lib/currency", () => ({ parseBudget: vi.fn() }));
+vi.mock("../src/lib/currency", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/lib/currency")>(), parseBudget: vi.fn(),
+}));
 
 import { parseBudget } from "../src/lib/currency";
 import { DvmError } from "@dvmkit/sdk/internal";
-import { buildPolicy } from "../src/lib/policy";
+import { buildPolicy, defaultPaymentCount } from "../src/lib/policy";
 
 beforeEach(() => vi.clearAllMocks());
 
@@ -50,4 +52,23 @@ describe("buildPolicy", () => {
       expect(() => buildPolicy({ maxPayments }, 100_000)).toThrow(DvmError);
     }
   });
+});
+
+it.each([
+  ["$2.81", "$0.20", 15],
+  ["$2.80", "$0.20", 14],
+  ["$1.00", undefined, 100],
+])("derives the default count from budget %s and threshold %s", (budget, threshold, count) => {
+  expect(defaultPaymentCount(budget, threshold, 100_000)).toBe(count);
+});
+
+it.each([
+  ["3111080", "$0.20", 90_001, 15],
+  ["3111076", "$0.20", 90_001, 14],
+  ["$2.80", "222219", 90_001, 15],
+  ["$2.80", "222221", 90_001, 14],
+  ["1400000", "$0.10", 100_000, 14],
+  ["1400001", "$0.10", 100_000.125, 15],
+])("rounds the mixed ratio only after division: %s / %s at %s", (budget, threshold, rate, count) => {
+  expect(defaultPaymentCount(budget, threshold, rate)).toBe(count);
 });

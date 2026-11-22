@@ -1,5 +1,6 @@
 import {
-  mandateRequestJson as json, mandateJobData, mandateDurationMs, prepareStandingMandate,
+  approvedMandateUnavailable, checkMandateCredit, mandateRequestJson as json, mandateJobData, mandateExpiryMs,
+  parseMandateApproval, prepareStandingMandate, previewStandingMandate, resolveMandateExpiry,
   setMandateUpfront, signJobData, standingMandateRecord, type PreparedStandingMandate,
 } from "../lib/standing-mandate";
 import { dropPendingMandate, MANDATE_SUBMIT_DISPLAY } from "../lib/mandate-recovery";
@@ -12,7 +13,7 @@ import { isTempoBroadcastOutcome, sendTempoCredential, tempoBroadcastOutcome } f
 import { buildTempoCredential } from "../lib/payment-rails/tempo-credential";
 import { isTerminalJobStatus, pollNextAction } from "../lib/next-action";
 import { parseBudget } from "../lib/currency";
-import { buildPolicy } from "../lib/policy";
+import { buildPolicy, defaultPaymentCount } from "../lib/policy";
 import {
   buildCompletionHintFields,
   completionSnapshot,
@@ -242,6 +243,8 @@ export interface RequestOptions {
   maxIncrement?: string;
   mandate?: boolean;
   mandateUntil?: string;
+  mandatePreview?: string;
+  dryRun?: boolean;
   /** Max number of payments to honour for this job. Required — agents must declare expectations. */
   maxPayments?: string;
   outputType?: string;
@@ -298,7 +301,7 @@ export async function request(opts: RequestOptions): Promise<void> {
     try {
       await requestWithWarnings(opts, stage);
     } catch (error) {
-      throw stage.intentReached ? error : markRefusedBeforeSend(opts.requestId, error);
+      throw stage.intentReached || opts.dryRun ? error : markRefusedBeforeSend(opts.requestId, error);
     }
   }, opts.human);
 }
@@ -321,7 +324,16 @@ async function requestWithWarnings(
   opts: RequestOptions,
   stage: { intentReached: boolean }
 ): Promise<void> {
-  if (opts.mandateUntil !== undefined) mandateDurationMs(opts.mandateUntil);
+  const approval = opts.mandatePreview === undefined ? undefined : parseMandateApproval(opts.mandatePreview);
+  if (approval) {
+    if (opts.dryRun || opts.mandateUntil !== undefined || opts.mandate === false || opts.strictPerCall)
+      throw new DvmError("invalid_arguments", "--mandate-preview supplies the expiry for a live mandate.",
+        "Use the approval from a dry run in place of --mandate-until when submitting.");
+    if (!opts.budget || !opts.autoPayBelow)
+      throw new DvmError("invalid_arguments", "--mandate-preview requires --budget and --auto-pay-below.");
+    opts = { ...opts, mandateUntil: new Date(approval.expires_at_ms).toISOString() };
+  }
+  if (opts.mandateUntil !== undefined) mandateExpiryMs(opts.mandateUntil);
   const artifactSession = opts.human ? createArtifactSaveSession() : undefined;
   const timeout = opts.timeout ? Number(opts.timeout) * 1000 : 30000;
   // Validate the money cap before warmup or quote I/O. The wallet repeats the
@@ -436,9 +448,7 @@ async function requestWithWarnings(
   const autoPayConsent =
     !opts.creditOnly && (opts.autoPay === true || (opts.autoPayBelow !== undefined && opts.autoPayBelow.trim() !== ""));
 
-  // Resolve --max-payments: flag → config default → hardcoded default of 5
-  const DEFAULT_MAX_PAYMENTS = 5;
-  let maxPaymentsN: number;
+  let maxPaymentsN = config?.defaultMaxPayments;
   if (opts.maxPayments !== undefined) {
     const trimmed = opts.maxPayments.trim();
     const parsed = Number(trimmed);
@@ -450,8 +460,6 @@ async function requestWithWarnings(
       );
     }
     maxPaymentsN = parsed;
-  } else {
-    maxPaymentsN = config?.defaultMaxPayments ?? DEFAULT_MAX_PAYMENTS;
   }
 
   let budgetMsats: number | undefined;
@@ -491,6 +499,22 @@ async function requestWithWarnings(
   endpoint = resolvedEndpoint.endpoint;
   requestedCapability ??= resolvedEndpoint.capability;
   const providerInfo = resolvedEndpoint.info;
+  const canSignRequests = providerInfo.auth?.includes(SIGNED_REQUEST_AUTH_ID) ||
+    providerInfo.auth?.includes("secp256k1-schnorr");
+  // Even the advisory quote is a signed POST.
+  try {
+    if (opts.mandateUntil !== undefined) {
+      resolveMandateExpiry(opts, providerInfo);
+      if (!canSignRequests) {
+        const display = "The DVM does not advertise signed requests for standing credit limits.";
+        throw new DvmError("mandate_duration_unsupported", display,
+          "Omit --mandate-until and check back to pay later asks.", undefined, display);
+      }
+    }
+  } catch (error) {
+    transport.close();
+    throw error;
+  }
   const ref: ProviderRef = { endpoint };
   if (opts.requestId && providerInfo.requestRecovery !== true) {
     transport.close();
@@ -515,20 +539,6 @@ async function requestWithWarnings(
   const identifier = dvmId ? formatIdentifier(dvmId, capability) : endpoint;
   if (opts.human) info(`Targeting ${identifier}.`);
 
-  // every per-DVM rule below — posture, rail pin, trust ladder — is
-  // resolved against this DVM's attested identity rather than the hostname the
-  // caller happened to type, so a rule written under one spelling governs a job
-  // that names another. Teach the config the link first, and clear any pins two
-  // spellings disagree on, before anything reads one.
-  const attestedIdentity = providerDvmIdentity(providerInfo);
-  await reconcilePerDvmIdentity({
-    endpoint: ref.endpoint,
-    identity: attestedIdentity,
-    config: loadConfig()?.credit,
-    dvm: dvmId ?? ref.endpoint,
-    ...(opts.human ? { human: true } : {}),
-  });
-
   // fill top-level JSON-Schema `default` values from the DVM's
   // advertised input schema so a minimal call doesn't require the caller
   // to spell out every defaulted field. Mirrors `dvm quote`. Must fill
@@ -551,15 +561,13 @@ async function requestWithWarnings(
     }
   }
 
-  // Build the job policy before the probe (hoisted for ): the
-  // draw-first gate needs `autoPayBelowMsats` before the first submit.
-  // maxPaymentsN always defined (defaulted to 5).
+  // The draw-first gate needs the spending policy before the first submit.
   const policy = buildPolicy(
     {
       budget: effectiveBudget,
       autoPayBelow: effectiveAutoPayBelow,
       maxIncrement: opts.maxIncrement,
-      maxPayments: maxPaymentsN,
+      maxPayments: maxPaymentsN ?? defaultPaymentCount(effectiveBudget, effectiveAutoPayBelow, btcRate),
     },
     btcRate
   );
@@ -574,6 +582,52 @@ async function requestWithWarnings(
       "Strict per-call mode requires identical explicit budget, auto-pay, and increment ceilings with exactly one payment.",
       "Pass the same millisat value to --budget, --auto-pay-below, and --max-increment, plus --max-payments 1."
     );
+
+  const attestedIdentity = providerDvmIdentity(providerInfo);
+  const creditBinding = (callerPubkey: string, stored: StoredCredit | undefined) => {
+    if (!stored || stored.selectionCleared || stored.status !== "active" ||
+        (stored.expiryMs > 0 && stored.expiryMs <= Date.now())) {
+      const credit = approval ? ` (${approval.credit.creditId})` : "";
+      throw approvedMandateUnavailable(`Select the prepaid credit${credit} before submitting.`,
+        "Check the selected credit and its balance with dvm credit balance.");
+    }
+    const binding = { endpoint, callerPubkey, creditId: stored.creditId, currency: stored.currency };
+    if (approval) checkMandateCredit(approval.credit, binding);
+    if (providerInfo.credit) checkMandateCredit(binding, { ...binding, currency: providerInfo.credit.currency });
+    return binding;
+  };
+
+  if (opts.dryRun) {
+    try {
+      if (!canSignRequests || opts.strictPerCall)
+        throw new DvmError("mandate_preview_unavailable", "This request cannot carry a signed standing mandate.");
+      const prepared = await prepareStandingMandate(opts, providerInfo, btcRate, policy.maxPayments);
+      const pricing = providerInfo.capabilities?.[capability]?.pricing as { max?: unknown } | undefined;
+      const { pubkey } = resolveSigningIdentity({ as: opts.as, config });
+      const binding = creditBinding(pubkey, loadCredit(endpoint, pubkey, attestedIdentity));
+      if (opts.creditOnly && opts.creditOnly !== binding.creditId)
+        checkMandateCredit({ ...binding, creditId: opts.creditOnly }, binding);
+      const mandate = previewStandingMandate(prepared, pricing?.max ?? providerInfo.pricing?.max, binding);
+      if (opts.human) info(mandate.display);
+      json({ status: "dry_run", mandate });
+      return;
+    } finally {
+      transport.close();
+    }
+  }
+
+  // every per-DVM rule below — posture, rail pin, trust ladder — is
+  // resolved against this DVM's attested identity rather than the hostname the
+  // caller happened to type, so a rule written under one spelling governs a job
+  // that names another. Teach the config the link first, and clear any pins two
+  // spellings disagree on, before anything reads one.
+  await reconcilePerDvmIdentity({
+    endpoint: ref.endpoint,
+    identity: attestedIdentity,
+    config: loadConfig()?.credit,
+    dvm: dvmId ?? ref.endpoint,
+    ...(opts.human ? { human: true } : {}),
+  });
 
   // auto-sign when the DVM advertises descriptor auth. Resolver
   // walks --as → DVM_IDENTITY_KEY → defaultIdentity → sole-entry → error,
@@ -597,10 +651,7 @@ async function requestWithWarnings(
       "Use a descriptor-auth DVM and select the same identity later with dvm request-result."
     );
   }
-  if (
-    providerInfo.auth?.includes(SIGNED_REQUEST_AUTH_ID) ||
-    providerInfo.auth?.includes("secp256k1-schnorr")
-  ) {
+  if (canSignRequests) {
     const authDomain = signedRequestDomain({
       provider: providerInfo,
       endpoint,
@@ -614,6 +665,15 @@ async function requestWithWarnings(
       ...(opts.requestId ? { request_id: opts.requestId } : {}),
     };
     signing = { privkey: signer.privkey, pubkey: signer.pubkey, unsignedData, domain: authDomain };
+  }
+
+  if (approval && signing) {
+    try {
+      creditBinding(signing.pubkey, loadCredit(endpoint, signing.pubkey, attestedIdentity));
+    } catch (error) {
+      transport.close();
+      throw error;
+    }
   }
 
   // Start the job clock AFTER warmup so cold-start latency doesn't eat the budget.
@@ -668,7 +728,7 @@ async function requestWithWarnings(
       );
     }
     const implicitCredits =
-      opts.strictPerCall || opts.creditOnly
+      opts.strictPerCall || opts.creditOnly || approval
         ? []
         : loadImplicitCredits(endpoint, signer.pubkey, attestedIdentity);
     if (storedCredit && btcRate === 0 &&
@@ -713,6 +773,18 @@ async function requestWithWarnings(
           config: config?.credit,
           ...(attestedIdentity ? { identity: attestedIdentity } : {}),
         });
+    if (approval) {
+      try {
+        const binding = creditBinding(signer.pubkey, storedCredit);
+        if (probePlan.mode !== "draw")
+          throw approvedMandateUnavailable(`The approved credit (${binding.creditId}) could not be drawn.`,
+            "Check the credit balance, credit posture, and upfront quote.");
+        checkMandateCredit(approval.credit, { ...binding, creditId: probePlan.creditId });
+      } catch (error) {
+        transport.close();
+        throw error;
+      }
+    }
     if (opts.creditOnly && (probePlan.mode !== "draw" || probePlan.creditId !== opts.creditOnly)) {
       transport.close();
       throw new DvmError(
@@ -730,7 +802,7 @@ async function requestWithWarnings(
       );
     }
     if (probePlan.mode === "draw") {
-      signing.standingMandate = await prepareStandingMandate(opts, providerInfo, btcRate, policy.maxPayments);
+      signing.standingMandate = await prepareStandingMandate(opts, providerInfo, btcRate, policy.maxPayments, approval);
       setMandateUpfront(signing.standingMandate, previewQuotes[0]);
       const creditId = probePlan.creditId;
       const bound = [storedCredit, ...(storedCredit?.siblingCredits ?? []), ...implicitCredits]
@@ -761,7 +833,7 @@ async function requestWithWarnings(
             ...(drawRequestId ? { request_id: drawRequestId } : {}),
           }
         : unsignedData;
-    data = signJobData(signing, probeData);
+    data = signJobData(signing, probeData, opts.human);
     if (opts.human) info(`Signed as ${signer.pubkey}.`);
     if (opts.human && probePlan.mode === "draw") {
       info(
@@ -852,6 +924,13 @@ async function requestWithWarnings(
   try {
     receipt = await submitProbe(envelope);
   } catch (err) {
+    if (approval && !outcomeUnknownAfterSubmit(err)) {
+      transport.close();
+      if (err instanceof DvmError && ["credit_not_found", "credit_expired", "insufficient_credit", "draw_conflict"].includes(err.code))
+        throw approvedMandateUnavailable(`The DVM refused the approved credit (${approval.credit.creditId}, ${err.code}).`,
+          "Check the approved credit with dvm credit balance before trying again.");
+      throw err;
+    }
     if (opts.requestId) {
       transport.close();
       throw requestOutcomeUnknown(opts.requestId, err);
@@ -902,6 +981,11 @@ async function requestWithWarnings(
   // Upfront payment required — handle before saving (no job exists yet)
   if (receipt.status === "payment-required") {
     const quotes = receipt.quotes ?? [];
+    if (approval) {
+      transport.close();
+      throw approvedMandateUnavailable(`The DVM requests payment beyond the approved credit (${approval.credit.creditId}).`,
+        "Check the approved credit with dvm credit balance before trying again.");
+    }
     if (opts.creditOnly) {
       transport.close();
       throw new DvmError("credit_only_unavailable", "The selected prepaid credit did not cover this submission; no fresh payment was attempted.");
@@ -1048,7 +1132,7 @@ async function requestWithWarnings(
           dvmId,
           providerInfo,
           signing,
-          allowTopup: !opts.creditOnly,
+          allowTopup: !opts.creditOnly && !approval,
           human: opts.human,
         });
       // the job is over and this emission is terminal — the one
@@ -1122,7 +1206,7 @@ async function requestWithWarnings(
           dvmId,
           providerInfo,
           signing,
-          allowTopup: !opts.creditOnly,
+          allowTopup: !opts.creditOnly && !approval,
           human: opts.human,
         });
       }
@@ -2834,6 +2918,11 @@ const PREACCEPT_REFUSAL_CODES = new Set([
 ]);
 
 function requestOutcomeUnknown(requestId: string, cause: unknown): DvmError {
+  if (cause instanceof DvmError && cause.code === "protected_post_redirect") {
+    return new DvmError("protected_post_redirect", cause.message, cause.hint,
+      { request_id: requestId, from_origin: cause.data?.from_origin, to_origin: cause.data?.to_origin,
+        ...(cause.data?.spend_committed === true ? { spend_committed: true } : {}) }, cause.display);
+  }
   // Payment/uncertainty evidence takes precedence even when a provider uses
   // the same code as a preaccept gate, including a structured 400 response.
   if (cause instanceof DvmError && PREACCEPT_REFUSAL_CODES.has(cause.code) &&
@@ -3125,7 +3214,7 @@ async function tryAgentWalletPayment(
             amount_micro: fundPlan.wireAmountMicro ?? fundPlan.fundMicro,
             commitment: sha256Hex(prepared.cashuToken),
           },
-        })),
+        }), opts.human),
     };
   }
   // Persisted against the exact `data` about to go on the wire, so a later
