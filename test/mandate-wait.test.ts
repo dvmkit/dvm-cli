@@ -1,7 +1,8 @@
 import { DvmError, signDvmRequestData, type Message, type Transport } from "@dvmkit/sdk/internal";
 import { expect, it, vi } from "vitest";
 import { loadJob, saveJob, type CreditPaymentIntent } from "../src/lib/job-store";
-import { mandateWindowAction } from "../src/lib/mandate-wait";
+import { appendMessages } from "../src/lib/messages/index";
+import { assertApprovedMandatePayment, mandateWindowAction } from "../src/lib/mandate-wait";
 import { waitForJob } from "../src/lib/wait-for-job";
 
 const start = 1_000_000;
@@ -38,6 +39,22 @@ it("does not wait when this draw cannot fit the ask under the standing total", (
     credit_id: "credit", draw_id: "draw", request_seq: 1, payment_id: "paid", amount_micro: 200_000, currency: "usd",
   } } } as Message;
   expect(mandateWindowAction(job.id, ask, 3, [payment], start)).toBeUndefined();
+});
+
+it("checks the approved payment window and a running native total", () => {
+  const approved = { ...job, mandate: { ...job.mandate, expires_at_ms: Date.now() + 60_000,
+    approvedCaps: { max_total_micro: 300_000, max_ask_micro: 200_000 } } };
+  expect(() => assertApprovedMandatePayment(approved, ask, 3)).not.toThrow();
+  appendMessages(job.id, [{ seq: 2, from: "requester", timestamp: start / 1000, type: "payment", content: { credit: {
+    mandate: true, credit_id: "credit", draw_id: "draw", request_seq: 1, payment_id: "paid", amount_micro: 101_000, currency: "usd",
+  } } }]);
+  expect(() => assertApprovedMandatePayment(approved, ask, 3)).toThrow(expect.objectContaining({
+    code: "mandate_payment_approval_required",
+    display: expect.stringContaining("exceed the total"),
+  }));
+  expect(() => assertApprovedMandatePayment(
+    { ...approved, mandate: { ...approved.mandate, expires_at_ms: Date.now() - 1 } }, ask, 3,
+  )).toThrow(expect.objectContaining({ code: "mandate_payment_approval_required", display: expect.stringContaining("has expired") }));
 });
 
 it.each(["recovers", "keeps timing out"])("reconciles the ask within the wait limit when mandate history %s", async (historyOutcome) => {

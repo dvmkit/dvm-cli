@@ -152,7 +152,7 @@ globalThis.fetch = (input, init) => {
     writeFileSync(join(root, "credits.json"), JSON.stringify(store));
     const listed = async () => JSON.parse((await cli(["credit", "list"])).stdout).credits[0];
     const requested = JSON.parse((await cli(["request", "--endpoint", endpoint, "--input", "work",
-      "--request-id", requestId, "--auto-pay", "--budget", "1000000", "--auto-pay-below", "1000000", "--timeout", "15"])).stdout);
+      "--request-id", requestId, "--auto-pay", "--budget", "1000000", "--auto-pay-below", "1000000", "--max-payments", "2", "--timeout", "15"])).stdout);
     assert.equal(requested.receipt_verified, "absent");
     assert.equal(requested.next_action, null);
     assert.equal(counters.jobReads, 1, "request makes exactly one best-effort receipt read");

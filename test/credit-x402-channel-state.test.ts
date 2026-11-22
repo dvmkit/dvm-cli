@@ -735,14 +735,15 @@ describe("cooperative x402 credit refund", () => {
     await expect(storage.get(otherChannelId)).resolves.toEqual(before);
   });
 
-  // The SDK currently drops malformed refund records; reopening re-derives the channel from the wallet’s deterministic salt. Restore retention assertions when the SDK keeps the record.
-  it.each(["balance", "totalClaimed", "chargedCumulativeAmount"])("drops refund %s past uint256 without failing the drain", async (field) => {
+  it.each(["balance", "totalClaimed", "chargedCumulativeAmount"])("ignores refund %s past uint256 without changing stored channels", async (field) => {
     const before = await storage.get(otherChannelId);
+    const chainState = { balance: "200000", totalClaimed: "10000", chargedCumulativeAmount: "10000" };
+    await storage.set(channelId, chainState);
     await drain({
       channelId, balance: "123", totalClaimed: "10", chargedCumulativeAmount: "20",
       [field]: (2n ** 256n).toString(),
     });
-    await expect(storage.get(channelId)).resolves.toBeUndefined();
+    await expect(storage.get(channelId)).resolves.toEqual(chainState);
     const output = vi.mocked(renderCreditDrain).mock.calls.at(-1)![0].json;
     expect(output).toMatchObject({ receipts_verified: "absent", receipts_total: 0,
       display: expect.stringContaining("The DVM reports") });

@@ -1,4 +1,4 @@
-import { parseBudget } from "./currency";
+import { assertValidBudget, decimalRatio, parseBudget } from "./currency";
 import { DvmError } from "@dvmkit/sdk/internal";
 import type { JobBudgetPolicy } from "./job-budget";
 import { dollarLimitMicro } from "./quote-limit";
@@ -41,4 +41,27 @@ export function buildPolicy(
   return { maxTotalMsats, autoPayBelowMsats, maxIncrementMsats, maxPayments: opts.maxPayments, maxIncrementExplicit: opts.maxIncrement !== undefined,
     ...(maxTotalUsdMicro !== undefined && Number.isSafeInteger(Number(maxTotalUsdMicro))
       ? { maxTotalUsdMicro: Number(maxTotalUsdMicro) } : {}) };
+}
+
+export function defaultPaymentCount(budget: string | undefined, perPayment: string | undefined, btcRate: number): number {
+  if (!budget || !perPayment) return 100;
+  const budgetIsUsd = budget.startsWith("$");
+  const capIsUsd = perPayment.startsWith("$");
+  const rate = budgetIsUsd === capIsUsd ? [1n, 1n] : decimalRatio(String(btcRate));
+  if (!rate || rate[0] === 0n) return 100;
+
+  // Convert mixed amounts to rational millisats without rounding either operand.
+  const amount = (text: string, dollars: boolean) => {
+    if (!dollars) return decimalRatio(String(assertValidBudget(text)));
+    const usd = decimalRatio(text.slice(1)) ?? decimalRatio(String(assertValidBudget(text)));
+    return usd && budgetIsUsd !== capIsUsd
+      ? [usd[0] * 100_000_000_000n * rate[1], usd[1] * rate[0]]
+      : usd;
+  };
+  const total = amount(budget, budgetIsUsd);
+  const cap = amount(perPayment, capIsUsd);
+  if (!total || !cap || cap[0] === 0n) return 100;
+  const numerator = total[0] * cap[1];
+  const denominator = total[1] * cap[0];
+  return Math.min(Number((numerator + denominator - 1n) / denominator), Number.MAX_SAFE_INTEGER);
 }

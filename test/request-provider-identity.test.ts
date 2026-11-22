@@ -884,7 +884,7 @@ describe("a credit-funded submit to a recovery-capable provider", () => {
     seedCredit(0);
     provider.bindsPaid = recovery === "read-back";
     provider.paid = () => (response) => response.socket?.destroy();
-    await expect(paidRequest()).rejects.toBeInstanceOf(Error);
+    await expect(paidRequest({ maxPayments: "5" })).rejects.toBeInstanceOf(Error);
     const original = provider.paidPosts()[0].body;
     const publicId = original.request_id as string;
     if (existing) jobs.saveJob({ id: "job-a", endpoint: provider.endpoint, status: "processing",

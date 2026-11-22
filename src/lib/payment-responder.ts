@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { finishPaymentCredit, receivePaymentCredit, refreshPaymentCredit, paymentCreditChoice, type PaymentCredit, type CreditMessageResult, type CreditedPaymentResult } from "./payment-credit";
-import { guardMandatePayment } from "./mandate-wait";
+import { assertApprovedMandatePayment, guardMandatePayment, mandatePaymentApprovalRequired } from "./mandate-wait";
 import { hasPendingAcceptedJobAccess } from "./submission-evidence";
 import { askUsdMicro, describeBudgetOverrun, formatUsdMicro, budgetVerdict, dollarBoundUsdMicro, usdMicro, type BudgetOverrun, type JobBudgetPolicy } from "./job-budget";
 import { withJobPaymentLock } from "./payment-lock";
@@ -41,6 +41,7 @@ import {
   loadJob,
   hasUnknownUpfrontCredit,
   hasUnknownUpfrontRail,
+  type CreditPaymentIntent,
   type HeldPaymentBlock,
   type JobRecord,
   markPaymentRequestPaid,
@@ -82,6 +83,16 @@ export interface PaidPaymentResult {
   amountMsats: number;
   /** Exact signed x402 value in USDC microunits. */
   amountUsdcMicro?: string;
+  /** References for an accepted balance debit, including the exact native amount. */
+  creditReceipt?: { payment_id: string; credit_id: string; draw_id: string; amount_micro: number; currency: string };
+}
+
+function confirmedCreditPayment(intent: CreditPaymentIntent): PaidPaymentResult {
+  const { payment_id, credit_id, draw_id, amount_micro, currency } = intent.authorization;
+  return {
+    status: "paid", rail: "credit", amountMsats: intent.amountMsats ?? intent.request.amount_msats,
+    creditReceipt: { payment_id, credit_id, draw_id, amount_micro, currency },
+  };
 }
 
 export type PaymentResult =
@@ -178,7 +189,7 @@ export async function handlePaymentRequest(
   }).catch((error: unknown) => {
     if (budgetSaved && !(error instanceof DvmError)) error = new DvmError("payment_failed", "The payment was not completed.");
     if (!(error instanceof DvmError)) throw error;
-    if (["payment_credit_choice_required", "payment_credit_rail_repeated"].includes(error.code)) throw error;
+    if (["mandate_payment_approval_required", "payment_credit_choice_required", "payment_credit_rail_repeated"].includes(error.code)) throw error;
     if (error.code === "budget_below_spend" || error.code === "invalid_budget" ||
         (error.code === "over_budget" && opts?.budget !== undefined && !budgetSaved)) {
       error.data = providerFields({ ...error.data, job_id: jobId, next_step: error.hint,
@@ -312,20 +323,26 @@ async function handleLockedPaymentRequest(
     throw new DvmError("credit_only_unavailable", "This job may spend only its original prepaid credit.");
   if (matchingEndpoint && opts?.requestSeq !== undefined)
     await guardMandatePayment(jobId, opts.requestSeq, transport, provider, jobToken, opts.mandateReadTimeoutMs);
+  const automaticMandate = !!job?.mandate?.approvedCaps && opts?.approval !== "explicit";
+  const requireExplicit = () => mandatePaymentApprovalRequired(jobId, opts?.requestSeq,
+    "Automatic payment requires the original approved prepaid credit.");
   let balanceRefused = false;
   const booked = matchingEndpoint ? bookedCreditPayment(jobId, opts?.requestSeq) : undefined;
   if (booked && (booked.request.amount_msats !== request.amount_msats ||
       booked.request.credit?.amount_micro !== request.credit?.amount_micro ||
       booked.request.credit?.currency !== request.credit?.currency))
     throw new DvmError("credit_payment_conflict", "The saved payment ask differs from this request.");
-  if (booked) return { status: "paid", rail: "credit", amountMsats: booked.amountMsats ?? booked.request.amount_msats };
-  if (job?.pendingCreditPayment) {
-    const pending = job.pendingCreditPayment;
-    const paid = await sendCreditPayment(jobId, pending, transport, provider, jobToken);
+  if (booked) return confirmedCreditPayment(booked);
+  const pending = loadJob(jobId)?.pendingCreditPayment;
+  if (pending) {
+    if (automaticMandate && (pending.authorization.request_seq !== opts?.requestSeq ||
+        pending.authorization.credit_id !== job?.mandate?.credit_id || pending.authorization.draw_id !== job?.mandate?.draw_id))
+      throw requireExplicit();
+    const paid = await sendCreditPayment(jobId, pending, transport, provider, jobToken, automaticMandate);
     if (paid) {
       if (pending.authorization.request_seq !== opts?.requestSeq)
         throw new DvmError("credit_payment_recovered", "The prior balance payment was recovered; reload this job before paying another ask.");
-      return { status: "paid", rail: "credit", amountMsats: pending.amountMsats ?? pending.request.amount_msats };
+      return confirmedCreditPayment(pending);
     }
     balanceRefused = true;
     // An old unresolved ask cannot authorize a rail spend for a different ask.
@@ -363,6 +380,10 @@ async function handleLockedPaymentRequest(
   // Settling above can book an earlier payment, so the caps read the job now.
   const latest = loadJob(jobId);
   const paymentsHonoured = latest?.paymentsHonoured ?? 0;
+  if (automaticMandate) {
+    if (!matchingEndpoint || opts?.rail !== undefined) throw requireExplicit();
+    assertApprovedMandatePayment(latest, request, opts?.requestSeq);
+  }
 
   if (opts?.budget !== undefined && paymentsHonoured >= policy.maxPayments) return "payment-cap-exceeded";
 
@@ -409,6 +430,7 @@ async function handleLockedPaymentRequest(
 
   // Before any balance or rail can sign a second payment for the same ask.
   if (unconfirmed && opts?.requestSeq !== undefined) {
+    if (automaticMandate) throw requireExplicit();
     // A token that can still be re-delivered is sent again, never replaced.
     if (!unconfirmed.blocked)
       return redeliverUnconfirmedPayment({
@@ -442,8 +464,10 @@ async function handleLockedPaymentRequest(
   if (matchingEndpoint && !balanceRefused && opts?.rail === undefined) {
     const creditPaid = await tryCreditPayment({ jobId, request, policy,
       requestSeq: opts?.requestSeq, approval: opts?.approval ?? "auto", transport, provider, jobToken });
-    if (creditPaid !== false) return { status: "paid", rail: "credit", amountMsats: creditPaid };
+    if (creditPaid) return confirmedCreditPayment(creditPaid);
   }
+
+  if (automaticMandate) throw requireExplicit();
 
   if (priorLanding && !explicitRail) {
     const action = paymentCreditChoice(jobId, opts!.requestSeq!, request, false)!;

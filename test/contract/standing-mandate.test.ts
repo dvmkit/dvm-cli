@@ -46,9 +46,9 @@ afterAll(async () => {
   for (const directory of roots) rmSync(directory, { recursive: true, force: true });
 });
 
-async function request(extra: string[] = []) {
+async function request(extra: string[] = [], stream = false) {
   return execute(process.execPath, [binary, "request", "--endpoint", endpoint, "--input", "watch",
-    "--budget", "$1.10", "--auto-pay-below", "$0.55", "--no-stream", ...extra], {
+    "--budget", "$1.10", "--auto-pay-below", "$0.55", ...(stream ? [] : ["--no-stream"]), ...extra], {
     env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
   }).then((run) => ({ ...run, code: 0 }), (error) => error as { stdout: string; stderr: string; code: number });
 }
@@ -56,7 +56,7 @@ function records(): Array<Record<string, any>> { return JSON.parse(readFileSync(
 
 it("signs native credit limits for 24 hours and the real SDK stores the same mandate", async () => {
   const started = Date.now();
-  const run = await request();
+  const run = await request(["--max-payments", "5"]);
   expect(run.code, run.stdout + run.stderr).toBe(0);
   const output = JSON.parse(run.stdout);
   const snapshot = await control({ op: "snapshot", ids: [output.jobId] });
@@ -92,28 +92,226 @@ it("honors opt-out without sending or storing a mandate", async () => {
 
 it("sets a two-hour expiry and relays the same sentence in human mode", async () => {
   const started = Date.now();
-  const run = await request(["--mandate-until", "2h", "--human"]);
+  const run = await request(["--mandate-until", "2h", "--human", "--max-payments", "5"]);
   expect(run.code, run.stdout + run.stderr).toBe(0);
   const m = records()[0].mandate;
   expect(m.expires_at_ms).toBeGreaterThanOrEqual(started + 7_200_000);
   expect(m.expires_at_ms).toBeLessThanOrEqual(Date.now() + 7_200_000);
+  expect(run.stderr).toContain("can charge at most $1.10 USD until");
+  expect(run.stderr.indexOf("can charge at most")).toBeLessThan(run.stderr.indexOf("Signed as"));
   expect(run.stderr).toContain("while the credit lasts");
   expect(run.stderr).toContain("including the upfront payment");
-  expect(run.stderr).toMatch(/until \d{1,2} [A-Z][a-z]+ \d{4} at \d{2}:\d{2} UTC/);
-  expect(run.stderr).not.toContain(new Date(m.expires_at_ms).toISOString());
+  expect(run.stderr).toContain(`until ${new Date(m.expires_at_ms).toISOString()}`);
 });
 
-it("refuses expiry above seven days before any submit", async () => {
+it("refuses fourteen days against the pinned SDK before signing or posting", async () => {
   const before = await control({ op: "snapshot", ids: [] });
-  const run = await request(["--mandate-until", "7d1s"]);
+  const run = await request(["--mandate-until", "14d"]);
   expect(run.code).toBe(1);
-  expect(JSON.parse(run.stdout).error.message).toContain("at most 7 days");
+  expect(JSON.parse(run.stdout).error).toMatchObject({
+    code: "mandate_duration_unsupported",
+    display: "The DVM accepts standing limits up to 7 days.",
+    hint: "Choose a shorter --mandate-until or check back to pay later asks.",
+  });
+  const human = await request(["--mandate-until", "14d", "--human"]);
+  expect(human.code).toBe(1);
+  expect(human.stderr).toContain("The DVM accepts standing limits up to 7 days.");
+  expect(human.stderr).not.toContain("Signed as");
   const after = await control({ op: "snapshot", ids: [] });
-  expect(after.submissions.length).toBe(before.submissions.length);
+  expect(after.postPaths.slice(before.postPaths.length)).toEqual([]);
+});
+
+it.each([true, false])("refuses an explicit expiry without standing support before any POST (credit advertised: %s)", async (advertiseCredit) => {
+  await control({ op: "support", value: false });
+  await control({ op: "configure", advertiseCredit });
+  const before = await control({ op: "snapshot", ids: [] });
+  const run = await request(["--mandate-until", "14d"]);
+  expect(run.code).toBe(1);
+  expect(JSON.parse(run.stdout).error).toMatchObject({
+    code: "mandate_duration_unsupported",
+    display: expect.stringContaining("does not advertise automatic credit payments"),
+  });
+  expect((await control({ op: "snapshot", ids: [] })).postPaths).toEqual(before.postPaths);
+});
+
+it("previews a fourteen-day mandate when info explicitly has no ceiling", async () => {
+  await control({ op: "configure", maxDuration: null });
+  const before = await control({ op: "snapshot", ids: [] });
+  const expiry = new Date(Date.now() + 14 * 86_400_000);
+  const run = await request(["--dry-run", "--mandate-until", expiry.toISOString()]);
+  expect(run.code, run.stdout + run.stderr).toBe(0);
+  expect(JSON.parse(run.stdout).mandate).toMatchObject({ max_total_micro: 650_000, expires_at_ms: expiry.getTime() });
+  expect((await control({ op: "snapshot", ids: [] })).postPaths).toEqual(before.postPaths);
+});
+
+it("keeps the full mixed-currency budget within the signed ceiling", async () => {
+  writeFileSync(join(root, "btc-rate.json"), JSON.stringify({ rate: 90_001, timestamp: Date.now() }));
+  const run = await request(["--budget", "3111080", "--auto-pay-below", "$0.20"]);
+  expect(run.code, run.stdout + run.stderr).toBe(0);
+  const output = JSON.parse(run.stdout);
+  const snapshot = await control({ op: "snapshot", ids: [output.jobId] });
+  expect(snapshot.submissions.at(-1).data.mandate).toMatchObject({ max_total_micro: 2_800_003, max_ask_micro: 200_000 });
+});
+
+it("previews exact limits without signing or posting and signs the approved terms on submit", async () => {
+  const expiry = new Date(Date.now() + 3_600_000);
+  expiry.setUTCMilliseconds(999);
+  const before = await control({ op: "snapshot", ids: [] });
+  const preview = await request(["--dry-run", "--mandate-until", expiry.toISOString()]);
+  expect(preview.code, preview.stdout + preview.stderr).toBe(0);
+  const { status, mandate } = JSON.parse(preview.stdout);
+  expect(status).toBe("dry_run");
+  expect(mandate).toMatchObject({
+    status: "preview", max_total: { amount_micro: 650_000, currency: "usd", display: "$0.65 USD" },
+    expires_at_ms: expiry.getTime(), expires_at: expiry.toISOString(),
+    display: expect.stringContaining(`can charge at most $0.65 USD until ${expiry.toISOString()}`),
+  });
+  expect((await control({ op: "snapshot", ids: [] })).postPaths).toEqual(before.postPaths);
+
+  const live = await request(["--mandate-preview", mandate.approval]);
+  expect(live.code, live.stdout + live.stderr).toBe(0);
+  const { jobId } = JSON.parse(live.stdout);
+  const { submissions } = await control({ op: "snapshot", ids: [jobId] });
+  expect(submissions.at(-1).data.mandate).toEqual({
+    max_total_micro: 650_000, max_ask_micro: 550_000, expires_at_ms: expiry.getTime(),
+  });
+
+  await control({ op: "configure", quote: "fail" });
+  const changed = await request(["--mandate-preview", mandate.approval]);
+  expect(changed.code).toBe(1);
+  expect(JSON.parse(changed.stdout).error.code).toBe("mandate_preview_unavailable");
+  expect((await control({ op: "snapshot", ids: [] })).submissions).toHaveLength(submissions.length);
+}, 15_000);
+
+async function previewApproval(extra: string[] = []) {
+  const run = await request(["--dry-run", ...extra]);
+  expect(run.code, run.stdout + run.stderr).toBe(0);
+  return JSON.parse(run.stdout).mandate;
+}
+
+it.each(["removed", "replaced"])("refuses to sign when the selected credit was %s after preview", async (change) => {
+  const mandate = await previewApproval();
+  const file = join(root, "credits.json");
+  const store = JSON.parse(readFileSync(file, "utf8"));
+  if (change === "removed") store.credits = [];
+  else store.credits[0].creditId = "replacement-credit";
+  writeFileSync(file, JSON.stringify(store));
+  const before = await control({ op: "snapshot", ids: [] });
+
+  const run = await request(["--mandate-preview", mandate.approval]);
+  expect(run.code).toBe(1);
+  const { error } = JSON.parse(run.stdout);
+  expect(error.code).toBe(change === "removed" ? "mandate_preview_unavailable" : "mandate_preview_changed");
+  if (change === "replaced") {
+    expect(error.display).toContain("approved credit was mandate-credit. The live credit is replacement-credit");
+    expect(error.hint).toContain("confirm a new approval for replacement-credit");
+  }
+  expect((await control({ op: "snapshot", ids: [] })).postPaths).toEqual(before.postPaths);
+});
+
+it.each([
+  { requestId: [] },
+  { requestId: ["--request-id", "approved-credit-rejected"] },
+])("stops after the DVM rejects approved credit without retrying or paying ($requestId)", async ({ requestId }) => {
+  const mandate = await previewApproval();
+  await control({ op: "configure", rejectCredit: true });
+  const before = await control({ op: "snapshot", ids: [] });
+
+  const run = await request(["--mandate-preview", mandate.approval, ...requestId]);
+  expect(run.code).toBe(1);
+  expect(JSON.parse(run.stdout).error).toMatchObject({
+    code: "mandate_preview_unavailable",
+    display: expect.stringContaining("credit_not_found"),
+  });
+  const after = await control({ op: "snapshot", ids: [] });
+  expect(after.postPaths.slice(before.postPaths.length)).toEqual(["/v1/quote", "/v1/job"]);
+  expect(after.submissions.at(-1).data.mandate).toMatchObject({ max_total_micro: 650_000 });
+});
+
+it("keeps the mandate on recovery after an approved submit is refused", async () => {
+  const mandate = await previewApproval();
+  await control({ op: "configure", rejectCredit: true });
+  const requestId = "approved-recovery";
+  const submit = await request(["--mandate-preview", mandate.approval, "--request-id", requestId]);
+  expect(JSON.parse(submit.stdout).error.code).toBe("mandate_preview_unavailable");
+  const before = await control({ op: "snapshot", ids: [] });
+
+  const resume = await execute(process.execPath, [binary, "request-resume", requestId], {
+    env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
+  }).then((run) => ({ ...run, code: 0 }), (error) => error as { stdout: string; stderr: string; code: number });
+  expect(resume.code).toBe(1);
+  expect(JSON.parse(resume.stdout).error.code).toBe("invalid_mandate");
+  const after = await control({ op: "snapshot", ids: [] });
+  expect(after.postPaths.slice(before.postPaths.length)).toEqual([
+    `/v1/request-result/${requestId}`, `/v1/request-resume/${requestId}`,
+  ]);
+  const original = before.submissions.at(-1).data.mandate;
+  expect(after.recoveryPosts.slice(before.recoveryPosts.length).map(({ data }: { data: { mandate: unknown } }) => data.mandate))
+    .toEqual([original, original]);
+});
+
+it("refuses when the provider shortens the maximum below the approved expiry", async () => {
+  const mandate = await previewApproval(["--mandate-until", "2h"]);
+  await control({ op: "configure", maxDuration: 3_600_000 });
+  const before = await control({ op: "snapshot", ids: [] });
+  const run = await request(["--mandate-preview", mandate.approval]);
+  expect(run.code).toBe(1);
+  expect(JSON.parse(run.stdout).error).toMatchObject({
+    code: "mandate_duration_unsupported",
+    display: expect.stringContaining(`The approved expiry is ${mandate.expires_at}. The DVM currently accepts standing limits up to 1h.`),
+  });
+  expect((await control({ op: "snapshot", ids: [] })).postPaths).toEqual(before.postPaths);
+});
+
+it.each([
+  [[], 650_000, 550_000, "$0.65"],
+  [["--max-increment", "$0.40"], 500_000, 400_000, "$0.50"],
+] as const)("signs and reports lower live caps when the upfront ceiling is higher (%j)", async (flags, total, ask, label) => {
+  await control({ op: "configure", advertisedUpfront: 0.50 });
+  const approval = await previewApproval();
+  expect(approval.max_total_micro).toBe(1_050_000);
+
+  const run = await request(["--mandate-preview", approval.approval, ...flags]);
+  expect(run.code, run.stdout + run.stderr).toBe(0);
+  const output = JSON.parse(run.stdout);
+  const snapshot = await control({ op: "snapshot", ids: [output.jobId] });
+  expect(snapshot.submissions.at(-1).data.mandate).toEqual({
+    max_total_micro: total, max_ask_micro: ask, expires_at_ms: approval.expires_at_ms,
+  });
+  expect(output.mandate).toMatchObject({
+    max_total_micro: total, approved_max_total_micro: 1_050_000,
+    max_ask_micro: ask, approved_max_ask_micro: 550_000,
+  });
+  expect(output.mandate.display).toContain(`Approved up to $1.05 USD total. Signed ${label} USD under the live limits.`);
+  if (flags.length) expect(output.mandate.display).toContain("Approved up to $0.55 USD per charge. Signed $0.40 USD under the live limits.");
+});
+
+it.each([
+  [90_002, 2_800_003],
+  [90_000, 2_700_000],
+])("bounds the signed total when the FX rate moves to %s", async (liveRate, signedTotal) => {
+  const setRate = (rate: number) => writeFileSync(join(root, "btc-rate.json"), JSON.stringify({ rate, timestamp: Date.now() }));
+  const flags = ["--budget", "3111080", "--auto-pay-below", "$0.20"];
+  setRate(90_001);
+  const approval = await previewApproval(flags);
+  expect(approval.max_total_micro).toBe(2_800_003);
+  setRate(liveRate);
+
+  const run = await request([...flags, "--mandate-preview", approval.approval]);
+  expect(run.code, run.stdout + run.stderr).toBe(0);
+  const output = JSON.parse(run.stdout);
+  const snapshot = await control({ op: "snapshot", ids: [output.jobId] });
+  expect(snapshot.submissions.at(-1).data.mandate).toEqual({
+    max_total_micro: signedTotal, max_ask_micro: 200_000, expires_at_ms: approval.expires_at_ms,
+  });
+  expect(output.mandate).toMatchObject({ max_total_micro: signedTotal, approved_max_total_micro: 2_800_003 });
+  if (liveRate < 90_001)
+    expect(output.mandate.display).toContain("Approved up to $2.800003 USD total. Signed $2.70 USD under the live limits.");
 });
 
 it("withholds a mandate without advertised support and says a payer is needed", async () => {
   await control({ op: "support", value: false });
+  await control({ op: "configure", maxDuration: 4 * 3_600_000 });
   const run = await request();
   expect(run.code, run.stdout + run.stderr).toBe(0);
   const output = JSON.parse(run.stdout);
@@ -183,7 +381,7 @@ it("explains a provider's invalid mandate refusal without sending another job", 
 
 it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("reports the SDK's second and third mandate-paid pieces once each without a CLI payment POST", async () => {
   await control({ op: "configure", hold: true, pieces: 2 });
-  const submitted = await request();
+  const submitted = await request(["--max-payments", "5"]);
   expect(submitted.code, submitted.stdout + submitted.stderr).toBe(0);
   const { jobId } = JSON.parse(submitted.stdout);
   const before = await control({ op: "snapshot", ids: [] });
@@ -203,3 +401,106 @@ it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("reports
   expect(snapshot.jobs[0].status).toBe("completed");
   expect(records()[0]).toMatchObject({ totalPaidMsats: 500_000, paymentsHonoured: 3 });
 }, 15_000);
+
+it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("settles fourteen later asks with the default payment count", async () => {
+  await control({ op: "configure", hold: true, pieces: 14 });
+  const submitted = await request(["--budget", "$2.90", "--auto-pay-below", "$0.20"]);
+  expect(submitted.code, submitted.stdout + submitted.stderr).toBe(0);
+  const { jobId, mandate } = JSON.parse(submitted.stdout);
+  expect(mandate.max_total_micro).toBe(2_900_000);
+  await control({ op: "release" });
+  const run = await execute(process.execPath, [binary, "messages", jobId, "--wait", "--until", "5s"], {
+    env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
+  });
+  const payments = run.stdout.trim().split("\n").map((line) => JSON.parse(line)).filter((event) => event.event === "payment");
+  expect(payments).toHaveLength(14);
+  expect(payments.at(-1)).toMatchObject({ mandate: true, total_micro: 2_900_000, overcharged: false });
+}, 15_000);
+
+it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI).each([true, false])(
+  "protects the preview per-charge cap after FX rises (attached payer: %s)", async (attached) => {
+    const setRate = (rate: number) => writeFileSync(join(root, "btc-rate.json"), JSON.stringify({ rate, timestamp: Date.now() }));
+    const flags = ["--auto-pay-below", "200000"];
+    setRate(90_001);
+    const approval = await previewApproval(flags);
+    expect(approval.max_ask_micro).toBe(180_002);
+    setRate(100_000);
+    await control({ op: "configure", pieces: 1, hold: !attached });
+    const before = await control({ op: "snapshot", ids: [] });
+    const submit = await request([...flags, "--mandate-preview", approval.approval, "--timeout", "8"], attached);
+    const cli = (args: string[]) => execute(process.execPath, [binary, ...args], {
+      env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
+    }).then((run) => ({ ...run, code: 0 }), (error) => error as { stdout: string; stderr: string; code: number });
+
+    let blocked = submit;
+    if (!attached) {
+      expect(submit.code, submit.stdout + submit.stderr).toBe(0);
+      await control({ op: "release" });
+      blocked = await cli(["messages", JSON.parse(submit.stdout).jobId, "--wait", "--until", "5s"]);
+    }
+    expect(blocked.code, blocked.stdout + blocked.stderr).toBe(1);
+    const { error } = JSON.parse(blocked.stdout.trim().split("\n").at(-1)!);
+    const { job_id: jobId, request_seq: seq } = error;
+    expect(error).toMatchObject({
+      code: "mandate_payment_approval_required",
+      display: expect.stringContaining("exceeds the standing per-charge limit"),
+      hint: expect.stringContaining(`dvm pay ${jobId} ${seq}`),
+    });
+    const after = await control({ op: "snapshot", ids: [jobId] });
+    expect(after.submissions.at(-1).data.mandate.max_ask_micro).toBe(180_002);
+    expect(after.paymentPosts).toHaveLength(before.paymentPosts.length);
+    expect(after.jobs[0].status).toBe("awaiting-input");
+    if (!attached) {
+      const auto = await cli(["pay", jobId, "--auto"]);
+      expect(JSON.parse(auto.stdout).error.code).toBe("mandate_payment_approval_required");
+      const wrongAsk = await cli(["pay", jobId, String(seq + 1)]);
+      expect(JSON.parse(wrongAsk.stdout).error.code).toBe("payment_request_not_pending");
+      expect((await control({ op: "snapshot", ids: [jobId] })).paymentPosts).toHaveLength(before.paymentPosts.length);
+      const explicit = await cli(["pay", jobId, String(seq)]);
+      expect(explicit.code, explicit.stdout + explicit.stderr).toBe(0);
+      const paid = await control({ op: "snapshot", ids: [jobId] });
+      expect(paid.paymentPosts.slice(before.paymentPosts.length)).toMatchObject([{ content: { credit: { amount_micro: 200_000, request_seq: seq } } }]);
+    }
+  }, 25_000);
+
+it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI).each([false, true])(
+  "reports the approved charge as paid and the later ask separately (lost payment response: %s)", async (dropPaymentResponse) => {
+    const flags = ["--auto-pay-below", "$0.20", "--max-payments", "3"];
+    const approval = await previewApproval(flags);
+    await control({ op: "configure", hold: true, askAmounts: [0.45, 0.20], dropPaymentResponse });
+    const submit = await request([...flags, "--mandate-preview", approval.approval]);
+    expect(submit.code, submit.stdout + submit.stderr).toBe(0);
+    const { jobId, mandate } = JSON.parse(submit.stdout);
+    expect(mandate.max_total_micro).toBe(500_000);
+    const before = await control({ op: "snapshot", ids: [] });
+    await control({ op: "release" });
+    const cli = (args: string[]) => execute(process.execPath, [binary, ...args], {
+      env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
+    }).then((run) => ({ ...run, code: 0 }), (error) => error as { stdout: string; stderr: string; code: number });
+
+    const initial = await cli(["pay", jobId, "--auto"]);
+    const { error } = JSON.parse(initial.stdout);
+    expect(error.code).toBe("mandate_payment_approval_required");
+    const seq = error.request_seq;
+    const explicit = await cli(["pay", jobId, String(seq), "--timeout", "5"]);
+    if (dropPaymentResponse) {
+      expect(explicit.code).toBe(1);
+      expect(records()[0].pendingCreditPayment.authorization.request_seq).toBe(seq);
+    }
+    const result = dropPaymentResponse ? await cli(["pay", jobId, "--auto", "--timeout", "5"]) : explicit;
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    const { paid, next_action: next } = JSON.parse(result.stdout);
+    const after = await control({ op: "snapshot", ids: [jobId] });
+    const posts = after.paymentPosts.slice(before.paymentPosts.length);
+    expect(posts).toHaveLength(1);
+    expect(paid).toMatchObject({
+      seq, rail: "credit", amount: { amount_micro: 450_000, currency: "usd", display: "$0.45 USD" },
+      receipt: { payment_id: posts[0].content.credit.payment_id, amount_micro: 450_000, currency: "usd" },
+    });
+    expect(next, result.stdout).toMatchObject({ type: "pay", code: "mandate_payment_approval_required", requires_approval: true,
+      display: expect.stringContaining("exceed the total"), credit: { amount_micro: 200_000, currency: "usd" } });
+    expect(next.request_seq).toBeGreaterThan(seq);
+    expect(next.hint).toContain(`dvm pay ${jobId} ${next.request_seq}`);
+    expect(records()[0]).toMatchObject({ paymentsHonoured: 2, totalPaidMsats: 550_000 });
+    expect(records()[0].pendingCreditPayment).toBeUndefined();
+  }, 25_000);

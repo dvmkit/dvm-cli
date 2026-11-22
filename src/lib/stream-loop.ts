@@ -41,6 +41,8 @@ export interface StreamLoopOptions {
   transport: Transport;
   provider: ProviderRef;
   policy?: JobBudgetPolicy;
+  /** A charge confirmed by the command before this follow-up stream. */
+  confirmedPaymentSeq?: number;
   afterSeq: number;
   /** An explicit caller cursor must never be rewound to an older yield. */
   afterSeqExplicit?: boolean;
@@ -139,6 +141,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
   const landedUnconfirmedAction = (): NextAction => pollNextAction(jobId,
     `The payment landed as provider credit, but the charge's current state could not be confirmed. Keep watching with \`dvm messages ${shellQuoteArg(jobId)} --wait\`; no new rail payment will be sent for this charge.`);
   let creditChoiceAction: NextAction = null;
+  let mandateApprovalAction: NextAction = null;
   let cursor = opts.afterSeq;
   let messageAppendSession = opts.messageAppendSession;
   // when the caller didn't pass an explicit jobToken, fall back to
@@ -284,10 +287,17 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
       const lastYield = findLastYield(batchMessages.filter((message) => !answeredSeqs.has(message.seq) &&
         (message.type !== "payment-request" || message.seq === pendingPayment?.seq)))
         ?? findLastYield(batchMessages);
+      // A replay of progress before a known payment cannot represent the
+      // current state of the resumed job.
+      if (lastYield?.type === "working" && opts.confirmedPaymentSeq !== undefined &&
+          lastYield.seq < opts.confirmedPaymentSeq) continue;
       if (lastYield?.type === "payment-request" && answeredSeqs.has(lastYield.seq)) {
         // A declined ask was not paid; any other answer books only what history proves.
         if (persistLocalState && !declinedAskSeqs(jobId).has(lastYield.seq))
           await settleAnsweredAsk(jobId, lastYield.seq, loadMessages(jobId));
+        // A stream can yield on the old ask before the provider publishes its
+        // next one. This command has already confirmed the old charge.
+        if (lastYield.seq === opts.confirmedPaymentSeq) continue;
         break;
       }
       if (lastYield?.type === "payment-request" && persistLocalState &&
@@ -316,7 +326,8 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
         const req = lastYield.content;
         const activePolicy = (persistLocalState ? loadJob(jobId)?.policy ?? policy : policy) ?? { maxTotalMsats: 0, maxIncrementMsats: 0, autoPayBelowMsats: 0, maxPayments: 0 };
         if (
-          stopRequested || (req.amount_msats <= activePolicy.autoPayBelowMsats &&
+          stopRequested || (persistLocalState && loadJob(jobId)?.mandate?.approvedCaps) ||
+          (req.amount_msats <= activePolicy.autoPayBelowMsats &&
           (activePolicy.maxIncrementMsats === 0 || req.amount_msats <= activePolicy.maxIncrementMsats))
         ) {
           let result: PaymentResult;
@@ -336,6 +347,18 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
             if (error instanceof MandateGuardReadError) {
               // Reconnect behind the ask so the guard can recheck it after releasing the payment lock.
               paymentWaitAction = pollNextAction(jobId);
+              cursor = Math.min(cursor, lastYield.seq - 1);
+              break;
+            }
+            if (error instanceof DvmError && error.code === "mandate_payment_approval_required" &&
+                opts.confirmedPaymentSeq !== undefined && lastYield.seq > opts.confirmedPaymentSeq) {
+              mandateApprovalAction = {
+                type: "pay", job_id: jobId, request_seq: lastYield.seq,
+                code: "mandate_payment_approval_required", requires_approval: true,
+                amount_msats: req.amount_msats,
+                ...(req.credit && { credit: req.credit, _provider_fields: ["credit"] }),
+                reason: asProviderText(req.reason), display: error.message, hint: error.hint!,
+              };
               cursor = Math.min(cursor, lastYield.seq - 1);
               break;
             }
@@ -461,6 +484,7 @@ export async function streamLoop(opts: StreamLoopOptions): Promise<StreamLoopRes
     nextAction = mandateWindowAction(jobId, lastYield.content, lastYield.seq) ?? nextAction;
   if (!paymentUnresolved && !terminal && nextAction?.type === "pay" && lastYield?.type === "payment-request" && persistLocalState)
     nextAction = creditChoiceAction ?? paymentCreditChoice(jobId, lastYield.seq, lastYield.content) ?? nextAction;
+  if (mandateApprovalAction) nextAction = mandateApprovalAction;
   if (hasUnsavedJobState() && !terminal)
     nextAction = pollNextAction(jobId, "Local state may lag; refresh this job before another payment.");
   return { messages: allMessages, autoPayments, refunds, nextAction, cursor, ...(paymentUnresolved && { paymentInFlight: true }) };

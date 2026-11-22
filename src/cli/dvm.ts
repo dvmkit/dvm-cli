@@ -349,12 +349,14 @@ export function buildProgram(): Command {
       "--auto-pay-below <amount>",
       "Auto-pay any single charge at or below this — upfront quote or mid-job (millisats or $USD). Bounded consent: implies --auto-pay, except with --credit-only where only that prepaid credit may be spent."
     )
-    .option("--mandate-until <duration>", "Automatic credit payment expiry (default: 24h; maximum: 7d; e.g. 2h, 1d)")
+    .option("--mandate-until <end>", "Automatic credit payment expiry (default: 24h; duration like 2h, 15d, 6w or ISO date/timestamp with Z or an offset; subject to provider limit)")
+    .option("--dry-run", "Preview the standing mandate as JSON without signing or sending any POST")
+    .option("--mandate-preview <approval>", "Use this dry-run approval as the standing mandate ceiling on the selected credit")
     .option("--no-mandate", "Keep later credit charges dependent on an attached payer or scheduled check-ins")
     .option("--max-increment <amount>", "Max single payment (millisats or $USD)")
     .option(
       "--max-payments <n>",
-      "Max payments to honour per job (default: 5); 0 = free, 1 = typical, 3+ = multi-turn"
+      "Max payments to honour per job (default: configured value, else budget divided by auto-pay threshold rounded up, or 100 if unavailable); use 0 for free jobs"
     )
     .option("--output-type <mime>", "Desired output MIME type")
     .option("--no-stream", "Submit and return immediately; later asks use a supported credit mandate, otherwise need dvm messages <job> --wait or dvm pay <job>")
@@ -703,12 +705,13 @@ export function buildProgram(): Command {
     });
 
   program
-    .command("pay <job-id>")
+    .command("pay <job-id> [seq]")
     .description(
-      "Approve a pending payment request. The job's stored --max-increment still applies — a payment that exceeds it returns an over-budget error even when explicitly approved here."
+      "Pay a pending charge. Pass its sequence to approve that specific charge separately from a standing mandate. The job’s stored --max-increment still applies."
     )
     .option("--endpoint <url>", "Provider URL override (env: DVM_JOB_ENDPOINT)")
     .option("--job-token <hex>", "Job bearer token override (env: DVM_JOB_TOKEN)")
+    .option("--auto", "Pay only within the job’s standing automatic limits")
     .option("--budget <amount>", "Approve a new total job budget and pay the open ask (dollars or millisats)")
     .option("--human", "Human-readable output instead of JSON")
     .option("--timeout <sec>", "Override default timeout for streaming")
@@ -721,8 +724,8 @@ export function buildProgram(): Command {
       "--max-cashu-principal-sats <sats>",
       "Refuse Cashu proof selection above this exact principal ceiling (requires --rail cashu)"
     )
-    .action((jobId: string, opts: PayOptions) => {
-      return catchErrors(() => pay(jobId, opts), opts.human);
+    .action((jobId: string, seq: string | undefined, opts: PayOptions) => {
+      return catchErrors(() => pay(jobId, { ...opts, seq }), opts.human);
     });
 
   program

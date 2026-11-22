@@ -110,3 +110,13 @@ export function formatAmountBestEffort(msats?: number, opts?: AmountLabelOptions
   if (Date.now() - cached.cachedAt < FX_CACHE_TTL_MS) return base;
   return `${base} (rate cached ${formatStaleness(cached.cachedAt)})`;
 }
+
+// Integer ratios avoid granting an extra micro-unit through binary or intermediate FX rounding.
+export function decimalRatio(text: string): [bigint, bigint] | undefined {
+  const match = /^(\d*)(?:\.(\d*))?(?:e([+-]?\d+))?$/i.exec(text);
+  if (!match || !(match[1] || match[2])) return undefined;
+  const exponent = Number(match[3] ?? 0) - (match[2]?.length ?? 0);
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 100) return undefined;
+  const digits = BigInt((match[1] || "0") + (match[2] ?? ""));
+  return exponent >= 0 ? [digits * 10n ** BigInt(exponent), 1n] : [digits, 10n ** BigInt(-exponent)];
+}

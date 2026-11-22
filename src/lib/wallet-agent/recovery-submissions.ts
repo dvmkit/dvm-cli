@@ -1,6 +1,7 @@
 import { dropPendingMandate, recoveredStandingMandate } from "../mandate-recovery";
 import type { SignedRequestDomain } from "@dvmkit/sdk";
 import { dvmFetch } from "../http";
+import { sameOriginPost } from "../protected-post";
 /**
  * Resume with the original payment token, request ID and body. Descriptor-auth
  * bodies are freshly signed because request timestamps expire before the
@@ -112,11 +113,18 @@ export const RESUME_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** Resume attempts before an entry is declared `stale`. */
 export const RESUME_MAX_ATTEMPTS = 5;
 
+interface SubmissionRedirectDiagnostic {
+  code: "protected_post_redirect";
+  display: string;
+  from_origin: string;
+  to_origin: string;
+}
+
 export type SubmissionSweepOutcome =
   | { kind: "shipped"; entry: PendingSubmission; jobId?: string }
   | { kind: "already_accepted"; entry: PendingSubmission }
   | { kind: "abandoned"; entry: PendingSubmission; reason: string }
-  | { kind: "still_pending"; entry: PendingSubmission; reason: string }
+  | { kind: "still_pending"; entry: PendingSubmission; reason: string; redirect?: SubmissionRedirectDiagnostic }
   /** Pre-swap crash whose inputs the in-flight sweep has since recovered. Entry dropped. */
   | { kind: "pruned"; entry: PendingSubmission }
   /** Pre-swap crash still inside the in-flight window. Entry kept, untouched. */
@@ -255,6 +263,7 @@ export interface RecoverPendingSubmissionResult {
   outcome: "shipped" | "already_accepted" | "pending";
   jobId: string | null;
   attemptCount: 1;
+  redirect?: SubmissionRedirectDiagnostic;
 }
 
 /**
@@ -534,7 +543,8 @@ export async function recoverPendingSubmission(
       };
     }
 
-    return { requestId: opts.requestId, outcome: "pending", jobId: null, attemptCount: 1 };
+    return { requestId: opts.requestId, outcome: "pending", jobId: null, attemptCount: 1,
+      ...(outcome.kind === "still_pending" && outcome.redirect && { redirect: outcome.redirect }) };
   });
 }
 
@@ -1106,6 +1116,18 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 
+function pendingAfterNetworkError(entry: PendingSubmission, error: unknown): SubmissionSweepOutcome {
+  const reason = `network error: ${errorText(error)}`;
+  if (error instanceof DvmError && error.code === "protected_post_redirect" &&
+      typeof error.data?.from_origin === "string" && typeof error.data.to_origin === "string") {
+    return { kind: "still_pending", entry, reason, redirect: {
+      code: "protected_post_redirect", display: error.message,
+      from_origin: error.data.from_origin, to_origin: error.data.to_origin,
+    } };
+  }
+  return { kind: "still_pending", entry, reason };
+}
+
 async function shipEntry(
   entry: PendingSubmission,
   httpPost: NonNullable<SubmissionSweepOptions["httpPost"]>,
@@ -1163,11 +1185,7 @@ async function shipEntry(
         body: JSON.stringify(body),
       });
     } catch (err) {
-      return {
-        kind: "still_pending",
-        entry,
-        reason: `network error: ${err instanceof Error ? err.message : String(err)}`,
-      };
+      return pendingAfterNetworkError(entry, err);
     }
 
     if (response.status >= 200 && response.status < 300) {
@@ -1299,7 +1317,7 @@ async function readBackByRequestId(
       body: JSON.stringify(body),
     });
   } catch (err) {
-    return { kind: "still_pending", entry, reason: `network error: ${errorText(err)}` };
+    return pendingAfterNetworkError(entry, err);
   }
   if (response.status === 404 && errorCodeOf(response.body) === "request_not_found") return null;
   if (response.status >= 200 && response.status < 300) {
@@ -1886,7 +1904,7 @@ function createDefaultHttpPost(
   }) {
     let res: Response;
     try {
-      res = await fetchImpl(req.url, { method: "POST", headers: req.headers, body: req.body });
+      res = await sameOriginPost(req.url, { headers: req.headers, body: req.body }, fetchImpl);
     } catch (err) {
       // A `DvmError` raised by the injected `fetch` is already the accurate
       // diagnosis and is rethrown as it stands. Re-wrapping it would report a

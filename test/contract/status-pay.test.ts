@@ -20,6 +20,7 @@ let creditReply: "accepted" | "refused" | undefined;
 let paymentBodies: Array<{ type: string; content: unknown }>;
 let terminalAfterPayment: "completed" | "failed" | "cancelled";
 let terminalReceipt: JobReceipt | undefined;
+let staleAskAfterPayment: boolean;
 const token = "ab".repeat(32);
 const ask = { seq: 5, from: "provider", timestamp: 1700000000, type: "payment-request",
   content: { amount_msats: 1500, reason: "Additional work", mints: ["https://mint.example"] } };
@@ -35,6 +36,7 @@ beforeEach(async () => {
   paymentBodies = [];
   terminalAfterPayment = "completed";
   terminalReceipt = undefined;
+  staleAskAfterPayment = false;
   server = createServer((request, response) => {
     expect(request.headers["x-job-token"]).toBe(token);
     requests.push(`${request.method} ${request.url}`);
@@ -53,8 +55,12 @@ beforeEach(async () => {
           response.statusCode = 402;
           response.end(JSON.stringify({ error: "insufficient_credit", remaining_micro: 1000, shortfall_micro: 500 }));
         } else {
-          state = terminalAfterPayment;
-          history = [terminalAfterPayment === "completed"
+          state = staleAskAfterPayment ? "awaiting-input" : terminalAfterPayment;
+          const payment = paymentBodies.at(-1)!;
+          history = staleAskAfterPayment
+            ? [ask, { ...payment, seq: 6, from: "requester", timestamp: 1700000001 },
+                { ...ask, seq: 7, content: { ...ask.content, credit: { amount_micro: 2000, currency: "usd" }, amount_msats: 2000 } }]
+            : [terminalAfterPayment === "completed"
             ? { seq: 7, from: "provider", timestamp: 1700000002, type: "complete", content: { status: "success", summary: "Done" } }
             : { seq: 7, from: "provider", timestamp: 1700000002, type: "cancel", content: { reason: terminalReceipt?.reason ?? "Cancelled" } }];
           response.statusCode = 201;
@@ -63,8 +69,12 @@ beforeEach(async () => {
       });
       return;
     }
-    response.end(JSON.stringify(request.url?.includes("/messages") ? { messages: history }
-      : { status: state, ...(state === terminalAfterPayment && terminalReceipt ? { receipt: terminalReceipt } : {}) }));
+    if (request.url?.includes("/messages")) {
+      response.end(JSON.stringify({ messages: history }));
+    } else {
+      response.end(JSON.stringify({ status: state, ...(state === terminalAfterPayment && terminalReceipt ? { receipt: terminalReceipt } : {}) }));
+      if (staleAskAfterPayment && posts > 0) state = terminalAfterPayment;
+    }
   });
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
   endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -238,3 +248,37 @@ it.each(([
   expect(replay.output).toMatchObject({ source: "local", receipt_verified: "verified",
     settlement: { status: scenario.expected, settled_msats: scenario.settled } });
 });
+
+it.each(["cancelled", "completed", "failed"] as const)(
+  "reports the confirmed payment and clears a stale next charge when the final read says %s", async (terminal) => {
+    terminalAfterPayment = terminal;
+    staleAskAfterPayment = true;
+    creditReply = "accepted";
+    const authorization = { credit_id: "held-credit", draw_id: "accepted-draw", payment_id: "original-payment",
+      request_seq: 5, amount_micro: 1500, currency: "usd", timestamp: Math.floor(Date.now() / 1000),
+      pubkey: "cd".repeat(32), signature: "ab".repeat(64),
+      auth_statement: { audience: { dvm_id: "example-provider", builder_pubkey: "cd".repeat(32) },
+        method: "POST", path: "/v1/job/job/messages", capability: null } };
+    const request = { ...ask.content, credit: { amount_micro: 1500, currency: "usd" } };
+    const limits = { max_ask_micro: 1500, max_total_micro: 3000 };
+    const jobs = JSON.parse(readFileSync(join(root, "jobs.json"), "utf8"));
+    Object.assign(jobs[0], {
+      mandate: { ...limits, approvedCaps: limits, expires_at_ms: Date.now() + 60_000,
+        credit_id: authorization.credit_id, draw_id: authorization.draw_id, currency: "usd", signed_data: {} },
+      pendingCreditPayment: { request, authorization, amountMsats: 1500, approval: "explicit" },
+    });
+    writeFileSync(join(root, "jobs.json"), JSON.stringify(jobs));
+    history = [{ ...ask, content: request }];
+
+    const result = await run("pay", ["5"]);
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    expect(result.output).toMatchObject({
+      status: terminal, next_action: null,
+      paid: { seq: 5, msats: 1500, receipt: { payment_id: "original-payment", amount_micro: 1500, currency: "usd" } },
+      messages: expect.arrayContaining([expect.objectContaining({ seq: 7, type: "payment-request" })]),
+    });
+    // The follow-up guard read an open ask. Only the final status read saw the job end.
+    expect(requests.slice(-2)).toEqual(["GET /v1/job/job", "GET /v1/job/job"]);
+    expect(posts).toBe(1);
+  },
+);

@@ -74,7 +74,7 @@ async function resumeRequest(requestId: string, opts: RequestResumeOptions): Pro
       timeoutMs === undefined ? undefined : { timeoutMs });
     try { await send(false); }
     catch (error) {
-      if (!(error instanceof DvmError) || error.code !== "invalid_mandate" || !intent.mandate) throw error;
+      if (!(error instanceof DvmError) || error.code !== "invalid_mandate" || !intent.mandate || intent.mandate.approvedCaps) throw error;
       info(MANDATE_RECOVERY_DISPLAY);
       await send(true);
     }
@@ -83,7 +83,7 @@ async function resumeRequest(requestId: string, opts: RequestResumeOptions): Pro
       await requestResult(requestId, opts);
       return;
     }
-    if (error instanceof DvmError && ["request_not_accepted", "invalid_mandate"].includes(error.code)) throw error;
+    if (error instanceof DvmError && ["request_not_accepted", "invalid_mandate", "protected_post_redirect"].includes(error.code)) throw error;
     throw new DvmError(
       "request_outcome_unknown",
       `The provider did not complete recovery for request ${requestId}.`,

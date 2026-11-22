@@ -4,6 +4,7 @@ import { appendMessages, loadMessages, maxSeq } from "./messages/index";
 import { mandateCredit, mandateDrawTotal, recordMandatePayments } from "./mandate-payments";
 import { guidanceJobArg } from "./provider-output";
 import { isTransientJobReadError } from "./job-read-error";
+import { settleRecordedPayments } from "./yield-state";
 
 // SDK 0.41.0 job-manager.ts: 10 s mandate-resume grace, then up to 60 s
 // for the default stale-job sweep tick. Add 10 s for settlement/read latency.
@@ -46,6 +47,40 @@ export function mandateWindowAction(jobId: string, request: PaymentRequestConten
   return { type: "poll" as const, job_id: jobId, display,
     hint: `${display} Nothing has been sent by this CLI for this charge. Keep watching with \`dvm messages ${guidanceJobArg(jobId)} --wait\`.`,
     retry_at_ms: retryAt };
+}
+
+export function mandatePaymentApprovalRequired(jobId: string, requestSeq: number | undefined, reason: string): DvmError {
+  const display = `${reason} This charge needs separate explicit approval.`;
+  const hint = requestSeq === undefined
+    ? "Ask your human to approve the specific charge after checking its sequence with dvm messages."
+    : `Ask your human to approve this charge, then run \`dvm pay ${guidanceJobArg(jobId)} ${requestSeq}\`.`;
+  return new DvmError("mandate_payment_approval_required", display, hint,
+    { job_id: jobId, request_seq: requestSeq, next_action: { type: "pay", job_id: jobId, display, hint } }, display);
+}
+
+export function assertApprovedMandatePayment(job: JobRecord | null, request: PaymentRequestContent, seq?: number): void {
+  const mandate = job?.mandate;
+  if (!job || !mandate?.approvedCaps) return;
+  const refuse = (reason: string): never => { throw mandatePaymentApprovalRequired(job.id, seq, reason); };
+  if (Date.now() >= mandate.expires_at_ms) refuse("The approved payment window has expired.");
+  const price = request.credit;
+  if (!price || price.currency !== mandate.currency || !Number.isSafeInteger(price.amount_micro) || price.amount_micro <= 0)
+    return refuse("The charge has no verifiable price in the approved credit currency.");
+  if (price.amount_micro > Math.min(mandate.max_ask_micro, mandate.approvedCaps.max_ask_micro))
+    refuse("This charge exceeds the standing per-charge limit the caller approved.");
+  const history = loadMessages(job.id);
+  // Only the original draw supplies native prices for all of its debits.
+  // If prior charges cannot all be reconciled in that currency, hold new auto-pay.
+  const bound = (credit: { credit_id?: string; draw_id?: string; currency?: string; amount_micro?: number } | undefined) =>
+    credit?.credit_id === mandate.credit_id && credit.draw_id === mandate.draw_id && credit.currency === mandate.currency &&
+    typeof credit.amount_micro === "number" && Number.isSafeInteger(credit.amount_micro) && credit.amount_micro > 0;
+  const paid = history.filter((message) => message.from === "requester" && message.type === "payment");
+  if ((job.upfrontPayment && job.upfrontPayment.amount_micro !== 0 && !bound(job.upfrontPayment)) ||
+      paid.some((message) => message.type === "payment" && !bound(message.content.credit)) ||
+      (job.paymentsHonoured ?? 0) > new Set(paid.map((message) => message.seq)).size + Number(bound(job.upfrontPayment)))
+    refuse("The amount already paid under the approval could not be verified.");
+  if (mandateDrawTotal(job, history) + price.amount_micro > Math.min(mandate.max_total_micro, mandate.approvedCaps.max_total_micro))
+    refuse("This charge would exceed the total the caller approved.");
 }
 
 export async function recoverMandateWinner(jobId: string, requestSeq: number, transport: Transport,
@@ -126,9 +161,15 @@ export async function guardMandatePayment(jobId: string, requestSeq: number, tra
     message.content.credit?.request_seq === requestSeq);
   if (payment?.type === "payment") {
     const id = payment.content.credit?.payment_id;
-    // The original signed payment still needs its existing replay-and-book path.
-    if (!mandateCredit(payment) && (job.pendingCreditPayment?.authorization.payment_id === id ||
-        job.bookedCreditPayments?.some((entry) => entry.authorization.payment_id === id))) return;
+    if (!mandateCredit(payment)) {
+      if (job.pendingCreditPayment?.authorization.payment_id === id) {
+        // Legacy jobs retain the existing signed replay path. An approved
+        // job must book the observed debit before applying any new limits.
+        if (!job.mandate?.approvedCaps) return;
+        await settleRecordedPayments(jobId, historyThrough);
+      }
+      if (loadJob(jobId)?.bookedCreditPayments?.some((entry) => entry.authorization.payment_id === id)) return;
+    }
     throw new DvmError("payment_already_sent", "This charge was already paid from credit. Do not pay again.");
   }
   if (job.stopRequested) return declineStoppedAsk(jobId, requestSeq, historyThrough, transport, provider, jobToken, waitReadTimeoutMs);

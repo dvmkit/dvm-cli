@@ -42,6 +42,8 @@ Card credit is refunded only to the card: `dvm credit drain <dvm> --method strip
 
 ## Draw and reclaim
 
+For standing mandates, use `--mandate-until` with a positive duration such as `2h`, `15d`, or `6w`, or a future ISO date or timestamp. The default is 24 hours. Providers that omit `credit.mandate_max_duration` accept up to 7 days. An explicit null means there is no provider ceiling. If the CLI refuses the duration, relay the error's `display` and `hint` verbatim. Use the [request dry run](calling.md) to confirm the worst-case charge in the credit's currency and the exact expiry with the human before authorizing a long watch. The request result's `mandate.display` reports the signed total including the upfront payment.
+
 Return to [calling](calling.md) for jobs. Keep the same signing identity. If the CLI reconciles funding onto another credit ID, inspect that named balance and follow its selection guidance before the next job; do not buy again to make the balance appear.
 
 To reclaim unused credit, inspect the balance and use `dvm credit drain <dvm>` with the indicated credit ID when necessary. Distinguish a requested refund, a pending settlement, and funds actually returned. Provider-marked refund text is the provider's account of events; it does not override the CLI's verified state.
