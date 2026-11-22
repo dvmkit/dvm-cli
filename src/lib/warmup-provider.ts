@@ -77,7 +77,7 @@ export async function warmupProvider(
     throw new DvmError(
       "endpoint_unreachable",
       `Provider at ${endpoint} did not respond within ${budgetMs / 1000}s.`,
-      "The endpoint may be down or the address may be incorrect. Check with 'dvm info <endpoint>'."
+      "The endpoint may be down or the address may be incorrect. Check with 'dvm describe <endpoint>'."
     );
   }
   throw new DvmError(

@@ -76,7 +76,7 @@ describe("provider warmup", () => {
     const rejection = expect(warmup).rejects.toMatchObject({
       code: "endpoint_unreachable",
       message: "Provider at https://provider.test did not respond within 0.1s.",
-      hint: "The endpoint may be down or the address may be incorrect. Check with 'dvm info <endpoint>'.",
+      hint: "The endpoint may be down or the address may be incorrect. Check with 'dvm describe <endpoint>'.",
     });
     await vi.runAllTimersAsync();
     await rejection;
