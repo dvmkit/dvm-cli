@@ -104,7 +104,8 @@ it("sets a two-hour expiry and relays the same sentence in human mode", async ()
   expect(run.stderr).toContain(`until ${new Date(m.expires_at_ms).toISOString()}`);
 });
 
-it("refuses fourteen days against the pinned SDK before signing or posting", async () => {
+it("refuses fourteen days when the provider omits its duration limit before signing or posting", async () => {
+  await control({ op: "configure", omitMaxDuration: true });
   const before = await control({ op: "snapshot", ids: [] });
   const run = await request(["--mandate-until", "14d"]);
   expect(run.code).toBe(1);
@@ -367,7 +368,7 @@ it("suppresses the attached-payer requirement only on an active nonterminal mand
 });
 
 it("explains a provider's invalid mandate refusal without sending another job", async () => {
-  await control({ op: "configure", reject: true });
+  await control({ op: "configure", reject: true, omitMaxDuration: true });
   const before = await control({ op: "snapshot", ids: [] });
   const run = await request(["--mandate-until", "7d"]);
   expect(run.code).toBe(1);
@@ -379,6 +380,13 @@ it("explains a provider's invalid mandate refusal without sending another job", 
 });
 
 
+function watchSettlement(jobId: string) {
+  // The watch exits at completion. Leave time for sequential asks under suite load.
+  return execute(process.execPath, [binary, "messages", jobId, "--wait", "--until", "60s"], {
+    env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 70_000,
+  });
+}
+
 it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("reports the SDK's second and third mandate-paid pieces once each without a CLI payment POST", async () => {
   await control({ op: "configure", hold: true, pieces: 2 });
   const submitted = await request(["--max-payments", "5"]);
@@ -386,9 +394,7 @@ it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("reports
   const { jobId } = JSON.parse(submitted.stdout);
   const before = await control({ op: "snapshot", ids: [] });
   await control({ op: "release" });
-  const run = await execute(process.execPath, [binary, "messages", jobId, "--wait", "--until", "5s"], {
-    env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
-  });
+  const run = await watchSettlement(jobId);
   const events = run.stdout.trim().split("\n").map((line) => JSON.parse(line));
   const payments = events.filter((event) => event.event === "payment");
   expect(payments, JSON.stringify({ events, snapshot: await control({ op: "snapshot", ids: [jobId] }) })).toHaveLength(2);
@@ -400,22 +406,54 @@ it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("reports
   expect(snapshot.paymentPosts).toHaveLength(before.paymentPosts.length);
   expect(snapshot.jobs[0].status).toBe("completed");
   expect(records()[0]).toMatchObject({ totalPaidMsats: 500_000, paymentsHonoured: 3 });
-}, 15_000);
+}, 90_000);
 
-it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("settles fourteen later asks with the default payment count", async () => {
+it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI)("submits a fourteen-day mandate and settles fourteen later asks with the default payment count", async () => {
+  const info = await fetch(new URL("/v1/info", endpoint)).then((response) => response.json());
+  expect(info.credit).toMatchObject({ standing_mandate: true, mandate_max_duration: null });
+  const flags = ["--mandate-until", "14d", "--budget", "$2.90", "--auto-pay-below", "$0.20"];
+  const duration = 14 * 86_400_000;
+  const started = Date.now();
   await control({ op: "configure", hold: true, pieces: 14 });
-  const submitted = await request(["--budget", "$2.90", "--auto-pay-below", "$0.20"]);
+  const submitted = await request(flags);
   expect(submitted.code, submitted.stdout + submitted.stderr).toBe(0);
   const { jobId, mandate } = JSON.parse(submitted.stdout);
-  expect(mandate.max_total_micro).toBe(2_900_000);
-  await control({ op: "release" });
-  const run = await execute(process.execPath, [binary, "messages", jobId, "--wait", "--until", "5s"], {
-    env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
+  expect(mandate.expires_at_ms).toBeGreaterThanOrEqual(started + duration);
+  expect(mandate.expires_at_ms).toBeLessThanOrEqual(Date.now() + duration);
+  const expiry = new Date(mandate.expires_at_ms).toISOString();
+  expect(mandate).toMatchObject({
+    max_total_micro: 2_900_000,
+    expires_at: expiry,
+    display: expect.stringContaining(`can charge at most $2.90 USD until ${expiry}`),
   });
+  const before = await control({ op: "snapshot", ids: [jobId] });
+  expect(before.jobs[0].mandate).toMatchObject({ max_total_micro: 2_900_000, expires_at_ms: mandate.expires_at_ms });
+  await control({ op: "release" });
+  const run = await watchSettlement(jobId);
   const payments = run.stdout.trim().split("\n").map((line) => JSON.parse(line)).filter((event) => event.event === "payment");
   expect(payments).toHaveLength(14);
-  expect(payments.at(-1)).toMatchObject({ mandate: true, total_micro: 2_900_000, overcharged: false });
-}, 15_000);
+  for (const [index, payment] of payments.entries()) {
+    expect(payment).toMatchObject({ mandate: true, total_micro: 100_000 + (index + 1) * 200_000, overcharged: false });
+  }
+  expect(run.stderr).not.toMatch(/overcharg/i);
+  expect(records()[0]).toMatchObject({ paymentsHonoured: 15, totalPaidMsats: 2_900_000 });
+  const after = await control({ op: "snapshot", ids: [jobId] });
+  expect(after.paymentPosts).toHaveLength(before.paymentPosts.length);
+  expect(after.jobs[0].status).toBe("completed");
+
+  await control({ op: "configure" });
+  const humanStarted = Date.now();
+  const human = await request([...flags, "--human"]);
+  expect(human.code, human.stdout + human.stderr).toBe(0);
+  const confirmation = await control({ op: "snapshot", ids: [] });
+  const humanExpiry = confirmation.submissions.at(-1).data.mandate.expires_at_ms;
+  expect(humanExpiry).toBeGreaterThanOrEqual(humanStarted + duration);
+  expect(humanExpiry).toBeLessThanOrEqual(Date.now() + duration);
+  const sentence = `can charge at most $2.90 USD until ${new Date(humanExpiry).toISOString()}`;
+  expect(human.stderr).toContain(sentence);
+  expect(human.stderr).toContain("Signed as");
+  expect(human.stderr.indexOf(sentence)).toBeLessThan(human.stderr.indexOf("Signed as"));
+}, 110_000);
 
 it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI).each([true, false])(
   "protects the preview per-charge cap after FX rises (attached payer: %s)", async (attached) => {

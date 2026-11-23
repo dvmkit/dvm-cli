@@ -26,6 +26,7 @@ const submissions = [];
 let supported = true;
 let advertiseCredit = true;
 let maxDuration;
+let omitMaxDuration = false;
 let hold = false;
 let pieces = 0;
 let askAmounts;
@@ -104,13 +105,18 @@ const server = createServer(async (incoming, outgoing) => {
   if (incoming.url === "/v1/info") {
     const body = await response.json();
     // Memory runs exercise SDK admission; database runs also exercise automatic settlement.
-    if (supported) body.credit.standing_mandate = true;
-    else delete body.credit.standing_mandate;
+    if (!supported) {
+      delete body.credit.standing_mandate;
+      delete body.credit.mandate_max_duration;
+    } else if (!db) {
+      body.credit.standing_mandate = true;
+    }
     if (advertisedUpfront !== undefined) {
       const max = { amount: advertisedUpfront, currency: "usd" };
       body.pricing = { ...body.pricing, max };
       body.capabilities.run.pricing = { ...body.capabilities.run.pricing, max };
     }
+    if (omitMaxDuration) delete body.credit.mandate_max_duration;
     if (maxDuration !== undefined) body.credit.mandate_max_duration = maxDuration;
     if (!advertiseCredit) delete body.credit;
     response = Response.json(body);
@@ -126,6 +132,7 @@ process.on("message", async (message) => {
     advertisedUpfront = message.advertisedUpfront;
     advertiseCredit = message.advertiseCredit ?? true;
     maxDuration = message.maxDuration;
+    omitMaxDuration = message.omitMaxDuration ?? false;
     askAmounts = message.askAmounts;
     dropPaymentResponse = message.dropPaymentResponse ?? false;
     process.send({ type: "configured" });

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Dependencies
+
+* Pin `@dvmkit/sdk` to 0.46.0.
+
 ### Features
 
 * `dvm request --mandate-until` accepts longer durations and future ISO dates or timestamps, subject to the provider's advertised limit. The default stays 24 hours, and older providers allow up to seven days. Use `dvm request --dry-run` to preview the maximum charge in the credit's currency and exact expiry without signing or posting, then pass the returned approval to `--mandate-preview` when submitting. The approval sets ceilings for the total and per-charge amounts and fixes the expiry and prepaid credit. The CLI reports reductions from live terms and stops if the approved credit cannot carry the mandate. Automatic payments also obey the signed total, per-charge limit, and expiry. Defer any charge that requires separate approval to `dvm pay <job-id> <seq>`.

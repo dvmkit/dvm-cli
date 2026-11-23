@@ -203,7 +203,8 @@ export class HttpsTransport implements Transport {
       inputSchema: data.input_schema as Record<string, unknown> | undefined,
       protocolVersion: providerVersion,
       paymentMethods: (data.payment as { methods?: string[] } | undefined)?.methods,
-      credit: creditTermsWithStandingMandate(data.credit),
+      // Preserve numeric limits from providers that advertise them even though the SDK only types null.
+      credit: creditTermsWithStandingMandate(data.credit) as ProviderInfo["credit"],
       x402: data.x402 as ProviderInfo["x402"],
       tempo: data.tempo as ProviderInfo["tempo"],
       cashu: data.cashu as ProviderInfo["cashu"],
