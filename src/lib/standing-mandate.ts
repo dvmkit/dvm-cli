@@ -84,8 +84,7 @@ export function mandateExpiryMs(input = "24h", now = Date.now()): number {
 }
 
 function mandateCredit(provider: ProviderInfo) {
-  return provider.credit as (ProviderInfo["credit"] & {
-    standing_mandate?: true;
+  return provider.credit as (Omit<NonNullable<ProviderInfo["credit"]>, "mandate_max_duration"> & {
     mandate_max_duration?: number | null;
   }) | undefined;
 }
