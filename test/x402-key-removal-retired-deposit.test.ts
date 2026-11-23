@@ -3,11 +3,11 @@ import { decodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentRequired } from "@x402/core/types";
 import { isBatchSettlementDepositPayload } from "@x402/evm";
 import { computeChannelId } from "@x402/evm/batch-settlement/client";
-import { keccak256, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createX402BatchPayment,
+  deriveLegacyX402ChannelSalt,
   DvmX402ChannelStorage,
   recordPendingX402Funding,
   recordX402ChannelMetadata,
@@ -50,7 +50,7 @@ const config = {
   receiverAuthorizer: `0x${"33".repeat(20)}` as const,
   token: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as const,
   withdrawDelay: 86_400,
-  salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+  salt: deriveLegacyX402ChannelSalt({ network, payer: account.address }),
 };
 const channelId = computeChannelId(config, network);
 const finalizedHash = `0x${"ab".repeat(32)}`;

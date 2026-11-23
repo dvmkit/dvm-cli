@@ -90,6 +90,21 @@
     ]
   },
   {
+    "file": "lib/credit/drain.ts",
+    "owner": "closeChannel",
+    "expression": "err",
+    "path": [
+      "code"
+    ],
+    "reason": "The provider’s x402 challenge keeps its refusal code when the matching offer is passed to the refund SDK.",
+    "alsoPaths": [
+      [
+        "data",
+        "code"
+      ]
+    ]
+  },
+  {
     "file": "lib/float.ts",
     "owner": "loadFloat",
     "expression": "err",
@@ -490,7 +505,7 @@
   },
   {
     "file": "lib/credit-fund.ts",
-    "owner": "fundOverX402Rail",
+    "owner": "runCreditFunding",
     "expression": "err",
     "path": [
       "code"

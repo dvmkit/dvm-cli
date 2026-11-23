@@ -117,7 +117,6 @@ import {
 } from "./wallet-agent/spend";
 import {
   acknowledgeReplayedX402Payment,
-  assertX402RequirementDescribesChannel,
   processX402BatchCorrection,
   processX402BatchResponseForWallet,
   x402RequiredFromError,
@@ -126,15 +125,16 @@ import {
   createX402BatchPayment,
   finalizedX402DepositExpiredUnused,
   isVoucherOnlyX402Funding,
+  recordedX402BatchRequirement,
   x402RetiredDepositExpiresAt,
   x402VoucherPendingRefusal,
 } from "./x402/batch-client";
+import { missingX402CreditChannel, resolveX402CreditChannel } from "./x402/credit-channel";
 import {
   acknowledgeX402ChannelOwner,
   clearPendingX402ExactFunding,
   clearPendingX402Funding,
   findX402Channel,
-  listPendingX402Fundings,
   listResumableX402ExactFundings,
   listResumableX402Fundings,
   loadResumableX402ExactFunding,
@@ -144,11 +144,9 @@ import {
   recordPendingX402ExactFunding,
   recordPendingX402Funding,
   retirePendingX402Funding,
-  type StoredX402ChannelMetadata,
   withX402ChannelLock,
   x402PendingBlockExpiresAt,
   x402PendingRetired,
-  x402PendingUnsettled,
 } from "@dvmkit/sdk/internal";
 import {
   isSignableExactRequirement,
@@ -575,7 +573,15 @@ async function runCreditFunding(args: FundCreditArgs): Promise<CreditFundOutcome
     : availableRails(railArgs);
 
   const x402Network = loadX402Wallet()?.network;
-  const x402Binding = boundX402Binding(args);
+  let x402Binding: StoredCreditX402Binding = {};
+  if (eligible.includes("x402")) {
+    try {
+      const scope = resolveX402CreditChannel(x402CreditScope(args));
+      x402Binding = boundX402Binding(args, scope);
+    } catch (err) {
+      return x402Refusal(args, { ...base, rail: "x402", x402Flavour: X402_BATCH_SETTLEMENT_SCHEME }, err);
+    }
+  }
   // Outstanding signed authority takes precedence over mode changes, before any new credential
   // is created.
   const mode = args.fundingMode;
@@ -1253,30 +1259,7 @@ async function fundOverX402Rail(
   const wallet = loadX402Wallet();
   if (!wallet) return fundOverX402(args, fundId);
   if (binding.instrument === "x402_channel" && !binding.channelNetwork) {
-    const candidate = boundX402Channel(args);
-    if (candidate) {
-      try {
-        assertX402ChannelPayer(
-          candidate.recorded,
-          privateKeyToAccount(wallet.privateKey as `0x${string}`).address
-        );
-      } catch (err) {
-        return x402Refusal(
-          args,
-          {
-            creditId: args.creditId,
-            fundId,
-            rail: "x402",
-            x402Flavour: X402_BATCH_SETTLEMENT_SCHEME,
-          },
-          err
-        );
-      }
-      // The fallback can name a newer, unrelated channel at this DVM. Its
-      // network becomes evidence only after the unsigned discovery challenge
-      // derives this exact channel id inside `fundOverX402`.
-      return fundOverX402(args, fundId, undefined, false, false, candidate);
-    }
+    return fundOverX402(args, fundId);
   }
   const bound = x402FlavourForInstrument(binding.instrument);
   // A recorded channel chain is stronger evidence than the live menu. The DVM
@@ -1325,48 +1308,38 @@ async function fundOverX402Rail(
   return fundOverX402(args, fundId);
 }
 
-/**
- * The x402 binding this funding's credit carries, as the caller last heard it:
- * the instrument it must be topped up over, and — where that instrument is a
- * settlement channel — the chain that channel lives on. Empty for a credit
- * adopted from a balance read, one opened before these fields existed, or a
- * `--credit-id` naming something the local record doesn't track. A recorded
- * channel instrument whose chain is empty is enriched from channel metadata in
- * the channel leg, after the connected payer and DVM challenge can be checked.
- */
-function boundX402Binding(args: FundCreditArgs): StoredCreditX402Binding {
+function x402CreditScope(args: FundCreditArgs) {
+  return {
+    endpoint: args.ref.endpoint,
+    callerPubkey: args.signing.pubkey,
+    creditId: args.creditId,
+    ...identityArg(fundedDvmIdentity(args.providerInfo)),
+  };
+}
+
+/** The requested credit's local instrument and chain guide dispatch before the live menu. */
+function boundX402Binding(
+  args: FundCreditArgs,
+  { credit, recorded }: ReturnType<typeof resolveX402CreditChannel>
+): StoredCreditX402Binding {
+  if (recorded && credit?.creditId === args.creditId && credit.x402Instrument === "x402_exact") {
+    throw new DvmError("x402_channel_ambiguous", `Credit ${args.creditId} has conflicting local x402 instrument bindings.`);
+  }
+  if (recorded) {
+    return { instrument: "x402_channel" };
+  }
+  if (credit?.creditId === args.creditId && (credit.status === "active" || credit.status === "expired")) {
+    return {
+      ...(credit.x402Instrument ? { instrument: credit.x402Instrument } : {}),
+      ...(credit.x402ChannelNetwork ? { channelNetwork: credit.x402ChannelNetwork } : {}),
+    };
+  }
   return loadCreditX402Binding(
     args.ref.endpoint,
     args.signing.pubkey,
     args.creditId,
     fundedDvmIdentity(args.providerInfo)
   );
-}
-
-/**
- * The channel metadata that backs this credit, including the stale-credit-id
- * fallback the drain uses. Current writes change the owner only after a DVM
- * acknowledgement, but rows written by an older CLI can still name a refused
- * credit. The fallback is only a candidate here; the unsigned DVM challenge
- * must derive its exact channel id before its network is used.
- */
-function boundX402Channel(args: FundCreditArgs): BoundX402ChannelCandidate | undefined {
-  const recorded = findX402Channel({
-    endpoint: args.ref.endpoint,
-    callerPubkey: args.signing.pubkey,
-    creditId: args.creditId,
-  });
-  if (recorded) return { recorded, creditScoped: true };
-  const fallback = findX402Channel({
-    endpoint: args.ref.endpoint,
-    callerPubkey: args.signing.pubkey,
-  });
-  return fallback ? { recorded: fallback, creditScoped: false } : undefined;
-}
-
-interface BoundX402ChannelCandidate {
-  recorded: StoredX402ChannelMetadata;
-  creditScoped: boolean;
 }
 
 /**
@@ -1855,8 +1828,7 @@ async function fundOverX402(
   resumed?: PendingX402Funding,
   corrected = false,
   locked = false,
-  /** Payer-checked metadata whose channel id the discovery challenge must confirm. */
-  channelCandidate?: BoundX402ChannelCandidate
+  replacingChannelId?: PendingX402Funding["channelId"]
 ): Promise<CreditFundOutcome> {
   if (!locked) {
     return withX402ChannelLock(async () => {
@@ -1868,7 +1840,7 @@ async function fundOverX402(
           durable,
           corrected,
           true,
-          channelCandidate
+          replacingChannelId
         );
       }
       // The caller handed us a journal entry that is no longer on disk: a
@@ -1885,7 +1857,7 @@ async function fundOverX402(
           hint: "Check the balance with 'dvm credit balance'.",
         };
       }
-      return fundOverX402(args, fundId, undefined, corrected, true, channelCandidate);
+      return fundOverX402(args, fundId, undefined, corrected, true, replacingChannelId);
     });
   }
   const base: X402FundBase = {
@@ -1908,18 +1880,25 @@ async function fundOverX402(
   let btcRate = 100_000;
   let pending = resumed;
   if (!pending) {
-    // Cheap local pre-check for the case that dominates: another credit at this
-    // same DVM still owes a signed voucher. `createX402BatchPayment` gates the
-    // authoritative version on the channel id — which catches two DVMs behind
-    // one payout address — but only after a discovery round trip, and the
-    // post-job auto-refill would pay for that on every single job.
-    const rival = otherCreditPendingX402(args);
-    if (rival) {
-      return voucherPendingOutcome(
-        base,
-        rival,
-        `A signed x402 voucher for credit ${rival.creditId} is still waiting for its acknowledgement, so this channel cannot sign another.`
-      );
+    const creditScope = x402CreditScope(args);
+    let scope;
+    let binding;
+    try {
+      scope = resolveX402CreditChannel(creditScope);
+      binding = boundX402Binding(args, scope);
+      if (scope.recorded) {
+        assertX402ChannelPayer(
+          scope.recorded,
+          privateKeyToAccount(wallet.privateKey as `0x${string}`).address
+        );
+      }
+    } catch (err) {
+      return x402Refusal(args, base, err);
+    }
+    const { recorded, credit, identity } = scope;
+    if (!recorded && binding.instrument === "x402_channel" && args.menu &&
+      !offersX402CreditFlavour(args.menu, wallet.network, X402_BATCH_SETTLEMENT_SCHEME)) {
+      return x402InstrumentUnavailable(args, fundId, X402_BATCH_SETTLEMENT_SCHEME, wallet.network, binding.channelNetwork);
     }
     // The cap is checked on a fresh attempt only, as on the Lightning and Tempo
     // legs. Re-running it against an already-signed authorization moves no new
@@ -1946,46 +1925,39 @@ async function fundOverX402(
       required = x402RequiredFromError(err);
       if (!required) return x402Refusal(args, base, err);
     }
-    if (channelCandidate) {
-      try {
-        assertX402RequirementDescribesChannel({
-          wallet,
-          paymentRequired: required,
-          recorded: channelCandidate.recorded,
-          depositMicro: args.maxDepositMicro ?? args.amountMicro,
-        });
-        if (channelCandidate.recorded.network !== wallet.network) {
-          return x402InstrumentUnavailable(
-            args,
-            fundId,
-            X402_BATCH_SETTLEMENT_SCHEME,
-            wallet.network,
-            channelCandidate.recorded.network
-          );
-        }
-      } catch (err) {
-        // A credit-scoped row is this credit's channel even when the DVM has
-        // retired its chain or changed its terms, so the drain-style refusal is
-        // authoritative. Only the stale-credit fallback is ambiguous enough to
-        // discard when the current challenge derives a different channel.
-        if (channelCandidate.creditScoped) {
+    try {
+      if (
+        (replacingChannelId && recorded?.channelId !== replacingChannelId) ||
+        (!recorded && (
+          (identity && !creditScope.identity) ||
+          binding.instrument === "x402_channel" ||
+          (credit?.creditId === args.creditId &&
+            (credit.x402Instrument === "x402_channel" || credit.rail === "x402")) ||
+          credit?.siblingCredits?.some((sibling) => sibling.creditId === args.creditId)
+        ))
+      ) {
+        throw missingX402CreditChannel(args.creditId);
+      }
+      if (recorded) {
+        try {
+          required = recordedX402BatchRequirement({
+            wallet, paymentRequired: required, recorded, depositMicro: args.maxDepositMicro ?? args.amountMicro,
+          });
+        } catch (err) {
           if (err instanceof DvmError && err.code === "x402_batch_not_offered") {
-            return x402InstrumentUnavailable(
-              args,
-              fundId,
-              X402_BATCH_SETTLEMENT_SCHEME,
-              wallet.network,
-              channelCandidate.recorded.network
-            );
+            return x402InstrumentUnavailable(args, fundId, X402_BATCH_SETTLEMENT_SCHEME, wallet.network, recorded.network);
           }
-          return x402Refusal(args, base, err);
+          throw err;
+        }
+        if (recorded.network !== wallet.network) {
+          return x402InstrumentUnavailable(args, fundId, X402_BATCH_SETTLEMENT_SCHEME, wallet.network, recorded.network);
         }
       }
-    }
-    try {
       const payment = await createX402BatchPayment({
         wallet,
         paymentRequired: required,
+        ...identityArg(creditScope.identity),
+        ...(recorded ? { recorded } : {}),
         endpoint: args.ref.endpoint,
         callerPubkey: args.signing.pubkey,
         creditId: args.creditId,
@@ -2089,7 +2061,7 @@ async function fundOverX402(
       }
       // The journal write supersedes the original header. Keeping it until then
       // preserves the funding ID if discovery or signing fails first.
-      const outcome = await fundOverX402(args, pending.fundId, undefined, true, true);
+      const outcome = await fundOverX402(args, pending.fundId, undefined, true, true, pending.channelId);
       if (outcome.status === "funded") clearPendingX402Funding(pending);
       return outcome.status === "unavailable" ? pendingX402Refusal(base, outcome.error ?? err) : outcome;
     }
@@ -2119,14 +2091,24 @@ async function fundOverX402(
     }
     if (correction && !corrected) {
       try {
+        const { recorded } = resolveX402CreditChannel({
+          endpoint: pending.endpoint,
+          callerPubkey: pending.callerPubkey,
+          creditId: pending.creditId,
+          ...identityArg(fundedDvmIdentity(args.providerInfo)),
+        });
+        if (recorded?.channelId !== pending.channelId) throw missingX402CreditChannel(pending.creditId);
         const recovered = await processX402BatchCorrection({
           wallet,
-          paymentRequired: correction,
+          paymentRequired: recordedX402BatchRequirement({
+            wallet, paymentRequired: correction, recorded, depositMicro: pending.targetMicro,
+          }),
+          channelId: pending.channelId,
           depositMicro: pending.targetMicro,
         });
         if (recovered) {
           clearPendingX402Funding(pending);
-          return await fundOverX402(args, pending.fundId, undefined, true, true);
+          return await fundOverX402(args, pending.fundId, undefined, true, true, pending.channelId);
         }
       } catch {
         // Keep the original signed header durable when recovery cannot be proven.
@@ -4153,23 +4135,6 @@ function tempoChargePendingOutcome(
     display,
     hint,
   };
-}
-
-/**
- * Check the endpoint journal for holds that can be decided locally. The signer
- * checks retired deposits against finalized state once discovery identifies the channel.
- */
-function otherCreditPendingX402(args: FundCreditArgs): PendingX402Funding | undefined {
-  return listPendingX402Fundings({
-    endpoint: args.ref.endpoint,
-    callerPubkey: args.signing.pubkey,
-  })
-    .filter(
-      (entry) => x402PendingRetired(entry)
-        ? isVoucherOnlyX402Funding(entry) && x402PendingUnsettled(entry)
-        : entry.creditId !== args.creditId
-    )
-    .sort((a, b) => a.requestedAt - b.requestedAt)[0];
 }
 
 function withLightningOffer(pending: PendingFunding, offer: LightningFundingOffer): PendingFunding {

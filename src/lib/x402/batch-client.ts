@@ -1,6 +1,10 @@
 import {
+  assertX402ChannelPayer,
+  assertX402RequirementDescribesChannel,
+  deriveX402ChannelSalt,
   DvmError,
   DvmX402ChannelStorage,
+  findX402Channel,
   listPendingX402FundingsForChannel,
   normalizeCreditEndpoint,
   type PendingX402Funding,
@@ -15,6 +19,8 @@ import {
   x402PendingDepositExpiresAt,
   x402PendingRetired,
   x402PendingUnsettled,
+  type AttestedDvmIdentity,
+  type StoredX402ChannelMetadata,
   type X402Wallet,
 } from "@dvmkit/sdk/internal";
 import { decodePaymentSignatureHeader, encodePaymentSignatureHeader } from "@x402/core/http";
@@ -28,10 +34,11 @@ import {
   toClientEvmSigner,
 } from "@x402/evm";
 import { BatchSettlementEvmScheme, computeChannelId } from "@x402/evm/batch-settlement/client";
-import { createPublicClient, encodeAbiParameters, http, isAddress, isHash, keccak256, parseAbi, toBytes } from "viem";
+import { createPublicClient, encodeAbiParameters, http, isAddress, isHash, keccak256, parseAbi } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import * as chains from "viem/chains";
 import { x402NetworkLabel } from "./networks";
+import { resolveX402CreditChannel } from "./credit-channel";
 
 const permit2NonceAbi = parseAbi(["function nonceBitmap(address owner, uint256 wordPos) view returns (uint256)"]);
 
@@ -196,20 +203,48 @@ export function x402RetiredDepositExpiresAt(pending: PendingX402Funding): number
   return deadline !== undefined && Number.isFinite(new Date(deadline).getTime()) ? deadline : undefined;
 }
 
+export function recordedX402BatchRequirement(args: {
+  wallet: X402Wallet;
+  paymentRequired: PaymentRequired;
+  recorded: StoredX402ChannelMetadata;
+  depositMicro: number;
+}) {
+  const { wallet, paymentRequired, recorded } = args;
+  const account = privateKeyToAccount(wallet.privateKey as `0x${string}`);
+  assertX402ChannelPayer(recorded, account.address);
+  const scheme = new BatchSettlementEvmScheme(account, { salt: recorded.config.salt });
+  const matching = paymentRequired.accepts.find((terms) => {
+    if (terms.scheme !== X402_BATCH_SETTLEMENT_SCHEME || terms.network !== recorded.network) return false;
+    try {
+      return computeChannelId(scheme.buildChannelConfig(terms), terms.network).toLowerCase() === recorded.channelId.toLowerCase();
+    } catch {
+      return false;
+    }
+  });
+  if (matching) {
+    return { ...paymentRequired, accepts: [matching] };
+  }
+  // Preserve the SDK's refusal and recovery guidance for the recorded channel.
+  assertX402RequirementDescribesChannel(args);
+  throw new DvmError("x402_channel_mismatch", `No offered x402 terms match channel ${recorded.channelId}.`);
+}
+
 /** Call under the channel lock so the journal and the escrow used to size the payment agree. */
 export async function createX402BatchPayment(args: {
   wallet: X402Wallet;
   paymentRequired: PaymentRequired;
   endpoint: string;
+  recorded?: StoredX402ChannelMetadata;
+  identity?: AttestedDvmIdentity;
   callerPubkey: string;
   creditId: string;
   depositMicro: number;
 }) {
-  const { wallet, paymentRequired } = args;
+  const { wallet, paymentRequired, callerPubkey, creditId, recorded } = args;
   const accepted = paymentRequired.accepts.find(
     (terms) => terms.scheme === X402_BATCH_SETTLEMENT_SCHEME && terms.network === wallet.network
   );
-  if (!accepted) {
+  if (!accepted || (recorded && recorded.network !== wallet.network)) {
     const label = x402NetworkLabel(wallet.network);
     throw new DvmError(
       "x402_batch_not_offered",
@@ -221,10 +256,14 @@ export async function createX402BatchPayment(args: {
   if (!network) throw new DvmError("x402_unsupported_network", `Unsupported x402 network ${wallet.network}.`);
 
   const account = privateKeyToAccount(wallet.privateKey as `0x${string}`);
-  const { client, rpcUrl } = createX402ChannelReader(network, wallet.network);
+  const { client, chain, rpcUrl } = createX402ChannelReader(network, wallet.network);
   const storage = new DvmX402ChannelStorage();
-  // The existing salt keeps the SDK channel identity for replay, correction and exits.
-  const salt = keccak256(toBytes(`dvmkit:x402-batch:${wallet.network}:${account.address.toLowerCase()}`));
+  const salt = recorded?.config.salt ?? deriveX402ChannelSalt({
+    network: wallet.network,
+    payer: account.address,
+    endpoint: args.endpoint,
+    ...(args.identity ? { identity: args.identity } : {}),
+  });
   const scheme = new BatchSettlementEvmScheme(toClientEvmSigner(account, client), {
     storage,
     salt,
@@ -237,7 +276,30 @@ export async function createX402BatchPayment(args: {
   });
   const config = scheme.buildChannelConfig(accepted);
   const channelId = computeChannelId(config, accepted.network);
-  await assertX402ChannelReady(channelId, args.creditId, wallet.network, storage);
+  if (recorded && recorded.channelId.toLowerCase() !== channelId.toLowerCase()) {
+    throw new DvmError("x402_channel_mismatch", `The offer does not match recorded x402 channel ${recorded.channelId}.`);
+  }
+  const journal = listPendingX402FundingsForChannel(channelId);
+  const rival = journal.find((entry) => entry.creditId !== creditId && !x402PendingRetired(entry));
+  if (rival) throw x402VoucherPendingRefusal(rival);
+  const owner = recorded ?? findX402Channel({ channelId });
+  if (!recorded && owner && (
+    owner.callerPubkey !== callerPubkey ||
+    resolveX402CreditChannel({
+      endpoint: args.endpoint,
+      callerPubkey,
+      creditId: owner.creditId,
+      ...(args.identity ? { identity: args.identity } : {}),
+    }).recorded?.channelId !== channelId
+  )) {
+    throw new DvmError(
+      "x402_channel_mismatch",
+      `Channel ${channelId} already has a different local credit binding.`,
+      "Use the recorded credit at its original DVM to manage this channel."
+    );
+  }
+
+  await assertX402ChannelReady(channelId, journal, wallet.network, storage, client, chain.id);
 
   const created = await scheme.createPaymentPayload(X402_VERSION, accepted, { extensions: paymentRequired.extensions });
   const { payload } = created;
@@ -248,15 +310,17 @@ export async function createX402BatchPayment(args: {
     throw new DvmError("x402_voucher_unreadable", "The signed x402 payload carries no cumulative voucher to journal.");
   }
   const deposit = payload.type === "deposit" ? payload.deposit : undefined;
-  recordX402ChannelMetadata({
-    channelId,
-    endpoint: normalizeCreditEndpoint(args.endpoint),
-    callerPubkey: args.callerPubkey,
-    creditId: args.creditId,
-    network: accepted.network,
-    config,
-    updatedAt: Date.now(),
-  });
+  if (!owner) {
+    recordX402ChannelMetadata({
+      channelId,
+      endpoint: normalizeCreditEndpoint(args.endpoint),
+      callerPubkey,
+      creditId,
+      network: accepted.network,
+      config,
+      updatedAt: Date.now(),
+    });
+  }
   const authorizationValidBefore = deposit?.authorization.erc3009Authorization?.validBefore;
   return {
     channelId,
@@ -274,14 +338,12 @@ export async function createX402BatchPayment(args: {
 
 async function assertX402ChannelReady(
   channelId: `0x${string}`,
-  creditId: string,
+  journal: PendingX402Funding[],
   walletNetwork: string,
-  storage: DvmX402ChannelStorage
+  storage: DvmX402ChannelStorage,
+  client: ReturnType<typeof createX402ChannelReader>["client"],
+  chainId: number
 ): Promise<void> {
-  const journal = listPendingX402FundingsForChannel(channelId);
-  const rival = journal.find((entry) => entry.creditId !== creditId && !x402PendingRetired(entry));
-  if (rival) throw x402VoucherPendingRefusal(rival);
-
   let verifiedClient: ReturnType<typeof createX402ChannelReader>["client"] | undefined;
   let consumedDeposit: PendingX402Funding | undefined;
   for (const entry of journal.filter(x402PendingRetired)) {
@@ -298,12 +360,15 @@ async function assertX402ChannelReady(
     verifiedClient = proof.client;
     if (proof.consumed) consumedDeposit ??= entry;
   }
-  if (!verifiedClient) return;
+  const refreshRefundProbe = storage.refundProbeNeedsRefresh(channelId);
+  const reader = verifiedClient ?? (refreshRefundProbe ? client : undefined);
+  if (!reader) return;
 
   // An unused deposit permits signing even if the projection cannot be repaired.
-  // A used nonce requires refreshed escrow before sizing another payment.
+  // A used nonce or a retained refund probe requires fresh escrow before signing.
   try {
-    const [balance, totalClaimed] = await verifiedClient.readContract({
+    if (!verifiedClient && (await reader.getChainId()) !== chainId) throw new Error("Unexpected x402 RPC chain");
+    const [balance, totalClaimed] = await reader.readContract({
       address: BATCH_SETTLEMENT_ADDRESS,
       abi: X402_BATCH_CHANNEL_ABI,
       functionName: "channels",
@@ -313,12 +378,17 @@ async function assertX402ChannelReady(
     if (typeof balance !== "bigint" || typeof totalClaimed !== "bigint") {
       throw new Error("Invalid x402 channel balance or claims");
     }
-    await storage.reconcileChainState(channelId, {
-      balance: balance.toString(),
-      totalClaimed: totalClaimed.toString(),
-    });
+    const state = { balance: balance.toString(), totalClaimed: totalClaimed.toString() };
+    if (refreshRefundProbe) {
+      await storage.setRefundProbe(channelId, { ...state, chargedCumulativeAmount: state.totalClaimed });
+    } else {
+      await storage.reconcileChainState(channelId, state);
+    }
   } catch {
     if (consumedDeposit) throw x402VoucherPendingRefusal(consumedDeposit);
+    if (refreshRefundProbe) {
+      throw new DvmError("x402_rpc_error", "Reading the x402 channel after a cooperative refund failed.");
+    }
   }
 }
 
