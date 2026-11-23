@@ -18,6 +18,34 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.23.0](https://github.com/dvmkit/dvm-cli/compare/v0.22.1...v0.23.0) (2026-11-23)
+
+
+### Features
+
+* **cli:** let callers choose standing mandate duration ([#154](https://github.com/dvmkit/dvm-cli/issues/154)) ([73a4c0b](https://github.com/dvmkit/dvm-cli/commit/73a4c0bf6df1eefa24b88eaaeb7f5a768ee7c958))
+
+
+### Bug Fixes
+
+* **cli:** omit upstream text from provider warmup errors ([ddbfba2](https://github.com/dvmkit/dvm-cli/commit/ddbfba229c793791bfa1e871aaf17b2709544777))
+* **cli:** omit upstream text from receipt refresh errors ([ae6035f](https://github.com/dvmkit/dvm-cli/commit/ae6035fbac68f128ba56688026cf517884358ce6))
+* **credit:** guide retries after an absent x402 deposit ([105ebd0](https://github.com/dvmkit/dvm-cli/commit/105ebd0ebd256bbe91f38f8b86c327f810b734b4))
+* **credit:** label server and local credit status separately ([5787474](https://github.com/dvmkit/dvm-cli/commit/578747444630d802a382e7f697b15d9955e18685))
+* **credit:** retire unused expired x402 funding on terms changes ([ade9e1f](https://github.com/dvmkit/dvm-cli/commit/ade9e1fc27c2d9cec0f08905db88afa01e8923c4))
+* **credit:** verify finalized state before replacing x402 deposits ([a37355f](https://github.com/dvmkit/dvm-cli/commit/a37355f68259a0cb2fdd1abcb8f61c3487c7d8d3))
+* **credit:** verify retired x402 deposits before signing again ([de0b3ba](https://github.com/dvmkit/dvm-cli/commit/de0b3baa72fd302a6e1c957a228a942c475ff5d6))
+* **deps:** update SDK and x402 funding dependencies ([03a774e](https://github.com/dvmkit/dvm-cli/commit/03a774e7781c1cb26ba5bce178d7e7142423b475))
+* **messages:** name one command in the human poll line ([837e072](https://github.com/dvmkit/dvm-cli/commit/837e07280a5c8c5e8224999480378652b043c741))
+* **messages:** retry status after accepted declines ([83ae055](https://github.com/dvmkit/dvm-cli/commit/83ae0559525296d302882f547c3c98d9a5db6738))
+* **payments:** resend the same Tempo credential on not_broadcast and stop on settlement_unconfirmed ([6e56a8e](https://github.com/dvmkit/dvm-cli/commit/6e56a8e8ce24a7014a4c13641a19230dbc631310))
+* point provider timeout hints to dvm describe ([365639f](https://github.com/dvmkit/dvm-cli/commit/365639fa06ac3e082fe4fe7d3cfecd54341ec89f))
+* **wallet:** coordinate Cashu quote issuance ([47621a3](https://github.com/dvmkit/dvm-cli/commit/47621a30b3abb067e796a76bf8b2d130aa2cf09e))
+* **wallet:** require chain proof before removing a key for a retired x402 deposit ([22ab9f2](https://github.com/dvmkit/dvm-cli/commit/22ab9f2c3f80f15a733a690b841f67663e5b24ca))
+* **wallet:** suggest dates for overlong history durations ([1ee51f2](https://github.com/dvmkit/dvm-cli/commit/1ee51f2bdeef72c6d75864e4154153e6508ce1a3))
+* **wallet:** use chain time for x402 withdrawal finalization ([4d551d8](https://github.com/dvmkit/dvm-cli/commit/4d551d8785db1e214fd5a12b6827c52b6c98a7f6))
+* **x402:** scope new batch channels per DVM ([#155](https://github.com/dvmkit/dvm-cli/issues/155)) ([8c1f63a](https://github.com/dvmkit/dvm-cli/commit/8c1f63ad5be13a5f3a237459d0d0ca53d19d0a87))
+
 ## [0.22.1](https://github.com/dvmkit/dvm-cli/compare/v0.22.0...v0.22.1) (2026-11-19)
 
 
