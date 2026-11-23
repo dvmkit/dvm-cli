@@ -3,22 +3,29 @@ import { decodePaymentSignatureHeader, encodePaymentResponseHeader } from "@x402
 import type { PaymentRequired } from "@x402/core/types";
 import { isBatchSettlementDepositPayload, PERMIT2_ADDRESS } from "@x402/evm";
 import { computeChannelId } from "@x402/evm/batch-settlement/client";
-import { concatHex, keccak256, toBytes } from "viem";
+import { concatHex, keccak256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  X402_CHANNELS_FILE,
+  acknowledgeX402ChannelOwner,
+  buildAttestation,
   createX402BatchPayment,
   deriveIdentityFromPrivkey,
+  deriveLegacyX402ChannelSalt,
   DvmError,
   DvmX402ChannelStorage,
   encodePaymentRequiredHeader,
+  findX402Channel,
   listPendingX402FundingsForChannel,
   loadCredit,
   loadResumableX402Funding,
+  receiptPubkeyFromSecret,
   recordFundResponse,
   recordPendingX402Funding,
   recordX402ChannelMetadata,
   retirePendingX402Funding,
+  signAttestation,
   type CreditMenu,
   type CreditOpResult,
   type ProviderInfo,
@@ -53,6 +60,7 @@ vi.mock("../src/commands/credit/render", async (original) => ({
 }));
 
 import { renderCreditDrain } from "../src/commands/credit/render";
+import { createX402BatchPayment as createCliBatchPayment } from "../src/lib/x402/batch-client";
 import { fundCredit } from "../src/lib/credit-fund";
 import { runCreditDrain } from "../src/lib/credit/drain";
 import { HttpsTransport } from "../src/lib/transport/https";
@@ -72,7 +80,7 @@ const config = {
   receiverAuthorizer: `0x${"33".repeat(20)}` as const,
   token: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as const,
   withdrawDelay: 86_400,
-  salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+  salt: deriveLegacyX402ChannelSalt({ network, payer: account.address }),
 };
 const channelId = computeChannelId(config, network);
 const otherChannelId = computeChannelId({ ...config, receiver: `0x${"44".repeat(20)}` }, network);
@@ -133,7 +141,7 @@ beforeEach(async () => {
   external.credit.mockReset();
   external.describe.mockResolvedValue(provider);
   external.getBlock.mockReset();
-  external.getChainId.mockReset();
+  external.getChainId.mockReset().mockResolvedValue(84532);
   external.readContract.mockReset();
   external.readContract.mockResolvedValue([200_000n, 10_000n]);
   vi.stubEnv("DVM_IDENTITY_KEY", signer.privkey);
@@ -355,6 +363,9 @@ describe("x402 funding recovery", () => {
     const pending = await journalDeposit(true, -1n);
     const secondCredit = "credit-2";
     const otherEndpoint = "https://shared.example";
+    acknowledgeX402ChannelOwner({
+      channelId, endpoint: otherEndpoint, callerPubkey: signer.pubkey, creditId: secondCredit,
+    });
     const fetch = vi.fn<typeof globalThis.fetch>(async (_request, init) => {
       const { paymentHeader } = submittedFunding(init);
       if (paymentHeader === pending.paymentHeader) {
@@ -463,7 +474,9 @@ describe("x402 funding recovery", () => {
     await expect(fund()).resolves.toMatchObject({
       status: "unavailable", error: { code: "x402_voucher_pending" },
     });
-    expect(fetch.mock.calls).toHaveLength(1);
+    expect(fetch.mock.calls.map(([, init]) => submittedFunding(init).paymentHeader)).toEqual([
+      pending.paymentHeader, null,
+    ]);
 
     now.mockReturnValue(pending.requestedAt + 86_400_001);
     await expect(fund()).resolves.toMatchObject({ status: "funded", fundId: "fund-new" });
@@ -566,6 +579,64 @@ describe("x402 funding recovery", () => {
       { paymentHeader: pending.paymentHeader, fundId: pending.fundId },
       { paymentHeader: pending.paymentHeader, fundId: pending.fundId },
     ]);
+  });
+
+  it("corrects the journalled legacy channel and signs its next cumulative voucher", async () => {
+    const pending = await journalFunding();
+    const original = decodePaymentSignatureHeader(pending.paymentHeader).payload;
+    if (!isBatchSettlementDepositPayload(original)) throw new Error("Expected the first deposit");
+    const otherBefore = await storage.get(otherChannelId);
+    const corrected = {
+      ...previous,
+      error: "invalid_batch_settlement_evm_cumulative_amount_mismatch",
+      accepts: previous.accepts.map((offer) => ({ ...offer, extra: {
+        ...offer.extra,
+        channelState: { chargedCumulativeAmount: "40000" },
+        voucherState: { signedMaxClaimable: original.voucher.maxClaimableAmount, signature: original.voucher.signature },
+      } })),
+    };
+    external.readContract.mockResolvedValue([500_000n, 10_000n]);
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(Response.json({ error: "payment_invalid" }, {
+        status: 402, headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(corrected) },
+      }))
+      .mockImplementationOnce(async () => {
+        await expect(storage.get(channelId)).resolves.toMatchObject({
+          balance: "500000", totalClaimed: "10000", chargedCumulativeAmount: "40000",
+        });
+        return challengeResponse();
+      })
+      .mockResolvedValueOnce(Response.json({
+        op: "fund", funded_micro: 200_000, credit: credit(200_000),
+      }, { headers: { "PAYMENT-RESPONSE": response({
+        channelId, balance: "500000", totalClaimed: "10000", chargedCumulativeAmount: "240000",
+      }, "200000") } }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(fund()).resolves.toMatchObject({ status: "funded", fundId: pending.fundId });
+    const submissions = fetch.mock.calls.map(([, init]) => submittedFunding(init));
+    expect(submissions).toEqual([
+      { paymentHeader: pending.paymentHeader, fundId: pending.fundId },
+      { paymentHeader: null, fundId: pending.fundId },
+      { paymentHeader: expect.any(String), fundId: pending.fundId },
+    ]);
+    expect(decodePaymentSignatureHeader(submissions[2].paymentHeader!).payload).toMatchObject({
+      voucher: { channelId, maxClaimableAmount: "240000" },
+    });
+    expect(listPendingX402FundingsForChannel(channelId)).toEqual([]);
+    await expect(storage.get(otherChannelId)).resolves.toEqual(otherBefore);
+  });
+
+  it("passes the second offer to the signer when only it describes the recorded channel", async () => {
+    const matching = previous.accepts[0];
+    const terms = { ...previous, accepts: [{ ...matching, payTo: `0x${"44".repeat(20)}` }, matching] };
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(challengeResponse(terms))
+      .mockResolvedValueOnce(fundedDeposit());
+    vi.stubGlobal("fetch", fetch);
+    await expect(fund()).resolves.toMatchObject({ status: "funded" });
+    const signed = decodePaymentSignatureHeader(submittedFunding(fetch.mock.calls[1][1]).paymentHeader!);
+    expect(signed.accepted).toEqual(matching);
+    expect(signed.payload).toMatchObject({ voucher: { channelId } });
   });
 
   it("submits a replacement under the original funding ID after finalized proof", async () => {
@@ -722,6 +793,42 @@ describe("cooperative x402 credit refund", () => {
     });
   }
 
+  it.each([
+    { name: "on another machine at an unattested origin", attested: false },
+    { name: "when only the second provider read attests", attested: true },
+  ])("refuses a legacy drain without local metadata $name", async ({ attested }) => {
+    rmSync(X402_CHANNELS_FILE);
+    if (attested) {
+      const secret = "44".repeat(32);
+      const pubkey = receiptPubkeyFromSecret(secret);
+      const attestation = buildAttestation({
+        dvmId: "provider", builderPubkey: pubkey, slug: "provider",
+        capabilities: [], receiptPubkey: pubkey, deployedAt: 1_700_000_000,
+      });
+      external.describe.mockRejectedValueOnce(new Error("Provider info temporarily unavailable."));
+      external.describe.mockResolvedValue({
+        ...provider, builder: { pubkey, attestation, signature: signAttestation(attestation, secret) },
+      });
+    }
+    external.readContract.mockImplementation(async ({ args }) =>
+      args[0] === channelId ? [200_000n, 10_000n] : [0n, 0n]
+    );
+    recordFundResponse({
+      endpoint, callerPubkey: signer.pubkey, credit: credit(190_000), targetMicro: 200_000,
+      rail: "x402", x402Instrument: "x402_channel",
+    });
+    external.credit.mockRejectedValueOnce(challenge("0"));
+    await expect(runCreditDrain(endpoint, { creditId, drainId: "drain-1", method: "x402" })).rejects.toMatchObject({
+      code: "x402_channel_mismatch",
+      hint: expect.stringContaining("timed on-chain withdrawal"),
+    });
+    expect(external.describe).toHaveBeenCalledTimes(2);
+    expect(external.credit).toHaveBeenCalledTimes(1);
+    expect(external.credit.mock.calls[0][2]).toBeUndefined();
+    expect(external.readContract).not.toHaveBeenCalled();
+    expect(findX402Channel({ channelId })).toBeUndefined();
+  });
+
   it("preserves another channel when a zero-balance answer would delete it", async () => {
     const before = await storage.get(otherChannelId);
     await drain({ channelId: otherChannelId, balance: "0", totalClaimed: "0", chargedCumulativeAmount: "0" });
@@ -735,6 +842,89 @@ describe("cooperative x402 credit refund", () => {
     await expect(storage.get(otherChannelId)).resolves.toEqual(before);
   });
 
+  it.each([
+    { label: "refuses changed terms", matches: false },
+    { label: "signs for the requested channel when the second offer matches", matches: true },
+  ])("$label at an attested alias without touching the sibling's cursor", async ({ matches }) => {
+    const alias = "https://alias.example";
+    const secret = "44".repeat(32);
+    const builderPubkey = receiptPubkeyFromSecret(secret);
+    const identity = { dvmId: "provider", builderPubkey };
+    const attestation = buildAttestation({
+      ...identity, slug: "provider", capabilities: [], receiptPubkey: builderPubkey, deployedAt: 1_700_000_000,
+    });
+    external.describe.mockResolvedValue({
+      ...provider,
+      builder: { pubkey: builderPubkey, attestation, signature: signAttestation(attestation, secret) },
+    });
+    for (const id of [creditId, "other-credit"]) {
+      recordFundResponse({
+        endpoint, identity, callerPubkey: signer.pubkey, credit: { ...credit(190_000), credit_id: id },
+        targetMicro: 200_000, rail: "x402", x402Instrument: "x402_channel",
+      });
+    }
+    expect(loadCredit(endpoint, signer.pubkey, identity)?.creditId).toBe("other-credit");
+    acknowledgeX402ChannelOwner({ channelId: otherChannelId, endpoint, callerPubkey: signer.pubkey, creditId: "other-credit" });
+    const terms = required("0");
+    const matching = terms.accepts[0];
+    const changed = { ...matching, payTo: `0x${"44".repeat(20)}` };
+    terms.accepts = matches ? [changed, matching] : [changed];
+    external.credit.mockRejectedValueOnce(new DvmError("payment_required", "Channel approval required.", undefined, {
+      x402_payment_required: terms,
+    }));
+    const sibling = await storage.get(otherChannelId);
+    const drainId = "drain-alias";
+    if (matches) {
+      external.credit.mockResolvedValueOnce({
+        op: "drain", credit: credit(0),
+        drain: {
+          drain_id: drainId, credit_id: creditId, method: "x402", status: "sent",
+          amount_micro: 190_000, currency: "usd", ledger_seq: 8, created_at: 1, receipts: [],
+        },
+        x402PaymentResponse: response({ channelId, balance: "0", totalClaimed: "0", chargedCumulativeAmount: "0" }),
+      });
+      await runCreditDrain(alias, { creditId, drainId, method: "x402" });
+      expect(external.credit).toHaveBeenCalledTimes(2);
+      expect(external.credit.mock.calls[1][0]).toMatchObject({ endpoint: alias });
+      const signed = decodePaymentSignatureHeader(external.credit.mock.calls[1][2].x402Payment);
+      expect(signed.accepted).toEqual(matching);
+      expect(signed.payload).toMatchObject({ type: "refund", voucher: { channelId } });
+    } else {
+      await expect(runCreditDrain(alias, { creditId, drainId, method: "x402" })).rejects.toMatchObject({
+        code: "x402_channel_mismatch", data: { channel_id: channelId },
+      });
+      expect(external.credit).toHaveBeenCalledTimes(1);
+      expect(external.credit.mock.calls[0][2]).toBeUndefined();
+      expect(external.readContract).not.toHaveBeenCalled();
+    }
+    await expect(storage.get(otherChannelId)).resolves.toEqual(sibling);
+  });
+
+  it("keeps the refund snapshot and refuses to sign when the RPC is on the wrong chain", async () => {
+    await drain({ channelId, balance: (2n ** 256n).toString() });
+    const before = await storage.get(channelId);
+    external.getChainId.mockResolvedValue(8453);
+    external.readContract.mockClear().mockResolvedValue([0n, 0n]);
+    await expect(createCliBatchPayment({
+      wallet, paymentRequired: required("200000"), endpoint, callerPubkey: signer.pubkey,
+      creditId, depositMicro: 200_000, recorded: findX402Channel({ channelId })!,
+    })).rejects.toMatchObject({ code: "x402_rpc_error" });
+    expect(external.readContract).not.toHaveBeenCalled();
+    await expect(storage.get(channelId)).resolves.toEqual(before);
+    expect(storage.refundProbeNeedsRefresh(channelId)).toBe(true);
+  });
+
+  it("sizes a top-up using fresh escrow after a refund with malformed state", async () => {
+    await drain({ channelId, balance: (2n ** 256n).toString() });
+    external.readContract.mockResolvedValue([0n, 0n]);
+    const payment = await createCliBatchPayment({
+      wallet, paymentRequired: required("200000"), endpoint, callerPubkey: signer.pubkey,
+      creditId, depositMicro: 200_000, recorded: findX402Channel({ channelId })!,
+    });
+    expect(payment).toMatchObject({ channelId, depositMicro: "200000" });
+    expect(storage.refundProbeNeedsRefresh(channelId)).toBe(false);
+  });
+
   it.each(["balance", "totalClaimed", "chargedCumulativeAmount"])("ignores refund %s past uint256 without changing stored channels", async (field) => {
     const before = await storage.get(otherChannelId);
     const chainState = { balance: "200000", totalClaimed: "10000", chargedCumulativeAmount: "10000" };
@@ -744,6 +934,7 @@ describe("cooperative x402 credit refund", () => {
       [field]: (2n ** 256n).toString(),
     });
     await expect(storage.get(channelId)).resolves.toEqual(chainState);
+    expect(storage.refundProbeNeedsRefresh(channelId)).toBe(true);
     const output = vi.mocked(renderCreditDrain).mock.calls.at(-1)![0].json;
     expect(output).toMatchObject({ receipts_verified: "absent", receipts_total: 0,
       display: expect.stringContaining("The DVM reports") });

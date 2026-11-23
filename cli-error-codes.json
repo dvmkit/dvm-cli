@@ -321,6 +321,7 @@
     "x402_batch_not_offered",
     "x402_build_failed",
     "x402_channel_ambiguous",
+    "x402_channel_mismatch",
     "x402_channel_not_found",
     "x402_channel_store_invalid",
     "x402_exact_authorization_pending",

@@ -79,6 +79,9 @@ import {
 import {
   loadX402Wallet,
 } from "../x402/wallet";
+import { providerDvmIdentity } from "../credit-per-dvm";
+import { recordedX402BatchRequirement } from "../x402/batch-client";
+import { missingX402CreditChannel, resolveX402CreditChannel } from "../x402/credit-channel";
 import {
   resolveSigningIdentity,
 } from "../cli-identity-resolve";
@@ -159,14 +162,18 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
   // it. A sibling still defaults to `tempo` on a session channel of
   // its own, which is credit-scoped and so describes the right credit; with no
   // scoped signal at all the default falls through to `cashu` as before.
+  const x402Scope = { endpoint, callerPubkey: signer.pubkey, creditId, ...(identity ? { identity } : {}) };
+  const hasRecordedX402Channel = !opts.recoverFromReceipts &&
+    (!opts.method || opts.method.toLowerCase() === "x402") &&
+    resolveX402CreditChannel(x402Scope).recorded !== undefined;
   const method = (
     opts.method ??
     ((stored?.creditId === creditId && stored.rail === "tempo") || tempoSession
       ? "tempo"
       : stored?.creditId === creditId && stored.rail === "stripe"
         ? "stripe"
-        : stored?.creditId === creditId &&
-          (stored.rail === "x402" || stored.x402Instrument !== undefined)
+        : hasRecordedX402Channel || (stored?.creditId === creditId &&
+          (stored.rail === "x402" || stored.x402Instrument !== undefined))
           ? "x402"
           : "cashu")
   ).toLowerCase();
@@ -194,7 +201,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
   const channelBacked =
     method === "tempo"
       ? tempoSession
-      : stored?.creditId === creditId && stored.x402Instrument === "x402_channel";
+      : hasRecordedX402Channel || (stored?.creditId === creditId && stored.x402Instrument === "x402_channel");
   if (tempoSession && method !== "tempo") {
     throw new DvmError(
       "invalid_argument",
@@ -443,6 +450,7 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
       capability: null,
     });
   }
+  const signingIdentity = providerInfo && providerDvmIdentity(providerInfo);
   const signCredit = (body: Record<string, unknown>) =>
     signDvmRequestData(signer.privkey, body, authDomain);
   // Convert the timeout at the POST boundary so channel adapters can carry the
@@ -590,17 +598,53 @@ export async function runCreditDrain(dvm: string, opts: CreditDrainOptions): Pro
             "Reconnect that exact key: 'dvm wallet x402-connect --key-file <path>', or DVM_X402_KEY=<key> dvm wallet x402-connect. A bare 'dvm wallet x402-connect' generates a new wallet, and a different key cannot refund this channel."
           );
         }
+        const { recorded, credit } = resolveX402CreditChannel(x402Scope);
+        const signingScope = { endpoint, callerPubkey: signer.pubkey, creditId, ...(signingIdentity ? { identity: signingIdentity } : {}) };
+        if (recorded && (
+          (identity && !signingIdentity) ||
+          resolveX402CreditChannel(signingScope).recorded?.channelId !== recorded.channelId
+        )) throw missingX402CreditChannel(creditId);
+        const depositMicro = Math.max(credit?.targetMicro ?? 0, 1);
+        const post = (paymentHeader?: string) =>
+          postDrain(
+            signCredit(unsignedBody()),
+            paymentHeader ? { x402Payment: paymentHeader, x402Version: 2 } : undefined
+          );
+        if (!recorded) {
+          try {
+            return await post();
+          } catch (err) {
+            if (err instanceof DvmError && x402RequiredFromError(err)) throw missingX402CreditChannel(creditId);
+            throw err;
+          }
+        }
         const refunded = await refundX402BatchChannel({
+          ...(signingIdentity ? { identity: signingIdentity } : {}),
           wallet,
-          endpoint,
+          // The SDK's exact lookup uses this origin. The request still goes to the caller's alias.
+          endpoint: recorded.endpoint,
           callerPubkey: signer.pubkey,
           creditId,
-          depositMicro: Math.max(stored?.targetMicro ?? 0, 1),
-          post: (paymentHeader) =>
-            postDrain(
-              signCredit(unsignedBody()),
-              paymentHeader ? { x402Payment: paymentHeader, x402Version: 2 } : undefined
-            ),
+          depositMicro,
+          post: async (paymentHeader) => {
+            try {
+              return await post(paymentHeader);
+            } catch (err) {
+              if (!(err instanceof DvmError)) throw err;
+              const required = x402RequiredFromError(err);
+              if (!required) throw err;
+              // This runs under the SDK lock, immediately before its channel lookup or correction.
+              const current = resolveX402CreditChannel(signingScope).recorded;
+              if (current?.channelId !== recorded.channelId || current.endpoint !== recorded.endpoint) {
+                throw missingX402CreditChannel(creditId);
+              }
+              const paymentRequired = recordedX402BatchRequirement({ wallet, paymentRequired: required, recorded, depositMicro });
+              throw new DvmError(err.code, err.message, err.hint, {
+                ...err.data,
+                x402_payment_required: paymentRequired,
+              }, err.display);
+            }
+          },
         });
         x402AtRisk = { micro: refunded.atRiskMicro, pending: refunded.pendingFundings };
         return refunded.result;

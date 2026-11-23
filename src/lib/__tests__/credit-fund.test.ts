@@ -3,6 +3,7 @@ vi.mock("../x402/wallet", async () => ({ ...(await vi.importActual<typeof import
 vi.mock("../x402/batch-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../x402/batch-client")>()),
   createX402BatchPayment: vi.fn(),
+  recordedX402BatchRequirement: vi.fn(),
 }));
 vi.mock("../x402/client", async () => ({ ...(await vi.importActual<typeof import("../x402/client")>("../x402/client")), tryX402Payment: vi.fn() }));
 vi.mock("../payment-rails/tempo-wallet", async () => ({ ...(await vi.importActual<typeof import("../payment-rails/tempo-wallet")>("../payment-rails/tempo-wallet")), connectedTempoAccount: vi.fn(() => Promise.resolve(null)) }));
@@ -26,6 +27,7 @@ clearPendingX402ExactFunding: vi.fn(),
 clearPendingX402Funding: vi.fn(),
 findX402Channel: vi.fn(() => undefined),
 listPendingX402Fundings: vi.fn(() => []),
+listX402Channels: vi.fn(() => []),
 listPendingX402FundingsForChannel: vi.fn(() => []),
 listResumableX402ExactFundings: vi.fn(() => []),
 listResumableX402Fundings: vi.fn(() => []),
@@ -36,7 +38,6 @@ recordPendingX402Funding: vi.fn(),
 retirePendingX402Funding: vi.fn(),
 withX402ChannelLock: vi.fn((operation: () => Promise<unknown>) => operation()),
 acknowledgeReplayedX402Payment: vi.fn(() => Promise.resolve()),
-assertX402RequirementDescribesChannel: vi.fn(),
 processX402BatchCorrection: vi.fn(),
 processX402BatchResponseForWallet: vi.fn(() => Promise.resolve()),
 x402RequiredFromError: vi.fn((err: DvmError) => err.data?.x402_payment_required),
@@ -161,11 +162,10 @@ import { TEMPO_SESSION_UPDATED_REASON } from "@dvmkit/sdk/internal";
 import type { CreditMenu, ProviderInfo, Transport } from "@dvmkit/sdk/internal";
 import { loadAgentWallet } from "@dvmkit/sdk/internal";
 import { abandonPendingSubmission, prepareAgentSpend } from "../wallet-agent/spend";
-import { createX402BatchPayment, x402VoucherPendingRefusal } from "../x402/batch-client";
+import { createX402BatchPayment, recordedX402BatchRequirement, x402VoucherPendingRefusal } from "../x402/batch-client";
 
 import {
   acknowledgeReplayedX402Payment,
-  assertX402RequirementDescribesChannel,
   processX402BatchResponseForWallet,
 } from "@dvmkit/sdk/internal";
 import {
@@ -174,6 +174,7 @@ import {
   clearPendingX402Funding,
   findX402Channel,
   listPendingX402Fundings,
+  listX402Channels,
   listResumableX402ExactFundings,
   listResumableX402Fundings,
   loadResumableX402ExactFunding,
@@ -293,6 +294,18 @@ function args(overrides: Record<string, unknown> = {}) {
 
 type TempoFetchArgs = Parameters<NonNullable<Parameters<typeof fundCredit>[0]["tempoFetch"]>>[0];
 
+function recordedChannel(wallet: { privateKey: string }) {
+  return {
+    channelId: `0x${"44".repeat(32)}` as const,
+    endpoint: ENDPOINT,
+    callerPubkey: SIGNING.pubkey,
+    creditId: "credit-1",
+    network: "eip155:8453",
+    config: { payer: privateKeyToAccount(wallet.privateKey as `0x${string}`).address } as never,
+    updatedAt: 1,
+  };
+}
+
 function preparedSpend() {
   return async (a: Parameters<typeof prepareAgentSpend>[0]) => {
     void a;
@@ -316,7 +329,8 @@ beforeEach(async () => {
   // `clearAllMocks` empties the call log but not the queued `…Once` values, so
   // a test that leaves one unconsumed would answer the next test's first POST.
   mockCreditOp.mockReset();
-  vi.mocked(assertX402RequirementDescribesChannel).mockImplementation(() => undefined);
+  vi.mocked(recordedX402BatchRequirement).mockImplementation(({ paymentRequired }) => paymentRequired);
+  vi.mocked(listX402Channels).mockReturnValue([]);
   vi.mocked(loadAgentWallet).mockReturnValue({ lock_pubkey: `02${"cd".repeat(32)}` } as never);
   vi.mocked(loadPendingFunding).mockReturnValue(undefined);
   vi.mocked(listPendingFundings).mockReturnValue([]);
@@ -630,7 +644,10 @@ describe("fundCredit over x402 batch settlement", () => {
   });
 
   it("refuses to sign a second voucher while another credit's is unacknowledged", async () => {
-    vi.mocked(listPendingX402Fundings).mockReturnValue([journalled()]);
+    mockCreditOp.mockRejectedValueOnce(new DvmError("payment_required", "Channel payment required.", undefined, {
+      x402_payment_required: required,
+    }));
+    vi.mocked(createX402BatchPayment).mockRejectedValueOnce(x402VoucherPendingRefusal(journalled()));
 
     const outcome = await fundCredit(args({ creditId: "credit-2", rail: "x402", menu: X402_MENU }));
 
@@ -645,12 +662,16 @@ describe("fundCredit over x402 batch settlement", () => {
       hint: expect.stringContaining("dvm credit fund https://wordcount.example --credit-id credit-1") });
     expect(notice).not.toHaveProperty("spent_sats");
     expect(notice).not.toHaveProperty("spent_micro");
-    expect(createX402BatchPayment).not.toHaveBeenCalled();
-    expect(mockCreditOp).not.toHaveBeenCalled();
+    expect(recordPendingX402Funding).not.toHaveBeenCalled();
+    expect(mockCreditOp).toHaveBeenCalledTimes(1);
+    expect(mockCreditOp.mock.calls[0][2]).toBeUndefined();
   });
 
   it("reaches x402 after ecash and reports the block without ending the cascade", async () => {
-    vi.mocked(listPendingX402Fundings).mockReturnValue([journalled()]);
+    mockCreditOp.mockRejectedValueOnce(new DvmError("payment_required", "Channel payment required.", undefined, {
+      x402_payment_required: required,
+    }));
+    vi.mocked(createX402BatchPayment).mockRejectedValueOnce(x402VoucherPendingRefusal(journalled()));
     vi.mocked(loadAgentWallet).mockReturnValue(null);
 
     const outcome = await fundCredit(
@@ -1541,6 +1562,9 @@ describe("x402 instrument binding", () => {
 
   it("leaves a channel-bound credit on the channel", async () => {
     vi.mocked(loadCreditX402Binding).mockReturnValue({ instrument: "x402_channel" });
+    vi.mocked(listX402Channels).mockReturnValue([{
+      ...recordedChannel(wallet), network: wallet.network,
+    }]);
     mockCreditOp
       .mockRejectedValueOnce(challenge())
       .mockResolvedValueOnce({ ...fundedResponse(), x402PaymentResponse: "settled-response" });
@@ -1741,129 +1765,40 @@ describe("x402 instrument binding", () => {
       expect(mockCreditOp).not.toHaveBeenCalled();
     });
 
-    it("learns a missing chain from the channel store before signing", async () => {
+    it("learns a missing chain from an exact credit binding before signing", async () => {
       vi.mocked(loadCreditX402Binding).mockReturnValue({ instrument: "x402_channel" });
-      const recorded = {
-        channelId: `0x${"44".repeat(32)}` as `0x${string}`,
-        endpoint: ENDPOINT,
-        callerPubkey: SIGNING.pubkey,
-        // An older CLI rewrote this field before a cross-credit refusal, so
-        // the credit-scoped lookup misses and the payer-checked fallback
-        // supplies the channel that still backs credit-1.
-        creditId: "credit-9",
-        network: "eip155:8453",
-        config: {
-          payer: privateKeyToAccount(wallet.privateKey as `0x${string}`).address,
-        } as never,
-        updatedAt: 1,
-      };
-      vi.mocked(findX402Channel).mockReturnValueOnce(undefined).mockReturnValueOnce(recorded);
+      const recorded = recordedChannel(wallet);
+      vi.mocked(listX402Channels).mockReturnValue([recorded]);
       mockCreditOp.mockRejectedValueOnce(challenge());
 
-      const outcome = await fundCredit(
-        args({ rail: "x402", menu: dualChannelMenu, providerInfo: {} })
-      );
+      const outcome = await fundCredit(args({ rail: "x402", menu: dualChannelMenu, providerInfo: {} }));
 
       expect(outcome).toMatchObject({ status: "refused", rail: "x402" });
       expect(outcome.error?.data).toMatchObject({ channel_network: "eip155:8453" });
       expect(outcome.display).toContain("settlement channel on Base (eip155:8453)");
       expect(outcome.hint).toContain("dvm wallet x402-network eip155:8453");
-      expect(assertX402RequirementDescribesChannel).toHaveBeenCalledWith(
-        expect.objectContaining({ recorded })
-      );
       expect(createX402BatchPayment).not.toHaveBeenCalled();
       expect(recordPendingX402Funding).not.toHaveBeenCalled();
       expect(mockCreditOp).toHaveBeenCalledTimes(1);
     });
 
-    it("ignores a fallback whose channel id the DVM challenge does not derive", async () => {
+    it.each([
+      ["changed terms", "x402_channel_mismatch", "x402_channel_mismatch"],
+      ["a retired chain", "x402_batch_not_offered", "x402_instrument_unavailable"],
+    ])("refuses %s for an exact credit binding before signing", async (_case, refusal, code) => {
       vi.mocked(loadCreditX402Binding).mockReturnValue({ instrument: "x402_channel" });
-      const unrelated = {
-        channelId: `0x${"55".repeat(32)}` as `0x${string}`,
-        endpoint: ENDPOINT,
-        callerPubkey: SIGNING.pubkey,
-        creditId: "credit-9",
-        network: "eip155:8453",
-        config: {
-          payer: privateKeyToAccount(wallet.privateKey as `0x${string}`).address,
-        } as never,
-        updatedAt: 2,
-      };
-      vi.mocked(findX402Channel).mockReturnValueOnce(undefined).mockReturnValueOnce(unrelated);
-      vi.mocked(assertX402RequirementDescribesChannel).mockImplementation(() => {
-        throw new DvmError("x402_channel_mismatch", "Different channel.");
-      });
-      mockCreditOp
-        .mockRejectedValueOnce(challenge())
-        .mockResolvedValueOnce({ ...fundedResponse(), x402PaymentResponse: "settled-response" });
-
-      const outcome = await fundCredit(
-        args({ rail: "x402", menu: dualChannelMenu, providerInfo: {} })
-      );
-
-      expect(outcome).toMatchObject({ status: "funded", x402Flavour: "batch-settlement" });
-      expect(assertX402RequirementDescribesChannel).toHaveBeenCalledWith(
-        expect.objectContaining({ recorded: unrelated })
-      );
-      expect(createX402BatchPayment).toHaveBeenCalledTimes(1);
-      expect(recordPendingX402Funding).toHaveBeenCalledTimes(1);
-    });
-
-    it("refuses changed terms for an exact credit-scoped channel before signing", async () => {
-      vi.mocked(loadCreditX402Binding).mockReturnValue({ instrument: "x402_channel" });
-      const recorded = {
-        channelId: `0x${"44".repeat(32)}` as `0x${string}`,
-        endpoint: ENDPOINT,
-        callerPubkey: SIGNING.pubkey,
-        creditId: "credit-1",
-        network: "eip155:8453",
-        config: {
-          payer: privateKeyToAccount(wallet.privateKey as `0x${string}`).address,
-        } as never,
-        updatedAt: 1,
-      };
-      vi.mocked(findX402Channel).mockReturnValue(recorded);
-      vi.mocked(assertX402RequirementDescribesChannel).mockImplementation(() => {
-        throw new DvmError("x402_channel_mismatch", "The DVM's terms derive another channel.");
+      vi.mocked(listX402Channels).mockReturnValue([recordedChannel(wallet)]);
+      vi.mocked(recordedX402BatchRequirement).mockImplementation(() => {
+        throw new DvmError(refusal, "The recorded channel is no longer offered.");
       });
       mockCreditOp.mockRejectedValueOnce(challenge());
 
-      const outcome = await fundCredit(
-        args({ rail: "x402", menu: dualChannelMenu, providerInfo: {} })
-      );
+      const outcome = await fundCredit(args({ rail: "x402", menu: X402_EXACT_MENU, providerInfo: {} }));
 
-      expect(outcome).toMatchObject({ status: "refused", rail: "x402" });
-      expect(outcome.error?.code).toBe("x402_channel_mismatch");
-      expect(createX402BatchPayment).not.toHaveBeenCalled();
-      expect(recordPendingX402Funding).not.toHaveBeenCalled();
-      expect(mockCreditOp).toHaveBeenCalledTimes(1);
-    });
-
-    it("refuses a retired chain for an exact credit-scoped channel before signing", async () => {
-      vi.mocked(loadCreditX402Binding).mockReturnValue({ instrument: "x402_channel" });
-      vi.mocked(findX402Channel).mockReturnValue({
-        channelId: `0x${"44".repeat(32)}`,
-        endpoint: ENDPOINT,
-        callerPubkey: SIGNING.pubkey,
-        creditId: "credit-1",
-        network: "eip155:8453",
-        config: {
-          payer: privateKeyToAccount(wallet.privateKey as `0x${string}`).address,
-        } as never,
-        updatedAt: 1,
-      });
-      vi.mocked(assertX402RequirementDescribesChannel).mockImplementation(() => {
-        throw new DvmError("x402_batch_not_offered", "The recorded chain was retired.");
-      });
-      mockCreditOp.mockRejectedValueOnce(challenge());
-
-      const outcome = await fundCredit(
-        args({ rail: "x402", menu: X402_EXACT_MENU, providerInfo: {} })
-      );
-
-      expect(outcome).toMatchObject({ status: "refused", rail: "x402" });
-      expect(outcome.error?.code).toBe("x402_instrument_unavailable");
-      expect(outcome.error?.data).toMatchObject({ channel_network: "eip155:8453" });
+      expect(outcome).toMatchObject({ status: "refused", rail: "x402", error: { code } });
+      if (code === "x402_instrument_unavailable") {
+        expect(outcome.error?.data).toMatchObject({ channel_network: "eip155:8453" });
+      }
       expect(createX402BatchPayment).not.toHaveBeenCalled();
       expect(recordPendingX402Funding).not.toHaveBeenCalled();
       expect(mockCreditOp).toHaveBeenCalledTimes(1);
@@ -1871,40 +1806,29 @@ describe("x402 instrument binding", () => {
 
     it("does not trust a channel-store chain controlled by another wallet", async () => {
       vi.mocked(loadCreditX402Binding).mockReturnValue({ instrument: "x402_channel" });
-      vi.mocked(findX402Channel).mockReturnValue({
-        channelId: `0x${"44".repeat(32)}`,
-        endpoint: ENDPOINT,
-        callerPubkey: SIGNING.pubkey,
-        creditId: "credit-1",
-        network: "eip155:8453",
-        config: { payer: `0x${"77".repeat(20)}` } as never,
-        updatedAt: 1,
-      });
+      const recorded = recordedChannel(wallet);
+      vi.mocked(listX402Channels).mockReturnValue([{
+        ...recorded, config: { payer: `0x${"77".repeat(20)}` } as never,
+      }]);
 
-      const outcome = await fundCredit(
-        args({ rail: "x402", menu: dualChannelMenu, providerInfo: {} })
-      );
+      const outcome = await fundCredit(args({ rail: "x402", menu: dualChannelMenu, providerInfo: {} }));
 
-      expect(outcome).toMatchObject({ status: "refused", rail: "x402" });
-      expect(outcome.error?.code).toBe("x402_wallet_mismatch");
+      expect(outcome).toMatchObject({ status: "refused", rail: "x402", error: { code: "x402_wallet_mismatch" } });
       expect(createX402BatchPayment).not.toHaveBeenCalled();
       expect(recordPendingX402Funding).not.toHaveBeenCalled();
       expect(mockCreditOp).not.toHaveBeenCalled();
     });
 
-    it("still funds on the wallet's chain when the channel chain is unknown", async () => {
+    it("refuses a channel-bound credit with no attributable channel record", async () => {
       vi.mocked(loadCreditX402Binding).mockReturnValue({ instrument: "x402_channel" });
-      mockCreditOp
-        .mockRejectedValueOnce(challenge())
-        .mockResolvedValueOnce({ ...fundedResponse(), x402PaymentResponse: "settled-response" });
+      mockCreditOp.mockRejectedValueOnce(challenge());
 
-      const outcome = await fundCredit(
-        args({ rail: "x402", menu: dualChannelMenu, providerInfo: {} })
-      );
+      const outcome = await fundCredit(args({ rail: "x402", menu: dualChannelMenu, providerInfo: {} }));
 
-      expect(outcome).toMatchObject({ status: "funded", x402Flavour: "batch-settlement" });
-      expect(createX402BatchPayment).toHaveBeenCalledTimes(1);
-      expect(recordPendingX402Funding).toHaveBeenCalledTimes(1);
+      expect(outcome).toMatchObject({ status: "refused", rail: "x402", error: { code: "x402_channel_mismatch" } });
+      expect(createX402BatchPayment).not.toHaveBeenCalled();
+      expect(recordPendingX402Funding).not.toHaveBeenCalled();
+      expect(mockCreditOp).toHaveBeenCalledTimes(1);
     });
 
     it("offers drain or a separate credit alone where the DVM has left that chain", async () => {
