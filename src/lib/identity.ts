@@ -31,7 +31,7 @@ export interface Config {
   defaultBudget?: string;
   /** Auto-pay threshold — payments at or below this are paid without confirmation, e.g. "1000" or "$0.01" */
   autoPayThreshold?: string;
-  /** Default max number of payments per job (overridden by --max-payments). Otherwise derived from the budget and per-payment cap, or 100. */
+  /** Default max number of payments per job (overridden by --max-payments). Otherwise derived from the budget and per-payment cap with a minimum of 5, or 100 if unavailable. */
   defaultMaxPayments?: number;
   /**
    * Legacy Cashu mint list. Replaced by `wallet.mints` in
