@@ -9,7 +9,7 @@
 ### Features
 
 * `dvm request --mandate-until` accepts longer durations and future ISO dates or timestamps, subject to the provider's advertised limit. The default stays 24 hours, and older providers allow up to seven days. Use `dvm request --dry-run` to preview the maximum charge in the credit's currency and exact expiry without signing or posting, then pass the returned approval to `--mandate-preview` when submitting. The approval sets ceilings for the total and per-charge amounts and fixes the expiry and prepaid credit. The CLI reports reductions from live terms and stops if the approved credit cannot carry the mandate. Automatic payments also obey the signed total, per-charge limit, and expiry. Defer any charge that requires separate approval to `dvm pay <job-id> <seq>`.
-* Requests derive the default payment count by dividing the budget by the automatic per-payment threshold and rounding up. When either limit is unavailable or the threshold is zero, the default is 100. An explicit `--max-payments` or configured default still takes precedence.
+* Requests derive the default payment count by dividing the budget by the automatic per-payment threshold and rounding up, with a minimum of 5. When either limit is unavailable or the threshold is zero, the default is 100. An explicit `--max-payments` or configured default still takes precedence.
 * Define an additive JSON contract for core job actions, recovery identifiers and states, and existing recovery commands in the bundled recovery guide. Pay and refund `amount_msats` remain provisional; unknown action types require human review.
 * Remove the never-emitted `approve` action declaration. Pre-1.0 breaking contract changes require migration notes and a minor version bump.
 
