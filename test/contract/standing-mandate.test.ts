@@ -174,7 +174,6 @@ it("keeps the full mixed-currency budget within the signed ceiling", async () =>
 });
 
 it("previews exact limits without signing or posting and signs the approved terms on submit", async () => {
-  await control({ op: "configure", advertisedUpfront: 0.50 });
   const expiry = new Date(Date.now() + 3_600_000);
   expiry.setUTCMilliseconds(999);
   const before = await control({ op: "snapshot", ids: [] });
