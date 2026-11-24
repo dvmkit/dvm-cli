@@ -63,5 +63,6 @@ export function defaultPaymentCount(budget: string | undefined, perPayment: stri
   if (!total || !cap || cap[0] === 0n) return 100;
   const numerator = total[0] * cap[1];
   const denominator = total[1] * cap[0];
-  return Math.min(Number((numerator + denominator - 1n) / denominator), Number.MAX_SAFE_INTEGER);
+  const count = Number((numerator + denominator - 1n) / denominator);
+  return Math.min(Math.max(5, count), Number.MAX_SAFE_INTEGER);
 }

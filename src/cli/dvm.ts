@@ -356,7 +356,7 @@ export function buildProgram(): Command {
     .option("--max-increment <amount>", "Max single payment (millisats or $USD)")
     .option(
       "--max-payments <n>",
-      "Max payments to honour per job (default: configured value, else budget divided by auto-pay threshold rounded up, or 100 if unavailable); use 0 for free jobs"
+      "Max payments to honour per job (default: configured value, else budget divided by auto-pay threshold rounded up with a minimum of 5, or 100 if unavailable); use 0 for free jobs"
     )
     .option("--output-type <mime>", "Desired output MIME type")
     .option("--no-stream", "Submit and return immediately; later asks use a supported credit mandate, otherwise need dvm messages <job> --wait or dvm pay <job>")

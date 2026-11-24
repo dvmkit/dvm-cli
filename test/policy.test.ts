@@ -55,14 +55,19 @@ describe("buildPolicy", () => {
 });
 
 it.each([
+  ["$1.00", "$1.00", 5],
+  ["$1.00", "$0.50", 5],
   ["$2.81", "$0.20", 15],
   ["$2.80", "$0.20", 14],
   ["$1.00", undefined, 100],
+  [undefined, "$1.00", 100],
 ])("derives the default count from budget %s and threshold %s", (budget, threshold, count) => {
   expect(defaultPaymentCount(budget, threshold, 100_000)).toBe(count);
 });
 
 it.each([
+  ["200000", "$0.10", 100_000, 5],
+  ["$0.20", "100000", 100_000, 5],
   ["3111080", "$0.20", 90_001, 15],
   ["3111076", "$0.20", 90_001, 14],
   ["$2.80", "222219", 90_001, 15],
