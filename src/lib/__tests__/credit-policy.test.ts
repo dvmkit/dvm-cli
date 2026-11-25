@@ -1260,18 +1260,21 @@ describe("planProbeDraw", () => {
     });
   });
 
-  it("uses native USD for the boundary and orders dollar limits in native USD", () => {
+  it.each([
+    ["$0.10", "$0.20"],
+    ["$0.1000000", "$0.2000000"],
+  ])("uses native USD for the boundary and orders dollar limits %s and %s", (budget, threshold) => {
     const dollarLimits = {
-      budget: { declared: "$0.10", msats: 150_000, source: "budget" },
-      threshold: { declared: "$0.20", msats: 50_000, source: "config_threshold" },
+      budget: { declared: budget, msats: 150_000, source: "budget" },
+      threshold: { declared: threshold, msats: 50_000, source: "config_threshold" },
     } as const;
-    expect(planProbeDraw({ ...base, ...dollarLimits, btcRate: 0,
-      quote: { ...fixed(100_000), priceMsats: 1_000_000 } }).mode).toBe("draw");
     expect(planProbeDraw({ ...base, ...dollarLimits, btcRate: 0,
       quote: { ...fixed(100_001), priceMsats: 1 } })).toMatchObject({
       mode: "none",
       drawSkipped: { ceilingSource: "budget", ceilingMicro: 100_000, lastPriceMicro: 100_001 },
     });
+    expect(planProbeDraw({ ...base, ...dollarLimits, btcRate: 0,
+      quote: { ...fixed(100_000), priceMsats: 1_000_000 } }).mode).toBe("draw");
     expect(planProbeDraw({ ...base, ...dollarLimits,
       quote: { ...fixed(210_000), priceMsats: 1 } })).toMatchObject({
       mode: "none", drawSkipped: { ceilingSource: "budget", ceilingMicro: 100_000 },

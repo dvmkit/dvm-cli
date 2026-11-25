@@ -14,7 +14,8 @@ export function quoteWithinDeclaredLimit(
 }
 
 export function dollarLimitMicro(declaredLimit: string): bigint | undefined {
-  const amount = /^\$(\d+)(?:\.(\d{1,6}))?$/.exec(declaredLimit.trim().replace(/^\$\./, "$0."));
+  // Extra trailing zeros preserve the exact microunit value.
+  const amount = /^\$(\d+)(?:\.(\d{1,6})0*)?$/.exec(declaredLimit.trim().replace(/^\$\./, "$0."));
   if (!amount) return undefined;
   const whole = BigInt(amount[1]);
   const fraction = BigInt((amount[2] || "").padEnd(6, "0"));
