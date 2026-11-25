@@ -22,7 +22,13 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { decodePaymentSignatureHeader, encodePaymentResponseHeader } from "@x402/core/http";
 import { privateKeyToAccount } from "viem/accounts";
-import { beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
+const balanceTransport = vi.hoisted(() => ({ describe: vi.fn(), credit: vi.fn(), close: vi.fn() }));
+vi.mock("../transport", () => ({ createDvmTransport: () => balanceTransport }));
+vi.mock("../output", async (original) => ({
+  ...await original<typeof import("../output")>(), json: vi.fn(),
+}));
 
 vi.mock("../btc-rate", () => ({
   tryResolveBtcUsdRate: vi.fn(() => Promise.resolve({ rate: 100_000, stale: false })),
@@ -33,17 +39,21 @@ vi.mock("../budget-ledger", () => ({
   recordSpendOnce: vi.fn(),
 }));
 
+import { creditBalance } from "../../commands/credit";
 import { fundCredit } from "../credit-fund";
+import * as batchClient from "../x402/batch-client";
 import { DvmError } from "@dvmkit/sdk/internal";
 import type { CreditMenu, ProviderInfo, Transport } from "@dvmkit/sdk/internal";
 import {
   attestedDvmIdentity,
   buildAttestation,
+  deriveIdentityFromPrivkey,
   deriveLegacyX402ChannelSalt,
   deriveX402ChannelSalt,
   DvmX402ChannelStorage,
   ensureProvisionalCredit,
   findX402Channel,
+  listPendingX402Fundings,
   listPendingX402FundingsForChannel,
   listX402Channels,
   loadCredit,
@@ -58,6 +68,8 @@ beforeEach(() => {
   rmSync(root, { recursive: true, force: true });
   mkdirSync(root, { recursive: true });
 });
+
+afterEach(() => vi.unstubAllEnvs());
 
 function fixture() {
   const key = `0x${"11".repeat(32)}` as `0x${string}`;
@@ -115,13 +127,14 @@ function fund(
   credit: ReturnType<typeof vi.fn>,
   creditId: string,
   providerInfo: ProviderInfo = {},
-  endpoint = fixture().endpoint
+  endpoint = fixture().endpoint,
+  signing = { privkey: "bb".repeat(32), pubkey: "cc".repeat(32) }
 ) {
   const { menu } = fixture();
   return fundCredit({
     transport: { credit } as unknown as Transport,
     ref: { endpoint },
-    signing: { privkey: "bb".repeat(32), pubkey: "cc".repeat(32) },
+    signing,
     creditId,
     fundId: `fund-${creditId}`,
     amountMicro: 200_000,
@@ -179,24 +192,90 @@ function fundedCredit(creditId: string) {
   };
 }
 
-it("signs different first-funding channels for two attested DVMs sharing an origin and payout terms", async () => {
+function batchFunding(creditId: string) {
   const { account, challenge, network } = fixture();
-  const channels: string[] = [];
-  for (const creditId of ["first", "second"]) {
-    const credit = vi.fn().mockRejectedValueOnce(challenge).mockResolvedValueOnce({
-      op: "fund",
-      funded_micro: 200_000,
-      credit: fundedCredit(creditId),
-      x402PaymentResponse: encodePaymentResponseHeader({
-        success: true, transaction: "0xsettled", network, payer: account.address,
-        extra: { chargedAmount: "200000" },
-      }),
+  return vi.fn().mockRejectedValueOnce(challenge).mockResolvedValueOnce({
+    op: "fund",
+    funded_micro: 200_000,
+    credit: fundedCredit(creditId),
+    x402PaymentResponse: encodePaymentResponseHeader({
+      success: true, transaction: "0xsettled", network, payer: account.address,
+      extra: { chargedAmount: "200000" },
+    }),
+  });
+}
+
+it("signs per-DVM v2 channels for provisional credits sharing an origin and payout terms", async () => {
+  const { endpoint } = fixture();
+  // Channel IDs computed from the v2 domain, attested DVM IDs and fixture payout terms.
+  const cases = [
+    ["first", "0xf98bae6bd996cf9efa8ff65705fc011aabe7db3cabc56edf68ecc39a315162d0"],
+    ["second", "0x3bd0b702c16ae7bfa96f4c3ee214bc75b00fd77cc6c82ff12cd63eb77a619107"],
+  ];
+  for (const [creditId, channelId] of cases) {
+    const provider = providerInfo(`dvm-${creditId}`);
+    const identity = attestedDvmIdentity(provider.builder)!;
+    ensureProvisionalCredit({
+      endpoint, identity, callerPubkey: "cc".repeat(32), creditId, targetMicro: 200_000, currency: "usd",
     });
-    await expect(fund(credit, creditId, providerInfo(`dvm-${creditId}`))).resolves.toMatchObject({ status: "funded" });
-    channels.push(signedChannel(credit));
+
+    const credit = batchFunding(creditId);
+    await expect(fund(credit, creditId, provider)).resolves.toMatchObject({ status: "funded" });
+    expect(signedChannel(credit)).toBe(channelId);
   }
-  expect(new Set(channels).size).toBe(2);
 });
+
+it.each(["unset", "provisional"] as const)(
+  "refuses a top-up after a signed balance adopts an unbound legacy credit (prior local selection: %s)",
+  async (selection) => {
+    const { endpoint, menu } = fixture();
+    const signer = deriveIdentityFromPrivkey("01".repeat(32));
+    vi.stubEnv("DVM_IDENTITY_KEY", signer.privkey);
+
+    const creditId = "adopted";
+    const provider = providerInfo("dvm-adopted");
+    const identity = attestedDvmIdentity(provider.builder)!;
+    if (selection === "provisional") {
+      ensureProvisionalCredit({
+        endpoint, identity, callerPubkey: signer.pubkey, creditId, targetMicro: 200_000, currency: "usd",
+      });
+    }
+    balanceTransport.describe.mockResolvedValue({
+      ...provider,
+      auth: ["secp256k1-schnorr-v2"],
+      authAudience: { dvm_id: identity.dvmId, builder_pubkey: identity.builderPubkey },
+    });
+    // The legacy credit's balance predates rail and instrument reporting.
+    const row = fundedCredit(creditId);
+    balanceTransport.credit.mockResolvedValue({ op: "balance", credit: row, credits: [row], menu });
+
+    await creditBalance(endpoint, {});
+
+    const adopted = loadCredit(endpoint, signer.pubkey, identity);
+    expect(adopted).toMatchObject({ creditId, status: "active", remainingMicro: row.remaining_micro });
+    expect(adopted?.provisional).toBeUndefined();
+    expect(adopted?.rail).toBeUndefined();
+    expect(adopted?.x402Instrument).toBeUndefined();
+    expect(listX402Channels()).toEqual([]);
+    const journal = listPendingX402Fundings();
+
+    const signVoucher = vi.spyOn(batchClient, "createX402BatchPayment");
+    const credit = batchFunding(creditId);
+    const result = await fund(credit, creditId, provider, endpoint, signer);
+
+    expect(credit.mock.calls.length > 1 ? [signedChannel(credit)] : []).toEqual([]);
+    expect(signVoucher).not.toHaveBeenCalled();
+    expect(credit).toHaveBeenCalledTimes(1);
+    expect(credit.mock.calls[0]?.[2]).toBeUndefined();
+    expect(result).toMatchObject({
+      status: "refused",
+      error: { code: "x402_channel_mismatch" },
+      hint: "Use the credit's original local channel record to retry, or use its channel ID for a timed on-chain withdrawal.",
+    });
+    expect(listX402Channels()).toEqual([]);
+    expect(listPendingX402Fundings()).toEqual(journal);
+  }
+);
 
 it("refuses to open a channel from a stored attestation alone", async () => {
   const { endpoint, challenge } = fixture();

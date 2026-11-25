@@ -1926,11 +1926,15 @@ async function fundOverX402(
       if (!required) return x402Refusal(args, base, err);
     }
     try {
+      // A signed balance can establish a credit without revealing its funding rail.
+      const establishedPrimary = credit?.creditId === args.creditId && !credit.provisional &&
+        (credit.status === "active" || credit.status === "expired");
       if (
         (replacingChannelId && recorded?.channelId !== replacingChannelId) ||
         (!recorded && (
           (identity && !creditScope.identity) ||
           binding.instrument === "x402_channel" ||
+          establishedPrimary ||
           (credit?.creditId === args.creditId &&
             (credit.x402Instrument === "x402_channel" || credit.rail === "x402")) ||
           credit?.siblingCredits?.some((sibling) => sibling.creditId === args.creditId)
