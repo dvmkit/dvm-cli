@@ -269,20 +269,16 @@ describe("automatic credit funding notices", () => {
 
     await request({ endpoint, input: "Echo", budget: "50000", autoPayBelow: "550000" });
 
-    if (hasHistory && posture === "auto") {
-      expect(terminal()).toMatchObject({
-        status: "over-budget",
-        next_action: { command: expect.stringContaining("--budget 100000") },
-      });
-      expect(seams.submit).toHaveBeenCalledTimes(submissions + 1);
-      expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
-    } else {
-      expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk" });
-      if (hasHistory) expect(terminal()).toMatchObject({ credit_suggestion: { reason: "open" } });
-      expect(seams.submit).toHaveBeenCalledTimes(submissions + 2);
-      expect(paidEnvelopes().at(-1)?.data).not.toHaveProperty("fund");
-      expect(seams.prepareAgentSpend.mock.calls.map(([args]) => args.amountSats)).toEqual([50]);
+    expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk" });
+    if (hasHistory && posture === "suggest") {
+      expect(terminal()).toMatchObject({ credit_suggestion: { reason: "open" } });
     }
+    expect(seams.submit).toHaveBeenCalledTimes(submissions + 2);
+    const data = paidEnvelopes().at(-1)?.data;
+    expect(data).not.toHaveProperty("fund");
+    expect(data).not.toHaveProperty("credit_id");
+    expect(data).not.toHaveProperty("draw_id");
+    expect(seams.prepareAgentSpend.mock.calls.map(([args]) => args.amountSats)).toEqual([50]);
   });
 
   it.each([
@@ -305,6 +301,47 @@ describe("automatic credit funding notices", () => {
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { budget: "50000", paysPerCall: true, walletAmounts: [50] },
+    { budget: "49999", paysPerCall: false, walletAmounts: [] },
+  ])("handles an over-budget prepaid draw with a $budget msat budget", async ({
+    budget, paysPerCall, walletAmounts,
+  }) => {
+    const { setCaps } = await import("../src/lib/budget-ledger");
+    seams.rate = 100_000;
+    seedCredit(20_000);
+    setCaps({ dailyUsd: 10 });
+    const { credit } = await seams.describe();
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" },
+      priceMsats: 50_000,
+      credit,
+    }] });
+    const prepareSpend = seams.prepareAgentSpend.getMockImplementation()!;
+    seams.prepareAgentSpend.mockImplementation(async (args) => args.amountSats <= 75
+      ? { ...await prepareSpend(args), swapFeeSats: 0 }
+      : { error: { code: "insufficient_balance", message: "Wallet has 75 sats." } });
+
+    await request({ endpoint, input: "Echo", autoPay: true, budget, autoPayBelow: "550000" });
+
+    const paid = paidEnvelopes();
+    if (paysPerCall) {
+      expect(terminal()).toMatchObject({ summary: "Done", paidWith: "cashu_p2pk", amountSats: 50 });
+      expect(paid).toHaveLength(1);
+      expect(paid[0].data).not.toHaveProperty("fund");
+      expect(paid[0].data).not.toHaveProperty("credit_id");
+      expect(paid[0].data).not.toHaveProperty("draw_id");
+    } else {
+      expect(terminal()).toMatchObject({ status: "over-budget" });
+      expect(paid).toEqual([]);
+    }
+    expect(seams.prepareAgentSpend.mock.calls.map(([args]) => args.amountSats)).toEqual(walletAmounts);
+    expect(sdk.loadCredit(endpoint, sdk.receiptPubkeyFromSecret(secret))).toMatchObject({
+      remainingMicro: 20_000,
+      balanceMicro: 20_000,
+    });
+  });
+
   it("pays per-call when the global cap covers the job but rules out its credit deposit", async () => {
     const { setCaps } = await import("../src/lib/budget-ledger");
     seams.rate = 100_000;
@@ -318,11 +355,31 @@ describe("automatic credit funding notices", () => {
       credit,
     }] });
 
-    await request({ endpoint, input: "Echo", budget: "50000", autoPayBelow: "550000" });
+    await request({ endpoint, input: "Echo", budget: "100000", autoPayBelow: "550000" });
 
     expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk" });
+    expect(seams.info).toHaveBeenCalledWith(expect.stringContaining("Daily budget would be exceeded"));
     expect(seams.prepareAgentSpend.mock.calls.map(([args]) => args.amountSats)).toEqual([50]);
     expect(paidEnvelopes().at(-1)?.data).not.toHaveProperty("fund");
+  });
+
+  it("checks the rounded Cashu charge against the global cap when the prepaid draw exceeds budget", async () => {
+    const { setCaps } = await import("../src/lib/budget-ledger");
+    seams.rate = 100_000;
+    seedCredit(20_000);
+    setCaps({ dailyUsd: 0.0505 });
+    const { credit } = await seams.describe();
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" },
+      priceMsats: 50_001,
+      credit,
+    }] });
+
+    await expect(request({ endpoint, input: "Echo", autoPay: true, budget: "51000", autoPayBelow: "550000" }))
+      .rejects.toMatchObject({ code: "budget_exceeded" });
+
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+    expect(paidEnvelopes()).toEqual([]);
   });
 
   it.each([
