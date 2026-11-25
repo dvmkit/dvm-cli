@@ -35,10 +35,23 @@ async function quoteFromWire(body: Record<string, unknown>) {
 }
 
 describe("transport quote prices in the credit draw gate", () => {
+  it.each([undefined, "fixed"])("rejects a legacy millisat quote with shape %s without receipts", async (shape) => {
+    const quote = await quoteFromWire({ price_msats: 830_000, shape });
+    const budget = { ...policy.budget, declared: "$0.06" };
+    expect(planProbeDraw({ ...policy, budget, quote, receipts: [] })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", ceilingSource: "budget",
+        lastPriceMsats: 830_000, ceilingMsats: 60_000 },
+    });
+    expect(JSON.parse(JSON.stringify(quote.upfront))).toEqual({ amount: 0, currency: "usd" });
+  });
+
+  it("uses a legacy millisat quote at the ceiling ahead of a more expensive receipt", async () => {
+    const quote = await quoteFromWire({ price_msats: 60_000 });
+    expect(planProbeDraw({ ...policy, quote }).mode).toBe("draw");
+  });
+
   it.each([
-    ["legacy sats", { price_msats: 830_000 }],
-    ["legacy zero sats", { price_msats: 0 }],
-    ["legacy fixed shape", { price_msats: 830_000, shape: "fixed" }],
+    ["legacy zero millisats", { price_msats: 0 }],
     ["missing price", {}],
   ])("uses capability history for a %s quote", async (_label, body) => {
     const quote = await quoteFromWire(body);

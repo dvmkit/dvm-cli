@@ -909,7 +909,9 @@ function priceAboveDrawCeiling(
     const ceilingMicro = dollars === undefined ? convertedMicro(ceiling.msats) : Number(dollars);
     const freeDollarQuote = dollars !== undefined && quoteMicro === 0 && !quote?.requiredUsdcMicro;
     const above = quote
-      ? !freeDollarQuote && !quoteWithinDeclaredLimit(quote, ceiling.msats, ceiling.declared, rail)
+      ? hasKnownUpfrontPrice(quote)
+        ? !freeDollarQuote && !quoteWithinDeclaredLimit(quote, ceiling.msats, ceiling.declared, rail)
+        : quote.priceMsats > ceiling.msats
       : receiptMicro !== undefined && ceilingMicro !== undefined &&
         (dollars === undefined ? receiptMicro > ceilingMicro : BigInt(receiptMicro) > dollars);
     return above ? { ceiling, dollars, ceilingMicro } : undefined;
@@ -944,7 +946,11 @@ function priceAboveDrawCeiling(
 }
 
 function upfrontDrawQuote(quote: Quote | undefined, btcRate: number): Quote | undefined {
-  if (!quote || !hasKnownUpfrontPrice(quote)) return undefined;
+  if (!quote) return undefined;
+  // Legacy quotes can state a millisat price without a native upfront amount.
+  if (!hasKnownUpfrontPrice(quote)) {
+    return Number.isFinite(quote.priceMsats) && quote.priceMsats > 0 ? quote : undefined;
+  }
   // A zero upfront on a metered job does not establish the draw price.
   if (quote.shape === "rate" && (quote.upfront.amount_micro ?? quote.upfront.amount) <= 0)
     return undefined;
