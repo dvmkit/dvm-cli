@@ -9,7 +9,7 @@ import { finishBookedSubmission, midJobSpendLabel } from "./taken-payment";
 import { sameEndpoint } from "./job-access";
 import { unknownUpfrontCreditError } from "./upfront-credit-error";
 import { bookedCreditPayment, sendCreditPayment, tryCreditPayment } from "./credit-payment";
-import { sendTempoCredential, tempoBroadcastOutcome, tempoBroadcastRefusal } from "./payment-rails/tempo-broadcast";
+import { isTempoBroadcastOutcome, sendTempoCredential, tempoBroadcastOutcome, tempoBroadcastRefusal } from "./payment-rails/tempo-broadcast";
 import { buildTempoCredential } from "./payment-rails/tempo-credential";
 import {
   DvmError,
@@ -46,6 +46,7 @@ import {
   type JobRecord,
   markPaymentRequestPaid,
   markPaymentRequestInFlight,
+  recordTempoPendingSettlement,
   blockHeldPayment,
   type PaymentApproval,
   type UnconfirmedPaymentSubmission,
@@ -437,6 +438,12 @@ async function handleLockedPaymentRequest(
         jobId, request, requestSeq: opts.requestSeq, submission: unconfirmed,
         transport, provider, jobToken, rail: opts.rail,
       });
+    // Older versions could mark a short Tempo reply as credit held without
+    // receiving a credit receipt. The saved credential can still settle.
+    if (unconfirmed.rail === "tempo" && unconfirmed.blocked.reason === "credit_held") {
+      blockHeldPayment(jobId, opts.requestSeq, { reason: "not_resendable", detail: TEMPO_UNCONFIRMED_DETAIL });
+      throw unconfirmedPaymentError(jobId, TEMPO_UNCONFIRMED_DETAIL);
+    }
     if (unconfirmed.blocked.reason === "not_resendable")
       throw unconfirmedPaymentError(jobId, "Sending the earlier payment for this request again cannot settle it.",
         paymentInFlightHint(jobId, loadJob(jobId), opts.requestSeq));
@@ -638,6 +645,16 @@ function unconfirmedPaymentError(jobId: string, message: string, hint = unresend
   return new DvmError("payment_unconfirmed", `${message} No new payment was signed.`, hint);
 }
 
+const TEMPO_UNCONFIRMED_DETAIL = "The earlier Tempo payment may still settle.";
+
+function assertTempoReplayUnexpired(jobId: string, requestSeq: number, expires: string | undefined): void {
+  if (Date.parse(expires ?? "") <= Date.now()) {
+    const detail = "The earlier Tempo challenge expired and the payment's settlement is still unconfirmed.";
+    blockHeldPayment(jobId, requestSeq, { reason: "not_resendable", detail });
+    throw unconfirmedPaymentError(jobId, detail);
+  }
+}
+
 function holdsPayment(job: JobRecord, requestSeq: number): boolean {
   return job.inFlightPaymentRequestSeqs?.includes(requestSeq) === true ||
     job.unconfirmedPaymentSubmissions?.[requestSeq] !== undefined;
@@ -665,6 +682,10 @@ async function redeliverUnconfirmedPayment(args: {
   if (args.rail !== undefined && args.rail !== sentRail)
     throw unconfirmedPaymentError(jobId, `An unconfirmed ${sentRail} payment was already sent for this request.`,
       `Re-send it with \`dvm pay ${guidanceJobArg(jobId)}\` without --rail; it re-delivers that same payment.`);
+  if (submission.rail === "tempo") {
+    const credential = submission.content.tempo_credential as MppxCredential | undefined;
+    assertTempoReplayUnexpired(jobId, args.requestSeq, credential?.challenge?.expires);
+  }
   if (submission.rail !== "cashu_p2pk")
     return deliverSignedRailPayment({ ...args, submission, redelivery: true });
 
@@ -1015,20 +1036,68 @@ async function sendRailPayment(
   };
   // Persist before dispatch: a lost reply cannot distinguish a rejected send
   // from a payment the provider already accepted.
-  if (requestSeq !== undefined) markPaymentRequestInFlight(jobId, requestSeq, submission);
+  const replayingTempo = redelivery && submission?.rail === "tempo";
+  if (requestSeq !== undefined) {
+    try {
+      markPaymentRequestInFlight(jobId, requestSeq, submission);
+    } catch (error) {
+      if (replayingTempo) blockHeldPayment(jobId, requestSeq, { reason: "not_resendable", detail: TEMPO_UNCONFIRMED_DETAIL });
+      throw error;
+    }
+  }
+  const tempoCredential = submission?.rail === "tempo"
+    ? submission.content.tempo_credential as MppxCredential | undefined
+    : undefined;
+  const tempoExpires = tempoCredential?.challenge?.expires;
+  // The journal write can wait for the jobs lock while a replay's challenge expires.
+  if (replayingTempo && requestSeq !== undefined)
+    assertTempoReplayUnexpired(jobId, requestSeq, tempoExpires);
+
+  const savedSettlement = submission?.rail === "tempo" ? submission.tempoPendingSettlement : undefined;
+  // Journal evidence supplies metadata for the locally authored replay error.
+  let pendingSettlement = savedSettlement && new DvmError("payment_invalid", "Tempo settlement unconfirmed.", undefined, {
+    rail: "tempo", reason: "settlement_unconfirmed",
+    retryable: savedSettlement.retryable,
+    transaction_hash: savedSettlement.transaction_hash,
+  });
+  let sends = 0;
   let result: Awaited<ReturnType<Transport["sendMessage"]>>;
   try {
-    const send = () => transport.sendMessage(jobId, message, provider, options);
-    result = await (submission?.rail === "tempo" ? sendTempoCredential(send) : send());
+    const send = () => {
+      sends++;
+      return transport.sendMessage(jobId, message, provider, options);
+    };
+    if (submission?.rail === "tempo") {
+      result = await sendTempoCredential(send, {
+        expires: tempoExpires,
+        onPendingSettlement: (refusal) => {
+          pendingSettlement = refusal;
+          if (requestSeq === undefined) return;
+          const { retryable, transaction_hash } = refusal.data ?? {};
+          recordTempoPendingSettlement(jobId, requestSeq, {
+            ...(typeof retryable === "boolean" ? { retryable } : {}),
+            ...(typeof transaction_hash === "string" ? { transaction_hash } : {}),
+          });
+        },
+      });
+    } else {
+      result = await send();
+    }
   } catch (error) {
     // A failure after deposit acceptance can still carry signed funding evidence.
     if (error instanceof DvmError && error.data) capture(error.data);
     const accepted = error instanceof DvmError && error.code === "payment_unapplied" ? error.data?.paymentCredit as PaymentCredit | undefined : undefined;
     if (accepted && submission) result = { seq: 0, credit: accepted } as CreditMessageResult;
     else {
-      const outcome = sendOutcome(error, submission, redelivery);
-      // The agent reads this error, so it names the payment as possibly settled.
-      const surfaced = submission?.rail === "tempo" ? tempoBroadcastOutcome(error) : error;
+      const tempo = submission?.rail === "tempo";
+      let surfaced = error;
+      let outcome: SendOutcome;
+      if (tempo && (replayingTempo || sends > 1 || pendingSettlement)) {
+        ({ surfaced, outcome } = tempoContinuationFailure(jobId, error, pendingSettlement));
+      } else {
+        if (tempo) surfaced = tempoBroadcastOutcome(error);
+        outcome = sendOutcome(surfaced, submission, redelivery);
+      }
       if (requestSeq === undefined) {
         if (outcome.kind === "taken" && error instanceof DvmError && error.code === "replay_rejected") return { tracked: false };
         throw surfaced;
@@ -1084,13 +1153,39 @@ type SendOutcome =
   | { kind: "taken" | "refused" | "not_sent" | "unknown" }
   | { kind: "blocked"; blocked: HeldPaymentBlock };
 
+function tempoContinuationFailure(jobId: string, error: unknown, pendingSettlement?: DvmError):
+  { surfaced: unknown; outcome: SendOutcome } {
+  // The SDK's structured replay acknowledgement refers to the payment just
+  // presented. Its not_broadcast response follows a chain check and release
+  // of the replay marker. The SDK gives no distinct wire evidence of expiry
+  // without inclusion, so even an expired reason alone cannot release a hold.
+  if (error instanceof DvmError && error.data?.code_source !== "inferred"
+    && error.data?.payment_state !== "unknown" && error.data?.status !== "unknown") {
+    if (error.code === "replay_rejected" && error.data?.http_status === 409)
+      return { surfaced: error, outcome: { kind: "taken" } };
+    if (error.data?.http_status === 402 && error.data.retryable === true && tempoBroadcastRefusal(error) === "not_broadcast") {
+      const surfaced = new DvmError("payment_invalid", "The provider confirmed the earlier Tempo payment was not broadcast.",
+        undefined, { rail: "tempo", reason: "not_broadcast" });
+      return { surfaced, outcome: { kind: "refused" } };
+    }
+  }
+
+  const broadcast = tempoBroadcastOutcome(pendingSettlement ?? error);
+  const surfaced = broadcast instanceof DvmError && isTempoBroadcastOutcome(broadcast)
+    ? broadcast
+    : unconfirmedPaymentError(jobId, TEMPO_UNCONFIRMED_DETAIL);
+  return { surfaced, outcome: { kind: "blocked", blocked: {
+    reason: "not_resendable", detail: surfaced.display ?? TEMPO_UNCONFIRMED_DETAIL,
+  } } };
+}
+
 function sendOutcome(error: unknown, submission: UnconfirmedPaymentSubmission | undefined, redelivery: boolean | undefined): SendOutcome {
   if (!(error instanceof DvmError)) return { kind: requestNeverSent(error) ? "not_sent" : "unknown" };
   if (error.code === "replay_rejected") return { kind: "taken" };
   // The signed transfer may still land, so the ask stays held and no new
   // credential is signed for it.
-  if (submission?.rail === "tempo" && tempoBroadcastRefusal(error))
-    return { kind: "blocked", blocked: { reason: "not_resendable", detail: (tempoBroadcastOutcome(error) as DvmError).display ?? "The Tempo payment may still settle." } };
+  if (submission?.rail === "tempo" && isTempoBroadcastOutcome(error))
+    return { kind: "blocked", blocked: { reason: "not_resendable", detail: error.display ?? "The Tempo payment may still settle." } };
   const status = error.data?.http_status;
   if (typeof status !== "number" || status < 400 || status >= 500) return { kind: "unknown" };
   // A code the transport filled in for a body that named none proves nothing.
@@ -1118,14 +1213,11 @@ function sendOutcome(error: unknown, submission: UnconfirmedPaymentSubmission | 
     return { kind: "blocked", blocked: { reason: "not_resendable",
       detail: "The provider did not take this payment, because its request id already carries a different payment there." } };
   if (!DEFINITE_REFUSALS.has(error.code)) return { kind: "unknown" };
-  // After a lost first send, `payment_invalid` may mean the provider already
-  // took this credential: it answers that way for a Tempo credential it used,
-  // and for an x402 authorization it settled before writing its replay marker.
-  // An authorization that never settled stays unpaid, so holding loses nothing.
-  if (redelivery && submission && submission.rail !== "cashu_p2pk" && error.code === "payment_invalid")
-    return { kind: "blocked", blocked: { reason: "not_resendable", detail: submission.rail === "tempo"
-      ? "The provider refused the earlier Tempo credential, which it also does for one it already used."
-      : `${x402RefusalNote(submission.content.x402_payment)} It also answers that way for an authorization it already settled.` } };
+  // A provider also refuses an x402 authorization it settled before writing
+  // its replay marker. Keep the earlier payment when its first reply was lost.
+  if (redelivery && submission?.rail === "x402" && error.code === "payment_invalid")
+    return { kind: "blocked", blocked: { reason: "not_resendable",
+      detail: `${x402RefusalNote(submission.content.x402_payment)} It also answers that way for an authorization it already settled.` } };
   return { kind: "refused" };
 }
 

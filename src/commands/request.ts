@@ -2568,6 +2568,16 @@ async function tryTempoPayment(
   return true;
 }
 
+function tempoResendUnconfirmed(): DvmError {
+  return new DvmError(
+    "tempo_settlement_unconfirmed",
+    "The provider did not confirm the outcome of the resent Tempo payment.",
+    "Do not pay again. The signed transfer may still settle. Contact the provider with the request id.",
+    { rail: "tempo", payment_state: "unknown" },
+    "The Tempo payment may still settle. Do not pay again."
+  );
+}
+
 export async function payWithTempo(args: RailAttemptArgs, credential: MppxCredential): Promise<void> {
   const { transport, ref, envelope, chosen, opts, identity, policy, account, btcRate } = args;
   const dvmFields = dvmIdentity(identity.dvmId, identity.capability);
@@ -2600,18 +2610,28 @@ export async function payWithTempo(args: RailAttemptArgs, credential: MppxCreden
     });
   }
 
-  // the credential is signed and single-use — the money is committed
-  // the moment this POST lands. Never abort it on a deadline sliver.
+  const { Credential } = await import("mppx");
+  const payment = { mppCredentialRaw: Credential.serialize(credential) };
+  let pendingSettlement: DvmError | undefined;
+  let sends = 0;
   let receipt;
   try {
-    receipt = await sendTempoCredential(() =>
-      transport.submit(
-        ref,
-        envelope,
-        { mppCredential: credential },
-        { timeoutMs: paidSubmitTimeoutMs(args.deadlineMs) }
-      )
+    receipt = await sendTempoCredential(
+      () => {
+        sends++;
+        // Each paid POST keeps its timeout floor once the resend is dispatched.
+        return transport.submit(ref, envelope, payment, { timeoutMs: paidSubmitTimeoutMs(args.deadlineMs) });
+      },
+      {
+        expires: credential.challenge.expires,
+        deadlineMs: args.deadlineMs,
+        onPendingSettlement: (refusal) => { pendingSettlement = refusal; },
+      }
     );
+    if (receipt.status === "payment-required" && (pendingSettlement || sends > 1)) {
+      transport.close?.();
+      throw pendingSettlement ?? tempoResendUnconfirmed();
+    }
   } catch (err) {
     const unconfirmed = (key: string | undefined) =>
       recordUnconfirmedSpend({
@@ -2621,15 +2641,23 @@ export async function payWithTempo(args: RailAttemptArgs, credential: MppxCreden
         endpoint: ref.endpoint,
         capability: identity.capability,
       });
-    const tempoOutcome = tempoBroadcastOutcome(err);
+    const tempoOutcome = tempoBroadcastOutcome(err, pendingSettlement);
     if (isTempoBroadcastOutcome(tempoOutcome)) {
       // The transfer may still land, so the ledger keeps it as spent.
       unconfirmed(unconfirmedSpendKey(opts, tempoOutcome as DvmError));
       throw tempoOutcome;
     }
     if (!isIdentityFailure(err)) {
-      if (leavesOutcomeUnknown(raisedAfterPayment(err))) {
+      const unknown = leavesOutcomeUnknown(raisedAfterPayment(err));
+      if (unknown) {
         unconfirmed(unconfirmedSpendKey(opts, err as DvmError));
+        throw err;
+      }
+      // A refusal of the resend does not establish whether the signed transfer settled.
+      if (pendingSettlement || sends > 1) {
+        const outcome = pendingSettlement ? tempoBroadcastOutcome(pendingSettlement) : tempoResendUnconfirmed();
+        unconfirmed(unconfirmedSpendKey(opts, outcome as DvmError));
+        throw outcome;
       }
       throw err;
     }
