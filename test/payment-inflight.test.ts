@@ -624,6 +624,32 @@ describe("mid-job payment rail selection", () => {
       } finally { vi.useRealTimers(); }
     });
 
+    it("keeps a pending Tempo payment held when recovery reaches challenge expiry", async () => {
+      vi.useFakeTimers();
+      try {
+        const { store, jobId, transport, pay, credential } = await tempoPay("tempo-settlement-expired-replay", 45_000);
+        transport.sendMessage.mockRejectedValueOnce(refusal("settlement_unconfirmed", true, 0))
+          .mockRejectedValueOnce(new DvmError("timeout", "Resend reply lost"));
+
+        await expect(pay()).rejects.toMatchObject({ code: "timeout" });
+        await vi.advanceTimersByTimeAsync(45_000);
+
+        const replay = await pay("explicit").catch((error: unknown) => error);
+        expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+        expect(replay).toMatchObject({ code: "payment_unconfirmed" });
+        const held = store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5];
+        expect(held).toMatchObject({
+          rail: "tempo", content: { tempo_credential: credential },
+          tempoPendingSettlement: { retryable: true }, blocked: { reason: "not_resendable" },
+        });
+        await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_unconfirmed" });
+        expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toEqual(held);
+        expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+        expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
+        expect(sdk.recordSpend).not.toHaveBeenCalled();
+      } finally { vi.useRealTimers(); }
+    });
+
     it.each([undefined, "expired"])("holds the original submission when a resend is refused with reason %s", async (reason) => {
       const { store, jobId, transport, pay, credential } = await tempoPay(`tempo-settlement-ambiguous-${reason}`);
       transport.sendMessage.mockRejectedValueOnce(refusal("settlement_unconfirmed", true, 0))

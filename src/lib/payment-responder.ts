@@ -666,6 +666,14 @@ async function redeliverUnconfirmedPayment(args: {
   if (args.rail !== undefined && args.rail !== sentRail)
     throw unconfirmedPaymentError(jobId, `An unconfirmed ${sentRail} payment was already sent for this request.`,
       `Re-send it with \`dvm pay ${guidanceJobArg(jobId)}\` without --rail; it re-delivers that same payment.`);
+  if (submission.rail === "tempo") {
+    const credential = submission.content.tempo_credential as MppxCredential | undefined;
+    if (Date.parse(credential?.challenge?.expires ?? "") <= Date.now()) {
+      const detail = "The earlier Tempo challenge expired and the payment's settlement is still unconfirmed.";
+      blockHeldPayment(jobId, args.requestSeq, { reason: "not_resendable", detail });
+      throw unconfirmedPaymentError(jobId, detail);
+    }
+  }
   if (submission.rail !== "cashu_p2pk")
     return deliverSignedRailPayment({ ...args, submission, redelivery: true });
 
