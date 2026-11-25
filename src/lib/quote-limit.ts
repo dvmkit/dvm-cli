@@ -14,12 +14,23 @@ export function quoteWithinDeclaredLimit(
 }
 
 export function dollarLimitMicro(declaredLimit: string): bigint | undefined {
-  // Extra trailing zeros preserve the exact microunit value.
-  const amount = /^\$(\d+)(?:\.(\d{1,6})0*)?$/.exec(declaredLimit.trim().replace(/^\$\./, "$0."));
+  const text = declaredLimit.trim();
+  if (!text.startsWith("$")) return undefined;
+  const value = text.slice(1).trimStart();
+  if (!Number.isFinite(parseFloat(value))) return undefined;
+
+  // Match the decimal prefix accepted by parseBudget without rounding it to a float.
+  const amount = /^([+-]?)(\d+\.?\d*|\.\d+)(?:e([+-]?\d+))?/i.exec(value);
   if (!amount) return undefined;
-  const whole = BigInt(amount[1]);
-  const fraction = BigInt((amount[2] || "").padEnd(6, "0"));
-  return whole * 1_000_000n + fraction;
+  const [, sign, mantissa, exponent] = amount;
+  const [whole, fraction = ""] = mantissa.split(".");
+  const digits = whole + fraction;
+  if (!/[1-9]/.test(digits)) return 0n;
+  const places = Math.max(0, whole.length + Number(exponent ?? 0) + 6);
+  const micro = BigInt(digits.slice(0, places).padEnd(places, "0") || "0");
+  if (sign !== "-") return micro;
+  // A whole-microunit charge must fit under the declaration, even below zero.
+  return /[1-9]/.test(digits.slice(places)) ? -micro - 1n : -micro;
 }
 
 function quoteWithinNativeDollarLimit(

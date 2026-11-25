@@ -28,6 +28,7 @@ import type { StoredReceipt } from "@dvmkit/sdk/internal";
 import { type AttestedDvmIdentity, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
 import type { CreditMenu, Quote } from "@dvmkit/sdk/internal";
 import { offersX402CreditFunding } from "@dvmkit/sdk/internal";
+import { decimalRatio } from "./currency";
 import { dollarLimitMicro, quoteWithinDeclaredLimit } from "./quote-limit";
 import { hasKnownUpfrontPrice } from "./quote-upfront";
 
@@ -901,20 +902,29 @@ function priceAboveDrawCeiling(
   const quote = upfrontDrawQuote(args.quote, args.btcRate);
   const receiptMicro = quote ? undefined : drawnPriceMicro(args, credit);
   const quoteMicro = quote?.upfront.currency === "usd" ? quote.upfront.amount_micro : undefined;
+  const rate = args.btcRate > 0 ? decimalRatio(String(args.btcRate)) : undefined;
   const convertedMicro = (msats: number) =>
-    args.btcRate > 0 ? msatsToMicro(msats, args.btcRate) : undefined;
+    rate ? msatsToMicro(msats, args.btcRate) : undefined;
   const rejected = (ceiling: DrawCeiling | undefined) => {
     if (!ceiling) return undefined;
     const dollars = dollarLimitMicro(ceiling.declared);
-    const ceilingMicro = dollars === undefined ? convertedMicro(ceiling.msats) : Number(dollars);
-    const freeDollarQuote = dollars !== undefined && quoteMicro === 0 && !quote?.requiredUsdcMicro;
+    // A USD draw can cost more than its advisory millisats suggest. Compare its
+    // native charge to the bare-msat ceiling without rounding the FX result up.
+    const millisatCapMicro = rate && dollars === undefined && Number.isInteger(ceiling.msats)
+      ? BigInt(ceiling.msats) * rate[0] / (100_000n * rate[1])
+      : undefined;
+    const nativeCap = dollars ?? millisatCapMicro;
+    const ceilingMicro = nativeCap === undefined ? undefined : Number(nativeCap);
+    const nativeAbove = millisatCapMicro !== undefined && quoteMicro !== undefined &&
+      BigInt(quoteMicro) > millisatCapMicro;
+    const freeDollarQuote = dollars !== undefined && dollars >= 0n &&
+      quoteMicro === 0 && !quote?.requiredUsdcMicro;
     const above = quote
-      ? hasKnownUpfrontPrice(quote)
+      ? nativeAbove || (hasKnownUpfrontPrice(quote)
         ? !freeDollarQuote && !quoteWithinDeclaredLimit(quote, ceiling.msats, ceiling.declared, rail)
-        : quote.priceMsats > ceiling.msats
-      : receiptMicro !== undefined && ceilingMicro !== undefined &&
-        (dollars === undefined ? receiptMicro > ceilingMicro : BigInt(receiptMicro) > dollars);
-    return above ? { ceiling, dollars, ceilingMicro } : undefined;
+        : quote.priceMsats > ceiling.msats)
+      : receiptMicro !== undefined && nativeCap !== undefined && BigInt(receiptMicro) > nativeCap;
+    return above ? { ceiling, dollars, ceilingMicro, nativeAbove } : undefined;
   };
   const budget = rejected(args.budget);
   const threshold = rejected(args.threshold);
@@ -930,7 +940,7 @@ function priceAboveDrawCeiling(
     ? Number(quote.requiredUsdcMicro)
     : undefined;
   const quotedMicro = quote
-    ? (binding.dollars === undefined ? undefined : usdc ?? quoteMicro) ??
+    ? (binding.nativeAbove ? quoteMicro : binding.dollars === undefined ? undefined : usdc ?? quoteMicro) ??
       convertedMicro(quote.priceMsats)
     : undefined;
   return {

@@ -601,6 +601,8 @@ describe("initial prepaid draw limits", () => {
 
   it.each([
     { name: "budget and higher threshold", flags: ["--budget", "$0.05", "--auto-pay-below", "$0.55"], outcome: "over-budget" },
+    { name: "exponent budget just below the native price", flags: ["--budget", "$9.999995e-2", "--auto-pay-below", "$0.55"],
+      outcome: "over-budget", ceilingMicro: 99_999 },
     { name: "budget only", flags: ["--budget", "$0.05"], outcome: "over-budget" },
     { name: "budget and threshold from config", config: { defaultBudget: "$0.05", autoPayThreshold: "$0.55" },
       flags: [], outcome: "over-budget" },
@@ -612,7 +614,7 @@ describe("initial prepaid draw limits", () => {
     { name: "threshold only", flags: ["--auto-pay-below", "$0.55"], outcome: "draw" },
     { name: "no limits", flags: [], outcome: "draw" },
     { name: "selected credit only", flags: ["--budget", "$0.05"], outcome: "credit-only-unavailable" },
-  ])("$name", async ({ flags, config, outcome }) => {
+  ])("$name", async ({ flags, config, outcome, ceilingMicro = 50_000 }) => {
     const before = await control({ op: "snapshot", ids: [] });
     const creditId = String(credit.creditId);
     const initial = {
@@ -661,7 +663,7 @@ describe("initial prepaid draw limits", () => {
         credit_draw_skipped: {
           reason: "price_above_ceiling",
           ceiling_source: "budget",
-          ceiling_micro: 50_000,
+          ceiling_micro: ceilingMicro,
           last_price_micro: 100_000,
           hint: expect.stringContaining("--budget"),
         },

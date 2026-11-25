@@ -45,6 +45,27 @@ describe("transport quote prices in the credit draw gate", () => {
     expect(JSON.parse(JSON.stringify(quote.upfront))).toEqual({ amount: 0, currency: "usd" });
   });
 
+  it.each([
+    { btcRate: 100_000, mode: "draw" },
+    { btcRate: 99_999.5, mode: "none" },
+  ])("checks the native draw price with USD/BTC at $btcRate", async ({ btcRate, mode }) => {
+    const quote = await quoteFromWire({
+      price_msats: 50_000,
+      upfront: { amount: 0.1, amount_micro: 100_000, currency: "usd" },
+    });
+    const budget = { ...policy.budget, declared: "100000", msats: 100_000 };
+    const plan = planProbeDraw({ ...policy, btcRate, budget, quote, receipts: [] });
+    expect(plan.mode).toBe(mode);
+    if (mode === "none") {
+      expect(plan).toMatchObject({
+        drawSkipped: {
+          reason: "price_above_ceiling", ceilingSource: "budget",
+          ceilingMicro: 99_999, lastPriceMicro: 100_000,
+        },
+      });
+    }
+  });
+
   it("uses a legacy millisat quote at the ceiling ahead of a more expensive receipt", async () => {
     const quote = await quoteFromWire({ price_msats: 60_000 });
     expect(planProbeDraw({ ...policy, quote }).mode).toBe("draw");

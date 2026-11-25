@@ -1263,6 +1263,8 @@ describe("planProbeDraw", () => {
   it.each([
     ["$0.10", "$0.20"],
     ["$0.1000000", "$0.2000000"],
+    ["$1e-1", "$.2e0"],
+    ["$0.1000009", "$0.2000009"],
   ])("uses native USD for the boundary and orders dollar limits %s and %s", (budget, threshold) => {
     const dollarLimits = {
       budget: { declared: budget, msats: 150_000, source: "budget" },
