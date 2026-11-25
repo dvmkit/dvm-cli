@@ -741,6 +741,10 @@ describe("mid-job payment rail selection", () => {
         error: new DvmError("payment_invalid", "Provider prose.", undefined, {
           http_status: 402, rail: "tempo", reason: "not_broadcast", retryable: true, status: "unknown",
         }) },
+      { name: "not_broadcast with unknown payment state", disposition: "held", resends: true,
+        error: new DvmError("payment_invalid", "Provider prose.", undefined, {
+          http_status: 402, rail: "tempo", reason: "not_broadcast", retryable: true, payment_state: "unknown",
+        }) },
       { name: "expired", disposition: "held", error: refusal("expired") },
       { name: "invalid_request", disposition: "held",
         error: new DvmError("invalid_request", "Invalid request", undefined, { http_status: 400 }) },
