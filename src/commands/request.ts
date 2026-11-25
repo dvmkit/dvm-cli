@@ -2514,18 +2514,21 @@ export async function payWithTempo(args: RailAttemptArgs, credential: MppxCreden
     });
   }
 
-  // the credential is signed and single-use — the money is committed
-  // the moment this POST lands. Never abort it on a deadline sliver.
+  const { Credential } = await import("mppx");
+  const payment = { mppCredentialRaw: Credential.serialize(credential) };
+  let pendingSettlement: DvmError | undefined;
   let receipt;
   try {
-    receipt = await sendTempoCredential(() =>
-      transport.submit(
-        ref,
-        envelope,
-        { mppCredential: credential },
-        { timeoutMs: paidSubmitTimeoutMs(args.deadlineMs) }
-      )
+    receipt = await sendTempoCredential(
+      // Each paid POST keeps its timeout floor once the resend is dispatched.
+      () => transport.submit(ref, envelope, payment, { timeoutMs: paidSubmitTimeoutMs(args.deadlineMs) }),
+      {
+        expires: credential.challenge.expires,
+        deadlineMs: args.deadlineMs,
+        onPendingSettlement: (refusal) => { pendingSettlement = refusal; },
+      }
     );
+    if (receipt.status === "payment-required" && pendingSettlement) throw pendingSettlement;
   } catch (err) {
     const unconfirmed = (key: string | undefined) =>
       recordUnconfirmedSpend({
@@ -2535,15 +2538,18 @@ export async function payWithTempo(args: RailAttemptArgs, credential: MppxCreden
         endpoint: ref.endpoint,
         capability: identity.capability,
       });
-    const tempoOutcome = tempoBroadcastOutcome(err);
+    const tempoOutcome = tempoBroadcastOutcome(err, pendingSettlement);
     if (isTempoBroadcastOutcome(tempoOutcome)) {
       // The transfer may still land, so the ledger keeps it as spent.
       unconfirmed(unconfirmedSpendKey(opts, tempoOutcome as DvmError));
       throw tempoOutcome;
     }
     if (!isIdentityFailure(err)) {
-      if (leavesOutcomeUnknown(raisedAfterPayment(err))) {
-        unconfirmed(unconfirmedSpendKey(opts, err as DvmError));
+      const unknown = leavesOutcomeUnknown(raisedAfterPayment(err));
+      if (pendingSettlement || unknown) {
+        const outcome = pendingSettlement && !unknown ? tempoBroadcastOutcome(pendingSettlement) : err;
+        unconfirmed(unconfirmedSpendKey(opts, outcome as DvmError));
+        throw outcome;
       }
       throw err;
     }

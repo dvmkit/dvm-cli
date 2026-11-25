@@ -1428,6 +1428,9 @@ function buildStructuredError(
   const data: Record<string, unknown> = {};
   if (display !== undefined) data.display = display;
   if (typeof fields.retryable === "boolean") data.retryable = fields.retryable;
+  const innerDelay = fields.retry_after_ms;
+  const retryDelay = Number.isFinite(innerDelay) ? innerDelay : envelope.retry_after_ms;
+  if (Number.isFinite(retryDelay)) data.retry_after_ms = retryDelay;
   if (typeof fields.sub_reason === "string") data.sub_reason = fields.sub_reason;
   // Outcome metadata can sit beside a nested error. Neither level may erase
   // uncertainty reported by the other.
