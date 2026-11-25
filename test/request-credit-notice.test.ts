@@ -6,6 +6,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import type { JobEnvelope, Payment, ProviderInfo } from "@dvmkit/sdk/internal";
 
+import { unknownUpfrontPrice } from "../src/lib/quote-upfront";
+
 const endpoint = "https://provider.invalid";
 const mint = "https://mint.invalid";
 const secret = "01".repeat(32);
@@ -40,6 +42,7 @@ let sdk: typeof import("@dvmkit/sdk/internal");
 let request: typeof import("../src/commands/request")["request"];
 let notices: typeof import("../src/lib/credit-notice");
 let fetchRate: ReturnType<typeof vi.fn>;
+let legacy402: boolean;
 
 beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), "dvm-cli-funding-notice-"));
@@ -91,6 +94,7 @@ beforeEach(() => {
   mkdirSync(root, { recursive: true });
   notices.resetCreditNotices();
   seams.rate = undefined;
+  legacy402 = false;
   seams.quote.mockResolvedValue([]);
   writeConfig("auto");
   fetchRate = vi.fn().mockRejectedValue(new Error("rate provider unavailable"));
@@ -117,7 +121,11 @@ beforeEach(() => {
       return {
         jobId: "",
         status: "payment-required",
-        quotes: [{ priceMsats: 1_000, upfront: { amount: 0.001, amount_micro: 1_000, currency: "usd" }, credit }],
+        quotes: [{
+          priceMsats: 1_000,
+          upfront: legacy402 ? unknownUpfrontPrice() : { amount: 0.001, amount_micro: 1_000, currency: "usd" },
+          credit,
+        }],
       };
     }
     const jobId = `job-${++paidJobs}`;
@@ -213,6 +221,7 @@ it.each([5_000, 6_000])("names a Cashu receipt's USD currency only when its hold
 
 describe("automatic credit funding notices", () => {
   it("explains a skipped open on the second paid request when the rate fetch fails with no cache", async () => {
+    legacy402 = true;
     await paidRequest();
     expect(terminal()).not.toHaveProperty("credit_funding_skipped");
     await paidRequest();
@@ -240,7 +249,127 @@ describe("automatic credit funding notices", () => {
     expect(notices.takeCreditNoticeFields()).toEqual({});
   });
 
+  it.each([
+    { label: "first contact", rate: 100_000, posture: "auto", hasHistory: false },
+    { label: "first contact without FX", rate: undefined, posture: "auto", hasHistory: false },
+    { label: "suggest posture after a paid job", rate: 100_000, posture: "suggest", hasHistory: true },
+    { label: "automatic funding after a paid job", rate: 100_000, posture: "auto", hasHistory: true },
+  ] as const)("checks the charges available on $label", async ({ rate, posture, hasHistory }) => {
+    seams.rate = rate;
+    writeConfig(posture);
+    if (hasHistory) await paidRequest();
+    const submissions = seams.submit.mock.calls.length;
+    seams.prepareAgentSpend.mockClear();
+    const { credit } = await seams.describe();
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" },
+      priceMsats: 50_000,
+      credit,
+    }] });
+
+    await request({ endpoint, input: "Echo", budget: "50000", autoPayBelow: "550000" });
+
+    if (hasHistory && posture === "auto") {
+      expect(terminal()).toMatchObject({
+        status: "over-budget",
+        next_action: { command: expect.stringContaining("--budget 100000") },
+      });
+      expect(seams.submit).toHaveBeenCalledTimes(submissions + 1);
+      expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+    } else {
+      expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk" });
+      if (hasHistory) expect(terminal()).toMatchObject({ credit_suggestion: { reason: "open" } });
+      expect(seams.submit).toHaveBeenCalledTimes(submissions + 2);
+      expect(paidEnvelopes().at(-1)?.data).not.toHaveProperty("fund");
+      expect(seams.prepareAgentSpend.mock.calls.map(([args]) => args.amountSats)).toEqual([50]);
+    }
+  });
+
+  it.each([
+    { budget: "50000", autoPayBelow: "550000", status: "over-budget" },
+    { budget: "550000", autoPayBelow: "50000", status: "quotes-collected" },
+  ])("refuses a Cashu spend beyond budget $budget or threshold $autoPayBelow", async ({
+    budget, autoPayBelow, status,
+  }) => {
+    seams.rate = 100_000;
+    writeConfig("off");
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.04, amount_micro: 40_000, currency: "usd" },
+      priceMsats: 100_000,
+    }] });
+
+    await request({ endpoint, input: "Echo", budget, autoPayBelow });
+
+    expect(terminal()).toMatchObject({ status });
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it("pays per-call when the global cap covers the job but rules out its credit deposit", async () => {
+    const { setCaps } = await import("../src/lib/budget-ledger");
+    seams.rate = 100_000;
+    await paidRequest();
+    setCaps({ dailyUsd: 0.075 });
+    seams.prepareAgentSpend.mockClear();
+    const { credit } = await seams.describe();
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" },
+      priceMsats: 50_000,
+      credit,
+    }] });
+
+    await request({ endpoint, input: "Echo", budget: "50000", autoPayBelow: "550000" });
+
+    expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk" });
+    expect(seams.prepareAgentSpend.mock.calls.map(([args]) => args.amountSats)).toEqual([50]);
+    expect(paidEnvelopes().at(-1)?.data).not.toHaveProperty("fund");
+  });
+
+  it.each([
+    { budget: "50001", autoPayBelow: "50001", status: "over-budget", retryBudget: "51000" },
+    { budget: "550000", autoPayBelow: "50001", status: "quotes-collected", retryBudget: "550000" },
+  ])("builds the $status retry from the rounded Cashu charge", async ({
+    budget, autoPayBelow, status, retryBudget,
+  }) => {
+    seams.rate = 100_000;
+    writeConfig("off");
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.04, amount_micro: 40_000, currency: "usd" },
+      priceMsats: 50_001,
+    }] });
+
+    await request({ endpoint, input: "Echo", budget, autoPayBelow });
+
+    expect(terminal()).toMatchObject({ status, next_action: {
+      type: "resubmit",
+      command: expect.stringContaining(`--budget ${retryBudget} --auto-pay-below 51000`),
+    } });
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it("rechecks a legacy 402 against the native quote used to size credit funding", async () => {
+    seams.rate = 100_000;
+    seedCredit();
+    const { credit } = await seams.describe();
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0, currency: "usd" }, priceMsats: 1_000, credit,
+    }] });
+    seams.quote.mockResolvedValueOnce([]).mockResolvedValueOnce([{
+      upfront: { amount: 0.20, amount_micro: 200_000, currency: "usd" },
+      priceMsats: 1_000, shape: "fixed", description: "Upfront",
+    }]);
+
+    await paidRequest();
+
+    expect(terminal()).toMatchObject({ status: "over-budget" });
+    expect(seams.quote).toHaveBeenCalledTimes(2);
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(seams.submit.mock.calls[0][1].data).not.toHaveProperty("credit_id");
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
   it("names a refill when an active prepaid credit cannot cover the job", async () => {
+    legacy402 = true;
     seedCredit();
     await paidRequest();
 
@@ -258,6 +387,7 @@ describe("automatic credit funding notices", () => {
   });
 
   it("narrates the skipped funding in human mode without leaving a JSON notice behind", async () => {
+    legacy402 = true;
     await paidRequest();
     seams.json.mockClear();
     await paidRequest(true);
@@ -296,7 +426,7 @@ describe("capability-scoped credit draws", () => {
     seedCredit(5_000_000);
     writeFileSync(sdk.FAVORITES_FILE, JSON.stringify({ panel: { endpoint, addedAt: 1 } }));
     const provider = await seams.describe();
-    seams.describe.mockResolvedValue({ ...provider, capabilities: { stress: {}, recheck: {} } });
+    seams.describe.mockResolvedValue({ ...provider, requestRecovery: true, capabilities: { stress: {}, recheck: {} } });
     seams.quote.mockImplementation(async (_ref, envelope: JobEnvelope) => {
       return [{
         upfront: { amount: envelope.capability === "stress" ? 0.83 : 0.06,
@@ -329,12 +459,11 @@ describe("capability-scoped credit draws", () => {
     });
   });
 
-  it.each(["available", "unavailable"])("draws a cheap capability after an expensive one with its quote %s", async (quoteAvailability) => {
+  it("draws a cheap capability after an expensive one when its own quote fits", async () => {
     await request({ dvm: "panel/stress", input: "Run", budget: "$0.83", autoPayBelow: "$0.83" });
     expect(sdk.loadCredit(endpoint, sdk.receiptPubkeyFromSecret(secret))).toMatchObject({
       remainingMicro: 4_170_000, lastPriceMicro: 830_000,
     });
-    if (quoteAvailability === "unavailable") seams.quote.mockRejectedValueOnce(new Error("Quote unavailable"));
     await request({ dvm: "panel/recheck", input: "Run", budget: "$0.06", autoPayBelow: "$0.06" });
 
     expect(sdk.loadCredit(endpoint, sdk.receiptPubkeyFromSecret(secret))).toMatchObject({
@@ -343,6 +472,79 @@ describe("capability-scoped credit draws", () => {
     expect(terminal()).not.toHaveProperty("credit_draw_skipped");
     expect(seams.submit.mock.calls.map(([, envelope]) => envelope.data.credit_id))
       .toEqual(["prepaid-credit", "prepaid-credit"]);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it("skips a capability without its own quote or receipt after drawing on another capability", async () => {
+    await request({ dvm: "panel/stress", input: "Run", budget: "$0.83", autoPayBelow: "$0.83" });
+    seams.quote.mockRejectedValueOnce(new Error("Quote unavailable"));
+    await request({ dvm: "panel/recheck", input: "Run", budget: "$0.06" });
+
+    expect(terminal()).toMatchObject({ credit_draw_skipped: {
+      reason: "price_above_ceiling", ceiling_source: "budget",
+      display: expect.stringContaining("price is unavailable"),
+    } });
+    expect(seams.submit.mock.calls.map(([, envelope]) => envelope.data.credit_id))
+      .toEqual(["prepaid-credit", undefined]);
+    expect(sdk.loadCredit(endpoint, sdk.receiptPubkeyFromSecret(secret))?.remainingMicro).toBe(4_170_000);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { budget: "0", priceMsats: 0, only: false },
+    { budget: "0", priceMsats: 0, only: true },
+    { budget: "50000", priceMsats: 50_000, only: false },
+    { budget: "50000", priceMsats: 50_000, only: true },
+  ])("leaves credit undrawn with budget $budget when FX is unavailable (credit-only: $only)", async ({
+    budget, priceMsats, only,
+  }) => {
+    seams.rate = undefined;
+    const quote = {
+      upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" },
+      priceMsats, shape: "fixed", description: "Upfront",
+    };
+    seams.quote.mockResolvedValueOnce([quote]);
+    const args = { dvm: "panel/stress", input: "Run", budget };
+    if (only) {
+      await expect(request({ ...args, creditOnly: "prepaid-credit",
+        requestId: "5e2b95d7-665b-4201-9d59-be8ad010c393" })).rejects.toMatchObject({
+        code: "credit_only_unavailable",
+        hint: expect.stringContaining("--budget"),
+        data: { reason: "price_above_ceiling" },
+      });
+      expect(seams.submit).not.toHaveBeenCalled();
+    } else {
+      seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [quote] });
+      await request(args);
+      expect(terminal()).toMatchObject({ status: "over-budget", credit_draw_skipped: {
+        reason: "price_above_ceiling", ceiling_source: "budget", last_price_micro: 100_000,
+      } });
+      expect(seams.submit).toHaveBeenCalledTimes(1);
+      expect(seams.submit.mock.calls[0][1].data).not.toHaveProperty("credit_id");
+    }
+    expect(fetchRate).toHaveBeenCalled();
+    expect(sdk.loadCredit(endpoint, sdk.receiptPubkeyFromSecret(secret))?.remainingMicro).toBe(5_000_000);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it("collects quotes without wallet consent when an alternative fits the budget", async () => {
+    seams.submit.mockResolvedValueOnce({
+      jobId: "",
+      status: "payment-required",
+      quotes: [
+        { upfront: { amount: 0.83, amount_micro: 830_000, currency: "usd" }, priceMsats: 830_000 },
+        { upfront: { amount: 0.04, amount_micro: 40_000, currency: "usd" }, priceMsats: 40_000 },
+      ],
+    });
+
+    await request({ dvm: "panel/stress", input: "Run", budget: "$0.05" });
+
+    expect(terminal()).toMatchObject({
+      status: "quotes-collected",
+      credit_draw_skipped: { reason: "price_above_ceiling", ceiling_source: "budget" },
+    });
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(seams.submit.mock.calls[0][1].data).not.toHaveProperty("credit_id");
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 

@@ -264,15 +264,11 @@ async function quoteWithWarnings(opts: QuoteOptions): Promise<void> {
     q.priceMsats > 0 && q.upfront.amount > 0
       ? (q.upfront.amount * 100_000_000_000) / q.priceMsats
       : undefined;
-  // A quote declares no request budget, so the probe's documented zero-ceiling
-  // posture leaves the last-price proxy unenforced. The status/posture checks
-  // still tell the caller whether this held balance would be drawn at all.
+  // Quote diagnostics check credit eligibility without a spending ceiling.
   const probePlan = planProbeDraw({
     stored,
     capability,
     quote: q,
-    drawCeilingMsats: 0,
-    drawCeilingSource: "budget",
     btcRate: routeBtcRate ?? 0,
     config: config?.credit,
     ...(attestedIdentity ? { identity: attestedIdentity } : {}),

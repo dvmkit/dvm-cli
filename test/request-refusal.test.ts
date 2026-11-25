@@ -49,7 +49,9 @@ beforeEach(() => {
   mkdirSync(root, { recursive: true });
   vi.mocked(json).mockClear();
   seams.describe.mockResolvedValue(info);
-  seams.quote.mockResolvedValue([]);
+  seams.quote.mockResolvedValue([{
+    upfront: { amount: 0.1, amount_micro: 100_000, currency: "usd" }, priceMsats: 100_000,
+  }]);
   seams.submit.mockResolvedValue({ jobId: "job-1", status: "processing" });
   seams.requestResult.mockResolvedValue({ jobId: "job-1", status: "processing" });
   vi.stubEnv("DVM_IDENTITY_KEY", signer.privkey);

@@ -20,25 +20,82 @@ const history: StoredReceipt[] = [{
   endpoint, builder: dvm.anchor, verification: "verified", verified_at: 0,
 }];
 const policy = { stored, capability: "count", receipts: history, btcRate: 100_000,
-  drawCeilingMsats: 60_000, drawCeilingSource: "budget" as const };
+  budget: { declared: "60000", msats: 60_000, source: "budget" as const } };
 
 afterEach(() => vi.unstubAllGlobals());
 
-async function quoteFromWire(body: Record<string, unknown>) {
+async function quoteFromWire(body: Record<string, unknown>, btcRate = 100_000) {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
     headers: { "content-type": "application/json" },
   })));
   const [quote] = await new HttpsTransport().quote({ endpoint }, {
     capability: "count", input: "Run",
-  }, { btcRate: 100_000 });
+  }, { btcRate });
   return quote;
 }
 
 describe("transport quote prices in the credit draw gate", () => {
+  it.each([undefined, "fixed"])("rejects a legacy millisat quote with shape %s without receipts", async (shape) => {
+    const quote = await quoteFromWire({ price_msats: 830_000, shape });
+    const budget = { ...policy.budget, declared: "$0.06" };
+    expect(planProbeDraw({ ...policy, budget, quote, receipts: [] })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", ceilingSource: "budget",
+        lastPriceMsats: 830_000, ceilingMsats: 60_000 },
+    });
+    expect(JSON.parse(JSON.stringify(quote.upfront))).toEqual({ amount: 0, currency: "usd" });
+  });
+
   it.each([
-    ["legacy sats", { price_msats: 830_000 }],
-    ["legacy zero sats", { price_msats: 0 }],
-    ["legacy fixed shape", { price_msats: 830_000, shape: "fixed" }],
+    { btcRate: 100_000, mode: "draw" },
+    { btcRate: 99_999.5, mode: "none" },
+  ])("checks the native draw price with USD/BTC at $btcRate", async ({ btcRate, mode }) => {
+    const quote = await quoteFromWire({
+      price_msats: 50_000,
+      upfront: { amount: 0.1, amount_micro: 100_000, currency: "usd" },
+    });
+    const budget = { ...policy.budget, declared: "100000", msats: 100_000 };
+    const plan = planProbeDraw({ ...policy, btcRate, budget, quote, receipts: [] });
+    expect(plan.mode).toBe(mode);
+    if (mode === "none") {
+      expect(plan).toMatchObject({
+        drawSkipped: {
+          reason: "price_above_ceiling", ceilingSource: "budget",
+          ceilingMicro: 99_999, lastPriceMicro: 100_000,
+        },
+      });
+    }
+  });
+
+  it("checks a legacy USD quote against a millisat budget on stored Tempo credit", async () => {
+    const quote = await quoteFromWire({
+      price_msats: 50_000,
+      upfront: { amount: 0.1, currency: "usd" },
+    });
+    expect(planProbeDraw({ ...policy, stored: { ...stored, rail: "tempo" }, quote, receipts: [] }))
+      .toMatchObject({
+        mode: "none",
+        drawSkipped: { reason: "price_above_ceiling", ceilingSource: "budget", lastPriceMicro: 100_000 },
+      });
+  });
+
+  it("attributes a refusal to the lower of two sub-micro dollar limits", async () => {
+    const quote = await quoteFromWire({ upfront: { amount: 0.1000003, currency: "usd" } });
+    expect(planProbeDraw({
+      ...policy, quote, receipts: [],
+      budget: { declared: "$0.1000001", msats: 100_000, source: "budget" },
+      threshold: { declared: "$0.1000002", msats: 100_000, source: "auto_pay_below" },
+    })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", ceilingSource: "budget" },
+    });
+  });
+
+  it("uses a legacy millisat quote at the ceiling ahead of a more expensive receipt", async () => {
+    const quote = await quoteFromWire({ price_msats: 60_000 });
+    expect(planProbeDraw({ ...policy, quote }).mode).toBe("draw");
+  });
+
+  it.each([
+    ["legacy zero millisats", { price_msats: 0 }],
     ["missing price", {}],
   ])("uses capability history for a %s quote", async (_label, body) => {
     const quote = await quoteFromWire(body);
@@ -47,7 +104,17 @@ describe("transport quote prices in the credit draw gate", () => {
         lastPriceMicro: 830_000, ceilingMicro: 60_000 },
     });
     expect(JSON.parse(JSON.stringify(quote.upfront))).toEqual({ amount: 0, currency: "usd" });
-    expect(planProbeDraw({ ...policy, quote, receipts: [] }).mode).toBe("draw");
+    expect(planProbeDraw({ ...policy, quote, receipts: [] })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", ceilingSource: "budget" },
+    });
+  });
+
+  it("rejects a positive USD quote with no advisory price or FX against a zero budget", async () => {
+    const quote = await quoteFromWire({ upfront: { amount: 0.1, currency: "usd" } }, 0);
+    const budget = { ...policy.budget, declared: "0", msats: 0 };
+    expect(planProbeDraw({ ...policy, quote, budget, btcRate: 0, receipts: [] })).toMatchObject({
+      mode: "none", drawSkipped: { ceilingSource: "budget", lastPriceMicro: 100_000 },
+    });
   });
 
   it.each([undefined, "fixed"])("honors an explicit free upfront with shape %s", async (shape) => {

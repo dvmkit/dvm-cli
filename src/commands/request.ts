@@ -46,6 +46,8 @@ import {
   type ProviderInfo,
   type ProviderRef,
   type Quote,
+  type Rail,
+  type RailFlag,
   readFundValuation,
   receiveToAgentWallet,
   recordFundResponse,
@@ -57,6 +59,7 @@ import {
   signedRequestDomain,
   type StoredCredit,
   type TempoAccount,
+  tempoChallengeAmountMicro,
   tempoCredentialAmountMicro,
   type Transport,
   unsignRequestData,
@@ -122,7 +125,7 @@ import {
 import {
   automaticCreditBoundRail,
   type CreditPlan,
-  type DrawCeilingSource,
+  type DrawCeiling,
   effectiveCreditPosture,
   planCreditForQuote,
   planProbeDraw,
@@ -174,7 +177,7 @@ import { applyMintPin } from "../lib/mint-pin";
 import { selectRailOrder } from "../lib/payment-rails/select";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
-import { quoteWithinDeclaredLimit } from "../lib/quote-limit";
+import { minimumQuoteLimitMsats, quoteLimitPrice, quoteWithinDeclaredLimit, usdFromMicro, type QuoteLimitPrice } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
 import { receiptUpfrontFault, upfrontRailPayment, type UpfrontRailPayment } from "../lib/upfront-payment";
@@ -688,10 +691,20 @@ async function requestWithWarnings(
     bidMsats: budgetMsats,
   });
 
+  const drawBudget: DrawCeiling | undefined = effectiveBudget
+    ? { declared: effectiveBudget, msats: policy.maxTotalMsats, source: "budget" }
+    : undefined;
+  const drawThreshold: DrawCeiling | undefined = effectiveAutoPayBelow
+    ? {
+        declared: effectiveAutoPayBelow,
+        msats: policy.autoPayBelowMsats,
+        source: opts.autoPayBelow !== undefined ? "auto_pay_below" : "config_threshold",
+      }
+    : undefined;
   // Quote before a free or credit-draw submit can start the job without a 402.
-  // Advisory pricing must not turn quote availability into a submit requirement.
+  // An unavailable preview still permits an unpaid submit.
   let previewQuotes: Quote[] = [];
-  if (policy.maxTotalMsats > 0 || policy.autoPayBelowMsats > 0) {
+  if (drawBudget || drawThreshold) {
     try {
       const quoteData = signing
         ? signDvmRequestData(signing.privkey, signing.unsignedData, signedRequestDomain({
@@ -731,44 +744,24 @@ async function requestWithWarnings(
       opts.strictPerCall || opts.creditOnly || approval
         ? []
         : loadImplicitCredits(endpoint, signer.pubkey, attestedIdentity);
-    if (storedCredit && btcRate === 0 &&
-        (policy.maxTotalMsats > 0 || policy.autoPayBelowMsats > 0)) {
-      // Quotes and receipt history use fiat; millisat-only limits still need a
-      // best-effort rate for the draw gate. Without one the proxy stands down.
+    if ((storedCredit || implicitCredits.length > 0) && btcRate === 0 &&
+        (drawBudget || drawThreshold)) {
+      // A millisat limit may need FX to price a USD quote or historical draw.
       btcRate = (await tryResolveBtcUsdRate())?.rate ?? 0;
     }
-    // The ceiling for a draw is what the caller declared for the whole job: an
-    // explicit auto-pay threshold when they set one, otherwise the budget
-    // itself. `policy.autoPayBelowMsats` is the per-call *increment* bound and
-    // falls back to 20% of budget, which as a draw ceiling refused every draw
-    // after the first one recorded its price.
-    //
-    // The flag and the standing config resolve to the same number but are
-    // raised by different commands, so which one bound rides along — otherwise
-    // the skip hint can only guess, and it guessed --budget, which moves
-    // neither. The gate stays on `effectiveAutoPayBelow`, so that
-    // which-msats decision is untouched; only the label branches, and it can
-    // read `opts.autoPayBelow` directly because the flag wins the `??` whenever
-    // it is set.
-    const drawCeiling: { msats: number; source: DrawCeilingSource } =
-      effectiveAutoPayBelow !== undefined && effectiveAutoPayBelow.trim() !== ""
-        ? {
-            msats: policy.autoPayBelowMsats,
-            source: opts.autoPayBelow !== undefined ? "auto_pay_below" : "config_threshold",
-          }
-        : { msats: policy.maxTotalMsats, source: "budget" };
     probePlan = opts.strictPerCall
       ? { mode: "none" }
       : planProbeDraw({
           stored: storedCredit,
           capability,
-          ...(opts.creditOnly ? {} : {
-            quote: previewQuotes[0],
-            receipts: storedCredit && drawCeiling.msats > 0 ? loadReceipts() : [],
-          }),
+          quote: previewQuotes[0],
+          receipts: (storedCredit || implicitCredits.length > 0) && (drawBudget || drawThreshold)
+            ? loadReceipts()
+            : undefined,
           implicit: implicitCredits,
-          drawCeilingMsats: drawCeiling.msats,
-          drawCeilingSource: drawCeiling.source,
+          budget: drawBudget,
+          threshold: drawThreshold,
+          rail: opts.rail,
           btcRate,
           config: config?.credit,
           ...(attestedIdentity ? { identity: attestedIdentity } : {}),
@@ -790,7 +783,8 @@ async function requestWithWarnings(
       throw new DvmError(
         "credit_only_unavailable",
         `Prepaid credit ${opts.creditOnly} is not drawable under the current caller state.`,
-        probePlan.mode === "none" && probePlan.drawSkipped?.reason === "posture_off"
+        probePlan.mode === "none" && (probePlan.drawSkipped?.reason === "posture_off" ||
+          probePlan.drawSkipped?.reason === "price_above_ceiling")
           ? buildCreditDrawSkipped({ dvm: identity.dvmId ?? endpoint, endpoint, skip: probePlan.drawSkipped }).hint
           : "Reconcile that exact credit with 'dvm credit balance <dvm> --credit-id <id>'; this request did not fall back to a wallet payment.",
         {
@@ -960,7 +954,7 @@ async function requestWithWarnings(
           submitProbe,
           endpoint,
           deadlineMs,
-          budgetMsats,
+          quoteLimits: { budget: drawBudget, threshold: drawThreshold, btcRate },
           opts,
           identity,
           policy,
@@ -993,6 +987,21 @@ async function requestWithWarnings(
     if (!previewWarnings.length || previewUpfrontCoveredByCredit) {
       addOutputWarnings(autoPayWarnings(quotes, warningLimits, undefined, btcRate), opts.human);
     }
+    if (!autoPayConsent && drawBudget && quotes.length > 0) {
+      const flagRail = parseForcedRail(opts.rail);
+      const prices = quotes.map((quote) => upfrontQuoteLimitPrices(quote, [], flagRail));
+      const limitRate = btcRate || await resolveQuoteLimitRate(prices.flat());
+      if (!prices.some((charges) => charges.every((price) =>
+        quoteWithinDeclaredLimit(price, drawBudget.msats, drawBudget.declared, limitRate)
+      ))) {
+        transport.close();
+        outputUpfrontOverBudget(
+          receipt.jobId, quotes, opts, identity, false,
+          Math.min(...prices.map((charges) => upfrontRetryMsats(charges, limitRate)))
+        );
+        return;
+      }
+    }
     if (autoPayConsent && quotes.length > 0) {
       const pay = () =>
         handleAutoPayQuotes(
@@ -1002,7 +1011,7 @@ async function requestWithWarnings(
           receipt.jobId,
           deadlineMs,
           quotes,
-          budgetMsats,
+          { budget: drawBudget, threshold: drawThreshold, btcRate },
           opts,
           identity,
           policy,
@@ -1398,14 +1407,14 @@ function sha256Hex(value: string): string {
  * `required_msats`, so the two halves of the ratio are pinned against two fx
  * snapshots and the figure is strictly weaker than the one on the 402.
  */
-async function fetchServerPriceMicro(
+async function fetchServerQuote(
   transport: Transport,
   ref: ProviderRef,
   envelope: JobEnvelope
-): Promise<number | undefined> {
+): Promise<Quote | undefined> {
   try {
     const quotes = await transport.quote(ref, envelope);
-    return quotePriceMicro(quotes[0]);
+    return quotes[0];
   } catch {
     return undefined;
   }
@@ -1604,7 +1613,7 @@ interface DrawProbeRecoveryArgs {
   submitProbe: (env: JobEnvelope) => Promise<Awaited<ReturnType<Transport["submit"]>>>;
   endpoint: string;
   deadlineMs: number;
-  budgetMsats: number | undefined;
+  quoteLimits: RequestQuoteLimits;
   opts: RequestOptions;
   identity: DvmIdentity;
   policy: JobPolicy;
@@ -1786,7 +1795,7 @@ async function recoverDrawProbe(
         receipt.jobId,
         args.deadlineMs,
         receipt.quotes ?? [],
-        args.budgetMsats,
+        args.quoteLimits,
         args.opts,
         args.identity,
         args.policy,
@@ -1806,6 +1815,70 @@ async function recoverDrawProbe(
   throw err;
 }
 
+function upfrontRetryMsats(charges: QuoteLimitPrice[], btcRate: number): number {
+  return Math.max(...charges.map((charge) => minimumQuoteLimitMsats(charge, btcRate) ?? Infinity));
+}
+
+function outputUpfrontOverBudget(
+  jobId: string,
+  quotes: Quote[],
+  opts: RequestOptions,
+  identity: DvmIdentity,
+  autoPayConsent: boolean,
+  retryMsats: number
+): void {
+  const action = Number.isFinite(retryMsats) ? buildResubmitAction(
+    opts,
+    {
+      minBudgetMsats: retryMsats,
+      ...(autoPayConsent ? { minAutoPayBelowMsats: retryMsats } : {}),
+    },
+    `The upfront charge exceeds your --budget. Re-run with --budget at or above ${retryMsats} msats.`
+  ) : undefined;
+  outputOverBudget(jobId || null, quotes, opts, identity, action);
+}
+
+interface RequestQuoteLimits {
+  budget?: DrawCeiling;
+  threshold?: DrawCeiling;
+  btcRate: number;
+}
+
+function upfrontQuoteLimitPrices(
+  quote: Quote,
+  rails: readonly Rail[],
+  flagRail: RailFlag | undefined
+): QuoteLimitPrice[] {
+  const native = quoteLimitPrice(quote);
+  const cashu = { msats: native.msats === undefined ? undefined : cashuQuoteSats(native.msats) * 1000 };
+  const priceFor = (rail: Rail): QuoteLimitPrice => {
+    if (rail === "cashu_p2pk") return cashu;
+    if (rail === "x402") {
+      return quote.requiredUsdcMicro !== undefined
+        ? quoteLimitPrice(quote, "x402")
+        : { msats: native.msats };
+    }
+    return native;
+  };
+
+  if (rails.length === 0) {
+    if (flagRail) return [priceFor(flagRail === "cashu" ? "cashu_p2pk" : flagRail)];
+    // Without a selected rail, keep both forms of available price evidence.
+    return native.msats !== undefined && native.usd ? [native, cashu] : [native];
+  }
+
+  return rails.map(priceFor);
+}
+
+function cashuQuoteSats(msats: number): number {
+  return Math.ceil(msats / 1000);
+}
+
+async function resolveQuoteLimitRate(prices: QuoteLimitPrice[]): Promise<number> {
+  if (!prices.some((price) => price.usd?.digits)) return 0;
+  return (await tryResolveBtcUsdRate())?.rate ?? 0;
+}
+
 async function handleAutoPayQuotes(
   transport: Transport,
   ref: ProviderRef,
@@ -1813,58 +1886,188 @@ async function handleAutoPayQuotes(
   jobId: string,
   deadlineMs: number,
   quotes: Quote[],
-  budgetMsats: number | undefined,
+  { budget, threshold, btcRate }: RequestQuoteLimits,
   opts: RequestOptions,
   identity: DvmIdentity,
   policy: JobPolicy,
   providerInfo: ProviderInfo,
   creditCtx?: RequestCreditContext
 ): Promise<void> {
-  const configuredLimits = loadConfig();
-  const declaredBudget = opts.budget ?? configuredLimits?.defaultBudget;
-  const declaredAutoPayBelow = opts.autoPayBelow ?? configuredLimits?.autoPayThreshold;
-  const chosen = budgetMsats
-    ? quotes.find((quote) =>
-        quoteWithinDeclaredLimit(quote, budgetMsats, declaredBudget, opts.rail)
-      )
-    : quotes[0];
+  const flagRail = parseForcedRail(opts.rail);
+  const config = loadConfig();
+  const agentWallet = loadAgentWallet();
+  const tempoAccount = await connectedTempoAccount();
+  const x402Wallet = loadX402Wallet();
+  const attestedIdentity = providerDvmIdentity(providerInfo);
+  const signing = !opts.strictPerCall && !opts.requestId ? creditCtx?.signing : undefined;
+  const candidates = quotes.map((quote) => {
+    const selection = selectRailOrder({
+      flagRail,
+      defaultRail: config?.defaultRail,
+      providerInfo,
+      quote,
+      hasAgentWallet: agentWallet !== null,
+      hasTempoWallet: tempoAccount !== null,
+      hasX402Wallet: x402Wallet !== null,
+    });
+    return { quote, selection, charges: upfrontQuoteLimitPrices(quote, selection.rails, flagRail) };
+  });
+  const limitRate = btcRate || await resolveQuoteLimitRate(candidates.flatMap(({ charges }) => charges));
+  const fitsBudget = (price: QuoteLimitPrice, rate = limitRate) =>
+    !budget || quoteWithinDeclaredLimit(price, budget.msats, budget.declared, rate);
+  const fitsThreshold = (price: QuoteLimitPrice, rate = limitRate) =>
+    quoteWithinDeclaredLimit(price, policy.autoPayBelowMsats, threshold?.declared, rate);
 
-  if (!chosen) {
+  const rejectedCharges: { charges: QuoteLimitPrice[]; rate: number }[] = [];
+  const affordable = candidates.filter(({ charges }) => {
+    if (charges.every((price) => fitsBudget(price))) return true;
+    rejectedCharges.push({ charges, rate: limitRate });
+    return false;
+  });
+  const outputBudgetRefusal = (retryMsats: number, availableQuotes = quotes) => {
     transport.close?.();
-    const cheapest = cheapestQuote(quotes);
-    // Raise --auto-pay-below alongside --budget: a rerun that fits the budget
-    // still stops at the auto-pay threshold, which the caller never bumped.
-    const action = buildResubmitAction(
-      opts,
-      { minBudgetMsats: cheapest.priceMsats, minAutoPayBelowMsats: cheapest.priceMsats },
-      `Cheapest quote (${quoteAmountLabel(cheapest)}) exceeds your --budget. Re-run with --budget at or above the quote price.`
-    );
-    outputOverBudget(jobId || null, quotes, opts, identity, action);
+    outputUpfrontOverBudget(jobId, availableQuotes, opts, identity, true, retryMsats);
+  };
+  const outputRejectedQuotes = () =>
+    outputBudgetRefusal(Math.min(...rejectedCharges.map(({ charges, rate }) => upfrontRetryMsats(charges, rate))));
+  if (affordable.length === 0) {
+    outputRejectedQuotes();
     return;
   }
 
+  const planRate = signing ? limitRate || (await tryResolveBtcUsdRate())?.rate || 0 : 0;
+  const receipts = signing ? loadReceipts() : [];
+  const stored = signing ? loadCredit(ref.endpoint, signing.pubkey, attestedIdentity) : undefined;
+  const floatConnected = !!signing && floatUsable();
+  const planForQuote = (quote: Quote): CreditPlan => signing
+    ? planCreditForQuote({
+        // Attached-payment 402s carry the price but not the funding menu. The
+        // authenticated `/v1/info` read already supplied that menu; retaining it
+        // here lets the normal request path plan deferred Lightning/MPP funding
+        // just like an explicit `/v1/quote` response does.
+        menu: quote.credit ?? providerInfo.credit,
+        endpoint: ref.endpoint,
+        ...(attestedIdentity ? { identity: attestedIdentity } : {}),
+        signingPubkey: signing.pubkey,
+        priceMsats: quote.priceMsats,
+        btcRate: planRate,
+        receipts,
+        stored,
+        config: config?.credit,
+        // whether the float can carry a funding is half the rail rule,
+        // and it is caller-side state the planner is deliberately kept pure of.
+        floatConnected,
+        // The chain rides along with the connection: a channel on a network this
+        // wallet isn't pinned to is one it cannot sign a voucher against.
+        x402Connected: x402Wallet !== null,
+        ...(x402Wallet ? { x402Network: x402Wallet.network } : {}),
+        // A Tempo credit menu qualifies when this caller can sign its advertised
+        // charge or session; channel persistence is needed only for the latter.
+        tempoConnected: tempoAccount !== null,
+      })
+    : { mode: "none" };
+
+  let candidate: (typeof affordable)[number] | undefined;
+  let plan: CreditPlan = { mode: "none" };
+  let nativeCharge: { quote: Quote; price: QuoteLimitPrice } | undefined;
+  let fundingBtcRate: number | undefined;
+  for (const available of affordable) {
+    const { quote, selection } = available;
+    plan = planForQuote(quote);
+    nativeCharge = undefined;
+    if (plan.mode === "open" || plan.mode === "topup") {
+      if (selection.rails[0] !== "cashu_p2pk") {
+        info("Credit funding is Cashu-only for now — paying per-call on the selected rail.");
+        plan = { mode: "none" };
+      } else {
+        // Price the attached draw as well as the per-call fallback. A legacy
+        // 402 needs a provider quote because its USD amount may be reconstructed.
+        const stated = statedPriceMicro(quote);
+        const fallbackQuote = stated === undefined ? await fetchServerQuote(transport, ref, envelope) : undefined;
+        const nativeQuote = fallbackQuote ?? quote;
+        const price = quoteLimitPrice(nativeQuote);
+        const priceMicro = price.usd ? stated ?? quotePriceMicro(fallbackQuote) : undefined;
+        if (priceMicro === undefined) {
+          info("Credit funding skipped — the DVM's fiat price is unavailable. Paying per-call.");
+          plan = { mode: "none" };
+        } else {
+          // A deposit blocked by the global cap leaves only the per-call
+          // charge. Check eligibility before using the draw in quote selection.
+          try {
+            fundingBtcRate = await enforceGlobalBudget({ plannedMsats: plan.fundMsats, btcRate: planRate });
+          } catch (err) {
+            if (!(err instanceof DvmError) || err.code !== "budget_exceeded") throw err;
+            const display = typeof err.data?.display === "string" ? err.data.display : err.message;
+            info(`Credit funding skipped — ${display} Paying this job per-call.`);
+            plan = { mode: "none" };
+          }
+          if (plan.mode === "open" || plan.mode === "topup") {
+            if (!fitsBudget(price, planRate)) {
+              rejectedCharges.push({ charges: [...available.charges, price], rate: planRate });
+              fundingBtcRate = undefined;
+              continue;
+            }
+            nativeCharge = { quote: nativeQuote, price };
+            plan = {
+              ...plan,
+              wireAmountMicro: fundWireAmountMicro(priceMicro, plan.fundSats * 1000, quote.priceMsats),
+            };
+          }
+        }
+      }
+    }
+    candidate = available;
+    break;
+  }
+
+  if (!candidate) {
+    outputRejectedQuotes();
+    return;
+  }
+
+  const { quote: chosen, selection, charges } = candidate;
   setMandateUpfront(creditCtx?.signing.standingMandate, chosen);
 
   // Check auto-pay threshold (mirrors payment-responder.ts for mid-job payments)
-  if (
-    !quoteWithinDeclaredLimit(chosen, policy.autoPayBelowMsats, declaredAutoPayBelow, opts.rail)
-  ) {
+  const outputAboveThreshold = (retryMsats: number, availableQuotes = quotes) => {
     transport.close?.();
-    const action = buildResubmitAction(
+    const action = Number.isFinite(retryMsats) ? buildResubmitAction(
       opts,
-      { minAutoPayBelowMsats: chosen.priceMsats },
-      `Price (${quoteAmountLabel(chosen)}) exceeds your --auto-pay-below threshold. Re-run with --auto-pay-below at or above the quote price.`
-    );
+      { minAutoPayBelowMsats: retryMsats },
+      `The upfront charge exceeds your --auto-pay-below threshold. Re-run with --auto-pay-below at or above ${retryMsats} msats.`
+    ) : undefined;
     outputCollectedQuotes(
       jobId || null,
-      quotes,
+      availableQuotes,
       opts,
       identity,
       "Price exceeds your --auto-pay-below threshold. Increase it or pass a higher --budget.",
       action
     );
+  };
+  const selectedCharges = nativeCharge ? [...charges, nativeCharge.price] : charges;
+  if (!charges.every((price) => fitsThreshold(price))) {
+    outputAboveThreshold(upfrontRetryMsats(selectedCharges, planRate || limitRate));
     return;
   }
+  if (nativeCharge && !fitsThreshold(nativeCharge.price, planRate)) {
+    outputAboveThreshold(upfrontRetryMsats(selectedCharges, planRate), [nativeCharge.quote]);
+    return;
+  }
+
+  const acceptNativeCharge = (micro: bigint, rate: number) => {
+    const price = { usd: usdFromMicro(micro) };
+    const chargeRate = limitRate || rate;
+    if (!fitsBudget(price, chargeRate)) {
+      outputBudgetRefusal(upfrontRetryMsats([...selectedCharges, price], chargeRate), [chosen]);
+      return false;
+    }
+    if (!fitsThreshold(price, chargeRate)) {
+      outputAboveThreshold(upfrontRetryMsats([...selectedCharges, price], chargeRate));
+      return false;
+    }
+    return true;
+  };
 
   // Pre-check the payment count cap — upfront payment counts toward the cap
   if (policy.maxPayments < 1) {
@@ -1897,42 +2100,7 @@ async function handleAutoPayQuotes(
     }
   }
 
-  // decide how this payment engages the credit ledger BEFORE the
-  // budget gate — an open/top-up charges the caps with the funding amount,
-  // not the job price. The per-job auto-pay threshold above gated the job
-  // price (operator ruling 2026-07-28); funding size is bounded by the
-  // trust-tier caps and the budget-ledger caps.
-  let plan: CreditPlan = { mode: "none" };
-  let planRate = 0;
-  const attestedIdentity = providerDvmIdentity(providerInfo);
-  if (creditCtx?.signing && !opts.strictPerCall && !opts.requestId) {
-    planRate = (await tryResolveBtcUsdRate())?.rate ?? 0;
-    const x402Wallet = loadX402Wallet();
-    plan = planCreditForQuote({
-      // Attached-payment 402s carry the price but not the funding menu. The
-      // authenticated `/v1/info` read already supplied that menu; retaining it
-      // here lets the normal request path plan deferred Lightning/MPP funding
-      // just like an explicit `/v1/quote` response does.
-      menu: chosen.credit ?? providerInfo.credit,
-      endpoint: ref.endpoint,
-      ...(attestedIdentity ? { identity: attestedIdentity } : {}),
-      signingPubkey: creditCtx.signing.pubkey,
-      priceMsats: chosen.priceMsats,
-      btcRate: planRate,
-      receipts: loadReceipts(),
-      stored: loadCredit(ref.endpoint, creditCtx.signing.pubkey, attestedIdentity),
-      config: loadConfig()?.credit,
-      // whether the float can carry a funding is half the rail rule,
-      // and it is caller-side state the planner is deliberately kept pure of.
-      floatConnected: floatUsable(),
-      // The chain rides along with the connection: a channel on a network this
-      // wallet isn't pinned to is one it cannot sign a voucher against.
-      x402Connected: x402Wallet !== null,
-      ...(x402Wallet ? { x402Network: x402Wallet.network } : {}),
-      // A Tempo credit menu qualifies when this caller can sign its advertised
-      // charge or session; channel persistence is needed only for the latter.
-      tempoConnected: (await connectedTempoAccount()) !== null,
-    });
+  if (creditCtx && signing) {
     // The insufficient_credit recovery pins the credit + draw ids: whatever
     // the policy sized, the retry must run as a top-up of THAT credit under
     // THAT draw id (idempotency), never a fresh open.
@@ -1972,7 +2140,7 @@ async function handleAutoPayQuotes(
     // the posture held a purchase back. Say so here, where it was
     // suppressed — never on jobs that had nothing to suppress.
     if (plan.mode === "none" && plan.suppressed) {
-      const posture = effectiveCreditPosture(loadConfig()?.credit, ref.endpoint, attestedIdentity);
+      const posture = effectiveCreditPosture(config?.credit, ref.endpoint, attestedIdentity);
       const priceMicro = planRate > 0 ? msatsToMicro(chosen.priceMsats, planRate) : 0;
       stageCreditSuggestion(
         buildCreditSuggestion({
@@ -1994,97 +2162,17 @@ async function handleAutoPayQuotes(
     }
   }
 
-  // The signed `fund.amount_micro` must reproduce the server's own valuation
-  // of the token (`fundedMicroFor` over its quote-pinned fiat ↔ msats ratio)
-  // or the fund-and-draw is refused after the spend committed.
-  //
-  // the fiat side rides the 402 as `price_micro`, beside the
-  // `required_msats` this ratio's other half comes from — so first contact
-  // costs no extra round trip and both inputs are pinned against one server-side
-  // fx snapshot. `/v1/quote` is the fallback for providers that predate the
-  // field. No usable fiat price → per-call.
-  //
-  // Only the provider's own integer short-circuits the hop. `chosen` is
-  // routinely the synthetic quote `HttpsTransport.submit` builds from a 402,
-  // whose `upfront.amount` is a client-fx reconstruction rounded to four
-  // decimals — signing a fund amount off *that* is the mismatch
-  // itself, so it must reach `fundWireAmountMicro` through no path at all.
-  if (plan.mode === "open" || plan.mode === "topup") {
-    const priceMicroServer =
-      statedPriceMicro(chosen) ?? (await fetchServerPriceMicro(transport, ref, envelope));
-    if (priceMicroServer === undefined) {
-      info("Credit funding skipped — the DVM's fiat price is unavailable. Paying per-call.");
-      plan = { mode: "none" };
-    } else {
-      plan = {
-        ...plan,
-        wireAmountMicro: fundWireAmountMicro(
-          priceMicroServer,
-          plan.fundSats * 1000,
-          chosen.priceMsats
-        ),
-      };
-    }
-  }
-
-  // Pre-check the global budget ledger — the money leaving the wallet (the
-  // funding when opening/topping up, the job price otherwise) counts toward
-  // daily/weekly/monthly caps.
-  let upfrontBtcRate: number;
-  try {
-    upfrontBtcRate = await enforceGlobalBudget({
-      plannedMsats:
-        plan.mode === "open" || plan.mode === "topup" ? plan.fundMsats : chosen.priceMsats,
-      ...(planRate > 0 ? { btcRate: planRate } : {}),
-    });
-  } catch (budgetErr) {
-    if (
-      !(budgetErr instanceof DvmError) ||
-      budgetErr.code !== "budget_exceeded" ||
-      plan.mode === "none" ||
-      plan.mode === "draw"
-    ) {
-      throw budgetErr;
-    }
-    // Buffer semantics (spec §11): a blocked credit funding never blocks the
-    // job. Surface the structured budget refusal, degrade to per-call, and
-    // let the job price face the cap on its own.
-    const budgetDisplay =
-      typeof budgetErr.data?.display === "string" ? budgetErr.data.display : budgetErr.message;
-    info(`Credit funding skipped — ${budgetDisplay} Paying this job per-call.`);
-    plan = { mode: "none" };
-    upfrontBtcRate = await enforceGlobalBudget({ plannedMsats: chosen.priceMsats });
-  }
+  // Attached credit funding already passed the cap check during selection.
+  const upfrontBtcRate = fundingBtcRate ?? await enforceGlobalBudget({
+    plannedMsats: chosen.priceMsats,
+    ...(planRate > 0 ? { btcRate: planRate } : {}),
+  });
 
   // Every entry path hands this function a clean envelope (the
   // insufficient_credit recovery re-signs before re-probing), so the rails
   // below use it as-is; only the cashu fund factory re-signs with credit
   // fields merged in.
   const plainEnvelope: JobEnvelope = envelope;
-
-  // Resolve rail preferences via the pure `selectRailOrder` so the
-  // selector is the single source of truth — both the issue-spec preference
-  // and `--rail` / `defaultRail` enforcement live in one place.
-  const railFlag = parseForcedRail(opts.rail);
-  const config = loadConfig();
-  const agentWallet = loadAgentWallet();
-  const tempoAccount = await connectedTempoAccount();
-  const x402Wallet = loadX402Wallet();
-  // providerInfo was already fetched by the warmup probe — reuse it to
-  // avoid a redundant round-trip.
-
-  const selection = selectRailOrder({
-    flagRail: railFlag,
-    defaultRail: config?.defaultRail,
-    providerInfo,
-    quote: chosen,
-    // Cashu still owns its proof-bearing pending-submission journal. A public
-    // request id adds the server-side job lookup/acceptance binding around it;
-    // it does not replace or absorb that private wallet recovery regime.
-    hasAgentWallet: agentWallet !== null,
-    hasTempoWallet: tempoAccount !== null,
-    hasX402Wallet: x402Wallet !== null,
-  });
 
   if (selection.unsatisfiableFlag) {
     transport.close?.();
@@ -2118,15 +2206,6 @@ async function handleAutoPayQuotes(
         available_rails: selection.rails,
       }
     );
-  }
-
-  // credit funding is Cashu-only in v1 (Tempo challenges are
-  // job-priced; x402 is final-settlement with no resume machinery). When
-  // selection put a non-Cashu rail first, the credit plan stands down and
-  // the call stays per-call implicit N=1.
-  if ((plan.mode === "open" || plan.mode === "topup") && selection.rails[0] !== "cashu_p2pk") {
-    info("Credit funding is Cashu-only for now — paying per-call on the selected rail.");
-    plan = { mode: "none" };
   }
 
   // A per-call submit to a recovery-capable provider carries a generated
@@ -2206,6 +2285,7 @@ async function handleAutoPayQuotes(
           btcRate: upfrontBtcRate,
           account: tempoAccount,
           providerInfo,
+          acceptNativeCharge,
           signing: railSigning,
         });
         if (handled) return;
@@ -2223,6 +2303,7 @@ async function handleAutoPayQuotes(
           btcRate: upfrontBtcRate,
           wallet: x402Wallet,
           providerInfo,
+          acceptNativeCharge,
           signing: railSigning,
         });
         if (handled) return;
@@ -2278,7 +2359,7 @@ function buildNoEligibleMintDetail(
     .filter((m) => m.sats > 0)
     .sort((a, b) => b.sats - a.sats);
   const heldSats = heldMints.reduce((sum, m) => sum + m.sats, 0);
-  const amountSats = Math.ceil(chosen.priceMsats / 1000);
+  const amountSats = cashuQuoteSats(chosen.priceMsats);
   const fundMint = acceptedMints[0];
   const fundCommand = fundMint
     ? `dvm wallet fund ${amountSats} --mint ${fundMint}`
@@ -2432,13 +2513,17 @@ function validateCreditOnlyOptions(opts: RequestOptions): void {
  * i.e. the selector's `/v1/info` and the live 402 response disagree — or when
  * there is no BTC/USD rate to check the DVM's advertised dollar figure against.
  */
-async function tryTempoPayment(args: RailAttemptArgs): Promise<boolean> {
+type CheckNativeCharge = (micro: bigint, rate: number) => boolean;
+
+async function tryTempoPayment(
+  args: RailAttemptArgs & { acceptNativeCharge: CheckNativeCharge }
+): Promise<boolean> {
   if (!args.transport.probeMppChallenges) return false;
 
   const challenges = await args.transport.probeMppChallenges(args.ref, args.envelope);
   assertTempoChallengeNetwork(challenges, tempoAccountNetwork(args.account), ["charge"]);
-  const hasTempo = challenges.some((c) => c.method === "tempo" && c.intent === "charge");
-  if (!hasTempo) return false;
+  const challenge = challenges.find((c) => c.method === "tempo" && c.intent === "charge");
+  if (!challenge) return false;
 
   // The rate that priced the cap, else a freshly resolved (or last-cached) one.
   // A zero is fine for a display label but useless here: with no rate the caller
@@ -2455,6 +2540,7 @@ async function tryTempoPayment(args: RailAttemptArgs): Promise<boolean> {
 
   let credential: MppxCredential | null;
   try {
+    if (!args.acceptNativeCharge(tempoChallengeAmountMicro(challenge), rate)) return true;
     credential = await buildTempoCredential({
       challenges,
       privateKey: args.account.privateKey,
@@ -3057,7 +3143,7 @@ async function tryAgentWalletPayment(
       signing.standingMandate = await prepareStandingMandate(opts, providerInfo, btcRate, policy.maxPayments);
     setMandateUpfront(signing.standingMandate, chosen);
   }
-  const priceSats = Math.ceil(chosen.priceMsats / 1000);
+  const priceSats = cashuQuoteSats(chosen.priceMsats);
   const maxCashuFeeSats = parseMaxCashuFeeSats(opts.maxCashuFeeSats);
   const baseContext = {
     upfront_rail_payment: cashuUpfrontPayment(chosen, btcRate),
@@ -3812,7 +3898,9 @@ interface X402AttemptArgs {
  * or when the local wallet can't construct a payload for the requested
  * `(network, asset)` pair.
  */
-async function tryX402UpfrontPayment(args: X402AttemptArgs): Promise<boolean> {
+async function tryX402UpfrontPayment(
+  args: X402AttemptArgs & { acceptNativeCharge: CheckNativeCharge }
+): Promise<boolean> {
   const x402Advert = args.providerInfo.x402;
   if (!x402Advert?.pay_to) return false;
 
@@ -3839,6 +3927,7 @@ async function tryX402UpfrontPayment(args: X402AttemptArgs): Promise<boolean> {
     throw err;
   }
   if (!proof) return false;
+  if (!args.acceptNativeCharge(BigInt(proof.amountUsdcMicro), proof.btcRate)) return true;
 
   // The server's advertised USDC amount can convert to slightly more msats at
   // the caller's rate than the original sats quote. Re-run the global ceiling

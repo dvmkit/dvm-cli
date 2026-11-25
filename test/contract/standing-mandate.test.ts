@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 const execute = promisify(execFile);
 const binary = resolve(import.meta.dirname, "../../dist/dvm.js");
@@ -46,9 +46,13 @@ afterAll(async () => {
   for (const directory of roots) rmSync(directory, { recursive: true, force: true });
 });
 
-async function request(extra: string[] = [], stream = false) {
+function request(extra: string[] = [], stream = false) {
+  return runRequest(["--budget", "$1.10", "--auto-pay-below", "$0.55", ...extra], stream);
+}
+
+function runRequest(flags: string[], stream: boolean) {
   return execute(process.execPath, [binary, "request", "--endpoint", endpoint, "--input", "watch",
-    "--budget", "$1.10", "--auto-pay-below", "$0.55", ...(stream ? [] : ["--no-stream"]), ...extra], {
+    ...(stream ? [] : ["--no-stream"]), ...flags], {
     env: { ...process.env, DVM_CONFIG_DIR: root, DVM_IDENTITY_KEY: "0d".repeat(32) }, timeout: 15_000,
   }).then((run) => ({ ...run, code: 0 }), (error) => error as { stdout: string; stderr: string; code: number });
 }
@@ -205,12 +209,9 @@ it("previews exact limits without signing or posting and signs the approved term
   expect((await control({ op: "snapshot", ids: [] })).submissions).toHaveLength(submissions.length);
 
   const withoutQuote = await request(["--mandate-preview", mandate.approval]);
-  expect(withoutQuote.code, withoutQuote.stdout + withoutQuote.stderr).toBe(0);
-  const { jobId: unquotedJobId } = JSON.parse(withoutQuote.stdout);
-  const unquoted = await control({ op: "snapshot", ids: [unquotedJobId] });
-  expect(unquoted.submissions.at(-1).data.mandate).toEqual({
-    max_total_micro: mandate.max_total_micro, max_ask_micro: mandate.max_ask_micro, expires_at_ms: mandate.expires_at_ms,
-  });
+  expect(withoutQuote.code).toBe(1);
+  expect(JSON.parse(withoutQuote.stdout).error.code).toBe("mandate_preview_unavailable");
+  expect((await control({ op: "snapshot", ids: [] })).submissions).toHaveLength(submissions.length);
 }, 15_000);
 
 async function previewApproval(extra: string[] = []) {
@@ -363,15 +364,21 @@ it("caps total at upfront plus the remaining payment-count times the smaller per
 
 // Two CLI startups and PostgreSQL submissions include a deliberate 1 s quote
 // deadline (the fixture replies at 1.5 s); allow headroom under shared CI load.
-it("keeps a valid submit working when its price quote is missing or times out", async () => {
+it("collects the live 402 without drawing when the preview quote is missing or times out", async () => {
   for (const quote of ["fail", "timeout"]) {
     await control({ op: "configure", quote });
-    const run = await request(["--budget", "$5", "--auto-pay-below", "$0.50"]);
+    const before = await control({ op: "snapshot", ids: [] });
+    const run = await runRequest(["--budget", "$5"], false);
     expect(run.code, run.stdout + run.stderr).toBe(0);
-    const output = JSON.parse(run.stdout);
-    expect(output.mandate).toMatchObject({ status: "skipped", display: expect.stringContaining("price was unknown") });
-    const snapshot = await control({ op: "snapshot", ids: [output.jobId] });
-    expect(snapshot.jobs[0].mandate).toBeUndefined();
+    expect(JSON.parse(run.stdout)).toMatchObject({
+      status: "quotes-collected",
+      credit_draw_skipped: { ceiling_source: "budget", display: expect.stringContaining("price is unavailable") },
+    });
+    const after = await control({ op: "snapshot", ids: [] });
+    const posts = after.submissions.slice(before.submissions.length);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].data).not.toHaveProperty("credit_id");
+    expect(after.balance).toEqual(before.balance);
   }
 }, 15_000);
 
@@ -591,3 +598,88 @@ it.skipIf(!process.env.DVM_CLI_MANDATE_DATABASE_URL && !process.env.CI).each([fa
     expect(records()[0]).toMatchObject({ paymentsHonoured: 2, totalPaidMsats: 550_000 });
     expect(records()[0].pendingCreditPayment).toBeUndefined();
   }, 25_000);
+
+describe("initial prepaid draw limits", () => {
+  const persisted = () => JSON.parse(readFileSync(join(root, "credits.json"), "utf8")).credits[0];
+
+  it.each([
+    { name: "budget and higher threshold", flags: ["--budget", "$0.05", "--auto-pay-below", "$0.55"], outcome: "over-budget" },
+    { name: "exponent budget just below the native price", flags: ["--budget", "$9.999995e-2", "--auto-pay-below", "$0.55"],
+      outcome: "over-budget", ceilingMicro: 99_999 },
+    { name: "402 native price exceeds the millisat budget despite a fitting advisory price",
+      flags: ["--budget", "50000", "--auto-pay-below", "550000"], outcome: "over-budget", requiredMsats: 50_000 },
+    { name: "402 Cashu price exceeds the millisat budget despite a fitting native price",
+      flags: ["--budget", "50000", "--auto-pay-below", "550000"], outcome: "over-budget",
+      requiredMsats: 100_000, responsePriceMicro: 40_000 },
+    { name: "budget only", flags: ["--budget", "$0.05"], outcome: "over-budget" },
+    { name: "budget and threshold from config", config: { defaultBudget: "$0.05", autoPayThreshold: "$0.55" },
+      flags: [], outcome: "over-budget" },
+    { name: "flag budget overrides config", config: { defaultBudget: "$0.05", autoPayThreshold: "$0.55" },
+      flags: ["--budget", "$1.10"], outcome: "draw" },
+    { name: "flag threshold overrides config", config: { defaultBudget: "$1.10", autoPayThreshold: "$0.05" },
+      flags: ["--auto-pay-below", "$0.55"], outcome: "draw" },
+    { name: "quote fits both limits", flags: ["--budget", "$1.10", "--auto-pay-below", "$0.55"], outcome: "draw" },
+    { name: "threshold only", flags: ["--auto-pay-below", "$0.55"], outcome: "draw" },
+    { name: "no limits", flags: [], outcome: "draw" },
+    { name: "selected credit only", flags: ["--budget", "$0.05"], outcome: "credit-only-unavailable" },
+  ])("$name", async ({ flags, config, outcome, ceilingMicro = 50_000, requiredMsats, responsePriceMicro }) => {
+    if (requiredMsats !== undefined) await control({ op: "configure", requiredMsats, responsePriceMicro });
+    const before = await control({ op: "snapshot", ids: [] });
+    const creditId = String(credit.creditId);
+    const initial = {
+      ...persisted(),
+      balanceMicro: before.balance.balanceMicro,
+      remainingMicro: before.balance.availableMicro,
+      ledgerSeq: before.balance.lastLedgerSeq,
+    };
+    writeFileSync(join(root, "credits.json"), JSON.stringify({ version: 1, credits: [initial] }));
+    if (config) writeFileSync(join(root, "config.json"), JSON.stringify(config));
+
+    const creditOnly = outcome === "credit-only-unavailable";
+    const args = creditOnly
+      ? [...flags, "--credit-only", creditId, "--request-id", "5e2b95d7-665b-4201-9d59-be8ad010c393"]
+      : flags;
+    const run = await runRequest([...args, "--no-mandate"], outcome === "draw");
+    expect(run.code, run.stdout + run.stderr).toBe(creditOnly ? 1 : 0);
+    const output = JSON.parse(run.stdout.trim().split("\n").at(-1)!);
+    const after = await control({ op: "snapshot", ids: [] });
+    const posts = after.submissions.slice(before.submissions.length);
+    expect(after.paymentPosts).toEqual(before.paymentPosts);
+
+    if (outcome === "draw") {
+      expect(posts).toHaveLength(1);
+      expect(posts[0].data).toMatchObject({ credit_id: creditId, draw_id: expect.any(String) });
+      expect(after.balance.availableMicro).toBe(before.balance.availableMicro - 100_000);
+      expect(after.balance.balanceMicro).toBe(before.balance.balanceMicro - 100_000);
+      return;
+    }
+
+    expect(persisted()).toEqual(initial);
+    expect(after.balance).toEqual(before.balance);
+    if (creditOnly) {
+      expect(posts).toEqual([]);
+      expect(output.error).toMatchObject({
+        code: "credit_only_unavailable",
+        reason: "price_above_ceiling",
+        hint: expect.stringContaining("--budget"),
+      });
+    } else {
+      expect(posts).toHaveLength(1);
+      expect(posts[0].data).not.toHaveProperty("credit_id");
+      expect(posts[0].data).not.toHaveProperty("draw_id");
+      expect(output).toMatchObject({
+        status: "over-budget",
+        credit_draw_skipped: {
+          reason: "price_above_ceiling",
+          ceiling_source: "budget",
+          ceiling_micro: ceilingMicro,
+          last_price_micro: 100_000,
+          hint: expect.stringContaining("--budget"),
+        },
+      });
+      if (!flags.includes("--auto-pay-below")) {
+        expect(output.next_action.command).not.toContain("--auto-pay");
+      }
+    }
+  }, 20_000);
+});
