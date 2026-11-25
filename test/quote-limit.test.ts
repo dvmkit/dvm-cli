@@ -44,15 +44,13 @@ describe("native-dollar quote limits", () => {
     ).toBe(false);
   });
 
-  it("refuses a Tempo dollar quote without a validated exact microunit amount", () => {
-    expect(
-      fits(
-        { ...tempoQuote, upfront: { amount: 0.02, currency: "usd" }, priceMsats: 1 },
-        24_503,
-        "$0.02",
-        "tempo"
-      )
-    ).toBe(false);
+  it("uses a legacy Tempo USD price against both dollar and millisat limits", () => {
+    const quote = { ...tempoQuote, upfront: { amount: 0.02, currency: "usd" }, priceMsats: 1 };
+    expect(fits(quote, 20_000, "$0.02", "tempo")).toBe(true);
+    expect(fits(quote, 10_000, "$0.01", "tempo")).toBe(false);
+    expect(fits(quote, 10_000, "10000", "tempo", 100_000)).toBe(false);
+    expect(fits(quote, 20_000, "20000", "tempo", 100_000)).toBe(true);
+    expect(fits(quote, 20_000, "20000", "tempo")).toBe(false);
   });
 
   it("compares the native Tempo charge to a bare-msat limit using FX", () => {
@@ -100,11 +98,15 @@ describe("native-dollar quote limits", () => {
     expect(fits(tempoQuote, 25_000, "25000", "cashu")).toBe(false);
   });
 
-  it("uses a legacy decimal USD amount in the exact comparison", () => {
-    const quote = { ...tempoQuote, upfront: { amount: 0.02, currency: "usd" }, priceMsats: 1 };
-    expect(fits(quote, 20_000, "$2.000000e-2")).toBe(true);
-    expect(fits(quote, 20_000, "$0.0199999")).toBe(false);
-  });
+  it.each(["$0.1000001", "$1.000001e-1", "$0.1000001000"])(
+    "accepts a legacy sub-micro USD price at the exact boundary %s",
+    (declared) => {
+      const quote = { ...tempoQuote, upfront: { amount: 0.1000001, currency: "usd" }, priceMsats: 1 };
+      expect(fits(quote, 100_000, declared)).toBe(true);
+      expect(fits(quote, 100_000, "$0.100000099999999999999")).toBe(false);
+      expect(fits(quote, 100_000, "100000", undefined, 100_000)).toBe(false);
+    }
+  );
 
   it("does not read unknown or metered pricing as free", () => {
     const free = { ...tempoQuote, upfront: { amount: 0, currency: "usd" }, priceMsats: 0 };

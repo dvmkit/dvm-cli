@@ -28,7 +28,10 @@ import type { StoredReceipt } from "@dvmkit/sdk/internal";
 import { type AttestedDvmIdentity, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
 import type { CreditMenu, Quote } from "@dvmkit/sdk/internal";
 import { offersX402CreditFunding } from "@dvmkit/sdk/internal";
-import { declaredLimitMicro, quoteLimitPrice, quoteWithinDeclaredLimit } from "./quote-limit";
+import {
+  compareDeclaredLimits, declaredLimitMicro, quoteLimitPrice, quoteLimitPriceMicro,
+  quoteWithinDeclaredLimit, usdFromMicro,
+} from "./quote-limit";
 
 /**
  * A multi-job credit purchase the consent posture held back.
@@ -801,8 +804,8 @@ export function planCreditForQuote(args: {
  * Decide whether the *initial* signed submit should draw on a credit already
  * held at this DVM, with no payment attach. Prefer this capability's upfront
  * quote; otherwise use its latest completed draw on this credit. A DVM-wide
- * last price cannot price a different capability. With neither source, leave
- * the estimate unknown and let the provider settle the draw.
+ * last price cannot price a different capability. A declared ceiling requires
+ * evidence that the draw fits.
  *
  * A draw is deliberately **not** gated on the caller's per-call payment
  * consent (`--auto-pay`). Drawing attaches no payment: the money left the
@@ -898,32 +901,23 @@ function priceAboveDrawCeiling(
 ): DrawSkip | undefined {
   if (!args.budget && !args.threshold) return undefined;
   const quoted = quoteLimitPrice(args.quote, rail);
-  const hasQuotedPrice = quoted.usdMicro !== undefined || quoted.msats !== undefined;
+  const hasQuotedPrice = quoted.usd !== undefined || quoted.msats !== undefined;
   const receiptMicro = hasQuotedPrice ? undefined : drawnPriceMicro(args, credit);
-  const price = receiptMicro === undefined ? quoted : { usdMicro: BigInt(receiptMicro) };
+  const price = receiptMicro === undefined ? quoted : { usd: usdFromMicro(BigInt(receiptMicro)) };
   const rejected = (ceiling: DrawCeiling | undefined) => ceiling &&
     !quoteWithinDeclaredLimit(price, ceiling.msats, ceiling.declared, args.btcRate, rail);
 
   const budget = rejected(args.budget) ? args.budget : undefined;
   const threshold = rejected(args.threshold) ? args.threshold : undefined;
-  let binding = budget ?? threshold;
-  if (budget && threshold) {
-    const budgetMicro = declaredLimitMicro(budget.msats, budget.declared, args.btcRate);
-    const thresholdMicro = declaredLimitMicro(threshold.msats, threshold.declared, args.btcRate);
-    // Equal limits retain the threshold's attribution.
-    const hasNativeLimits = (price.msats === undefined || price.usdMicro !== undefined) &&
-      budgetMicro !== undefined && thresholdMicro !== undefined;
-    const budgetBinds = hasNativeLimits ? budgetMicro < thresholdMicro : budget.msats < threshold.msats;
-    binding = budgetBinds ? budget : threshold;
-  }
+  // Equal limits retain the threshold's attribution.
+  const binding = budget && threshold
+    ? (compareDeclaredLimits(budget, threshold, price, args.btcRate) < 0 ? budget : threshold)
+    : budget ?? threshold;
   if (!binding) return undefined;
 
-  const ceilingMicro = declaredLimitMicro(binding.msats, binding.declared, args.btcRate);
-  const lastPriceMicro = price.usdMicro !== undefined
-    ? Number(price.usdMicro)
-    : price.msats !== undefined && args.btcRate > 0
-      ? msatsToMicro(price.msats, args.btcRate)
-      : undefined;
+  const ceilingMicro = declaredLimitMicro(binding, args.btcRate);
+  const lastPriceMicro = quoteLimitPriceMicro(price) ??
+    (price.msats !== undefined && args.btcRate > 0 ? msatsToMicro(price.msats, args.btcRate) : undefined);
   return {
     reason: "price_above_ceiling",
     creditId: credit.creditId,

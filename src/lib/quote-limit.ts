@@ -1,57 +1,107 @@
 import type { Quote } from "@dvmkit/sdk/internal";
 
-import { decimalRatio } from "./currency";
 import { hasKnownUpfrontPrice } from "./quote-upfront";
 
+interface Decimal {
+  digits: string;
+  point: bigint;
+  negative: boolean;
+}
+
 export interface QuoteLimitPrice {
-  usdMicro?: bigint;
+  usd?: Decimal;
   msats?: number;
+}
+
+interface DeclaredLimit {
+  declared?: string;
+  msats: number;
+}
+
+function decimal(coefficient: string, exponent: bigint, negative = false): Decimal {
+  const digits = coefficient.replace(/^0+/, "");
+  if (!digits) return { digits: "", point: 0n, negative: false };
+  return { digits: digits.replace(/0+$/, ""), point: BigInt(digits.length) + exponent, negative };
+}
+
+function parseDecimal(text: string): Decimal | undefined {
+  // Match parseBudget's decimal prefix while retaining digits lost by parseFloat.
+  const match = /^([+-]?)(\d+\.?\d*|\.\d+)(?:e([+-]?\d+))?/i.exec(text);
+  if (!match || !Number.isFinite(parseFloat(match[0]))) return undefined;
+  const [, sign, mantissa, exponent] = match;
+  const [whole, fraction = ""] = mantissa.split(".");
+  return decimal(whole + fraction, BigInt(exponent ?? "0") - BigInt(fraction.length), sign === "-");
+}
+
+function compareDecimals(a: Decimal, b: Decimal): number {
+  if (a.negative !== b.negative) return a.negative ? -1 : 1;
+  if (!a.digits || !b.digits) return Number(Boolean(a.digits)) - Number(Boolean(b.digits));
+  // With the same decimal point, significant digits sort as strings once
+  // trailing zeroes have been removed.
+  const direction = a.negative ? -1 : 1;
+  if (a.point !== b.point) return (a.point < b.point ? -1 : 1) * direction;
+  if (a.digits === b.digits) return 0;
+  return (a.digits < b.digits ? -1 : 1) * direction;
+}
+
+function floorMicro(amount: Decimal): bigint {
+  const places = amount.point + 6n;
+  if (!amount.digits) return 0n;
+  if (places <= 0n) return amount.negative ? -1n : 0n;
+  const count = Number(places);
+  const whole = BigInt(amount.digits.slice(0, count).padEnd(count, "0"));
+  if (!amount.negative) return whole;
+  return count < amount.digits.length ? -whole - 1n : -whole;
+}
+
+export function usdFromMicro(micro: bigint): Decimal {
+  return decimal(String(micro < 0n ? -micro : micro), -6n, micro < 0n);
 }
 
 export function quoteLimitPrice(quote: Quote | undefined, rail?: string): QuoteLimitPrice {
   if (!quote) return {};
-  const normalizedRail = rail?.trim().toLowerCase();
   const msats = Number.isSafeInteger(quote.priceMsats) && quote.priceMsats > 0
     ? quote.priceMsats
     : undefined;
   const usdc = quote.requiredUsdcMicro;
-  if (normalizedRail === "x402" && usdc !== undefined && /^\d+$/.test(usdc)) {
-    return { usdMicro: BigInt(usdc), msats };
+  if (rail?.trim().toLowerCase() === "x402" && usdc !== undefined && /^\d+$/.test(usdc)) {
+    return { usd: usdFromMicro(BigInt(usdc)), msats };
   }
   const upfront = quote.upfront;
   if (!upfront || !hasKnownUpfrontPrice(quote)) return { msats };
 
   const micro = upfront.amount_micro;
   if ((micro ?? 0) === 0 && upfront.amount === 0 && quote.shape !== "rate" && quote.priceMsats === 0) {
-    return { usdMicro: 0n, msats: 0 };
+    return { usd: usdFromMicro(0n), msats: 0 };
   }
   if (upfront.currency !== "usd") return { msats };
   if (micro !== undefined && Number.isSafeInteger(micro) && micro > 0) {
-    return { usdMicro: BigInt(micro), msats };
+    return { usd: usdFromMicro(BigInt(micro)), msats };
   }
-  if (micro === undefined && normalizedRail !== "tempo" && upfront.amount > 0) {
-    const dollars = decimalRatio(String(upfront.amount));
-    if (dollars) {
-      // Round a legacy decimal charge up so a positive sub-micro price cannot read as free.
-      const [numerator, denominator] = dollars;
-      return { usdMicro: (numerator * 1_000_000n + denominator - 1n) / denominator, msats };
-    }
+  if (micro === undefined && upfront.amount > 0) {
+    return { usd: parseDecimal(String(upfront.amount)), msats };
   }
   return { msats };
 }
 
-export function declaredLimitMicro(
-  limitMsats: number,
-  declaredLimit: string | undefined,
-  btcRate: number
-): bigint | undefined {
-  if (declaredLimit?.trim().startsWith("$")) return dollarLimitMicro(declaredLimit);
-  if (limitMsats === 0) return 0n;
-  const rate = btcRate > 0 ? decimalRatio(String(btcRate)) : undefined;
-  if (rate && Number.isSafeInteger(limitMsats) && limitMsats >= 0) {
-    return BigInt(limitMsats) * rate[0] / (100_000n * rate[1]);
-  }
-  return undefined;
+function dollarLimit(declared: string | undefined): Decimal | undefined {
+  const text = declared?.trim();
+  return text?.startsWith("$") ? parseDecimal(text.slice(1).trimStart()) : undefined;
+}
+
+function millisatLimitUsd(msats: number, btcRate: number): Decimal | undefined {
+  if (msats === 0) return usdFromMicro(0n);
+  if (!Number.isSafeInteger(msats) || msats < 0 || btcRate <= 0) return undefined;
+  const rate = parseDecimal(String(btcRate));
+  if (!rate) return undefined;
+  const coefficient = BigInt(msats) * BigInt(rate.digits);
+  return decimal(String(coefficient), rate.point - BigInt(rate.digits.length) - 11n);
+}
+
+function declaredLimitUsd(limit: DeclaredLimit, btcRate: number): Decimal | undefined {
+  return limit.declared?.trim().startsWith("$")
+    ? dollarLimit(limit.declared)
+    : millisatLimitUsd(limit.msats, btcRate);
 }
 
 export function quoteWithinDeclaredLimit(
@@ -61,31 +111,40 @@ export function quoteWithinDeclaredLimit(
   btcRate = 0,
   rail?: string
 ): boolean {
-  const nativeLimit = declaredLimitMicro(limitMsats, declaredLimit, btcRate);
-  if (price.usdMicro !== undefined) {
-    if (nativeLimit !== undefined) return price.usdMicro <= nativeLimit;
-    return price.usdMicro === 0n && limitMsats >= 0;
+  if (price.usd) {
+    const limit = declaredLimitUsd({ msats: limitMsats, declared: declaredLimit }, btcRate);
+    if (limit) return compareDecimals(price.usd, limit) <= 0;
+    return !price.usd.digits && limitMsats >= 0;
   }
   if (rail?.trim().toLowerCase() === "tempo" && declaredLimit?.trim().startsWith("$")) return false;
   return price.msats !== undefined && price.msats <= limitMsats;
 }
 
-export function dollarLimitMicro(declaredLimit: string): bigint | undefined {
-  const text = declaredLimit.trim();
-  if (!text.startsWith("$")) return undefined;
-  const value = text.slice(1).trimStart();
-  if (!Number.isFinite(parseFloat(value))) return undefined;
+export function compareDeclaredLimits(
+  a: DeclaredLimit,
+  b: DeclaredLimit,
+  price: QuoteLimitPrice,
+  btcRate: number
+): number {
+  const aUsd = declaredLimitUsd(a, btcRate);
+  const bUsd = declaredLimitUsd(b, btcRate);
+  if (aUsd && bUsd && (price.usd || price.msats === undefined)) {
+    return compareDecimals(aUsd, bUsd);
+  }
+  return a.msats - b.msats;
+}
 
-  // Match the decimal prefix accepted by parseBudget without rounding it to a float.
-  const amount = /^([+-]?)(\d+\.?\d*|\.\d+)(?:e([+-]?\d+))?/i.exec(value);
-  if (!amount) return undefined;
-  const [, sign, mantissa, exponent] = amount;
-  const [whole, fraction = ""] = mantissa.split(".");
-  const digits = whole + fraction;
-  if (!/[1-9]/.test(digits)) return 0n;
-  const places = Math.max(0, whole.length + Number(exponent ?? 0) + 6);
-  const micro = BigInt(digits.slice(0, places).padEnd(places, "0") || "0");
-  if (sign !== "-") return micro;
-  // A whole-microunit charge must fit under the declaration, even below zero.
-  return /[1-9]/.test(digits.slice(places)) ? -micro - 1n : -micro;
+export function declaredLimitMicro(limit: DeclaredLimit, btcRate: number): bigint | undefined {
+  const amount = declaredLimitUsd(limit, btcRate);
+  return amount === undefined ? undefined : floorMicro(amount);
+}
+
+export function dollarLimitMicro(declaredLimit: string): bigint | undefined {
+  const amount = dollarLimit(declaredLimit);
+  return amount === undefined ? undefined : floorMicro(amount);
+}
+
+export function quoteLimitPriceMicro(price: QuoteLimitPrice): number | undefined {
+  // Display a positive fractional microunit as at least one microunit.
+  return price.usd === undefined ? undefined : Number(-floorMicro({ ...price.usd, negative: true }));
 }

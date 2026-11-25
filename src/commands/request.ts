@@ -1834,7 +1834,7 @@ interface RequestQuoteLimits {
 }
 
 async function resolveQuoteLimitRate(prices: QuoteLimitPrice[]): Promise<number> {
-  if (!prices.some((price) => price.usdMicro !== undefined && price.usdMicro > 0n)) return 0;
+  if (!prices.some((price) => price.usd?.digits)) return 0;
   return (await tryResolveBtcUsdRate())?.rate ?? 0;
 }
 
@@ -2040,7 +2040,7 @@ async function handleAutoPayQuotes(
     const priceMicroServer = stated ?? quotePriceMicro(fallbackQuote);
     if (fallbackQuote && priceMicroServer !== undefined) {
       const price = quoteLimitPrice(fallbackQuote, opts.rail);
-      if (price.usdMicro !== undefined) {
+      if (price.usd !== undefined) {
         if (!fitsBudget(price, planRate)) {
           transport.close?.();
           outputUpfrontOverBudget(jobId, [fallbackQuote], opts, identity, true);

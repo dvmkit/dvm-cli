@@ -66,6 +66,29 @@ describe("transport quote prices in the credit draw gate", () => {
     }
   });
 
+  it("checks a legacy USD quote against a millisat budget on stored Tempo credit", async () => {
+    const quote = await quoteFromWire({
+      price_msats: 50_000,
+      upfront: { amount: 0.1, currency: "usd" },
+    });
+    expect(planProbeDraw({ ...policy, stored: { ...stored, rail: "tempo" }, quote, receipts: [] }))
+      .toMatchObject({
+        mode: "none",
+        drawSkipped: { reason: "price_above_ceiling", ceilingSource: "budget", lastPriceMicro: 100_000 },
+      });
+  });
+
+  it("attributes a refusal to the lower of two sub-micro dollar limits", async () => {
+    const quote = await quoteFromWire({ upfront: { amount: 0.1000003, currency: "usd" } });
+    expect(planProbeDraw({
+      ...policy, quote, receipts: [],
+      budget: { declared: "$0.1000001", msats: 100_000, source: "budget" },
+      threshold: { declared: "$0.1000002", msats: 100_000, source: "auto_pay_below" },
+    })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", ceilingSource: "budget" },
+    });
+  });
+
   it("uses a legacy millisat quote at the ceiling ahead of a more expensive receipt", async () => {
     const quote = await quoteFromWire({ price_msats: 60_000 });
     expect(planProbeDraw({ ...policy, quote }).mode).toBe("draw");
