@@ -209,12 +209,9 @@ it("previews exact limits without signing or posting and signs the approved term
   expect((await control({ op: "snapshot", ids: [] })).submissions).toHaveLength(submissions.length);
 
   const withoutQuote = await request(["--mandate-preview", mandate.approval]);
-  expect(withoutQuote.code, withoutQuote.stdout + withoutQuote.stderr).toBe(0);
-  const { jobId: unquotedJobId } = JSON.parse(withoutQuote.stdout);
-  const unquoted = await control({ op: "snapshot", ids: [unquotedJobId] });
-  expect(unquoted.submissions.at(-1).data.mandate).toEqual({
-    max_total_micro: mandate.max_total_micro, max_ask_micro: mandate.max_ask_micro, expires_at_ms: mandate.expires_at_ms,
-  });
+  expect(withoutQuote.code).toBe(1);
+  expect(JSON.parse(withoutQuote.stdout).error.code).toBe("mandate_preview_unavailable");
+  expect((await control({ op: "snapshot", ids: [] })).submissions).toHaveLength(submissions.length);
 }, 15_000);
 
 async function previewApproval(extra: string[] = []) {
@@ -367,15 +364,21 @@ it("caps total at upfront plus the remaining payment-count times the smaller per
 
 // Two CLI startups and PostgreSQL submissions include a deliberate 1 s quote
 // deadline (the fixture replies at 1.5 s); allow headroom under shared CI load.
-it("keeps a valid submit working when its price quote is missing or times out", async () => {
+it("collects the live 402 without drawing when the preview quote is missing or times out", async () => {
   for (const quote of ["fail", "timeout"]) {
     await control({ op: "configure", quote });
-    const run = await request(["--budget", "$5", "--auto-pay-below", "$0.50"]);
+    const before = await control({ op: "snapshot", ids: [] });
+    const run = await runRequest(["--budget", "$5"], false);
     expect(run.code, run.stdout + run.stderr).toBe(0);
-    const output = JSON.parse(run.stdout);
-    expect(output.mandate).toMatchObject({ status: "skipped", display: expect.stringContaining("price was unknown") });
-    const snapshot = await control({ op: "snapshot", ids: [output.jobId] });
-    expect(snapshot.jobs[0].mandate).toBeUndefined();
+    expect(JSON.parse(run.stdout)).toMatchObject({
+      status: "quotes-collected",
+      credit_draw_skipped: { ceiling_source: "budget", display: expect.stringContaining("price is unavailable") },
+    });
+    const after = await control({ op: "snapshot", ids: [] });
+    const posts = after.submissions.slice(before.submissions.length);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].data).not.toHaveProperty("credit_id");
+    expect(after.balance).toEqual(before.balance);
   }
 }, 15_000);
 
@@ -603,6 +606,8 @@ describe("initial prepaid draw limits", () => {
     { name: "budget and higher threshold", flags: ["--budget", "$0.05", "--auto-pay-below", "$0.55"], outcome: "over-budget" },
     { name: "exponent budget just below the native price", flags: ["--budget", "$9.999995e-2", "--auto-pay-below", "$0.55"],
       outcome: "over-budget", ceilingMicro: 99_999 },
+    { name: "402 native price exceeds the millisat budget despite a fitting advisory price",
+      flags: ["--budget", "50000", "--auto-pay-below", "550000"], outcome: "over-budget", requiredMsats: 50_000 },
     { name: "budget only", flags: ["--budget", "$0.05"], outcome: "over-budget" },
     { name: "budget and threshold from config", config: { defaultBudget: "$0.05", autoPayThreshold: "$0.55" },
       flags: [], outcome: "over-budget" },
@@ -614,7 +619,8 @@ describe("initial prepaid draw limits", () => {
     { name: "threshold only", flags: ["--auto-pay-below", "$0.55"], outcome: "draw" },
     { name: "no limits", flags: [], outcome: "draw" },
     { name: "selected credit only", flags: ["--budget", "$0.05"], outcome: "credit-only-unavailable" },
-  ])("$name", async ({ flags, config, outcome, ceilingMicro = 50_000 }) => {
+  ])("$name", async ({ flags, config, outcome, ceilingMicro = 50_000, requiredMsats }) => {
+    if (requiredMsats !== undefined) await control({ op: "configure", requiredMsats });
     const before = await control({ op: "snapshot", ids: [] });
     const creditId = String(credit.creditId);
     const initial = {

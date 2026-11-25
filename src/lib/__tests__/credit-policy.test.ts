@@ -1043,6 +1043,7 @@ describe("credit posture", () => {
     const probe = {
       stored: stored(),
       capability: "count",
+      quote: { upfront: { amount: 0.01, currency: "usd" }, priceMsats: 10_000, description: "" },
       budget: drawBudget(1_000_000),
       btcRate: RATE,
     };
@@ -1105,6 +1106,7 @@ describe("planProbeDraw", () => {
   it("spends the earliest released per-call balance before prepaid credit", () => {
     const plan = planProbeDraw({
       ...base,
+      budget: undefined,
       implicit: [
         implicit({ creditId: "imp:cashu:later", expiryMs: Date.now() + 20_000 }),
         implicit({ creditId: "imp:cashu:first", expiryMs: Date.now() + 10_000 }),
@@ -1283,6 +1285,18 @@ describe("planProbeDraw", () => {
     });
   });
 
+  it("attributes a refusal to the exact dollar budget when both limits round to the same millisats", () => {
+    expect(planProbeDraw({
+      ...base,
+      btcRate: 100_000,
+      quote: fixed(100_001),
+      budget: { declared: "$0.0999999", msats: 100_000, source: "budget" },
+      threshold: { declared: "100000", msats: 100_000, source: "auto_pay_below" },
+    })).toMatchObject({
+      mode: "none", drawSkipped: { ceilingSource: "budget", ceilingMicro: 99_999 },
+    });
+  });
+
   it("uses the x402 rail price when the quote supplies it", () => {
     expect(planProbeDraw({
       ...base,
@@ -1308,7 +1322,8 @@ describe("planProbeDraw", () => {
     const receipt = drawn(830_000);
     const args = { ...base, budget: drawBudget(100_000), implicit: [released] };
     expect(planProbeDraw({ ...args, receipts: [receipt] })).toMatchObject({
-      mode: "draw", creditId: released.creditId,
+      mode: "none",
+      drawSkipped: { creditId: released.creditId, reason: "price_above_ceiling", lastPriceMicro: undefined },
     });
     expect(planProbeDraw({ ...args, receipts: [{ ...receipt,
       receipt: dvm.sign({ requester_pubkey: CALLER_A, credit: {
@@ -1363,7 +1378,9 @@ describe("planProbeDraw", () => {
 
   it("makes no guess from another capability or a legacy DVM-wide price", () => {
     for (const history of [[], [drawn(830_000, "other")]]) {
-      expect(planProbeDraw({ ...scoped, receipts: history }).mode).toBe("draw");
+      expect(planProbeDraw({ ...scoped, receipts: history })).toMatchObject({
+        mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: undefined },
+      });
     }
   });
 
@@ -1378,7 +1395,9 @@ describe("planProbeDraw", () => {
       receipt: { ...entry.receipt, credit: { ...entry.receipt.credit!, amount: 999_999 } } })],
     ["an unrelated endpoint", (entry: StoredReceipt) => ({ ...entry, endpoint: "https://other.example", builder: undefined })],
   ] as const)("does not price a draw using %s", (_label, change) => {
-    expect(planProbeDraw({ ...scoped, receipts: [change(drawn(830_000))] }).mode).toBe("draw");
+    expect(planProbeDraw({ ...scoped, receipts: [change(drawn(830_000))] })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: undefined },
+    });
   });
 
   it("pools attested aliases but rejects a replacement builder at the same endpoint", () => {
@@ -1388,13 +1407,17 @@ describe("planProbeDraw", () => {
       mode: "none", drawSkipped: { reason: "price_above_ceiling" },
     });
     expect(planProbeDraw({ ...scoped, identity: attestedDvmIdentity(attestedDvm("wordcount").anchor),
-      receipts: [entry] }).mode).toBe("draw");
+      receipts: [entry] })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: undefined },
+    });
   });
 
   it("does not treat non-USD credit history or quotes as USD", () => {
     expect(planProbeDraw({ ...scoped, stored: stored({ currency: "eur" }),
       quote: { ...fixed(830_000), priceMsats: 0, upfront: { amount: 0.83, currency: "eur" } },
-      receipts: [drawn(830_000)] }).mode).toBe("draw");
+      receipts: [drawn(830_000)] })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: undefined },
+    });
   });
 });
 

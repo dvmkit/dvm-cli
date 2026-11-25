@@ -404,7 +404,7 @@ describe("a paid submit the provider accepts without a settled job identity", ()
     writeConfig("auto");
     seedCredit(40_000);
     provider.recovery = false;
-    provider.unpaid = () => answer(202, { job_id: "job-b", status: "processing" }, { [FIELD]: "job-a" });
+    provider.draw = () => answer(202, { job_id: "job-b", status: "processing" }, { [FIELD]: "job-a" });
 
     const error = await paidRequest().catch((caught: unknown) => caught);
 
@@ -1373,6 +1373,11 @@ async function startProvider(): Promise<Provider> {
       const path = new URL(request.url ?? "/", "http://fixture.invalid").pathname;
       if (request.method === "GET" && path === "/v1/info") return answer(200, info(state))(response);
       const raw = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<string, unknown>;
+      if (request.method === "POST" && path === "/v1/quote" && state.draw) {
+        return answer(200, {
+          upfront: { amount: 0.006, amount_micro: 6_000, currency: "usd" }, price_msats: 6_000,
+        })(response);
+      }
       if (request.method === "POST" && path === "/v1/job") return onJob(request, response, raw);
       if (request.method === "POST" && path === "/v1/job/job-a/messages") {
         const authorization = (raw.content as { credit: Record<string, unknown> }).credit;

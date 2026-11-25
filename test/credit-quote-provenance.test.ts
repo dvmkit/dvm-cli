@@ -24,13 +24,13 @@ const policy = { stored, capability: "count", receipts: history, btcRate: 100_00
 
 afterEach(() => vi.unstubAllGlobals());
 
-async function quoteFromWire(body: Record<string, unknown>) {
+async function quoteFromWire(body: Record<string, unknown>, btcRate = 100_000) {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
     headers: { "content-type": "application/json" },
   })));
   const [quote] = await new HttpsTransport().quote({ endpoint }, {
     capability: "count", input: "Run",
-  }, { btcRate: 100_000 });
+  }, { btcRate });
   return quote;
 }
 
@@ -81,7 +81,17 @@ describe("transport quote prices in the credit draw gate", () => {
         lastPriceMicro: 830_000, ceilingMicro: 60_000 },
     });
     expect(JSON.parse(JSON.stringify(quote.upfront))).toEqual({ amount: 0, currency: "usd" });
-    expect(planProbeDraw({ ...policy, quote, receipts: [] }).mode).toBe("draw");
+    expect(planProbeDraw({ ...policy, quote, receipts: [] })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", ceilingSource: "budget" },
+    });
+  });
+
+  it("rejects a positive USD quote with no advisory price or FX against a zero budget", async () => {
+    const quote = await quoteFromWire({ upfront: { amount: 0.1, currency: "usd" } }, 0);
+    const budget = { ...policy.budget, declared: "0", msats: 0 };
+    expect(planProbeDraw({ ...policy, quote, budget, btcRate: 0, receipts: [] })).toMatchObject({
+      mode: "none", drawSkipped: { ceilingSource: "budget", lastPriceMicro: 100_000 },
+    });
   });
 
   it.each([undefined, "fixed"])("honors an explicit free upfront with shape %s", async (shape) => {

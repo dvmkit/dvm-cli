@@ -52,6 +52,9 @@ const ask = { amount_msats: 900_000, fiat_amount: { amount: 0.9, currency: "usd"
 const walletAsk = { ...ask, x402: { pay_to: `0x${"f".repeat(40)}`, network: "eip155:8453", asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", required_usdc_micro: "900000" } };
 const metered: Quote = { upfront: { amount: 0, currency: "usd" }, description: "Metered", priceMsats: 0,
   rate: { per_unit: { amount: 0.09, currency: "usd" }, max_units: 10, unit: "block" }, shape: "rate" };
+const pricedMetered: Quote = {
+  ...metered, upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" }, priceMsats: 100_000,
+};
 const info: ProviderInfo = { name: "Test provider", capabilities: { work: { description: "Work" } } };
 
 beforeEach(() => {
@@ -225,7 +228,7 @@ describe("metered caller guidance", () => {
 
   it("uses returned payment quotes when the advisory quote endpoint is unavailable", async () => {
     seams.quote.mockRejectedValue(new Error("Quote endpoint unavailable"));
-    seams.submit.mockResolvedValue({ jobId: "", status: "payment-required", quotes: [metered] });
+    seams.submit.mockResolvedValue({ jobId: "", status: "payment-required", quotes: [pricedMetered] });
     await request({ endpoint, input: "work", budget: "$1.50" });
     expect(output()).toMatchObject({ status: "quotes-collected", warnings: [{ auto_pay_below: "900000" }] });
     expect(seams.sendMessage).not.toHaveBeenCalled();
@@ -337,11 +340,11 @@ describe("credit-only threshold", () => {
     seams.quote.mockImplementation(async (_ref, envelope) => {
       verifier.checkAuth(envelope.data, { audience: { dvm_id: "test-provider", builder_pubkey: "03".repeat(32) },
         method: "POST", path: "v1/quote", capability: "work" });
-      return [metered];
+      return [pricedMetered];
     });
     seams.submit.mockImplementation(async (_ref, envelope) => ({ jobId: "job-metered", status: "processing",
-      upfrontPayment: { amount_msats: 0, credit_id: "approved-credit", draw_id: envelope.data.draw_id,
-        amount_micro: 0, currency: "usd" } }));
+      upfrontPayment: { amount_msats: 100_000, credit_id: "approved-credit", draw_id: envelope.data.draw_id,
+        amount_micro: 100_000, currency: "usd" } }));
     await request({ endpoint, input: "work", budget: "$1.50", autoPayBelow: "$0.90", creditOnly: "approved-credit", requestId: "request-approved", stream: false });
     expect(output().next_action).toMatchObject({ type: "poll", hint: expect.stringContaining("dvm messages job-metered --wait") });
     expect(output().next_action.hint).toContain("An unanswered payment ask ends the job");
@@ -351,12 +354,13 @@ describe("credit-only threshold", () => {
     await handlePaymentRequest("job-metered", ask, loadJob("job-metered")!.policy!,
       seams as unknown as Transport, { endpoint }, { requestSeq: 1 });
     expect(seams.sendMessage).toHaveBeenCalledWith("job-metered", { type: "payment", content: { credit: expect.objectContaining({ credit_id: "approved-credit", amount_micro: 900_000 }) } }, { endpoint }, expect.anything());
-    expect(loadJob("job-metered")?.totalPaidMsats).toBe(900_000);
+    expect(loadJob("job-metered")?.totalPaidMsats).toBe(1_000_000);
   });
 
   it("never pays a fresh upfront quote when a credit-only draw is refused", async () => {
     seedCredit();
-    seams.submit.mockResolvedValue({ jobId: "", status: "payment-required", quotes: [metered] });
+    seams.quote.mockResolvedValue([pricedMetered]);
+    seams.submit.mockResolvedValue({ jobId: "", status: "payment-required", quotes: [pricedMetered] });
     await expect(request({ endpoint, input: "work", budget: "$1.50", autoPayBelow: "$0.90", creditOnly: "approved-credit", requestId: "request-refused" }))
       .rejects.toMatchObject({ code: "credit_only_unavailable" });
     expect(seams.submit).toHaveBeenCalledTimes(1);
@@ -402,6 +406,7 @@ describe("credit-only threshold", () => {
 
   it("restores the restriction from the request intent after loss of the job record", async () => {
     seedCredit();
+    seams.quote.mockResolvedValue([pricedMetered]);
     seams.submit.mockResolvedValue({ jobId: "job-metered", status: "processing" });
     await request({ endpoint, input: "work", budget: "$1.50", autoPayBelow: "$0.90", creditOnly: "approved-credit", requestId: "request-recovered", stream: false });
     rmSync(JOBS_FILE);

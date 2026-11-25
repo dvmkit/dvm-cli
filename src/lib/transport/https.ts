@@ -362,7 +362,7 @@ export class HttpsTransport implements Transport {
         const usd = rate ? (requiredMsats / 100_000_000_000) * rate : 0;
         const upfront: Quote["upfront"] =
           priceMicro === undefined
-            ? { amount: Math.round(usd * 10_000) / 10_000, currency: "usd" }
+            ? unknownUpfrontPrice(Math.round(usd * 10_000) / 10_000)
             : {
                 amount: priceMicro / 1_000_000,
                 // A provider stating `price_micro` should state

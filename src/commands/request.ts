@@ -174,7 +174,7 @@ import { applyMintPin } from "../lib/mint-pin";
 import { selectRailOrder } from "../lib/payment-rails/select";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
-import { quoteWithinDeclaredLimit } from "../lib/quote-limit";
+import { quoteLimitPrice, quoteWithinDeclaredLimit, type QuoteLimitPrice } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
 import { receiptUpfrontFault, upfrontRailPayment, type UpfrontRailPayment } from "../lib/upfront-payment";
@@ -699,7 +699,7 @@ async function requestWithWarnings(
       }
     : undefined;
   // Quote before a free or credit-draw submit can start the job without a 402.
-  // Advisory pricing must not turn quote availability into a submit requirement.
+  // An unavailable preview still permits an unpaid submit.
   let previewQuotes: Quote[] = [];
   if (drawBudget || drawThreshold) {
     try {
@@ -951,7 +951,7 @@ async function requestWithWarnings(
           submitProbe,
           endpoint,
           deadlineMs,
-          budgetMsats,
+          quoteLimits: { budget: drawBudget, threshold: drawThreshold, btcRate },
           opts,
           identity,
           policy,
@@ -984,13 +984,16 @@ async function requestWithWarnings(
     if (!previewWarnings.length || previewUpfrontCoveredByCredit) {
       addOutputWarnings(autoPayWarnings(quotes, warningLimits, undefined, btcRate), opts.human);
     }
-    if (
-      !autoPayConsent && drawBudget && quotes.length > 0 &&
-      !quotes.some((quote) => quoteWithinDeclaredLimit(quote, drawBudget.msats, drawBudget.declared, opts.rail))
-    ) {
-      transport.close();
-      outputUpfrontOverBudget(receipt.jobId, quotes, opts, identity, false);
-      return;
+    if (!autoPayConsent && drawBudget && quotes.length > 0) {
+      const prices = quotes.map((quote) => quoteLimitPrice(quote, opts.rail));
+      const limitRate = btcRate || await resolveQuoteLimitRate(prices);
+      if (!prices.some((price) =>
+        quoteWithinDeclaredLimit(price, drawBudget.msats, drawBudget.declared, limitRate, opts.rail)
+      )) {
+        transport.close();
+        outputUpfrontOverBudget(receipt.jobId, quotes, opts, identity, false);
+        return;
+      }
     }
     if (autoPayConsent && quotes.length > 0) {
       const pay = () =>
@@ -1001,7 +1004,7 @@ async function requestWithWarnings(
           receipt.jobId,
           deadlineMs,
           quotes,
-          budgetMsats,
+          { budget: drawBudget, threshold: drawThreshold, btcRate },
           opts,
           identity,
           policy,
@@ -1397,14 +1400,14 @@ function sha256Hex(value: string): string {
  * `required_msats`, so the two halves of the ratio are pinned against two fx
  * snapshots and the figure is strictly weaker than the one on the 402.
  */
-async function fetchServerPriceMicro(
+async function fetchServerQuote(
   transport: Transport,
   ref: ProviderRef,
   envelope: JobEnvelope
-): Promise<number | undefined> {
+): Promise<Quote | undefined> {
   try {
     const quotes = await transport.quote(ref, envelope);
-    return quotePriceMicro(quotes[0]);
+    return quotes[0];
   } catch {
     return undefined;
   }
@@ -1603,7 +1606,7 @@ interface DrawProbeRecoveryArgs {
   submitProbe: (env: JobEnvelope) => Promise<Awaited<ReturnType<Transport["submit"]>>>;
   endpoint: string;
   deadlineMs: number;
-  budgetMsats: number | undefined;
+  quoteLimits: RequestQuoteLimits;
   opts: RequestOptions;
   identity: DvmIdentity;
   policy: JobPolicy;
@@ -1785,7 +1788,7 @@ async function recoverDrawProbe(
         receipt.jobId,
         args.deadlineMs,
         receipt.quotes ?? [],
-        args.budgetMsats,
+        args.quoteLimits,
         args.opts,
         args.identity,
         args.policy,
@@ -1824,6 +1827,17 @@ function outputUpfrontOverBudget(
   outputOverBudget(jobId || null, quotes, opts, identity, action);
 }
 
+interface RequestQuoteLimits {
+  budget?: DrawCeiling;
+  threshold?: DrawCeiling;
+  btcRate: number;
+}
+
+async function resolveQuoteLimitRate(prices: QuoteLimitPrice[]): Promise<number> {
+  if (!prices.some((price) => price.usdMicro !== undefined && price.usdMicro > 0n)) return 0;
+  return (await tryResolveBtcUsdRate())?.rate ?? 0;
+}
+
 async function handleAutoPayQuotes(
   transport: Transport,
   ref: ProviderRef,
@@ -1831,21 +1845,21 @@ async function handleAutoPayQuotes(
   jobId: string,
   deadlineMs: number,
   quotes: Quote[],
-  budgetMsats: number | undefined,
+  { budget, threshold, btcRate }: RequestQuoteLimits,
   opts: RequestOptions,
   identity: DvmIdentity,
   policy: JobPolicy,
   providerInfo: ProviderInfo,
   creditCtx?: RequestCreditContext
 ): Promise<void> {
-  const configuredLimits = loadConfig();
-  const declaredBudget = opts.budget ?? configuredLimits?.defaultBudget;
-  const declaredAutoPayBelow = opts.autoPayBelow ?? configuredLimits?.autoPayThreshold;
-  const chosen = budgetMsats !== undefined
-    ? quotes.find((quote) =>
-        quoteWithinDeclaredLimit(quote, budgetMsats, declaredBudget, opts.rail)
-      )
-    : quotes[0];
+  const prices = quotes.map((quote) => quoteLimitPrice(quote, opts.rail));
+  const limitRate = btcRate || await resolveQuoteLimitRate(prices);
+  const fitsBudget = (price: QuoteLimitPrice, rate = limitRate) =>
+    !budget || quoteWithinDeclaredLimit(price, budget.msats, budget.declared, rate, opts.rail);
+  const fitsThreshold = (price: QuoteLimitPrice, rate = limitRate) =>
+    quoteWithinDeclaredLimit(price, policy.autoPayBelowMsats, threshold?.declared, rate, opts.rail);
+  const chosenIndex = prices.findIndex((price) => fitsBudget(price));
+  const chosen = quotes[chosenIndex];
 
   if (!chosen) {
     transport.close?.();
@@ -1856,23 +1870,24 @@ async function handleAutoPayQuotes(
   setMandateUpfront(creditCtx?.signing.standingMandate, chosen);
 
   // Check auto-pay threshold (mirrors payment-responder.ts for mid-job payments)
-  if (
-    !quoteWithinDeclaredLimit(chosen, policy.autoPayBelowMsats, declaredAutoPayBelow, opts.rail)
-  ) {
+  const outputAboveThreshold = (quote: Quote, availableQuotes = quotes) => {
     transport.close?.();
     const action = buildResubmitAction(
       opts,
-      { minAutoPayBelowMsats: chosen.priceMsats },
-      `Price (${quoteAmountLabel(chosen)}) exceeds your --auto-pay-below threshold. Re-run with --auto-pay-below at or above the quote price.`
+      { minAutoPayBelowMsats: quote.priceMsats },
+      `Price (${quoteAmountLabel(quote)}) exceeds your --auto-pay-below threshold. Re-run with --auto-pay-below at or above the quote price.`
     );
     outputCollectedQuotes(
       jobId || null,
-      quotes,
+      availableQuotes,
       opts,
       identity,
       "Price exceeds your --auto-pay-below threshold. Increase it or pass a higher --budget.",
       action
     );
+  };
+  if (!fitsThreshold(prices[chosenIndex])) {
+    outputAboveThreshold(chosen);
     return;
   }
 
@@ -1916,7 +1931,7 @@ async function handleAutoPayQuotes(
   let planRate = 0;
   const attestedIdentity = providerDvmIdentity(providerInfo);
   if (creditCtx?.signing && !opts.strictPerCall && !opts.requestId) {
-    planRate = (await tryResolveBtcUsdRate())?.rate ?? 0;
+    planRate = limitRate || (await tryResolveBtcUsdRate())?.rate || 0;
     const x402Wallet = loadX402Wallet();
     plan = planCreditForQuote({
       // Attached-payment 402s carry the price but not the funding menu. The
@@ -2020,8 +2035,23 @@ async function handleAutoPayQuotes(
   // decimals — signing a fund amount off *that* is the mismatch
   // itself, so it must reach `fundWireAmountMicro` through no path at all.
   if (plan.mode === "open" || plan.mode === "topup") {
-    const priceMicroServer =
-      statedPriceMicro(chosen) ?? (await fetchServerPriceMicro(transport, ref, envelope));
+    const stated = statedPriceMicro(chosen);
+    const fallbackQuote = stated === undefined ? await fetchServerQuote(transport, ref, envelope) : undefined;
+    const priceMicroServer = stated ?? quotePriceMicro(fallbackQuote);
+    if (fallbackQuote && priceMicroServer !== undefined) {
+      const price = quoteLimitPrice(fallbackQuote, opts.rail);
+      if (price.usdMicro !== undefined) {
+        if (!fitsBudget(price, planRate)) {
+          transport.close?.();
+          outputUpfrontOverBudget(jobId, [fallbackQuote], opts, identity, true);
+          return;
+        }
+        if (!fitsThreshold(price, planRate)) {
+          outputAboveThreshold(fallbackQuote, [fallbackQuote]);
+          return;
+        }
+      }
+    }
     if (priceMicroServer === undefined) {
       info("Credit funding skipped — the DVM's fiat price is unavailable. Paying per-call.");
       plan = { mode: "none" };

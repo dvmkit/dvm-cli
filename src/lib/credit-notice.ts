@@ -1002,8 +1002,14 @@ export function buildCreditDrawSkipped(args: {
           hint: `An expired credit keeps its balance — reclaim it with 'dvm credit drain ${handle}'.`,
         };
       case "price_above_ceiling": {
+        if (skip.lastPriceMicro === undefined && skip.lastPriceMsats === undefined) {
+          return {
+            display: `${parked}, but this capability's price is unavailable, so it was left undrawn.`,
+            hint: "Retry when the DVM can quote the job price.",
+          };
+        }
         const last = skip.lastPriceMicro === undefined
-          ? `${skip.lastPriceMsats ?? 0} msats`
+          ? `${skip.lastPriceMsats} msats`
           : `$${formatUsd(skip.lastPriceMicro / 1_000_000)}`;
         const ceiling = skip.ceilingMicro === undefined
           ? `${skip.ceilingMsats ?? 0} msats`

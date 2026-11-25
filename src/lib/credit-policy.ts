@@ -15,7 +15,7 @@ import {
 } from "./credit-fund";
 import type { StoredCredit, StoredImplicitCredit } from "@dvmkit/sdk/internal";
 import { normalizeCreditEndpoint } from "@dvmkit/sdk/internal";
-import { microToSats, msatsToMicro, usdToMsats } from "@dvmkit/sdk/internal";
+import { microToSats, msatsToMicro } from "@dvmkit/sdk/internal";
 export { microToSats, msatsToMicro } from "@dvmkit/sdk/internal";
 export { type FundValuation, fundWireAmountMicro, readFundValuation } from "@dvmkit/sdk/internal";
 import {
@@ -28,9 +28,7 @@ import type { StoredReceipt } from "@dvmkit/sdk/internal";
 import { type AttestedDvmIdentity, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
 import type { CreditMenu, Quote } from "@dvmkit/sdk/internal";
 import { offersX402CreditFunding } from "@dvmkit/sdk/internal";
-import { decimalRatio } from "./currency";
-import { dollarLimitMicro, quoteWithinDeclaredLimit } from "./quote-limit";
-import { hasKnownUpfrontPrice } from "./quote-upfront";
+import { declaredLimitMicro, quoteLimitPrice, quoteWithinDeclaredLimit } from "./quote-limit";
 
 /**
  * A multi-job credit purchase the consent posture held back.
@@ -899,76 +897,43 @@ function priceAboveDrawCeiling(
   rail: string | undefined
 ): DrawSkip | undefined {
   if (!args.budget && !args.threshold) return undefined;
-  const quote = upfrontDrawQuote(args.quote, args.btcRate);
-  const receiptMicro = quote ? undefined : drawnPriceMicro(args, credit);
-  const quoteMicro = quote?.upfront.currency === "usd" ? quote.upfront.amount_micro : undefined;
-  const rate = args.btcRate > 0 ? decimalRatio(String(args.btcRate)) : undefined;
-  const convertedMicro = (msats: number) =>
-    rate ? msatsToMicro(msats, args.btcRate) : undefined;
-  const rejected = (ceiling: DrawCeiling | undefined) => {
-    if (!ceiling) return undefined;
-    const dollars = dollarLimitMicro(ceiling.declared);
-    // A USD draw can cost more than its advisory millisats suggest. Compare its
-    // native charge to the bare-msat ceiling without rounding the FX result up.
-    const millisatCapMicro = rate && dollars === undefined && Number.isInteger(ceiling.msats)
-      ? BigInt(ceiling.msats) * rate[0] / (100_000n * rate[1])
-      : undefined;
-    const nativeCap = dollars ?? millisatCapMicro;
-    const ceilingMicro = nativeCap === undefined ? undefined : Number(nativeCap);
-    const nativeAbove = millisatCapMicro !== undefined && quoteMicro !== undefined &&
-      BigInt(quoteMicro) > millisatCapMicro;
-    const freeDollarQuote = dollars !== undefined && dollars >= 0n &&
-      quoteMicro === 0 && !quote?.requiredUsdcMicro;
-    const above = quote
-      ? nativeAbove || (hasKnownUpfrontPrice(quote)
-        ? !freeDollarQuote && !quoteWithinDeclaredLimit(quote, ceiling.msats, ceiling.declared, rail)
-        : quote.priceMsats > ceiling.msats)
-      : receiptMicro !== undefined && nativeCap !== undefined && BigInt(receiptMicro) > nativeCap;
-    return above ? { ceiling, dollars, ceilingMicro, nativeAbove } : undefined;
-  };
-  const budget = rejected(args.budget);
-  const threshold = rejected(args.threshold);
-  // Equal limits retain the threshold's attribution.
-  const binding = budget && threshold
-    ? ((budget.dollars !== undefined && threshold.dollars !== undefined
-        ? budget.dollars < threshold.dollars
-        : budget.ceiling.msats < threshold.ceiling.msats) ? budget : threshold)
-    : budget ?? threshold;
+  const quoted = quoteLimitPrice(args.quote, rail);
+  const hasQuotedPrice = quoted.usdMicro !== undefined || quoted.msats !== undefined;
+  const receiptMicro = hasQuotedPrice ? undefined : drawnPriceMicro(args, credit);
+  const price = receiptMicro === undefined ? quoted : { usdMicro: BigInt(receiptMicro) };
+  const rejected = (ceiling: DrawCeiling | undefined) => ceiling &&
+    !quoteWithinDeclaredLimit(price, ceiling.msats, ceiling.declared, args.btcRate, rail);
+
+  const budget = rejected(args.budget) ? args.budget : undefined;
+  const threshold = rejected(args.threshold) ? args.threshold : undefined;
+  let binding = budget ?? threshold;
+  if (budget && threshold) {
+    const budgetMicro = declaredLimitMicro(budget.msats, budget.declared, args.btcRate);
+    const thresholdMicro = declaredLimitMicro(threshold.msats, threshold.declared, args.btcRate);
+    // Equal limits retain the threshold's attribution.
+    const hasNativeLimits = (price.msats === undefined || price.usdMicro !== undefined) &&
+      budgetMicro !== undefined && thresholdMicro !== undefined;
+    const budgetBinds = hasNativeLimits ? budgetMicro < thresholdMicro : budget.msats < threshold.msats;
+    binding = budgetBinds ? budget : threshold;
+  }
   if (!binding) return undefined;
-  const usdc = rail?.trim().toLowerCase() === "x402" &&
-    binding.dollars !== undefined && quote?.requiredUsdcMicro && /^\d+$/.test(quote.requiredUsdcMicro)
-    ? Number(quote.requiredUsdcMicro)
-    : undefined;
-  const quotedMicro = quote
-    ? (binding.nativeAbove ? quoteMicro : binding.dollars === undefined ? undefined : usdc ?? quoteMicro) ??
-      convertedMicro(quote.priceMsats)
-    : undefined;
+
+  const ceilingMicro = declaredLimitMicro(binding.msats, binding.declared, args.btcRate);
+  const lastPriceMicro = price.usdMicro !== undefined
+    ? Number(price.usdMicro)
+    : price.msats !== undefined && args.btcRate > 0
+      ? msatsToMicro(price.msats, args.btcRate)
+      : undefined;
   return {
     reason: "price_above_ceiling",
     creditId: credit.creditId,
     remainingMicro: credit.remainingMicro,
-    ceilingSource: binding.ceiling.source,
-    ceilingMicro: binding.ceilingMicro,
-    lastPriceMicro: quotedMicro ?? receiptMicro,
-    ceilingMsats: binding.ceiling.msats,
-    lastPriceMsats: quote?.priceMsats,
+    ceilingSource: binding.source,
+    ceilingMicro: ceilingMicro === undefined ? undefined : Number(ceilingMicro),
+    lastPriceMicro,
+    ceilingMsats: binding.msats,
+    lastPriceMsats: price.msats,
   };
-}
-
-function upfrontDrawQuote(quote: Quote | undefined, btcRate: number): Quote | undefined {
-  if (!quote) return undefined;
-  // Legacy quotes can state a millisat price without a native upfront amount.
-  if (!hasKnownUpfrontPrice(quote)) {
-    return Number.isFinite(quote.priceMsats) && quote.priceMsats > 0 ? quote : undefined;
-  }
-  // A zero upfront on a metered job does not establish the draw price.
-  if (quote.shape === "rate" && (quote.upfront.amount_micro ?? quote.upfront.amount) <= 0)
-    return undefined;
-  if (quote.upfront.currency !== "usd") return quote.priceMsats > 0 ? quote : undefined;
-  const micro = quote.upfront.amount_micro ?? Math.round(quote.upfront.amount * 1_000_000);
-  if (!Number.isSafeInteger(micro) || micro < 0) return undefined;
-  const msats = quote.priceMsats || (btcRate > 0 ? usdToMsats(micro / 1_000_000, btcRate) : 0);
-  return { ...quote, priceMsats: msats, upfront: { ...quote.upfront, amount_micro: micro } };
 }
 
 function drawnPriceMicro(

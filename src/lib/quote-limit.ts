@@ -1,16 +1,73 @@
 import type { Quote } from "@dvmkit/sdk/internal";
 
-/**
- * Compare exact dollar prices before advisory BTC conversions to avoid FX rounding.
- */
-export function quoteWithinDeclaredLimit(
-  quote: Quote,
+import { decimalRatio } from "./currency";
+import { hasKnownUpfrontPrice } from "./quote-upfront";
+
+export interface QuoteLimitPrice {
+  usdMicro?: bigint;
+  msats?: number;
+}
+
+export function quoteLimitPrice(quote: Quote | undefined, rail?: string): QuoteLimitPrice {
+  if (!quote) return {};
+  const normalizedRail = rail?.trim().toLowerCase();
+  const msats = Number.isSafeInteger(quote.priceMsats) && quote.priceMsats > 0
+    ? quote.priceMsats
+    : undefined;
+  const usdc = quote.requiredUsdcMicro;
+  if (normalizedRail === "x402" && usdc !== undefined && /^\d+$/.test(usdc)) {
+    return { usdMicro: BigInt(usdc), msats };
+  }
+  const upfront = quote.upfront;
+  if (!upfront || !hasKnownUpfrontPrice(quote)) return { msats };
+
+  const micro = upfront.amount_micro;
+  if ((micro ?? 0) === 0 && upfront.amount === 0 && quote.shape !== "rate" && quote.priceMsats === 0) {
+    return { usdMicro: 0n, msats: 0 };
+  }
+  if (upfront.currency !== "usd") return { msats };
+  if (micro !== undefined && Number.isSafeInteger(micro) && micro > 0) {
+    return { usdMicro: BigInt(micro), msats };
+  }
+  if (micro === undefined && normalizedRail !== "tempo" && upfront.amount > 0) {
+    const dollars = decimalRatio(String(upfront.amount));
+    if (dollars) {
+      // Round a legacy decimal charge up so a positive sub-micro price cannot read as free.
+      const [numerator, denominator] = dollars;
+      return { usdMicro: (numerator * 1_000_000n + denominator - 1n) / denominator, msats };
+    }
+  }
+  return { msats };
+}
+
+export function declaredLimitMicro(
   limitMsats: number,
   declaredLimit: string | undefined,
-  rail: string | undefined
+  btcRate: number
+): bigint | undefined {
+  if (declaredLimit?.trim().startsWith("$")) return dollarLimitMicro(declaredLimit);
+  if (limitMsats === 0) return 0n;
+  const rate = btcRate > 0 ? decimalRatio(String(btcRate)) : undefined;
+  if (rate && Number.isSafeInteger(limitMsats) && limitMsats >= 0) {
+    return BigInt(limitMsats) * rate[0] / (100_000n * rate[1]);
+  }
+  return undefined;
+}
+
+export function quoteWithinDeclaredLimit(
+  price: QuoteLimitPrice,
+  limitMsats: number,
+  declaredLimit: string | undefined,
+  btcRate = 0,
+  rail?: string
 ): boolean {
-  const native = quoteWithinNativeDollarLimit(quote, declaredLimit, rail);
-  return native ?? quote.priceMsats <= limitMsats;
+  const nativeLimit = declaredLimitMicro(limitMsats, declaredLimit, btcRate);
+  if (price.usdMicro !== undefined) {
+    if (nativeLimit !== undefined) return price.usdMicro <= nativeLimit;
+    if (price.usdMicro === 0n) return limitMsats >= 0;
+  }
+  if (rail?.trim().toLowerCase() === "tempo" && declaredLimit?.trim().startsWith("$")) return false;
+  return price.msats !== undefined && price.msats <= limitMsats;
 }
 
 export function dollarLimitMicro(declaredLimit: string): bigint | undefined {
@@ -31,50 +88,4 @@ export function dollarLimitMicro(declaredLimit: string): bigint | undefined {
   if (sign !== "-") return micro;
   // A whole-microunit charge must fit under the declaration, even below zero.
   return /[1-9]/.test(digits.slice(places)) ? -micro - 1n : -micro;
-}
-
-function quoteWithinNativeDollarLimit(
-  quote: Quote,
-  declaredLimit: string | undefined,
-  rail: string | undefined
-): boolean | undefined {
-  const normalizedRail = rail?.trim().toLowerCase();
-  if (normalizedRail === "x402") {
-    const native = x402QuoteWithinDollarLimit(quote, declaredLimit);
-    if (native !== undefined) return native;
-  }
-  const upfront = upfrontQuoteWithinDollarLimit(quote, declaredLimit);
-  if (normalizedRail === "tempo" && declaredLimit?.trim().startsWith("$")) {
-    return upfront ?? false;
-  }
-  return upfront;
-}
-
-function x402QuoteWithinDollarLimit(
-  quote: Quote,
-  declaredLimit: string | undefined
-): boolean | undefined {
-  if (!declaredLimit || !quote.requiredUsdcMicro) return undefined;
-  const limitMicro = dollarLimitMicro(declaredLimit);
-  if (limitMicro === undefined || !/^\d+$/.test(quote.requiredUsdcMicro)) return undefined;
-  return BigInt(quote.requiredUsdcMicro) <= limitMicro;
-}
-
-function upfrontQuoteWithinDollarLimit(
-  quote: Quote,
-  declaredLimit: string | undefined
-): boolean | undefined {
-  if (!declaredLimit?.trim().startsWith("$")) return undefined;
-  const limitMicro = dollarLimitMicro(declaredLimit);
-  const amountMicro = quote.upfront?.amount_micro;
-  if (
-    limitMicro === undefined ||
-    quote.upfront?.currency !== "usd" ||
-    amountMicro === undefined ||
-    !Number.isSafeInteger(amountMicro) ||
-    amountMicro <= 0
-  ) {
-    return undefined;
-  }
-  return BigInt(amountMicro) <= limitMicro;
 }
