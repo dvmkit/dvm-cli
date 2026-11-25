@@ -76,6 +76,11 @@ export type HeldPaymentBlock =
   /** The provider's answer does not change on a re-send, but it may still redeem this payment. */
   | { reason: "not_resendable"; detail: string };
 
+interface TempoPendingSettlement {
+  retryable?: boolean;
+  transaction_hash?: string;
+}
+
 export type UnconfirmedPaymentSubmission =
   | (SubmissionBooking & {
       rail: "cashu_p2pk";
@@ -90,6 +95,8 @@ export type UnconfirmedPaymentSubmission =
       content: Record<string, unknown>;
       /** Exact signed x402 value in USDC microunits. */
       amountUsdcMicro?: string;
+      /** Evidence from a Tempo refusal that the original transfer may still settle. */
+      tempoPendingSettlement?: TempoPendingSettlement;
     });
 
 export interface JobRecord {
@@ -570,6 +577,13 @@ export function markPaymentRequestInFlight(jobId: string, requestSeq: number, su
       (job.inFlightPaymentRequestStartedAtMs ??= {})[requestSeq] = Date.now();
       if (submission) (job.unconfirmedPaymentSubmissions ??= {})[requestSeq] = submission;
     }
+  });
+}
+
+export function recordTempoPendingSettlement(jobId: string, requestSeq: number, evidence: TempoPendingSettlement): void {
+  mutateJobs((jobs) => {
+    const submission = jobs.find((entry) => entry.id === jobId)?.unconfirmedPaymentSubmissions?.[requestSeq];
+    if (submission?.rail === "tempo") submission.tempoPendingSettlement = { ...submission.tempoPendingSettlement, ...evidence };
   });
 }
 

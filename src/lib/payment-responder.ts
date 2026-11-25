@@ -46,6 +46,7 @@ import {
   type JobRecord,
   markPaymentRequestPaid,
   markPaymentRequestInFlight,
+  recordTempoPendingSettlement,
   blockHeldPayment,
   type PaymentApproval,
   type UnconfirmedPaymentSubmission,
@@ -1016,7 +1017,10 @@ async function sendRailPayment(
   // Persist before dispatch: a lost reply cannot distinguish a rejected send
   // from a payment the provider already accepted.
   if (requestSeq !== undefined) markPaymentRequestInFlight(jobId, requestSeq, submission);
-  let pendingSettlement: DvmError | undefined;
+  const savedSettlement = submission?.rail === "tempo" ? submission.tempoPendingSettlement : undefined;
+  let pendingSettlement = savedSettlement && new DvmError("payment_invalid", "Tempo settlement unconfirmed.", undefined, {
+    rail: "tempo", reason: "settlement_unconfirmed", ...savedSettlement,
+  });
   let result: Awaited<ReturnType<Transport["sendMessage"]>>;
   try {
     const send = () => transport.sendMessage(jobId, message, provider, options);
@@ -1024,7 +1028,15 @@ async function sendRailPayment(
       const credential = submission.content.tempo_credential as MppxCredential | undefined;
       result = await sendTempoCredential(send, {
         expires: credential?.challenge?.expires,
-        onPendingSettlement: (refusal) => { pendingSettlement = refusal; },
+        onPendingSettlement: (refusal) => {
+          pendingSettlement = refusal;
+          if (requestSeq === undefined) return;
+          const { retryable, transaction_hash } = refusal.data ?? {};
+          recordTempoPendingSettlement(jobId, requestSeq, {
+            ...(typeof retryable === "boolean" ? { retryable } : {}),
+            ...(typeof transaction_hash === "string" ? { transaction_hash } : {}),
+          });
+        },
       });
     } else {
       result = await send();

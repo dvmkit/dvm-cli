@@ -663,17 +663,42 @@ describe("mid-job payment rail selection", () => {
     it.each([
       new DvmError("timeout", "Reply lost"),
       Object.assign(new Error("Could not connect"), { code: "ECONNREFUSED" }),
-    ])("keeps the hold and recovery window after a resend failure ($code)", async (failure) => {
-      const { store, jobId, transport, pay, credential } = await tempoPay(`tempo-settlement-resend-${failure.code}`);
-      transport.sendMessage.mockRejectedValueOnce(refusal("settlement_unconfirmed", true, 0))
-        .mockRejectedValueOnce(failure);
-      await expect(pay()).rejects.toBe(failure);
-      expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({
-        rail: "tempo", content: { tempo_credential: credential },
-      });
-      await expect(pay()).rejects.toMatchObject({ code: "payment_settling" });
-      expect(transport.sendMessage).toHaveBeenCalledTimes(2);
-      expect(sdk.recordSpend).not.toHaveBeenCalled();
+    ])("keeps pending settlement across journal replay after a resend failure ($code)", async (failure) => {
+      vi.useFakeTimers();
+      try {
+        const { store, jobId, transport, pay, credential } = await tempoPay(`tempo-settlement-resend-${failure.code}`);
+        const transactionHash = "0x" + "ab".repeat(32);
+        const pending = new DvmError("payment_invalid", "Pending settlement", undefined, {
+          http_status: 402, rail: "tempo", reason: "settlement_unconfirmed", retryable: true, retry_after_ms: 0,
+          transaction_hash: transactionHash,
+        });
+        transport.sendMessage.mockRejectedValueOnce(pending)
+          .mockRejectedValueOnce(failure)
+          .mockRejectedValueOnce(new DvmError("payment_insufficient", "Short", undefined, {
+            http_status: 402, credit_id: "credit-1",
+          }));
+
+        await expect(pay()).rejects.toBe(failure);
+        await expect(pay()).rejects.toMatchObject({ code: "payment_settling" });
+        expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(45_000);
+
+        const replayError = await pay("explicit").catch((error: unknown) => error);
+        const held = store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5];
+        await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_unconfirmed" });
+        expect(replayError).toMatchObject({
+          code: "tempo_settlement_unconfirmed", data: { payment_state: "unknown", transaction_hash: transactionHash },
+        });
+        expect(held).toMatchObject({
+          rail: "tempo", content: { tempo_credential: credential }, blocked: { reason: "not_resendable" },
+        });
+        expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toEqual(held);
+        const originalSend = [jobId, { type: "payment", content: { tempo_credential: credential, amount_msats: 12_000 } },
+          provider, { jobToken: "job-token" }];
+        expect(transport.sendMessage.mock.calls).toEqual([originalSend, originalSend, originalSend]);
+        expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
+        expect(sdk.recordSpend).not.toHaveBeenCalled();
+      } finally { vi.useRealTimers(); }
     });
 
     it("resends not_broadcast once with the identical message and signs no second credential", async () => {
