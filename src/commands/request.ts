@@ -1975,13 +1975,13 @@ async function handleAutoPayQuotes(
     const { quote, selection } = available;
     plan = planForQuote(quote);
     nativeCharge = undefined;
+    fundingBtcRate = undefined;
     if (plan.mode === "open" || plan.mode === "topup") {
       if (selection.rails[0] !== "cashu_p2pk") {
         info("Credit funding is Cashu-only for now — paying per-call on the selected rail.");
         plan = { mode: "none" };
       } else {
-        // Price the attached draw as well as the per-call fallback. A legacy
-        // 402 needs a provider quote because its USD amount may be reconstructed.
+        // A legacy 402 needs a provider quote to price the attached draw.
         const stated = statedPriceMicro(quote);
         const fallbackQuote = stated === undefined ? await fetchServerQuote(transport, ref, envelope) : undefined;
         const nativeQuote = fallbackQuote ?? quote;
@@ -1989,6 +1989,9 @@ async function handleAutoPayQuotes(
         const priceMicro = price.usd ? stated ?? quotePriceMicro(fallbackQuote) : undefined;
         if (priceMicro === undefined) {
           info("Credit funding skipped — the DVM's fiat price is unavailable. Paying per-call.");
+          plan = { mode: "none" };
+        } else if (stated !== undefined && !fitsBudget(price, planRate)) {
+          info("Credit funding skipped — the prepaid draw exceeds your --budget. Paying per-call.");
           plan = { mode: "none" };
         } else {
           // A deposit blocked by the global cap leaves only the per-call
@@ -2002,9 +2005,8 @@ async function handleAutoPayQuotes(
             plan = { mode: "none" };
           }
           if (plan.mode === "open" || plan.mode === "topup") {
-            if (!fitsBudget(price, planRate)) {
+            if (stated === undefined && !fitsBudget(price, planRate)) {
               rejectedCharges.push({ charges: [...available.charges, price], rate: planRate });
-              fundingBtcRate = undefined;
               continue;
             }
             nativeCharge = { quote: nativeQuote, price };
@@ -2164,7 +2166,9 @@ async function handleAutoPayQuotes(
 
   // Attached credit funding already passed the cap check during selection.
   const upfrontBtcRate = fundingBtcRate ?? await enforceGlobalBudget({
-    plannedMsats: chosen.priceMsats,
+    plannedMsats: selection.rails[0] === "cashu_p2pk"
+      ? cashuQuoteSats(chosen.priceMsats) * 1000
+      : chosen.priceMsats,
     ...(planRate > 0 ? { btcRate: planRate } : {}),
   });
 
