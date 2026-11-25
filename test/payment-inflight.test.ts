@@ -61,7 +61,7 @@ vi.mock("../src/lib/wallet-agent/recovery-submissions", () => ({ sweepPendingSub
 import lockfile from "proper-lockfile";
 import { streamLoop } from "../src/lib/stream-loop";
 import { waitForJob } from "../src/lib/wait-for-job";
-import { DvmError, type Message } from "@dvmkit/sdk/internal";
+import { DvmError, JOBS_FILE, type Message } from "@dvmkit/sdk/internal";
 import { handlePaymentRequest } from "../src/lib/payment-responder";
 import { abandonPendingSubmission } from "../src/lib/wallet-agent/spend";
 
@@ -624,17 +624,28 @@ describe("mid-job payment rail selection", () => {
       } finally { vi.useRealTimers(); }
     });
 
-    it("keeps a pending Tempo payment held when recovery reaches challenge expiry", async () => {
+    it.each([
+      { timing: "before replay", expiresInMs: 45_000 },
+      { timing: "during the journal write", expiresInMs: 45_500 },
+    ])("keeps a pending Tempo payment held when the challenge expires $timing", async ({ timing, expiresInMs }) => {
       vi.useFakeTimers();
       try {
-        const { store, jobId, transport, pay, credential } = await tempoPay("tempo-settlement-expired-replay", 45_000);
+        const { store, jobId, transport, pay, credential } = await tempoPay(
+          `tempo-settlement-expired-replay-${expiresInMs}`, expiresInMs,
+        );
         transport.sendMessage.mockRejectedValueOnce(refusal("settlement_unconfirmed", true, 0))
           .mockRejectedValueOnce(new DvmError("timeout", "Resend reply lost"));
 
         await expect(pay()).rejects.toMatchObject({ code: "timeout" });
         await vi.advanceTimersByTimeAsync(45_000);
 
-        const replay = await pay("explicit").catch((error: unknown) => error);
+        const acquire = lockfile.lockSync.bind(lockfile);
+        const expiresAt = Date.parse(credential.challenge.expires!);
+        const journalLock = vi.spyOn(lockfile, "lockSync").mockImplementation((file, options) => {
+          if (timing === "during the journal write" && file === JOBS_FILE) vi.setSystemTime(expiresAt);
+          return acquire(file, options);
+        });
+        const replay = await pay("explicit").catch((error: unknown) => error).finally(() => journalLock.mockRestore());
         expect(transport.sendMessage).toHaveBeenCalledTimes(2);
         expect(replay).toMatchObject({ code: "payment_unconfirmed" });
         const held = store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5];

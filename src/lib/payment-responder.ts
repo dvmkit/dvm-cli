@@ -639,6 +639,14 @@ function unconfirmedPaymentError(jobId: string, message: string, hint = unresend
   return new DvmError("payment_unconfirmed", `${message} No new payment was signed.`, hint);
 }
 
+function assertTempoReplayUnexpired(jobId: string, requestSeq: number, expires: string | undefined): void {
+  if (Date.parse(expires ?? "") <= Date.now()) {
+    const detail = "The earlier Tempo challenge expired and the payment's settlement is still unconfirmed.";
+    blockHeldPayment(jobId, requestSeq, { reason: "not_resendable", detail });
+    throw unconfirmedPaymentError(jobId, detail);
+  }
+}
+
 function holdsPayment(job: JobRecord, requestSeq: number): boolean {
   return job.inFlightPaymentRequestSeqs?.includes(requestSeq) === true ||
     job.unconfirmedPaymentSubmissions?.[requestSeq] !== undefined;
@@ -668,11 +676,7 @@ async function redeliverUnconfirmedPayment(args: {
       `Re-send it with \`dvm pay ${guidanceJobArg(jobId)}\` without --rail; it re-delivers that same payment.`);
   if (submission.rail === "tempo") {
     const credential = submission.content.tempo_credential as MppxCredential | undefined;
-    if (Date.parse(credential?.challenge?.expires ?? "") <= Date.now()) {
-      const detail = "The earlier Tempo challenge expired and the payment's settlement is still unconfirmed.";
-      blockHeldPayment(jobId, args.requestSeq, { reason: "not_resendable", detail });
-      throw unconfirmedPaymentError(jobId, detail);
-    }
+    assertTempoReplayUnexpired(jobId, args.requestSeq, credential?.challenge?.expires);
   }
   if (submission.rail !== "cashu_p2pk")
     return deliverSignedRailPayment({ ...args, submission, redelivery: true });
@@ -1025,6 +1029,14 @@ async function sendRailPayment(
   // Persist before dispatch: a lost reply cannot distinguish a rejected send
   // from a payment the provider already accepted.
   if (requestSeq !== undefined) markPaymentRequestInFlight(jobId, requestSeq, submission);
+  const tempoCredential = submission?.rail === "tempo"
+    ? submission.content.tempo_credential as MppxCredential | undefined
+    : undefined;
+  const tempoExpires = tempoCredential?.challenge?.expires;
+  // The journal write can wait for the jobs lock while a replay's challenge expires.
+  if (redelivery && requestSeq !== undefined && submission?.rail === "tempo")
+    assertTempoReplayUnexpired(jobId, requestSeq, tempoExpires);
+
   const savedSettlement = submission?.rail === "tempo" ? submission.tempoPendingSettlement : undefined;
   let pendingSettlement = savedSettlement && new DvmError("payment_invalid", "Tempo settlement unconfirmed.", undefined, {
     rail: "tempo", reason: "settlement_unconfirmed", ...savedSettlement,
@@ -1033,9 +1045,8 @@ async function sendRailPayment(
   try {
     const send = () => transport.sendMessage(jobId, message, provider, options);
     if (submission?.rail === "tempo") {
-      const credential = submission.content.tempo_credential as MppxCredential | undefined;
       result = await sendTempoCredential(send, {
-        expires: credential?.challenge?.expires,
+        expires: tempoExpires,
         onPendingSettlement: (refusal) => {
           pendingSettlement = refusal;
           if (requestSeq === undefined) return;
