@@ -270,7 +270,10 @@ describe("automatic credit funding notices", () => {
     await request({ endpoint, input: "Echo", budget: "50000", autoPayBelow: "550000" });
 
     if (hasHistory && posture === "auto") {
-      expect(terminal()).toMatchObject({ status: "over-budget" });
+      expect(terminal()).toMatchObject({
+        status: "over-budget",
+        next_action: { command: expect.stringContaining("--budget 100000") },
+      });
       expect(seams.submit).toHaveBeenCalledTimes(submissions + 1);
       expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
     } else {
@@ -299,6 +302,48 @@ describe("automatic credit funding notices", () => {
 
     expect(terminal()).toMatchObject({ status });
     expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
+  it("pays per-call when the global cap covers the job but rules out its credit deposit", async () => {
+    const { setCaps } = await import("../src/lib/budget-ledger");
+    seams.rate = 100_000;
+    await paidRequest();
+    setCaps({ dailyUsd: 0.075 });
+    seams.prepareAgentSpend.mockClear();
+    const { credit } = await seams.describe();
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" },
+      priceMsats: 50_000,
+      credit,
+    }] });
+
+    await request({ endpoint, input: "Echo", budget: "50000", autoPayBelow: "550000" });
+
+    expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk" });
+    expect(seams.prepareAgentSpend.mock.calls.map(([args]) => args.amountSats)).toEqual([50]);
+    expect(paidEnvelopes().at(-1)?.data).not.toHaveProperty("fund");
+  });
+
+  it.each([
+    { budget: "50001", autoPayBelow: "50001", status: "over-budget", retryBudget: "51000" },
+    { budget: "550000", autoPayBelow: "50001", status: "quotes-collected", retryBudget: "550000" },
+  ])("builds the $status retry from the rounded Cashu charge", async ({
+    budget, autoPayBelow, status, retryBudget,
+  }) => {
+    seams.rate = 100_000;
+    writeConfig("off");
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.04, amount_micro: 40_000, currency: "usd" },
+      priceMsats: 50_001,
+    }] });
+
+    await request({ endpoint, input: "Echo", budget, autoPayBelow });
+
+    expect(terminal()).toMatchObject({ status, next_action: {
+      type: "resubmit",
+      command: expect.stringContaining(`--budget ${retryBudget} --auto-pay-below 51000`),
+    } });
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 

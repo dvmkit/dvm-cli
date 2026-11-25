@@ -177,7 +177,7 @@ import { applyMintPin } from "../lib/mint-pin";
 import { selectRailOrder } from "../lib/payment-rails/select";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
-import { quoteLimitPrice, quoteWithinDeclaredLimit, usdFromMicro, type QuoteLimitPrice } from "../lib/quote-limit";
+import { minimumQuoteLimitMsats, quoteLimitPrice, quoteWithinDeclaredLimit, usdFromMicro, type QuoteLimitPrice } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
 import { receiptUpfrontFault, upfrontRailPayment, type UpfrontRailPayment } from "../lib/upfront-payment";
@@ -995,7 +995,10 @@ async function requestWithWarnings(
         quoteWithinDeclaredLimit(price, drawBudget.msats, drawBudget.declared, limitRate)
       ))) {
         transport.close();
-        outputUpfrontOverBudget(receipt.jobId, quotes, opts, identity, false);
+        outputUpfrontOverBudget(
+          receipt.jobId, quotes, opts, identity, false,
+          Math.min(...prices.map((charges) => upfrontRetryMsats(charges, limitRate)))
+        );
         return;
       }
     }
@@ -1812,22 +1815,26 @@ async function recoverDrawProbe(
   throw err;
 }
 
+function upfrontRetryMsats(charges: QuoteLimitPrice[], btcRate: number): number {
+  return Math.max(...charges.map((charge) => minimumQuoteLimitMsats(charge, btcRate) ?? Infinity));
+}
+
 function outputUpfrontOverBudget(
   jobId: string,
   quotes: Quote[],
   opts: RequestOptions,
   identity: DvmIdentity,
-  autoPayConsent: boolean
+  autoPayConsent: boolean,
+  retryMsats: number
 ): void {
-  const cheapest = cheapestQuote(quotes);
-  const action = buildResubmitAction(
+  const action = Number.isFinite(retryMsats) ? buildResubmitAction(
     opts,
     {
-      minBudgetMsats: cheapest.priceMsats,
-      ...(autoPayConsent ? { minAutoPayBelowMsats: cheapest.priceMsats } : {}),
+      minBudgetMsats: retryMsats,
+      ...(autoPayConsent ? { minAutoPayBelowMsats: retryMsats } : {}),
     },
-    `Cheapest quote (${quoteAmountLabel(cheapest)}) exceeds your --budget. Re-run with --budget at or above the quote price.`
-  );
+    `The upfront charge exceeds your --budget. Re-run with --budget at or above ${retryMsats} msats.`
+  ) : undefined;
   outputOverBudget(jobId || null, quotes, opts, identity, action);
 }
 
@@ -1911,10 +1918,20 @@ async function handleAutoPayQuotes(
   const fitsThreshold = (price: QuoteLimitPrice, rate = limitRate) =>
     quoteWithinDeclaredLimit(price, policy.autoPayBelowMsats, threshold?.declared, rate);
 
-  const affordable = candidates.filter(({ charges }) => charges.every((price) => fitsBudget(price)));
-  if (affordable.length === 0) {
+  const rejectedCharges: { charges: QuoteLimitPrice[]; rate: number }[] = [];
+  const affordable = candidates.filter(({ charges }) => {
+    if (charges.every((price) => fitsBudget(price))) return true;
+    rejectedCharges.push({ charges, rate: limitRate });
+    return false;
+  });
+  const outputBudgetRefusal = (retryMsats: number, availableQuotes = quotes) => {
     transport.close?.();
-    outputUpfrontOverBudget(jobId, quotes, opts, identity, true);
+    outputUpfrontOverBudget(jobId, availableQuotes, opts, identity, true, retryMsats);
+  };
+  const outputRejectedQuotes = () =>
+    outputBudgetRefusal(Math.min(...rejectedCharges.map(({ charges, rate }) => upfrontRetryMsats(charges, rate))));
+  if (affordable.length === 0) {
+    outputRejectedQuotes();
     return;
   }
 
@@ -1953,6 +1970,7 @@ async function handleAutoPayQuotes(
   let candidate: (typeof affordable)[number] | undefined;
   let plan: CreditPlan = { mode: "none" };
   let nativeCharge: { quote: Quote; price: QuoteLimitPrice } | undefined;
+  let fundingBtcRate: number | undefined;
   for (const available of affordable) {
     const { quote, selection } = available;
     plan = planForQuote(quote);
@@ -1973,12 +1991,28 @@ async function handleAutoPayQuotes(
           info("Credit funding skipped — the DVM's fiat price is unavailable. Paying per-call.");
           plan = { mode: "none" };
         } else {
-          if (!fitsBudget(price, planRate)) continue;
-          nativeCharge = { quote: nativeQuote, price };
-          plan = {
-            ...plan,
-            wireAmountMicro: fundWireAmountMicro(priceMicro, plan.fundSats * 1000, quote.priceMsats),
-          };
+          // A deposit blocked by the global cap leaves only the per-call
+          // charge. Check eligibility before using the draw in quote selection.
+          try {
+            fundingBtcRate = await enforceGlobalBudget({ plannedMsats: plan.fundMsats, btcRate: planRate });
+          } catch (err) {
+            if (!(err instanceof DvmError) || err.code !== "budget_exceeded") throw err;
+            const display = typeof err.data?.display === "string" ? err.data.display : err.message;
+            info(`Credit funding skipped — ${display} Paying this job per-call.`);
+            plan = { mode: "none" };
+          }
+          if (plan.mode === "open" || plan.mode === "topup") {
+            if (!fitsBudget(price, planRate)) {
+              rejectedCharges.push({ charges: [...available.charges, price], rate: planRate });
+              fundingBtcRate = undefined;
+              continue;
+            }
+            nativeCharge = { quote: nativeQuote, price };
+            plan = {
+              ...plan,
+              wireAmountMicro: fundWireAmountMicro(priceMicro, plan.fundSats * 1000, quote.priceMsats),
+            };
+          }
         }
       }
     }
@@ -1987,8 +2021,7 @@ async function handleAutoPayQuotes(
   }
 
   if (!candidate) {
-    transport.close?.();
-    outputUpfrontOverBudget(jobId, quotes, opts, identity, true);
+    outputRejectedQuotes();
     return;
   }
 
@@ -1996,13 +2029,13 @@ async function handleAutoPayQuotes(
   setMandateUpfront(creditCtx?.signing.standingMandate, chosen);
 
   // Check auto-pay threshold (mirrors payment-responder.ts for mid-job payments)
-  const outputAboveThreshold = (quote: Quote, availableQuotes = quotes) => {
+  const outputAboveThreshold = (retryMsats: number, availableQuotes = quotes) => {
     transport.close?.();
-    const action = buildResubmitAction(
+    const action = Number.isFinite(retryMsats) ? buildResubmitAction(
       opts,
-      { minAutoPayBelowMsats: quote.priceMsats },
-      `Price (${quoteAmountLabel(quote)}) exceeds your --auto-pay-below threshold. Re-run with --auto-pay-below at or above the quote price.`
-    );
+      { minAutoPayBelowMsats: retryMsats },
+      `The upfront charge exceeds your --auto-pay-below threshold. Re-run with --auto-pay-below at or above ${retryMsats} msats.`
+    ) : undefined;
     outputCollectedQuotes(
       jobId || null,
       availableQuotes,
@@ -2012,24 +2045,25 @@ async function handleAutoPayQuotes(
       action
     );
   };
+  const selectedCharges = nativeCharge ? [...charges, nativeCharge.price] : charges;
   if (!charges.every((price) => fitsThreshold(price))) {
-    outputAboveThreshold(chosen);
+    outputAboveThreshold(upfrontRetryMsats(selectedCharges, planRate || limitRate));
     return;
   }
   if (nativeCharge && !fitsThreshold(nativeCharge.price, planRate)) {
-    outputAboveThreshold(nativeCharge.quote, [nativeCharge.quote]);
+    outputAboveThreshold(upfrontRetryMsats(selectedCharges, planRate), [nativeCharge.quote]);
     return;
   }
 
   const acceptNativeCharge = (micro: bigint, rate: number) => {
     const price = { usd: usdFromMicro(micro) };
-    if (!fitsBudget(price, limitRate || rate)) {
-      transport.close?.();
-      outputUpfrontOverBudget(jobId, [chosen], opts, identity, true);
+    const chargeRate = limitRate || rate;
+    if (!fitsBudget(price, chargeRate)) {
+      outputBudgetRefusal(upfrontRetryMsats([...selectedCharges, price], chargeRate), [chosen]);
       return false;
     }
-    if (!fitsThreshold(price, limitRate || rate)) {
-      outputAboveThreshold(chosen);
+    if (!fitsThreshold(price, chargeRate)) {
+      outputAboveThreshold(upfrontRetryMsats([...selectedCharges, price], chargeRate));
       return false;
     }
     return true;
@@ -2128,34 +2162,11 @@ async function handleAutoPayQuotes(
     }
   }
 
-  // Pre-check the global budget ledger — the money leaving the wallet (the
-  // funding when opening/topping up, the job price otherwise) counts toward
-  // daily/weekly/monthly caps.
-  let upfrontBtcRate: number;
-  try {
-    upfrontBtcRate = await enforceGlobalBudget({
-      plannedMsats:
-        plan.mode === "open" || plan.mode === "topup" ? plan.fundMsats : chosen.priceMsats,
-      ...(planRate > 0 ? { btcRate: planRate } : {}),
-    });
-  } catch (budgetErr) {
-    if (
-      !(budgetErr instanceof DvmError) ||
-      budgetErr.code !== "budget_exceeded" ||
-      plan.mode === "none" ||
-      plan.mode === "draw"
-    ) {
-      throw budgetErr;
-    }
-    // Buffer semantics (spec §11): a blocked credit funding never blocks the
-    // job. Surface the structured budget refusal, degrade to per-call, and
-    // let the job price face the cap on its own.
-    const budgetDisplay =
-      typeof budgetErr.data?.display === "string" ? budgetErr.data.display : budgetErr.message;
-    info(`Credit funding skipped — ${budgetDisplay} Paying this job per-call.`);
-    plan = { mode: "none" };
-    upfrontBtcRate = await enforceGlobalBudget({ plannedMsats: chosen.priceMsats });
-  }
+  // Attached credit funding already passed the cap check during selection.
+  const upfrontBtcRate = fundingBtcRate ?? await enforceGlobalBudget({
+    plannedMsats: chosen.priceMsats,
+    ...(planRate > 0 ? { btcRate: planRate } : {}),
+  });
 
   // Every entry path hands this function a clean envelope (the
   // insufficient_credit recovery re-signs before re-probing), so the rails

@@ -126,6 +126,22 @@ export function quoteWithinDeclaredLimit(
   return price.msats <= limitMsats;
 }
 
+export function minimumQuoteLimitMsats(price: QuoteLimitPrice, btcRate: number): number | undefined {
+  if (!price.usd) return Number.isSafeInteger(price.msats) ? price.msats : undefined;
+
+  // Find the first integer limit that fits using the same exact comparison
+  // as payment authorization, including for fractional dollar prices.
+  let low = 0;
+  let high = Number.MAX_SAFE_INTEGER;
+  if (!quoteWithinDeclaredLimit(price, high, undefined, btcRate)) return undefined;
+  while (low < high) {
+    const mid = low + Math.floor((high - low) / 2);
+    if (quoteWithinDeclaredLimit(price, mid, undefined, btcRate)) high = mid;
+    else low = mid + 1;
+  }
+  return low;
+}
+
 export function compareDeclaredLimits(
   a: DeclaredLimit,
   b: DeclaredLimit,
