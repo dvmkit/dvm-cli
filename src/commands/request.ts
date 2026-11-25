@@ -122,7 +122,7 @@ import {
 import {
   automaticCreditBoundRail,
   type CreditPlan,
-  type DrawCeilingSource,
+  type DrawCeiling,
   effectiveCreditPosture,
   planCreditForQuote,
   planProbeDraw,
@@ -688,10 +688,20 @@ async function requestWithWarnings(
     bidMsats: budgetMsats,
   });
 
+  const drawBudget: DrawCeiling | undefined = effectiveBudget
+    ? { declared: effectiveBudget, msats: policy.maxTotalMsats, source: "budget" }
+    : undefined;
+  const drawThreshold: DrawCeiling | undefined = effectiveAutoPayBelow
+    ? {
+        declared: effectiveAutoPayBelow,
+        msats: policy.autoPayBelowMsats,
+        source: opts.autoPayBelow !== undefined ? "auto_pay_below" : "config_threshold",
+      }
+    : undefined;
   // Quote before a free or credit-draw submit can start the job without a 402.
   // Advisory pricing must not turn quote availability into a submit requirement.
   let previewQuotes: Quote[] = [];
-  if (policy.maxTotalMsats > 0 || policy.autoPayBelowMsats > 0) {
+  if (drawBudget || drawThreshold) {
     try {
       const quoteData = signing
         ? signDvmRequestData(signing.privkey, signing.unsignedData, signedRequestDomain({
@@ -731,44 +741,24 @@ async function requestWithWarnings(
       opts.strictPerCall || opts.creditOnly || approval
         ? []
         : loadImplicitCredits(endpoint, signer.pubkey, attestedIdentity);
-    if (storedCredit && btcRate === 0 &&
-        (policy.maxTotalMsats > 0 || policy.autoPayBelowMsats > 0)) {
-      // Quotes and receipt history use fiat; millisat-only limits still need a
-      // best-effort rate for the draw gate. Without one the proxy stands down.
+    if ((storedCredit || implicitCredits.length > 0) && btcRate === 0 &&
+        (drawBudget || drawThreshold)) {
+      // A millisat limit may need FX to price a USD quote or historical draw.
       btcRate = (await tryResolveBtcUsdRate())?.rate ?? 0;
     }
-    // The ceiling for a draw is what the caller declared for the whole job: an
-    // explicit auto-pay threshold when they set one, otherwise the budget
-    // itself. `policy.autoPayBelowMsats` is the per-call *increment* bound and
-    // falls back to 20% of budget, which as a draw ceiling refused every draw
-    // after the first one recorded its price.
-    //
-    // The flag and the standing config resolve to the same number but are
-    // raised by different commands, so which one bound rides along — otherwise
-    // the skip hint can only guess, and it guessed --budget, which moves
-    // neither. The gate stays on `effectiveAutoPayBelow`, so that
-    // which-msats decision is untouched; only the label branches, and it can
-    // read `opts.autoPayBelow` directly because the flag wins the `??` whenever
-    // it is set.
-    const drawCeiling: { msats: number; source: DrawCeilingSource } =
-      effectiveAutoPayBelow !== undefined && effectiveAutoPayBelow.trim() !== ""
-        ? {
-            msats: policy.autoPayBelowMsats,
-            source: opts.autoPayBelow !== undefined ? "auto_pay_below" : "config_threshold",
-          }
-        : { msats: policy.maxTotalMsats, source: "budget" };
     probePlan = opts.strictPerCall
       ? { mode: "none" }
       : planProbeDraw({
           stored: storedCredit,
           capability,
-          ...(opts.creditOnly ? {} : {
-            quote: previewQuotes[0],
-            receipts: storedCredit && drawCeiling.msats > 0 ? loadReceipts() : [],
-          }),
+          quote: previewQuotes[0],
+          receipts: (storedCredit || implicitCredits.length > 0) && (drawBudget || drawThreshold)
+            ? loadReceipts()
+            : undefined,
           implicit: implicitCredits,
-          drawCeilingMsats: drawCeiling.msats,
-          drawCeilingSource: drawCeiling.source,
+          budget: drawBudget,
+          threshold: drawThreshold,
+          rail: opts.rail,
           btcRate,
           config: config?.credit,
           ...(attestedIdentity ? { identity: attestedIdentity } : {}),
@@ -790,7 +780,8 @@ async function requestWithWarnings(
       throw new DvmError(
         "credit_only_unavailable",
         `Prepaid credit ${opts.creditOnly} is not drawable under the current caller state.`,
-        probePlan.mode === "none" && probePlan.drawSkipped?.reason === "posture_off"
+        probePlan.mode === "none" && (probePlan.drawSkipped?.reason === "posture_off" ||
+          probePlan.drawSkipped?.reason === "price_above_ceiling")
           ? buildCreditDrawSkipped({ dvm: identity.dvmId ?? endpoint, endpoint, skip: probePlan.drawSkipped }).hint
           : "Reconcile that exact credit with 'dvm credit balance <dvm> --credit-id <id>'; this request did not fall back to a wallet payment.",
         {
@@ -992,6 +983,14 @@ async function requestWithWarnings(
     }
     if (!previewWarnings.length || previewUpfrontCoveredByCredit) {
       addOutputWarnings(autoPayWarnings(quotes, warningLimits, undefined, btcRate), opts.human);
+    }
+    if (
+      !autoPayConsent && drawBudget && quotes.length > 0 &&
+      !quotes.some((quote) => quoteWithinDeclaredLimit(quote, drawBudget.msats, drawBudget.declared, opts.rail))
+    ) {
+      transport.close();
+      outputUpfrontOverBudget(receipt.jobId, quotes, opts, identity, false);
+      return;
     }
     if (autoPayConsent && quotes.length > 0) {
       const pay = () =>
@@ -1806,6 +1805,25 @@ async function recoverDrawProbe(
   throw err;
 }
 
+function outputUpfrontOverBudget(
+  jobId: string,
+  quotes: Quote[],
+  opts: RequestOptions,
+  identity: DvmIdentity,
+  autoPayConsent: boolean
+): void {
+  const cheapest = cheapestQuote(quotes);
+  const action = buildResubmitAction(
+    opts,
+    {
+      minBudgetMsats: cheapest.priceMsats,
+      ...(autoPayConsent ? { minAutoPayBelowMsats: cheapest.priceMsats } : {}),
+    },
+    `Cheapest quote (${quoteAmountLabel(cheapest)}) exceeds your --budget. Re-run with --budget at or above the quote price.`
+  );
+  outputOverBudget(jobId || null, quotes, opts, identity, action);
+}
+
 async function handleAutoPayQuotes(
   transport: Transport,
   ref: ProviderRef,
@@ -1823,7 +1841,7 @@ async function handleAutoPayQuotes(
   const configuredLimits = loadConfig();
   const declaredBudget = opts.budget ?? configuredLimits?.defaultBudget;
   const declaredAutoPayBelow = opts.autoPayBelow ?? configuredLimits?.autoPayThreshold;
-  const chosen = budgetMsats
+  const chosen = budgetMsats !== undefined
     ? quotes.find((quote) =>
         quoteWithinDeclaredLimit(quote, budgetMsats, declaredBudget, opts.rail)
       )
@@ -1831,15 +1849,7 @@ async function handleAutoPayQuotes(
 
   if (!chosen) {
     transport.close?.();
-    const cheapest = cheapestQuote(quotes);
-    // Raise --auto-pay-below alongside --budget: a rerun that fits the budget
-    // still stops at the auto-pay threshold, which the caller never bumped.
-    const action = buildResubmitAction(
-      opts,
-      { minBudgetMsats: cheapest.priceMsats, minAutoPayBelowMsats: cheapest.priceMsats },
-      `Cheapest quote (${quoteAmountLabel(cheapest)}) exceeds your --budget. Re-run with --budget at or above the quote price.`
-    );
-    outputOverBudget(jobId || null, quotes, opts, identity, action);
+    outputUpfrontOverBudget(jobId, quotes, opts, identity, true);
     return;
   }
 

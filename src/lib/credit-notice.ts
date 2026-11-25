@@ -1002,8 +1002,12 @@ export function buildCreditDrawSkipped(args: {
           hint: `An expired credit keeps its balance — reclaim it with 'dvm credit drain ${handle}'.`,
         };
       case "price_above_ceiling": {
-        const last = `$${formatUsd((skip.lastPriceMicro ?? 0) / 1_000_000)}`;
-        const ceiling = `$${formatUsd((skip.ceilingMicro ?? 0) / 1_000_000)}`;
+        const last = skip.lastPriceMicro === undefined
+          ? `${skip.lastPriceMsats ?? 0} msats`
+          : `$${formatUsd(skip.lastPriceMicro / 1_000_000)}`;
+        const ceiling = skip.ceilingMicro === undefined
+          ? `${skip.ceilingMsats ?? 0} msats`
+          : `$${formatUsd(skip.ceilingMicro / 1_000_000)}`;
         return {
           display:
             `${parked}, but this capability's quoted or last drawn price is ${last}, above the ${ceiling} ceiling this request declared — ` +

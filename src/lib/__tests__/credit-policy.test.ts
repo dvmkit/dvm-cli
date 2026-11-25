@@ -11,6 +11,7 @@ import {
   automaticCreditBoundRail,
   CASHU_REFILL_TARGET_JOBS,
   DEFAULT_CREDIT_POSTURE,
+  type DrawCeiling,
   effectiveCreditPosture,
   effectiveFundingRail,
   fundWireAmountMicro,
@@ -102,6 +103,10 @@ function stored(overrides: Partial<StoredCredit> = {}): StoredCredit {
     updatedAt: 0,
     ...overrides,
   };
+}
+
+function drawBudget(msats: number): DrawCeiling {
+  return { declared: String(msats), msats, source: "budget" };
 }
 
 function implicit(overrides: Partial<StoredImplicitCredit> = {}): StoredImplicitCredit {
@@ -1038,8 +1043,7 @@ describe("credit posture", () => {
     const probe = {
       stored: stored(),
       capability: "count",
-      drawCeilingMsats: 1e6,
-      drawCeilingSource: "budget" as const,
+      budget: drawBudget(1_000_000),
       btcRate: RATE,
     };
     expect(planProbeDraw({ ...probe, config: { posture: "off" } }).mode).toBe("none");
@@ -1086,8 +1090,7 @@ describe("planProbeDraw", () => {
     stored: stored(),
     capability: "count",
     receipts: [drawn(10_000)],
-    drawCeilingMsats: 1_000_000,
-    drawCeilingSource: "budget" as const,
+    budget: drawBudget(1_000_000),
     btcRate: RATE,
   };
 
@@ -1138,12 +1141,12 @@ describe("planProbeDraw", () => {
   });
 
   it("draws with no per-call payment consent declared", () => {
-    expect(planProbeDraw({ ...base, drawCeilingMsats: 0 }).mode).toBe("draw");
+    expect(planProbeDraw({ ...base, budget: undefined }).mode).toBe("draw");
   });
 
   it("draws again at a ceiling the last drawn price sits under", () => {
     const stale = stored({ lastPriceMicro: 5_091 });
-    expect(planProbeDraw({ ...base, stored: stale, receipts: [drawn(5_091)], drawCeilingMsats: 31_427 }).mode).toBe("draw");
+    expect(planProbeDraw({ ...base, stored: stale, receipts: [drawn(5_091)], budget: drawBudget(31_427) }).mode).toBe("draw");
   });
 
   it.each([
@@ -1157,7 +1160,7 @@ describe("planProbeDraw", () => {
     ],
     [
       "last price above the declared ceiling",
-      { stored: stored({ lastPriceMicro: 5_000_000 }), receipts: [drawn(5_000_000)], drawCeilingMsats: 10_000 },
+      { stored: stored({ lastPriceMicro: 5_000_000 }), receipts: [drawn(5_000_000)], budget: drawBudget(10_000) },
       "price_above_ceiling",
     ],
   ])("stands down: %s, naming why", (_label, overrides, reason) => {
@@ -1175,8 +1178,8 @@ describe("planProbeDraw", () => {
         ...base,
         stored: stored({ lastPriceMicro: 5_000_000 }),
         receipts: [drawn(5_000_000)],
-        drawCeilingMsats: 10_000,
-        drawCeilingSource: source,
+        budget: undefined,
+        threshold: { ...drawBudget(10_000), source },
       });
       expect(plan.mode).toBe("none");
       if (plan.mode !== "none") return;
@@ -1212,7 +1215,107 @@ describe("planProbeDraw", () => {
     upfront: { amount: micro / 1_000_000, amount_micro: micro, currency: "usd" },
     priceMsats: micro, shape: "fixed", description: "Upfront",
   });
-  const scoped = { ...base, drawCeilingMsats: 60_000, stored: stored({ lastPriceMicro: 830_000 }) };
+  const limits = (
+    budget: number | undefined,
+    threshold: number | undefined
+  ): { budget?: DrawCeiling; threshold?: DrawCeiling } => ({
+    budget: budget === undefined ? undefined : drawBudget(budget),
+    threshold: threshold === undefined
+      ? undefined
+      : { ...drawBudget(threshold), source: "auto_pay_below" },
+  });
+
+  describe.each(["prepaid", "implicit"] as const)("%s credit", (source) => {
+    it.each([
+      ["budget below quote below threshold", 50_000, 550_000, "budget"],
+      ["quote below both", 1_100_000, 550_000, undefined],
+      ["threshold only, above quote", undefined, 550_000, undefined],
+      ["threshold only, below quote", undefined, 50_000, "auto_pay_below"],
+      ["budget only, above quote", 110_000, undefined, undefined],
+      ["budget only, below quote", 50_000, undefined, "budget"],
+      ["neither declared", undefined, undefined, undefined],
+      ["quote equals both limits", 100_000, 100_000, undefined],
+      ["threshold wins attribution on a tie", 50_000, 50_000, "auto_pay_below"],
+      ["threshold binds below budget", 75_000, 50_000, "auto_pay_below"],
+      ["an explicit zero budget", 0, undefined, "budget"],
+    ] as const)("%s", (_label, budget, threshold, ceilingSource) => {
+      const plan = planProbeDraw({
+        ...base,
+        ...limits(budget, threshold),
+        implicit: source === "implicit" ? [implicit()] : [],
+        quote: fixed(100_000),
+      });
+      if (ceilingSource) {
+        expect(plan).toMatchObject({
+          mode: "none",
+          drawSkipped: {
+            creditId: source === "implicit" ? "imp:cashu:released" : "credit-1",
+            reason: "price_above_ceiling",
+            ceilingSource,
+          },
+        });
+      } else {
+        expect(plan).toMatchObject({ mode: "draw", source });
+      }
+    });
+  });
+
+  it("uses native USD for the boundary and orders dollar limits in native USD", () => {
+    const dollarLimits = {
+      budget: { declared: "$0.10", msats: 150_000, source: "budget" },
+      threshold: { declared: "$0.20", msats: 50_000, source: "config_threshold" },
+    } as const;
+    expect(planProbeDraw({ ...base, ...dollarLimits, btcRate: 0,
+      quote: { ...fixed(100_000), priceMsats: 1_000_000 } }).mode).toBe("draw");
+    expect(planProbeDraw({ ...base, ...dollarLimits, btcRate: 0,
+      quote: { ...fixed(100_001), priceMsats: 1 } })).toMatchObject({
+      mode: "none",
+      drawSkipped: { ceilingSource: "budget", ceilingMicro: 100_000, lastPriceMicro: 100_001 },
+    });
+    expect(planProbeDraw({ ...base, ...dollarLimits,
+      quote: { ...fixed(210_000), priceMsats: 1 } })).toMatchObject({
+      mode: "none", drawSkipped: { ceilingSource: "budget", ceilingMicro: 100_000 },
+    });
+  });
+
+  it("uses the x402 rail price when the quote supplies it", () => {
+    expect(planProbeDraw({
+      ...base,
+      stored: stored({ rail: "x402" }),
+      quote: { ...fixed(100_000), requiredUsdcMicro: "100001" },
+      budget: { declared: "$0.10", msats: 100_000, source: "budget" },
+    })).toMatchObject({ mode: "none", drawSkipped: { lastPriceMicro: 100_001 } });
+  });
+
+  it("uses the millisat quote price without requiring a rate for a millisat ceiling", () => {
+    expect(planProbeDraw({
+      ...base,
+      ...limits(100_000, undefined),
+      btcRate: 0,
+      quote: { ...fixed(10_000), priceMsats: 100_001 },
+    })).toMatchObject({
+      mode: "none", drawSkipped: { ceilingSource: "budget", ceilingMsats: 100_000 },
+    });
+  });
+
+  it("never prices an implicit draw from a selected prepaid credit's history", () => {
+    const released = implicit();
+    const receipt = drawn(830_000);
+    const args = { ...base, budget: drawBudget(100_000), implicit: [released] };
+    expect(planProbeDraw({ ...args, receipts: [receipt] })).toMatchObject({
+      mode: "draw", creditId: released.creditId,
+    });
+    expect(planProbeDraw({ ...args, receipts: [{ ...receipt,
+      receipt: dvm.sign({ requester_pubkey: CALLER_A, credit: {
+        ...receipt.receipt.credit!, credit_id: released.creditId,
+      } }),
+    }] })).toMatchObject({
+      mode: "none",
+      drawSkipped: { creditId: released.creditId, reason: "price_above_ceiling" },
+    });
+  });
+
+  const scoped = { ...base, budget: drawBudget(60_000), stored: stored({ lastPriceMicro: 830_000 }) };
 
   it("prefers the capability's exact upfront quote over both historical prices", () => {
     expect(planProbeDraw({ ...scoped, quote: { ...fixed(60_000),
@@ -1228,6 +1331,17 @@ describe("planProbeDraw", () => {
       expect(planProbeDraw({ ...scoped, quote: { ...fixed(0),
         upfront: { amount, currency: "usd" } }, receipts: [drawn(830_000)] }).mode).toBe("draw");
     }
+  });
+
+  it("checks a metered quote's positive upfront charge", () => {
+    expect(planProbeDraw({
+      ...scoped,
+      quote: { ...fixed(100_000), shape: "rate",
+        rate: { per_unit: { amount: 0.01, currency: "usd" }, unit: "item" } },
+      receipts: [drawn(20_000)],
+    })).toMatchObject({
+      mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 100_000 },
+    });
   });
 
   it("uses a metered capability's own latest draw despite another capability's newer price", () => {
@@ -1250,11 +1364,11 @@ describe("planProbeDraw", () => {
 
   it.each([
     ["another caller", (entry: StoredReceipt) => ({ ...entry,
-      receipt: dvm.sign({ ...entry.receipt, requester_pubkey: CALLER_B }) })],
+      receipt: dvm.sign({ requester_pubkey: CALLER_B, credit: entry.receipt.credit }) })],
     ["another credit", (entry: StoredReceipt) => ({ ...entry,
-      receipt: dvm.sign({ ...entry.receipt, credit: { ...entry.receipt.credit!, credit_id: "other" } }) })],
+      receipt: dvm.sign({ requester_pubkey: CALLER_A, credit: { ...entry.receipt.credit!, credit_id: "other" } }) })],
     ["a failed job", (entry: StoredReceipt) => ({ ...entry,
-      receipt: dvm.sign({ ...entry.receipt, outcome: "failed", reason: "failed" }) })],
+      receipt: dvm.sign({ requester_pubkey: CALLER_A, credit: entry.receipt.credit, outcome: "failed", reason: "failed" }) })],
     ["a tampered price", (entry: StoredReceipt) => ({ ...entry,
       receipt: { ...entry.receipt, credit: { ...entry.receipt.credit!, amount: 999_999 } } })],
     ["an unrelated endpoint", (entry: StoredReceipt) => ({ ...entry, endpoint: "https://other.example", builder: undefined })],
@@ -1274,7 +1388,7 @@ describe("planProbeDraw", () => {
 
   it("does not treat non-USD credit history or quotes as USD", () => {
     expect(planProbeDraw({ ...scoped, stored: stored({ currency: "eur" }),
-      quote: { ...fixed(830_000), upfront: { amount: 0.83, currency: "eur" } },
+      quote: { ...fixed(830_000), priceMsats: 0, upfront: { amount: 0.83, currency: "eur" } },
       receipts: [drawn(830_000)] }).mode).toBe("draw");
   });
 });

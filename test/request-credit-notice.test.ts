@@ -346,6 +346,27 @@ describe("capability-scoped credit draws", () => {
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 
+  it("collects quotes without wallet consent when an alternative fits the budget", async () => {
+    seams.submit.mockResolvedValueOnce({
+      jobId: "",
+      status: "payment-required",
+      quotes: [
+        { upfront: { amount: 0.83, amount_micro: 830_000, currency: "usd" }, priceMsats: 830_000 },
+        { upfront: { amount: 0.04, amount_micro: 40_000, currency: "usd" }, priceMsats: 40_000 },
+      ],
+    });
+
+    await request({ dvm: "panel/stress", input: "Run", budget: "$0.05" });
+
+    expect(terminal()).toMatchObject({
+      status: "quotes-collected",
+      credit_draw_skipped: { reason: "price_above_ceiling", ceiling_source: "budget" },
+    });
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(seams.submit.mock.calls[0][1].data).not.toHaveProperty("credit_id");
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
   it("skips a metered capability whose own last draw exceeds the ceiling", async () => {
     await request({ dvm: "panel/stress", input: "Run", budget: "$0.83", autoPayBelow: "$0.83" });
     seams.quote.mockResolvedValueOnce([{ upfront: { amount: 0, currency: "usd" },

@@ -20,7 +20,7 @@ const history: StoredReceipt[] = [{
   endpoint, builder: dvm.anchor, verification: "verified", verified_at: 0,
 }];
 const policy = { stored, capability: "count", receipts: history, btcRate: 100_000,
-  drawCeilingMsats: 60_000, drawCeilingSource: "budget" as const };
+  budget: { declared: "60000", msats: 60_000, source: "budget" as const } };
 
 afterEach(() => vi.unstubAllGlobals());
 

@@ -157,8 +157,8 @@ describe("credit settlement on receipt reads", () => {
     await status(jobId, {});
     const replayed = loadCredit(endpoint, CALLER_A);
     expect(replayed).toEqual(before);
-    expect(planProbeDraw({ stored: replayed, capability: "count", receipts: loadReceipts(), drawCeilingMsats: 175_000,
-      drawCeilingSource: "budget", btcRate: 100_000, config: { posture: "auto" } })).toMatchObject({
+    expect(planProbeDraw({ stored: replayed, capability: "count", receipts: loadReceipts(),
+      budget: { declared: "175000", msats: 175_000, source: "budget" }, btcRate: 100_000, config: { posture: "auto" } })).toMatchObject({
       mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 200_000, ceilingMicro: 175_000 },
     });
   });
@@ -198,7 +198,8 @@ describe("credit settlement on receipt reads", () => {
     const stored = loadCredit(endpoint, CALLER_A);
     expect(stored).toMatchObject({ remainingMicro: 150_000, ledgerSeq: 3,
       lastPriceMicro: 200_000, lastReceiptJobId: "concurrent-job" });
-    expect(planProbeDraw({ stored, capability: "count", receipts: loadReceipts(), drawCeilingMsats: 175_000, drawCeilingSource: "budget",
+    expect(planProbeDraw({ stored, capability: "count", receipts: loadReceipts(),
+      budget: { declared: "175000", msats: 175_000, source: "budget" },
       btcRate: 100_000, config: { posture: "auto" } })).toMatchObject({
       mode: "none", drawSkipped: { reason: "price_above_ceiling", lastPriceMicro: 200_000, ceilingMicro: 175_000 },
     });

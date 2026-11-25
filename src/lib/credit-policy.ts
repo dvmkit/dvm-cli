@@ -15,7 +15,7 @@ import {
 } from "./credit-fund";
 import type { StoredCredit, StoredImplicitCredit } from "@dvmkit/sdk/internal";
 import { normalizeCreditEndpoint } from "@dvmkit/sdk/internal";
-import { microToSats, msatsToMicro } from "@dvmkit/sdk/internal";
+import { microToSats, msatsToMicro, usdToMsats } from "@dvmkit/sdk/internal";
 export { microToSats, msatsToMicro } from "@dvmkit/sdk/internal";
 export { type FundValuation, fundWireAmountMicro, readFundValuation } from "@dvmkit/sdk/internal";
 import {
@@ -28,6 +28,7 @@ import type { StoredReceipt } from "@dvmkit/sdk/internal";
 import { type AttestedDvmIdentity, attestedDvmIdentity, verifyJobReceipt } from "@dvmkit/sdk/internal";
 import type { CreditMenu, Quote } from "@dvmkit/sdk/internal";
 import { offersX402CreditFunding } from "@dvmkit/sdk/internal";
+import { dollarLimitMicro, quoteWithinDeclaredLimit } from "./quote-limit";
 import { hasKnownUpfrontPrice } from "./quote-upfront";
 
 /**
@@ -147,6 +148,12 @@ export type CreditPlan =
 /** Identifies the setting behind a draw ceiling so refusal hints name the right command. */
 export type DrawCeilingSource = "auto_pay_below" | "config_threshold" | "budget";
 
+export interface DrawCeiling {
+  declared: string;
+  msats: number;
+  source: DrawCeilingSource;
+}
+
 /** Explains why held credit was left undrawn rather than implying a provider refused it. */
 export interface DrawSkip {
   reason:
@@ -165,6 +172,8 @@ export interface DrawSkip {
   lastPriceMicro?: number;
   /** Which knob set that ceiling, so the hint names it. `price_above_ceiling` only. */
   ceilingSource?: DrawCeilingSource;
+  ceilingMsats?: number;
+  lastPriceMsats?: number;
 }
 
 export interface TrustTier {
@@ -803,15 +812,8 @@ export function planCreditForQuote(args: {
  * warns about — a caller holding a funded balance was offered an upfront
  * charge instead of spending it.
  *
- * `drawCeilingMsats` is the caller's declared ceiling for the whole job, not
- * the per-call auto-pay increment. Borrowing the increment made a draw
- * self-disabling: the first one records `lastPriceMicro`, and a threshold
- * derived as a fraction of the budget then refuses every draw after it.
- * A ceiling of 0 (no budget declared) leaves the price proxy unenforced, the
- * same as before — the credit's own balance is then the only bound.
- *
- * `drawCeilingSource` names which knob supplied it. Required rather than
- * optional so a caller can't produce a skip the hint has to guess at.
+ * Only declared limits bound a draw. Using the per-call increment derived
+ * from the budget refused subsequent draws after the first recorded its price.
  */
 export function planProbeDraw(args: {
   stored: StoredCredit | undefined;
@@ -820,8 +822,9 @@ export function planProbeDraw(args: {
   receipts?: StoredReceipt[];
   /** Receipt-backed per-call balances at this DVM, already scoped to this caller. */
   implicit?: readonly StoredImplicitCredit[];
-  drawCeilingMsats: number;
-  drawCeilingSource: DrawCeilingSource;
+  budget?: DrawCeiling;
+  threshold?: DrawCeiling;
+  rail?: string;
   btcRate: number;
   config?: CreditConfig;
   /** This DVM's attested identity, so a posture written at another spelling applies. */
@@ -846,6 +849,8 @@ export function planProbeDraw(args: {
         },
       };
     }
+    const skipped = priceAboveDrawCeiling(args, implicit, args.rail);
+    if (skipped) return { mode: "none", drawSkipped: skipped };
     return {
       mode: "draw",
       creditId: implicit.creditId,
@@ -882,37 +887,81 @@ export function planProbeDraw(args: {
   // the DVM's own figures), where a local skip only defers the question.
   if (stored.remainingMicro <= 0 && !stored.provisional) return skip("exhausted");
   if (stored.expiryMs > 0 && stored.expiryMs <= now) return skip("expired");
-  if (args.drawCeilingMsats > 0 && args.btcRate > 0) {
-    const priceMicro = probePriceMicro(args);
-    const ceilingMicro = msatsToMicro(args.drawCeilingMsats, args.btcRate);
-    if (priceMicro !== undefined && ceilingMicro > 0 && priceMicro > ceilingMicro) {
-      return skip("price_above_ceiling", {
-        ceilingMicro,
-        lastPriceMicro: priceMicro,
-        ceilingSource: args.drawCeilingSource,
-      });
-    }
-  }
+  const skipped = priceAboveDrawCeiling(args, stored, args.rail ?? automaticCreditBoundRail(stored));
+  if (skipped) return { mode: "none", drawSkipped: skipped };
   return { mode: "draw", creditId: stored.creditId, drawId: randomUUID(), source: "prepaid" };
 }
 
-function probePriceMicro(args: {
-  stored?: StoredCredit;
-  capability: string;
-  quote?: Quote;
-  receipts?: StoredReceipt[];
-  identity?: AttestedDvmIdentity;
-}): number | undefined {
-  const quote = args.quote;
-  // A metered quote's upfront zero is not the eventual job price.
-  if (quote && hasKnownUpfrontPrice(quote) && quote.shape !== "rate" && quote.upfront.currency === "usd") {
-    const micro = quote.upfront.amount_micro ?? Math.round(quote.upfront.amount * 1_000_000);
-    if (Number.isSafeInteger(micro) && micro >= 0) return micro;
-  }
-  const stored = args.stored;
+function priceAboveDrawCeiling(
+  args: Parameters<typeof planProbeDraw>[0],
+  credit: StoredCredit | StoredImplicitCredit,
+  rail: string | undefined
+): DrawSkip | undefined {
+  if (!args.budget && !args.threshold) return undefined;
+  const quote = upfrontDrawQuote(args.quote, args.btcRate);
+  const receiptMicro = quote ? undefined : drawnPriceMicro(args, credit);
+  const quoteMicro = quote?.upfront.currency === "usd" ? quote.upfront.amount_micro : undefined;
+  const convertedMicro = (msats: number) =>
+    args.btcRate > 0 ? msatsToMicro(msats, args.btcRate) : undefined;
+  const rejected = (ceiling: DrawCeiling | undefined) => {
+    if (!ceiling) return undefined;
+    const dollars = dollarLimitMicro(ceiling.declared);
+    const ceilingMicro = dollars === undefined ? convertedMicro(ceiling.msats) : Number(dollars);
+    const freeDollarQuote = dollars !== undefined && quoteMicro === 0 && !quote?.requiredUsdcMicro;
+    const above = quote
+      ? !freeDollarQuote && !quoteWithinDeclaredLimit(quote, ceiling.msats, ceiling.declared, rail)
+      : receiptMicro !== undefined && ceilingMicro !== undefined &&
+        (dollars === undefined ? receiptMicro > ceilingMicro : BigInt(receiptMicro) > dollars);
+    return above ? { ceiling, dollars, ceilingMicro } : undefined;
+  };
+  const budget = rejected(args.budget);
+  const threshold = rejected(args.threshold);
+  // Equal limits retain the threshold's attribution.
+  const binding = budget && threshold
+    ? ((budget.dollars !== undefined && threshold.dollars !== undefined
+        ? budget.dollars < threshold.dollars
+        : budget.ceiling.msats < threshold.ceiling.msats) ? budget : threshold)
+    : budget ?? threshold;
+  if (!binding) return undefined;
+  const usdc = rail?.trim().toLowerCase() === "x402" &&
+    binding.dollars !== undefined && quote?.requiredUsdcMicro && /^\d+$/.test(quote.requiredUsdcMicro)
+    ? Number(quote.requiredUsdcMicro)
+    : undefined;
+  const quotedMicro = quote
+    ? (binding.dollars === undefined ? undefined : usdc ?? quoteMicro) ??
+      convertedMicro(quote.priceMsats)
+    : undefined;
+  return {
+    reason: "price_above_ceiling",
+    creditId: credit.creditId,
+    remainingMicro: credit.remainingMicro,
+    ceilingSource: binding.ceiling.source,
+    ceilingMicro: binding.ceilingMicro,
+    lastPriceMicro: quotedMicro ?? receiptMicro,
+    ceilingMsats: binding.ceiling.msats,
+    lastPriceMsats: quote?.priceMsats,
+  };
+}
+
+function upfrontDrawQuote(quote: Quote | undefined, btcRate: number): Quote | undefined {
+  if (!quote || !hasKnownUpfrontPrice(quote)) return undefined;
+  // A zero upfront on a metered job does not establish the draw price.
+  if (quote.shape === "rate" && (quote.upfront.amount_micro ?? quote.upfront.amount) <= 0)
+    return undefined;
+  if (quote.upfront.currency !== "usd") return quote.priceMsats > 0 ? quote : undefined;
+  const micro = quote.upfront.amount_micro ?? Math.round(quote.upfront.amount * 1_000_000);
+  if (!Number.isSafeInteger(micro) || micro < 0) return undefined;
+  const msats = quote.priceMsats || (btcRate > 0 ? usdToMsats(micro / 1_000_000, btcRate) : 0);
+  return { ...quote, priceMsats: msats, upfront: { ...quote.upfront, amount_micro: micro } };
+}
+
+function drawnPriceMicro(
+  args: Pick<Parameters<typeof planProbeDraw>[0], "capability" | "receipts" | "identity">,
+  stored: StoredCredit | StoredImplicitCredit
+): number | undefined {
   // Receipt amounts have no currency field. Only this credit's denomination
   // is known; do not infer a price from a different credit or assume USD.
-  if (!stored || stored.currency !== "usd") return undefined;
+  if (stored.currency !== "usd") return undefined;
   const candidates = (args.receipts ?? []).filter(({ receipt }) =>
     receipt.capability === args.capability && receipt.credit?.credit_id === stored.creditId
   );

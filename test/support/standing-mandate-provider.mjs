@@ -141,7 +141,8 @@ process.on("message", async (message) => {
   if (message.op === "support") { supported = message.value; process.send({ type: "support" }); }
   if (message.op === "snapshot") {
     const jobs = await Promise.all(message.ids.map((id) => jobStore.get(id)));
-    process.send({ type: "snapshot", submissions, jobs, paymentPosts, postPaths, recoveryPosts });
+    const balance = await ledger.get(credit.creditId);
+    process.send({ type: "snapshot", submissions, jobs, paymentPosts, postPaths, recoveryPosts, balance });
   }
   if (message.op === "shutdown") {
     pending.splice(0).forEach((resolve) => resolve());
