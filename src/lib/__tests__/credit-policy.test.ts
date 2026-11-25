@@ -1285,11 +1285,14 @@ describe("planProbeDraw", () => {
     });
   });
 
-  it("attributes a refusal to the exact dollar budget when both limits round to the same millisats", () => {
+  it.each([
+    ["native USD", fixed(100_001)],
+    ["legacy millisats", { ...fixed(100_001), upfront: { amount: 0, currency: "usd" } }],
+  ] as const)("attributes a %s refusal to the exact dollar budget when both limits round to the same millisats", (_label, quote) => {
     expect(planProbeDraw({
       ...base,
       btcRate: 100_000,
-      quote: fixed(100_001),
+      quote,
       budget: { declared: "$0.0999999", msats: 100_000, source: "budget" },
       threshold: { declared: "100000", msats: 100_000, source: "auto_pay_below" },
     })).toMatchObject({

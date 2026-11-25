@@ -249,19 +249,37 @@ describe("automatic credit funding notices", () => {
     expect(notices.takeCreditNoticeFields()).toEqual({});
   });
 
-  it("refuses a native 402 before attempting payment when FX is unavailable", async () => {
+  it.each([
+    { label: "first contact", rate: 100_000, posture: "auto", hasHistory: false },
+    { label: "first contact without FX", rate: undefined, posture: "auto", hasHistory: false },
+    { label: "suggest posture after a paid job", rate: 100_000, posture: "suggest", hasHistory: true },
+    { label: "automatic funding after a paid job", rate: 100_000, posture: "auto", hasHistory: true },
+  ] as const)("checks the charges available on $label", async ({ rate, posture, hasHistory }) => {
+    seams.rate = rate;
+    writeConfig(posture);
+    if (hasHistory) await paidRequest();
+    const submissions = seams.submit.mock.calls.length;
+    seams.prepareAgentSpend.mockClear();
     const { credit } = await seams.describe();
     seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
-      upfront: { amount: 0.20, amount_micro: 200_000, currency: "usd" },
-      priceMsats: 1_000,
+      upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" },
+      priceMsats: 50_000,
       credit,
     }] });
 
-    await paidRequest();
+    await request({ endpoint, input: "Echo", budget: "50000", autoPayBelow: "550000" });
 
-    expect(terminal()).toMatchObject({ status: "over-budget" });
-    expect(seams.submit).toHaveBeenCalledTimes(1);
-    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+    if (hasHistory && posture === "auto") {
+      expect(terminal()).toMatchObject({ status: "over-budget" });
+      expect(seams.submit).toHaveBeenCalledTimes(submissions + 1);
+      expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+    } else {
+      expect(terminal()).toMatchObject({ paidWith: "cashu_p2pk" });
+      if (hasHistory) expect(terminal()).toMatchObject({ credit_suggestion: { reason: "open" } });
+      expect(seams.submit).toHaveBeenCalledTimes(submissions + 2);
+      expect(paidEnvelopes().at(-1)?.data).not.toHaveProperty("fund");
+      expect(seams.prepareAgentSpend.mock.calls.map(([args]) => args.amountSats)).toEqual([50]);
+    }
   });
 
   it.each([

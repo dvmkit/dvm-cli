@@ -911,7 +911,7 @@ function priceAboveDrawCeiling(
   const threshold = rejected(args.threshold) ? args.threshold : undefined;
   // Equal limits retain the threshold's attribution.
   const binding = budget && threshold
-    ? (compareDeclaredLimits(budget, threshold, price, args.btcRate) < 0 ? budget : threshold)
+    ? (compareDeclaredLimits(budget, threshold, args.btcRate) < 0 ? budget : threshold)
     : budget ?? threshold;
   if (!binding) return undefined;
 

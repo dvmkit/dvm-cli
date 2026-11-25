@@ -989,7 +989,7 @@ async function requestWithWarnings(
     }
     if (!autoPayConsent && drawBudget && quotes.length > 0) {
       const flagRail = parseForcedRail(opts.rail);
-      const prices = quotes.map((quote) => upfrontQuoteLimitPrices(quote, [], flagRail, false));
+      const prices = quotes.map((quote) => upfrontQuoteLimitPrices(quote, [], flagRail));
       const limitRate = btcRate || await resolveQuoteLimitRate(prices.flat());
       if (!prices.some((charges) => charges.every((price) =>
         quoteWithinDeclaredLimit(price, drawBudget.msats, drawBudget.declared, limitRate)
@@ -1840,8 +1840,7 @@ interface RequestQuoteLimits {
 function upfrontQuoteLimitPrices(
   quote: Quote,
   rails: readonly Rail[],
-  flagRail: RailFlag | undefined,
-  mayFund: boolean
+  flagRail: RailFlag | undefined
 ): QuoteLimitPrice[] {
   const native = quoteLimitPrice(quote);
   const cashu = { msats: native.msats === undefined ? undefined : cashuQuoteSats(native.msats) * 1000 };
@@ -1861,11 +1860,7 @@ function upfrontQuoteLimitPrices(
     return native.msats !== undefined && native.usd ? [native, cashu] : [native];
   }
 
-  const charges = rails.map(priceFor);
-  // An attached fund-and-draw charges the native job price. Cashu can
-  // still fall back to a per-call spend if the wallet cannot cover the fund.
-  if (mayFund && rails[0] === "cashu_p2pk" && native.usd) charges.push(native);
-  return charges;
+  return rails.map(priceFor);
 }
 
 function cashuQuoteSats(msats: number): number {
@@ -1897,8 +1892,7 @@ async function handleAutoPayQuotes(
   const tempoAccount = await connectedTempoAccount();
   const x402Wallet = loadX402Wallet();
   const attestedIdentity = providerDvmIdentity(providerInfo);
-  const mayFund = !!creditCtx?.signing && !opts.strictPerCall && !opts.requestId &&
-    effectiveCreditPosture(config?.credit, ref.endpoint, attestedIdentity).posture !== "off";
+  const signing = !opts.strictPerCall && !opts.requestId ? creditCtx?.signing : undefined;
   const candidates = quotes.map((quote) => {
     const selection = selectRailOrder({
       flagRail,
@@ -1909,17 +1903,88 @@ async function handleAutoPayQuotes(
       hasTempoWallet: tempoAccount !== null,
       hasX402Wallet: x402Wallet !== null,
     });
-    const menu = quote.credit ?? providerInfo.credit;
-    const charges = upfrontQuoteLimitPrices(quote, selection.rails, flagRail,
-      mayFund && menu?.currency.toLowerCase() === "usd" && menu.funding.includes("cashu"));
-    return { quote, selection, charges };
+    return { quote, selection, charges: upfrontQuoteLimitPrices(quote, selection.rails, flagRail) };
   });
   const limitRate = btcRate || await resolveQuoteLimitRate(candidates.flatMap(({ charges }) => charges));
   const fitsBudget = (price: QuoteLimitPrice, rate = limitRate) =>
     !budget || quoteWithinDeclaredLimit(price, budget.msats, budget.declared, rate);
   const fitsThreshold = (price: QuoteLimitPrice, rate = limitRate) =>
     quoteWithinDeclaredLimit(price, policy.autoPayBelowMsats, threshold?.declared, rate);
-  const candidate = candidates.find(({ charges }) => charges.every((price) => fitsBudget(price)));
+
+  const affordable = candidates.filter(({ charges }) => charges.every((price) => fitsBudget(price)));
+  if (affordable.length === 0) {
+    transport.close?.();
+    outputUpfrontOverBudget(jobId, quotes, opts, identity, true);
+    return;
+  }
+
+  const planRate = signing ? limitRate || (await tryResolveBtcUsdRate())?.rate || 0 : 0;
+  const receipts = signing ? loadReceipts() : [];
+  const stored = signing ? loadCredit(ref.endpoint, signing.pubkey, attestedIdentity) : undefined;
+  const floatConnected = !!signing && floatUsable();
+  const planForQuote = (quote: Quote): CreditPlan => signing
+    ? planCreditForQuote({
+        // Attached-payment 402s carry the price but not the funding menu. The
+        // authenticated `/v1/info` read already supplied that menu; retaining it
+        // here lets the normal request path plan deferred Lightning/MPP funding
+        // just like an explicit `/v1/quote` response does.
+        menu: quote.credit ?? providerInfo.credit,
+        endpoint: ref.endpoint,
+        ...(attestedIdentity ? { identity: attestedIdentity } : {}),
+        signingPubkey: signing.pubkey,
+        priceMsats: quote.priceMsats,
+        btcRate: planRate,
+        receipts,
+        stored,
+        config: config?.credit,
+        // whether the float can carry a funding is half the rail rule,
+        // and it is caller-side state the planner is deliberately kept pure of.
+        floatConnected,
+        // The chain rides along with the connection: a channel on a network this
+        // wallet isn't pinned to is one it cannot sign a voucher against.
+        x402Connected: x402Wallet !== null,
+        ...(x402Wallet ? { x402Network: x402Wallet.network } : {}),
+        // A Tempo credit menu qualifies when this caller can sign its advertised
+        // charge or session; channel persistence is needed only for the latter.
+        tempoConnected: tempoAccount !== null,
+      })
+    : { mode: "none" };
+
+  let candidate: (typeof affordable)[number] | undefined;
+  let plan: CreditPlan = { mode: "none" };
+  let nativeCharge: { quote: Quote; price: QuoteLimitPrice } | undefined;
+  for (const available of affordable) {
+    const { quote, selection } = available;
+    plan = planForQuote(quote);
+    nativeCharge = undefined;
+    if (plan.mode === "open" || plan.mode === "topup") {
+      if (selection.rails[0] !== "cashu_p2pk") {
+        info("Credit funding is Cashu-only for now — paying per-call on the selected rail.");
+        plan = { mode: "none" };
+      } else {
+        // Price the attached draw as well as the per-call fallback. A legacy
+        // 402 needs a provider quote because its USD amount may be reconstructed.
+        const stated = statedPriceMicro(quote);
+        const fallbackQuote = stated === undefined ? await fetchServerQuote(transport, ref, envelope) : undefined;
+        const nativeQuote = fallbackQuote ?? quote;
+        const price = quoteLimitPrice(nativeQuote);
+        const priceMicro = price.usd ? stated ?? quotePriceMicro(fallbackQuote) : undefined;
+        if (priceMicro === undefined) {
+          info("Credit funding skipped — the DVM's fiat price is unavailable. Paying per-call.");
+          plan = { mode: "none" };
+        } else {
+          if (!fitsBudget(price, planRate)) continue;
+          nativeCharge = { quote: nativeQuote, price };
+          plan = {
+            ...plan,
+            wireAmountMicro: fundWireAmountMicro(priceMicro, plan.fundSats * 1000, quote.priceMsats),
+          };
+        }
+      }
+    }
+    candidate = available;
+    break;
+  }
 
   if (!candidate) {
     transport.close?.();
@@ -1949,6 +2014,10 @@ async function handleAutoPayQuotes(
   };
   if (!charges.every((price) => fitsThreshold(price))) {
     outputAboveThreshold(chosen);
+    return;
+  }
+  if (nativeCharge && !fitsThreshold(nativeCharge.price, planRate)) {
+    outputAboveThreshold(nativeCharge.quote, [nativeCharge.quote]);
     return;
   }
 
@@ -1997,40 +2066,7 @@ async function handleAutoPayQuotes(
     }
   }
 
-  // decide how this payment engages the credit ledger BEFORE the
-  // budget gate — an open/top-up charges the caps with the funding amount,
-  // not the job price. The per-job auto-pay threshold above gated the job
-  // price (operator ruling 2026-07-28); funding size is bounded by the
-  // trust-tier caps and the budget-ledger caps.
-  let plan: CreditPlan = { mode: "none" };
-  let planRate = 0;
-  if (creditCtx?.signing && !opts.strictPerCall && !opts.requestId) {
-    planRate = limitRate || (await tryResolveBtcUsdRate())?.rate || 0;
-    plan = planCreditForQuote({
-      // Attached-payment 402s carry the price but not the funding menu. The
-      // authenticated `/v1/info` read already supplied that menu; retaining it
-      // here lets the normal request path plan deferred Lightning/MPP funding
-      // just like an explicit `/v1/quote` response does.
-      menu: chosen.credit ?? providerInfo.credit,
-      endpoint: ref.endpoint,
-      ...(attestedIdentity ? { identity: attestedIdentity } : {}),
-      signingPubkey: creditCtx.signing.pubkey,
-      priceMsats: chosen.priceMsats,
-      btcRate: planRate,
-      receipts: loadReceipts(),
-      stored: loadCredit(ref.endpoint, creditCtx.signing.pubkey, attestedIdentity),
-      config: loadConfig()?.credit,
-      // whether the float can carry a funding is half the rail rule,
-      // and it is caller-side state the planner is deliberately kept pure of.
-      floatConnected: floatUsable(),
-      // The chain rides along with the connection: a channel on a network this
-      // wallet isn't pinned to is one it cannot sign a voucher against.
-      x402Connected: x402Wallet !== null,
-      ...(x402Wallet ? { x402Network: x402Wallet.network } : {}),
-      // A Tempo credit menu qualifies when this caller can sign its advertised
-      // charge or session; channel persistence is needed only for the latter.
-      tempoConnected: tempoAccount !== null,
-    });
+  if (creditCtx && signing) {
     // The insufficient_credit recovery pins the credit + draw ids: whatever
     // the policy sized, the retry must run as a top-up of THAT credit under
     // THAT draw id (idempotency), never a fresh open.
@@ -2070,7 +2106,7 @@ async function handleAutoPayQuotes(
     // the posture held a purchase back. Say so here, where it was
     // suppressed — never on jobs that had nothing to suppress.
     if (plan.mode === "none" && plan.suppressed) {
-      const posture = effectiveCreditPosture(loadConfig()?.credit, ref.endpoint, attestedIdentity);
+      const posture = effectiveCreditPosture(config?.credit, ref.endpoint, attestedIdentity);
       const priceMicro = planRate > 0 ? msatsToMicro(chosen.priceMsats, planRate) : 0;
       stageCreditSuggestion(
         buildCreditSuggestion({
@@ -2089,62 +2125,6 @@ async function handleAutoPayQuotes(
         }),
         opts.human
       );
-    }
-  }
-
-  // credit funding is Cashu-only in v1 (Tempo challenges are
-  // job-priced; x402 is final-settlement with no resume machinery). When
-  // selection put a non-Cashu rail first, the credit plan stands down and
-  // the call stays per-call implicit N=1.
-  if ((plan.mode === "open" || plan.mode === "topup") && selection.rails[0] !== "cashu_p2pk") {
-    info("Credit funding is Cashu-only for now — paying per-call on the selected rail.");
-    plan = { mode: "none" };
-  }
-
-  // The signed `fund.amount_micro` must reproduce the server's own valuation
-  // of the token (`fundedMicroFor` over its quote-pinned fiat ↔ msats ratio)
-  // or the fund-and-draw is refused after the spend committed.
-  //
-  // the fiat side rides the 402 as `price_micro`, beside the
-  // `required_msats` this ratio's other half comes from — so first contact
-  // costs no extra round trip and both inputs are pinned against one server-side
-  // fx snapshot. `/v1/quote` is the fallback for providers that predate the
-  // field. No usable fiat price → per-call.
-  //
-  // Only the provider's own integer short-circuits the hop. `chosen` is
-  // routinely the synthetic quote `HttpsTransport.submit` builds from a 402,
-  // whose `upfront.amount` is a client-fx reconstruction rounded to four
-  // decimals — signing a fund amount off *that* is the mismatch
-  // itself, so it must reach `fundWireAmountMicro` through no path at all.
-  if (plan.mode === "open" || plan.mode === "topup") {
-    const stated = statedPriceMicro(chosen);
-    const fallbackQuote = stated === undefined ? await fetchServerQuote(transport, ref, envelope) : undefined;
-    const nativeQuote = fallbackQuote ?? chosen;
-    const price = quoteLimitPrice(nativeQuote);
-    const priceMicroServer = price.usd ? stated ?? quotePriceMicro(fallbackQuote) : undefined;
-    if (priceMicroServer !== undefined) {
-      if (!fitsBudget(price, planRate)) {
-        transport.close?.();
-        outputUpfrontOverBudget(jobId, [nativeQuote], opts, identity, true);
-        return;
-      }
-      if (!fitsThreshold(price, planRate)) {
-        outputAboveThreshold(nativeQuote, [nativeQuote]);
-        return;
-      }
-    }
-    if (priceMicroServer === undefined) {
-      info("Credit funding skipped — the DVM's fiat price is unavailable. Paying per-call.");
-      plan = { mode: "none" };
-    } else {
-      plan = {
-        ...plan,
-        wireAmountMicro: fundWireAmountMicro(
-          priceMicroServer,
-          plan.fundSats * 1000,
-          chosen.priceMsats
-        ),
-      };
     }
   }
 

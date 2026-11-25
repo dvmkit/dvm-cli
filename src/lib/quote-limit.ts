@@ -129,12 +129,11 @@ export function quoteWithinDeclaredLimit(
 export function compareDeclaredLimits(
   a: DeclaredLimit,
   b: DeclaredLimit,
-  price: QuoteLimitPrice,
   btcRate: number
 ): number {
   const aUsd = declaredLimitUsd(a, btcRate);
   const bUsd = declaredLimitUsd(b, btcRate);
-  if (aUsd && bUsd && (price.usd || price.msats === undefined)) {
+  if (aUsd && bUsd) {
     return compareDecimals(aUsd, bUsd);
   }
   return a.msats - b.msats;
