@@ -23,6 +23,22 @@
 * x402 credit funding and cooperative refunds discard settlement state naming another channel or carrying an amount above the uint256 maximum. Funding resumed after a restart checks the saved payment's channel, and discarded state does not turn an accepted funding into a failed payment.
 * `wallet release` reports the original output lock policy when recovering an interrupted swap. JSON consumers must handle `output_mode: "mixed"` when returned outputs have different policies across mints; the new `mints[].output_mode` reports `locked`, `unlocked`, or `null` when that mint returned no new outputs. When no mint returns outputs, the top-level field retains the requested policy.
 
+## [0.24.0](https://github.com/dvmkit/dvm-cli/compare/v0.23.1...v0.24.0) (2026-11-25)
+
+
+### Features
+
+* **transport:** carry sub_reason on structured provider errors ([4bed2b0](https://github.com/dvmkit/dvm-cli/commit/4bed2b0eb4e904bd72c78a42afcc1564120d7b90))
+
+
+### Bug Fixes
+
+* **credit:** require the original x402 channel for adopted credits ([66fafc9](https://github.com/dvmkit/dvm-cli/commit/66fafc95ac063940c422bcff15084629259b93df))
+* **credit:** require the original x402 channel for adopted credits ([061daaf](https://github.com/dvmkit/dvm-cli/commit/061daaf8e5f65810d527453acb15686c4170704d))
+* **request:** cap prepaid draws at the declared budget ([981cf5b](https://github.com/dvmkit/dvm-cli/commit/981cf5b75da27dc8577d264c220b17d1cc483ec4))
+* **request:** preserve affordable Cashu per-call payments ([718b187](https://github.com/dvmkit/dvm-cli/commit/718b187605cbe8d3241d75801b35a788d54f129f))
+* **tempo:** retry pending settlement with the original credential ([db53b59](https://github.com/dvmkit/dvm-cli/commit/db53b59ee0521833feaba59864eecfb0e01c79bb))
+
 ## [0.23.1](https://github.com/dvmkit/dvm-cli/compare/v0.23.0...v0.23.1) (2026-11-24)
 
 
