@@ -1073,6 +1073,12 @@ async function sendRailPayment(
           (outcome.kind === "blocked" && outcome.blocked.reason === "credit_held"))) {
         surfaced = tempoBroadcastOutcome(pendingSettlement);
         outcome = sendOutcome(surfaced, submission, redelivery);
+      } else if (redelivery && submission?.rail === "tempo" &&
+          outcome.kind === "blocked" && outcome.blocked.reason === "credit_held") {
+        // The pending-settlement journal write may have failed before replay.
+        const detail = "The provider reported a short payment on replay, and the earlier Tempo transfer may still settle.";
+        surfaced = unconfirmedPaymentError(jobId, detail);
+        outcome = { kind: "blocked", blocked: { reason: "not_resendable", detail } };
       }
       // A pre-dispatch failure on the resend leaves the first delivery pending.
       if (pendingSettlement && outcome.kind === "not_sent") outcome = { kind: "unknown" };
