@@ -47,7 +47,9 @@ async function exerciseReceiptRecovery(packageRoot, sdk, sample) {
   let drawId, signedReceipt;
   let published = false;
   const message = (seq, type, content) => ({ seq, type, content, from: "provider", timestamp: new Date().toISOString() });
-  const upfrontPayment = () => ({ amount_msats: 100_000, amount_micro: 100_000, currency: sample.currency,
+  const upfrontMicro = 100_000;
+  const upfrontMsats = 100_000;
+  const upfrontPayment = () => ({ amount_msats: upfrontMsats, amount_micro: upfrontMicro, currency: sample.currency,
     credit_id: creditId, draw_id: drawId });
   const completed = () => ({ job_id: jobId, status: "completed", summary: "Done", has_artifacts: false,
     upfront_payment: upfrontPayment(),
@@ -71,6 +73,10 @@ async function exerciseReceiptRecovery(packageRoot, sdk, sample) {
           auth_audience: audience, receipts: true, builder, request_recovery: true,
           capabilities: { echo: { description: "Echo", pricing: { max: { amount: 0.10, currency: sample.currency } } } },
           credit: menu, payment: { methods: [] } });
+      } else if (request.method === "POST" && path === "/v1/quote") {
+        verifier.checkAuth(body.data, { audience, method: "POST", path, capability: "echo" });
+        reply(200, { upfront: { amount: upfrontMicro / 1_000_000, amount_micro: upfrontMicro, currency: sample.currency },
+          price_msats: upfrontMsats });
       } else if (request.method === "POST" && path === "/v1/credit") {
         verifier.checkAuth(body, { audience, method: "POST", path, capability: null });
         if (body.op === "balance") {
