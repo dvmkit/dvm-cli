@@ -736,7 +736,11 @@ describe("mid-job payment rail selection", () => {
       { name: "acceptance", disposition: "paid" },
       { name: "replay acknowledgement", disposition: "paid",
         error: new DvmError("replay_rejected", "Already accepted", undefined, { http_status: 409 }) },
-      { name: "not_broadcast", disposition: "released", error: refusal("not_broadcast", true) },
+      { name: "not_broadcast", disposition: "released", resends: true, error: refusal("not_broadcast", true) },
+      { name: "not_broadcast with unknown status", disposition: "held", resends: true,
+        error: new DvmError("payment_invalid", "Provider prose.", undefined, {
+          http_status: 402, rail: "tempo", reason: "not_broadcast", retryable: true, status: "unknown",
+        }) },
       { name: "expired", disposition: "held", error: refusal("expired") },
       { name: "invalid_request", disposition: "held",
         error: new DvmError("invalid_request", "Invalid request", undefined, { http_status: 400 }) },
@@ -749,7 +753,7 @@ describe("mid-job payment rail selection", () => {
       { name: "a journal-write failure after dispatch", disposition: "held", journalFailure: "after-dispatch",
         error: refusal("settlement_unconfirmed", true, 0) },
     ])("resolves a Tempo journal replay after $name only with definitive evidence", async ({
-      name, disposition, error, journalFailure, legacyCreditHold, superseded,
+      name, disposition, error, resends, journalFailure, legacyCreditHold, superseded,
     }) => {
       vi.useFakeTimers();
       try {
@@ -782,7 +786,7 @@ describe("mid-job payment rail selection", () => {
           if (error) throw error;
           return { seq: 7 };
         });
-        if (disposition === "released") transport.sendMessage.mockRejectedValueOnce(error);
+        if (resends) transport.sendMessage.mockRejectedValueOnce(error);
         if (superseded) {
           const [ask] = history(false);
           transport.getMessages.mockResolvedValue([ask, { ...ask, seq: 7 }]);
@@ -793,7 +797,7 @@ describe("mid-job payment rail selection", () => {
         const originalSend = [jobId, { type: "payment", content: { tempo_credential: credential, amount_msats: 12_000 } },
           provider, { jobToken: "job-token" }];
         const noReplay = superseded || legacyCreditHold || journalFailure === "before-dispatch";
-        const originalSends = noReplay ? 1 : disposition === "released" ? 3 : 2;
+        const originalSends = noReplay ? 1 : resends ? 3 : 2;
         expect(transport.sendMessage.mock.calls).toEqual(Array.from({ length: originalSends }, () => originalSend));
         expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
         expect(journalWriteFailed).toBe(journalFailure !== undefined);

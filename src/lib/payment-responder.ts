@@ -1156,7 +1156,8 @@ function tempoContinuationFailure(jobId: string, error: unknown, pendingSettleme
   // presented. Its not_broadcast response follows a chain check and release
   // of the replay marker. The SDK gives no distinct wire evidence of expiry
   // without inclusion, so even an expired reason alone cannot release a hold.
-  if (error instanceof DvmError && error.data?.code_source !== "inferred" && error.data?.payment_state !== "unknown") {
+  if (error instanceof DvmError && error.data?.code_source !== "inferred"
+    && error.data?.payment_state !== "unknown" && error.data?.status !== "unknown") {
     if (error.code === "replay_rejected" && error.data?.http_status === 409)
       return { surfaced: error, outcome: { kind: "taken" } };
     if (error.data?.http_status === 402 && error.data.retryable === true && tempoBroadcastRefusal(error) === "not_broadcast") {
