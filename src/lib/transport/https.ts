@@ -1342,8 +1342,8 @@ async function parseSSEStream(
 
 /**
  * Parse a DVM's structured error envelope from a non-2xx (non-402) body and
- * surface it as a `DvmError` carrying the DVM's own `code`, plus `display` and
- * `retryable` on `data`, with explicit provider origin for every prose field so
+ * surface it as a `DvmError` carrying the DVM's own `code`, plus `display`,
+ * `retryable` and `sub_reason` on `data`, with explicit provider origin for every prose field so
  * the JSON boundary marks it while preserving the machine fields. Returns
  * `null` for genuinely unstructured bodies
  * (HTML, plain text, JSON without a usable `error` code) — the caller falls
@@ -1410,8 +1410,8 @@ function jobCredentialError(status: number, body: string): DvmError | null {
 
 /**
  * Build a `DvmError` from a structured envelope's `code` and the surrounding
- * fields (`message`, `display`, `hint`, `retryable`). `display` and
- * `retryable` ride on `data` — where the CLI error boundary spreads them into
+ * fields (`message`, `display`, `hint`, `retryable`, `sub_reason`). `display`,
+ * `retryable` and `sub_reason` ride on `data` — where the CLI error boundary spreads them into
  * the JSON error object — and are only included when present and well-typed.
  */
 function buildStructuredError(
@@ -1428,6 +1428,7 @@ function buildStructuredError(
   const data: Record<string, unknown> = {};
   if (display !== undefined) data.display = display;
   if (typeof fields.retryable === "boolean") data.retryable = fields.retryable;
+  if (typeof fields.sub_reason === "string") data.sub_reason = fields.sub_reason;
   // Outcome metadata can sit beside a nested error. Neither level may erase
   // uncertainty reported by the other.
   if (fields.status === "unknown" || envelope.status === "unknown") data.status = "unknown";

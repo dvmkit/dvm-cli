@@ -268,6 +268,18 @@ beforeAll(async () => {
         response.end(JSON.stringify({ error: "invalid_credit_fixture_request" }));
         return;
       }
+      if (request.method === "GET" && request.url?.startsWith("/v1/job/sub-reason-")) {
+        const variant = request.url.slice("/v1/job/sub-reason-".length).split(/[/?]/)[0];
+        const bodies: Record<string, unknown> = {
+          flat: { error: "auth_error", message: "Clock skew", hint: "Resync the clock", sub_reason: "timestamp_drift" },
+          nested: { error: { code: "auth_error", display: "Replay detected", sub_reason: "replay_detected" } },
+          absent: { error: "auth_error", message: "Rejected", hint: "Re-sign" },
+          numeric: { error: "auth_error", message: "Rejected", hint: "Re-sign", sub_reason: 42 },
+        };
+        response.statusCode = 401;
+        response.end(JSON.stringify(bodies[variant]));
+        return;
+      }
       if (request.method === "GET" && request.url?.startsWith("/v1/job/echo-secret")) {
         response.statusCode = 401;
         response.end(
@@ -1008,6 +1020,46 @@ describe("standalone caller contract", () => {
       message: { _source: "provider", text: "Provider rejected [REDACTED]" },
       hint: { _source: "provider", text: "Replace [REDACTED]" },
     } });
+  });
+
+  describe("provider auth rejection sub_reason", () => {
+    const statusError = async (variant: string) => {
+      const result = await runCliOutcome([
+        "status",
+        `sub-reason-${variant}`,
+        "--endpoint",
+        endpoint,
+        "--job-token",
+        portableToken,
+      ]);
+      expect(result.code).toBe(1);
+      return (JSON.parse(result.stdout) as { error: Record<string, unknown> }).error;
+    };
+
+    it("carries a flat-shape sub_reason as a plain string beside provider prose", async () => {
+      const error = await statusError("flat");
+      expect(error).toMatchObject({
+        code: "auth_error",
+        sub_reason: "timestamp_drift",
+        message: { _source: "provider", text: "Clock skew" },
+        hint: { _source: "provider", text: "Resync the clock" },
+      });
+    });
+
+    it("carries a nested-shape sub_reason as a plain string", async () => {
+      const error = await statusError("nested");
+      expect(error).toMatchObject({
+        code: "auth_error",
+        sub_reason: "replay_detected",
+        display: { _source: "provider", text: "Replay detected" },
+      });
+    });
+
+    it.each(["absent", "numeric"])("adds no sub_reason key for a %s value", async (variant) => {
+      const error = await statusError(variant);
+      expect(error).toMatchObject({ code: "auth_error" });
+      expect(error).not.toHaveProperty("sub_reason");
+    });
   });
 
   describe("credit command boundary", () => {
