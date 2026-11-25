@@ -64,7 +64,7 @@ export function quoteWithinDeclaredLimit(
   const nativeLimit = declaredLimitMicro(limitMsats, declaredLimit, btcRate);
   if (price.usdMicro !== undefined) {
     if (nativeLimit !== undefined) return price.usdMicro <= nativeLimit;
-    if (price.usdMicro === 0n) return limitMsats >= 0;
+    return price.usdMicro === 0n && limitMsats >= 0;
   }
   if (rail?.trim().toLowerCase() === "tempo" && declaredLimit?.trim().startsWith("$")) return false;
   return price.msats !== undefined && price.msats <= limitMsats;

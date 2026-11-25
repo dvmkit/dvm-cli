@@ -6,6 +6,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import type { JobEnvelope, Payment, ProviderInfo } from "@dvmkit/sdk/internal";
 
+import { unknownUpfrontPrice } from "../src/lib/quote-upfront";
+
 const endpoint = "https://provider.invalid";
 const mint = "https://mint.invalid";
 const secret = "01".repeat(32);
@@ -40,6 +42,7 @@ let sdk: typeof import("@dvmkit/sdk/internal");
 let request: typeof import("../src/commands/request")["request"];
 let notices: typeof import("../src/lib/credit-notice");
 let fetchRate: ReturnType<typeof vi.fn>;
+let legacy402: boolean;
 
 beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), "dvm-cli-funding-notice-"));
@@ -91,6 +94,7 @@ beforeEach(() => {
   mkdirSync(root, { recursive: true });
   notices.resetCreditNotices();
   seams.rate = undefined;
+  legacy402 = false;
   seams.quote.mockResolvedValue([]);
   writeConfig("auto");
   fetchRate = vi.fn().mockRejectedValue(new Error("rate provider unavailable"));
@@ -117,7 +121,11 @@ beforeEach(() => {
       return {
         jobId: "",
         status: "payment-required",
-        quotes: [{ priceMsats: 1_000, upfront: { amount: 0.001, amount_micro: 1_000, currency: "usd" }, credit }],
+        quotes: [{
+          priceMsats: 1_000,
+          upfront: legacy402 ? unknownUpfrontPrice() : { amount: 0.001, amount_micro: 1_000, currency: "usd" },
+          credit,
+        }],
       };
     }
     const jobId = `job-${++paidJobs}`;
@@ -213,6 +221,7 @@ it.each([5_000, 6_000])("names a Cashu receipt's USD currency only when its hold
 
 describe("automatic credit funding notices", () => {
   it("explains a skipped open on the second paid request when the rate fetch fails with no cache", async () => {
+    legacy402 = true;
     await paidRequest();
     expect(terminal()).not.toHaveProperty("credit_funding_skipped");
     await paidRequest();
@@ -240,6 +249,21 @@ describe("automatic credit funding notices", () => {
     expect(notices.takeCreditNoticeFields()).toEqual({});
   });
 
+  it("refuses a native 402 before attempting payment when FX is unavailable", async () => {
+    const { credit } = await seams.describe();
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.20, amount_micro: 200_000, currency: "usd" },
+      priceMsats: 1_000,
+      credit,
+    }] });
+
+    await paidRequest();
+
+    expect(terminal()).toMatchObject({ status: "over-budget" });
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
   it("rechecks a legacy 402 against the native quote used to size credit funding", async () => {
     seams.rate = 100_000;
     seedCredit();
@@ -262,6 +286,7 @@ describe("automatic credit funding notices", () => {
   });
 
   it("names a refill when an active prepaid credit cannot cover the job", async () => {
+    legacy402 = true;
     seedCredit();
     await paidRequest();
 
@@ -279,6 +304,7 @@ describe("automatic credit funding notices", () => {
   });
 
   it("narrates the skipped funding in human mode without leaving a JSON notice behind", async () => {
+    legacy402 = true;
     await paidRequest();
     seams.json.mockClear();
     await paidRequest(true);
@@ -381,14 +407,21 @@ describe("capability-scoped credit draws", () => {
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("leaves a zero budget undrawn when FX is unavailable (credit-only: %s)", async (only) => {
+  it.each([
+    { budget: "0", priceMsats: 0, only: false },
+    { budget: "0", priceMsats: 0, only: true },
+    { budget: "50000", priceMsats: 50_000, only: false },
+    { budget: "50000", priceMsats: 50_000, only: true },
+  ])("leaves credit undrawn with budget $budget when FX is unavailable (credit-only: $only)", async ({
+    budget, priceMsats, only,
+  }) => {
     seams.rate = undefined;
     const quote = {
       upfront: { amount: 0.10, amount_micro: 100_000, currency: "usd" },
-      priceMsats: 0, shape: "fixed", description: "Upfront",
+      priceMsats, shape: "fixed", description: "Upfront",
     };
     seams.quote.mockResolvedValueOnce([quote]);
-    const args = { dvm: "panel/stress", input: "Run", budget: "0" };
+    const args = { dvm: "panel/stress", input: "Run", budget };
     if (only) {
       await expect(request({ ...args, creditOnly: "prepaid-credit",
         requestId: "5e2b95d7-665b-4201-9d59-be8ad010c393" })).rejects.toMatchObject({

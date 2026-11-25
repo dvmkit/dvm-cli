@@ -96,9 +96,8 @@ describe("native-dollar quote limits", () => {
     }
   );
 
-  it("uses a positive millisat price when FX is unavailable for a nonzero millisat limit", () => {
-    expect(fits(tempoQuote, 24_503, "24503", "cashu")).toBe(false);
-    expect(fits(tempoQuote, 25_000, "25000", "cashu")).toBe(true);
+  it("refuses a positive native charge without FX even when the advisory price fits", () => {
+    expect(fits(tempoQuote, 25_000, "25000", "cashu")).toBe(false);
   });
 
   it("uses a legacy decimal USD amount in the exact comparison", () => {
