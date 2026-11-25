@@ -549,7 +549,8 @@ describe("mid-job payment rail selection", () => {
     store.updateJob(jobId, { inFlightPaymentRequestStartedAtMs: { 5: Date.now() - 60_000 } });
     transport.sendMessage.mockRejectedValueOnce(new DvmError("payment_invalid", "Credential refused", undefined, { http_status: 402 }));
     const refusal = await pay().catch((error: unknown) => error);
-    expect(refusal).toMatchObject({ code: "payment_invalid", hint: expect.stringContaining("dvm decline") });
+    expect(refusal).toMatchObject({ code: rail === "tempo" ? "payment_unconfirmed" : "payment_invalid",
+      hint: expect.stringContaining("dvm decline") });
     expect((refusal as DvmError).hint).toContain("dvm cancel");
     expect((refusal as DvmError).hint).not.toContain("new authorization");
     expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({ rail, blocked: { reason: "not_resendable" } });
@@ -633,10 +634,10 @@ describe("mid-job payment rail selection", () => {
         const { store, jobId, transport, pay, credential } = await tempoPay(
           `tempo-settlement-expired-replay-${expiresInMs}`, expiresInMs,
         );
-        transport.sendMessage.mockRejectedValueOnce(refusal("settlement_unconfirmed", true, 0))
-          .mockRejectedValueOnce(new DvmError("timeout", "Resend reply lost"));
-
+        transport.sendMessage.mockRejectedValueOnce(new DvmError("timeout", "Initial reply lost"));
         await expect(pay()).rejects.toMatchObject({ code: "timeout" });
+        // A previous process can exit after saving the pending evidence.
+        store.recordTempoPendingSettlement(jobId, 5, { retryable: true });
         await vi.advanceTimersByTimeAsync(45_000);
 
         const acquire = lockfile.lockSync.bind(lockfile);
@@ -646,7 +647,7 @@ describe("mid-job payment rail selection", () => {
           return acquire(file, options);
         });
         const replay = await pay("explicit").catch((error: unknown) => error).finally(() => journalLock.mockRestore());
-        expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+        expect(transport.sendMessage).toHaveBeenCalledTimes(1);
         expect(replay).toMatchObject({ code: "payment_unconfirmed" });
         const held = store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5];
         expect(held).toMatchObject({
@@ -655,7 +656,7 @@ describe("mid-job payment rail selection", () => {
         });
         await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_unconfirmed" });
         expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toEqual(held);
-        expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+        expect(transport.sendMessage).toHaveBeenCalledTimes(1);
         expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
         expect(sdk.recordSpend).not.toHaveBeenCalled();
       } finally { vi.useRealTimers(); }
@@ -700,83 +701,132 @@ describe("mid-job payment rail selection", () => {
     it.each([
       new DvmError("timeout", "Reply lost"),
       Object.assign(new Error("Could not connect"), { code: "ECONNREFUSED" }),
-    ])("keeps pending settlement across journal replay after a resend failure ($code)", async (failure) => {
+    ])("keeps pending settlement and blocks another pay after a resend failure ($code)", async (failure) => {
       vi.useFakeTimers();
       try {
-        const { store, jobId, transport, pay, credential } = await tempoPay(`tempo-settlement-resend-${failure.code}`);
+        const { store, jobId, transport, pay, credential } = await tempoPay("tempo-settlement-resend-" + failure.code);
         const transactionHash = "0x" + "ab".repeat(32);
         const pending = new DvmError("payment_invalid", "Pending settlement", undefined, {
           http_status: 402, rail: "tempo", reason: "settlement_unconfirmed", retryable: true, retry_after_ms: 0,
           transaction_hash: transactionHash,
         });
-        transport.sendMessage.mockRejectedValueOnce(pending)
-          .mockRejectedValueOnce(failure)
-          .mockRejectedValueOnce(new DvmError("payment_insufficient", "Short", undefined, {
-            http_status: 402, credit_id: "credit-1",
-          }));
+        transport.sendMessage.mockRejectedValueOnce(pending).mockRejectedValueOnce(failure);
 
-        await expect(pay()).rejects.toBe(failure);
-        await expect(pay()).rejects.toMatchObject({ code: "payment_settling" });
-        expect(transport.sendMessage).toHaveBeenCalledTimes(2);
-        await vi.advanceTimersByTimeAsync(45_000);
-
-        const replayError = await pay("explicit").catch((error: unknown) => error);
-        const held = store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5];
-        await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_unconfirmed" });
-        expect(replayError).toMatchObject({
+        await expect(pay()).rejects.toMatchObject({
           code: "tempo_settlement_unconfirmed", data: { payment_state: "unknown", transaction_hash: transactionHash },
         });
-        expect(held).toMatchObject({
-          rail: "tempo", content: { tempo_credential: credential }, blocked: { reason: "not_resendable" },
-        });
-        expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toEqual(held);
-        const originalSend = [jobId, { type: "payment", content: { tempo_credential: credential, amount_msats: 12_000 } },
-          provider, { jobToken: "job-token" }];
-        expect(transport.sendMessage.mock.calls).toEqual([originalSend, originalSend, originalSend]);
-        expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
-        expect(sdk.recordSpend).not.toHaveBeenCalled();
-      } finally { vi.useRealTimers(); }
-    });
-
-    it("holds a replayed Tempo payment after saving pending settlement fails", async () => {
-      vi.useFakeTimers();
-      try {
-        const { store, jobId, transport, pay, credential } = await tempoPay("tempo-settlement-journal-failure");
-        const writeError = new Error("Could not acquire the jobs lock");
-        const acquire = lockfile.lockSync.bind(lockfile);
-        const journalLock = vi.spyOn(lockfile, "lockSync");
-        transport.sendMessage.mockImplementationOnce(async () => {
-          journalLock.mockImplementationOnce((file, options) => {
-            if (file === JOBS_FILE) throw writeError;
-            return acquire(file, options);
-          });
-          throw refusal("settlement_unconfirmed", true, 0);
-        }).mockRejectedValueOnce(new DvmError("payment_insufficient", "Short", undefined, {
-          http_status: 402, credit_id: "credit-1",
-        }));
-
-        try {
-          await expect(pay()).rejects.toBe(writeError);
-        } finally { journalLock.mockRestore(); }
-        const saved = store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5];
-        expect(saved).toMatchObject({ rail: "tempo", content: { tempo_credential: credential } });
-        expect(saved).not.toHaveProperty("tempoPendingSettlement");
-        expect(transport.sendMessage).toHaveBeenCalledTimes(1);
-        await vi.advanceTimersByTimeAsync(45_000);
-
-        const replayError = await pay("explicit").catch((error: unknown) => error);
         const held = store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5];
-        await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_unconfirmed" });
-        expect(replayError).toMatchObject({ code: "payment_unconfirmed" });
         expect(held).toMatchObject({
-          rail: "tempo", content: { tempo_credential: credential }, blocked: { reason: "not_resendable" },
+          rail: "tempo", content: { tempo_credential: credential },
+          tempoPendingSettlement: { retryable: true, transaction_hash: transactionHash },
+          blocked: { reason: "not_resendable" },
         });
+        await vi.advanceTimersByTimeAsync(45_000);
+        await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_unconfirmed" });
         expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toEqual(held);
         const originalSend = [jobId, { type: "payment", content: { tempo_credential: credential, amount_msats: 12_000 } },
           provider, { jobToken: "job-token" }];
         expect(transport.sendMessage.mock.calls).toEqual([originalSend, originalSend]);
         expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
         expect(sdk.recordSpend).not.toHaveBeenCalled();
+      } finally { vi.useRealTimers(); }
+    });
+
+    it.each([
+      { name: "acceptance", disposition: "paid" },
+      { name: "replay acknowledgement", disposition: "paid",
+        error: new DvmError("replay_rejected", "Already accepted", undefined, { http_status: 409 }) },
+      { name: "not_broadcast", disposition: "released", error: refusal("not_broadcast", true) },
+      { name: "expired", disposition: "held", error: refusal("expired") },
+      { name: "invalid_request", disposition: "held",
+        error: new DvmError("invalid_request", "Invalid request", undefined, { http_status: 400 }) },
+      { name: "payment_insufficient", disposition: "held",
+        error: new DvmError("payment_insufficient", "Short", undefined, { http_status: 402, credit_id: "credit-1" }) },
+      { name: "timeout", disposition: "held", error: new DvmError("timeout", "Replay reply lost") },
+      { name: "a superseding ask", disposition: "held", superseded: true },
+      { name: "an older short-payment hold", disposition: "held", legacyCreditHold: true },
+      { name: "a journal-write failure before dispatch", disposition: "held", journalFailure: "before-dispatch" },
+      { name: "a journal-write failure after dispatch", disposition: "held", journalFailure: "after-dispatch",
+        error: refusal("settlement_unconfirmed", true, 0) },
+    ])("resolves a Tempo journal replay after $name only with definitive evidence", async ({
+      name, disposition, error, journalFailure, legacyCreditHold, superseded,
+    }) => {
+      vi.useFakeTimers();
+      try {
+        const { store, jobId, transport, pay, credential, history } = await tempoPay("tempo-replay-" + name);
+        transport.sendMessage.mockRejectedValueOnce(new DvmError("timeout", "Initial reply lost"));
+        await expect(pay()).rejects.toMatchObject({ code: "timeout" });
+        expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({
+          rail: "tempo", content: { tempo_credential: credential },
+        });
+        expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).not.toHaveProperty("tempoPendingSettlement");
+        await vi.advanceTimersByTimeAsync(45_000);
+
+        const acquire = lockfile.lockSync.bind(lockfile);
+        const journalLock = vi.spyOn(lockfile, "lockSync");
+        const writeError = new Error("Could not acquire the jobs lock");
+        let journalWriteFailed = false;
+        const failNextJournalWrite = () => journalLock.mockImplementationOnce((file, options) => {
+          if (file === JOBS_FILE) {
+            journalWriteFailed = true;
+            throw writeError;
+          }
+          return acquire(file, options);
+        });
+        if (journalFailure === "before-dispatch") transport.status.mockImplementationOnce(async () => {
+          failNextJournalWrite();
+          return { status: "awaiting-input" };
+        });
+        transport.sendMessage.mockImplementationOnce(async () => {
+          if (journalFailure === "after-dispatch") failNextJournalWrite();
+          if (error) throw error;
+          return { seq: 7 };
+        });
+        if (disposition === "released") transport.sendMessage.mockRejectedValueOnce(error);
+        if (superseded) {
+          const [ask] = history(false);
+          transport.getMessages.mockResolvedValue([ask, { ...ask, seq: 7 }]);
+        }
+        if (legacyCreditHold) store.blockHeldPayment(jobId, 5, { reason: "credit_held", creditId: "credit-1" });
+        const replay = await pay("explicit").catch((failure: unknown) => failure).finally(() => journalLock.mockRestore());
+
+        const originalSend = [jobId, { type: "payment", content: { tempo_credential: credential, amount_msats: 12_000 } },
+          provider, { jobToken: "job-token" }];
+        const noReplay = superseded || legacyCreditHold || journalFailure === "before-dispatch";
+        const originalSends = noReplay ? 1 : disposition === "released" ? 3 : 2;
+        expect(transport.sendMessage.mock.calls).toEqual(Array.from({ length: originalSends }, () => originalSend));
+        expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
+        expect(journalWriteFailed).toBe(journalFailure !== undefined);
+        const job = store.loadJob(jobId);
+        const held = job?.unconfirmedPaymentSubmissions?.[5];
+        const booked = disposition === "paid" ? 1 : 0;
+        expect(job?.paymentsHonoured ?? 0).toBe(booked);
+        expect(sdk.recordSpend).toHaveBeenCalledTimes(booked);
+        expect(job?.inFlightPaymentRequestSeqs).toBeUndefined();
+
+        if (disposition === "held") {
+          expect(held).toMatchObject({
+            rail: "tempo", content: { tempo_credential: credential }, blocked: { reason: "not_resendable" },
+          });
+          if (!legacyCreditHold) expect(job?.askPaymentBlocks).toBeUndefined();
+          await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_unconfirmed" });
+          expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toEqual(held);
+        } else {
+          expect(held).toBeUndefined();
+          if (disposition === "paid") {
+            expect(replay).toMatchObject({ status: "paid", rail: "tempo" });
+            await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_already_sent" });
+          } else {
+            expect(replay).toMatchObject({ code: "payment_invalid", data: { reason: "not_broadcast" } });
+            const replacement = { ...credential, payload: { type: "transaction", signature: "0xreplacement" } };
+            sdk.buildTempoCredential.mockResolvedValueOnce(replacement);
+            await expect(pay("explicit")).resolves.toMatchObject({ status: "paid", rail: "tempo" });
+            expect(transport.sendMessage).toHaveBeenLastCalledWith(jobId,
+              { type: "payment", content: { tempo_credential: replacement, amount_msats: 12_000 } }, provider, { jobToken: "job-token" });
+          }
+        }
+        expect(transport.sendMessage).toHaveBeenCalledTimes(originalSends + (disposition === "released" ? 1 : 0));
+        expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(disposition === "released" ? 2 : 1);
       } finally { vi.useRealTimers(); }
     });
 
@@ -790,9 +840,10 @@ describe("mid-job payment rail selection", () => {
       expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions).toBeUndefined();
     });
 
-    it("holds the ask after a second not_broadcast instead of freeing it for a new payment", async () => {
+    it("holds the ask when a resend returns not_broadcast without the SDK's release fields", async () => {
       const { store, jobId, transport, pay } = await tempoPay("tempo-not-broadcast-twice");
-      transport.sendMessage.mockRejectedValue(refusal("not_broadcast", true));
+      transport.sendMessage.mockRejectedValueOnce(refusal("not_broadcast", true))
+        .mockRejectedValueOnce(refusal("not_broadcast"));
       await expect(pay()).rejects.toMatchObject({ code: "tempo_not_broadcast", hint: expect.stringContaining("Do not pay again") });
       expect(transport.sendMessage).toHaveBeenCalledTimes(2);
       expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toMatchObject({ rail: "tempo", blocked: { reason: "not_resendable" } });

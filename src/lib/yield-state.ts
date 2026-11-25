@@ -1,6 +1,6 @@
 import { mandateCredit, recordMandatePayments } from "./mandate-payments";
 import { DvmError, isAbortError, shellQuoteArg, type Message, type MessagePollOptions, type ProviderRef, type Transport } from "@dvmkit/sdk/internal";
-import { bookCreditPayment, clearPaymentRequestInFlight, loadJob, markPaymentRequestAnswered, type UnconfirmedPaymentSubmission } from "./job-store";
+import { blockHeldPayment, bookCreditPayment, clearPaymentRequestInFlight, loadJob, markPaymentRequestAnswered, type UnconfirmedPaymentSubmission } from "./job-store";
 import { settleTakenPayment } from "./taken-payment";
 import { applySubmissionVerdicts } from "./wallet-agent/submission-verdicts";
 import { loadMessages } from "./messages/index";
@@ -142,7 +142,15 @@ export async function reconcilePaymentRequestHistory(
   }
   // A newer ask abandons this one; it must neither be retried nor pin the cursor.
   const superseded = (latestProviderPaymentRequest(history)?.seq ?? -1) > requestSeq;
-  if (superseded) clearPaymentRequestInFlight(jobId, requestSeq);
+  if (superseded) {
+    const submission = loadJob(jobId)?.unconfirmedPaymentSubmissions?.[requestSeq];
+    if (submission?.rail === "tempo") {
+      blockHeldPayment(jobId, requestSeq, { reason: "not_resendable",
+        detail: "The provider moved on to a later request, and the earlier Tempo payment may still settle." });
+    } else {
+      clearPaymentRequestInFlight(jobId, requestSeq);
+    }
+  }
   const decisionTime = now();
   const retryAt = settleUntilMs(jobId, requestSeq, decisionTime);
   const seconds = Math.ceil((retryAt - decisionTime) / 1000);
