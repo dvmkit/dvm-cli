@@ -608,6 +608,9 @@ describe("initial prepaid draw limits", () => {
       outcome: "over-budget", ceilingMicro: 99_999 },
     { name: "402 native price exceeds the millisat budget despite a fitting advisory price",
       flags: ["--budget", "50000", "--auto-pay-below", "550000"], outcome: "over-budget", requiredMsats: 50_000 },
+    { name: "402 Cashu price exceeds the millisat budget despite a fitting native price",
+      flags: ["--budget", "50000", "--auto-pay-below", "550000"], outcome: "over-budget",
+      requiredMsats: 100_000, responsePriceMicro: 40_000 },
     { name: "budget only", flags: ["--budget", "$0.05"], outcome: "over-budget" },
     { name: "budget and threshold from config", config: { defaultBudget: "$0.05", autoPayThreshold: "$0.55" },
       flags: [], outcome: "over-budget" },
@@ -619,8 +622,8 @@ describe("initial prepaid draw limits", () => {
     { name: "threshold only", flags: ["--auto-pay-below", "$0.55"], outcome: "draw" },
     { name: "no limits", flags: [], outcome: "draw" },
     { name: "selected credit only", flags: ["--budget", "$0.05"], outcome: "credit-only-unavailable" },
-  ])("$name", async ({ flags, config, outcome, ceilingMicro = 50_000, requiredMsats }) => {
-    if (requiredMsats !== undefined) await control({ op: "configure", requiredMsats });
+  ])("$name", async ({ flags, config, outcome, ceilingMicro = 50_000, requiredMsats, responsePriceMicro }) => {
+    if (requiredMsats !== undefined) await control({ op: "configure", requiredMsats, responsePriceMicro });
     const before = await control({ op: "snapshot", ids: [] });
     const creditId = String(credit.creditId);
     const initial = {

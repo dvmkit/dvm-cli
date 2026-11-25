@@ -39,6 +39,7 @@ let rejectMandate = false;
 let rejectCredit = false;
 let advertisedUpfront;
 let requiredMsats;
+let responsePriceMicro;
 const pending = [];
 const descriptor = configureDVM({ name: "Mandate contract", capability: "run", price: "$0.10",
   credit: { min: "$0.10", max: "$20" }, auth: secp256k1Auth({ replayStore: null }),
@@ -105,7 +106,7 @@ const server = createServer(async (incoming, outgoing) => {
   }
   if (incoming.url === "/v1/job" && response.status === 402 && requiredMsats !== undefined) {
     response = Response.json({
-      ...(await response.json()), required_msats: requiredMsats, price_micro: 100_000, price_currency: "usd",
+      ...(await response.json()), required_msats: requiredMsats, price_micro: responsePriceMicro, price_currency: "usd",
     }, { status: 402, headers: response.headers });
   }
   if (incoming.url === "/v1/info") {
@@ -137,6 +138,7 @@ process.on("message", async (message) => {
     rejectCredit = message.rejectCredit ?? false;
     advertisedUpfront = message.advertisedUpfront;
     requiredMsats = message.requiredMsats;
+    responsePriceMicro = message.responsePriceMicro ?? 100_000;
     advertiseCredit = message.advertiseCredit ?? true;
     maxDuration = message.maxDuration;
     omitMaxDuration = message.omitMaxDuration ?? false;

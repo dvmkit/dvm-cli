@@ -46,6 +46,8 @@ import {
   type ProviderInfo,
   type ProviderRef,
   type Quote,
+  type Rail,
+  type RailFlag,
   readFundValuation,
   receiveToAgentWallet,
   recordFundResponse,
@@ -57,6 +59,7 @@ import {
   signedRequestDomain,
   type StoredCredit,
   type TempoAccount,
+  tempoChallengeAmountMicro,
   tempoCredentialAmountMicro,
   type Transport,
   unsignRequestData,
@@ -174,7 +177,7 @@ import { applyMintPin } from "../lib/mint-pin";
 import { selectRailOrder } from "../lib/payment-rails/select";
 import { finalizeProgressLine } from "../lib/progress-bar";
 import { progressNotice } from "../lib/progress-notice";
-import { quoteLimitPrice, quoteWithinDeclaredLimit, type QuoteLimitPrice } from "../lib/quote-limit";
+import { quoteLimitPrice, quoteWithinDeclaredLimit, usdFromMicro, type QuoteLimitPrice } from "../lib/quote-limit";
 import { refundJsonField } from "../lib/refund-claim";
 import { saveRequestIntent, recordRequestRailPayment } from "../lib/request-intent-store";
 import { receiptUpfrontFault, upfrontRailPayment, type UpfrontRailPayment } from "../lib/upfront-payment";
@@ -985,11 +988,12 @@ async function requestWithWarnings(
       addOutputWarnings(autoPayWarnings(quotes, warningLimits, undefined, btcRate), opts.human);
     }
     if (!autoPayConsent && drawBudget && quotes.length > 0) {
-      const prices = quotes.map((quote) => quoteLimitPrice(quote, opts.rail));
-      const limitRate = btcRate || await resolveQuoteLimitRate(prices);
-      if (!prices.some((price) =>
-        quoteWithinDeclaredLimit(price, drawBudget.msats, drawBudget.declared, limitRate, opts.rail)
-      )) {
+      const flagRail = parseForcedRail(opts.rail);
+      const prices = quotes.map((quote) => upfrontQuoteLimitPrices(quote, [], flagRail, false));
+      const limitRate = btcRate || await resolveQuoteLimitRate(prices.flat());
+      if (!prices.some((charges) => charges.every((price) =>
+        quoteWithinDeclaredLimit(price, drawBudget.msats, drawBudget.declared, limitRate)
+      ))) {
         transport.close();
         outputUpfrontOverBudget(receipt.jobId, quotes, opts, identity, false);
         return;
@@ -1833,6 +1837,41 @@ interface RequestQuoteLimits {
   btcRate: number;
 }
 
+function upfrontQuoteLimitPrices(
+  quote: Quote,
+  rails: readonly Rail[],
+  flagRail: RailFlag | undefined,
+  mayFund: boolean
+): QuoteLimitPrice[] {
+  const native = quoteLimitPrice(quote);
+  const cashu = { msats: native.msats === undefined ? undefined : cashuQuoteSats(native.msats) * 1000 };
+  const priceFor = (rail: Rail): QuoteLimitPrice => {
+    if (rail === "cashu_p2pk") return cashu;
+    if (rail === "x402") {
+      return quote.requiredUsdcMicro !== undefined
+        ? quoteLimitPrice(quote, "x402")
+        : { msats: native.msats };
+    }
+    return native;
+  };
+
+  if (rails.length === 0) {
+    if (flagRail) return [priceFor(flagRail === "cashu" ? "cashu_p2pk" : flagRail)];
+    // Without a selected rail, keep both forms of available price evidence.
+    return native.msats !== undefined && native.usd ? [native, cashu] : [native];
+  }
+
+  const charges = rails.map(priceFor);
+  // An attached fund-and-draw charges the native job price. Cashu can
+  // still fall back to a per-call spend if the wallet cannot cover the fund.
+  if (mayFund && rails[0] === "cashu_p2pk" && native.usd) charges.push(native);
+  return charges;
+}
+
+function cashuQuoteSats(msats: number): number {
+  return Math.ceil(msats / 1000);
+}
+
 async function resolveQuoteLimitRate(prices: QuoteLimitPrice[]): Promise<number> {
   if (!prices.some((price) => price.usd?.digits)) return 0;
   return (await tryResolveBtcUsdRate())?.rate ?? 0;
@@ -1852,21 +1891,43 @@ async function handleAutoPayQuotes(
   providerInfo: ProviderInfo,
   creditCtx?: RequestCreditContext
 ): Promise<void> {
-  const prices = quotes.map((quote) => quoteLimitPrice(quote, opts.rail));
-  const limitRate = btcRate || await resolveQuoteLimitRate(prices);
+  const flagRail = parseForcedRail(opts.rail);
+  const config = loadConfig();
+  const agentWallet = loadAgentWallet();
+  const tempoAccount = await connectedTempoAccount();
+  const x402Wallet = loadX402Wallet();
+  const attestedIdentity = providerDvmIdentity(providerInfo);
+  const mayFund = !!creditCtx?.signing && !opts.strictPerCall && !opts.requestId &&
+    effectiveCreditPosture(config?.credit, ref.endpoint, attestedIdentity).posture !== "off";
+  const candidates = quotes.map((quote) => {
+    const selection = selectRailOrder({
+      flagRail,
+      defaultRail: config?.defaultRail,
+      providerInfo,
+      quote,
+      hasAgentWallet: agentWallet !== null,
+      hasTempoWallet: tempoAccount !== null,
+      hasX402Wallet: x402Wallet !== null,
+    });
+    const menu = quote.credit ?? providerInfo.credit;
+    const charges = upfrontQuoteLimitPrices(quote, selection.rails, flagRail,
+      mayFund && menu?.currency.toLowerCase() === "usd" && menu.funding.includes("cashu"));
+    return { quote, selection, charges };
+  });
+  const limitRate = btcRate || await resolveQuoteLimitRate(candidates.flatMap(({ charges }) => charges));
   const fitsBudget = (price: QuoteLimitPrice, rate = limitRate) =>
-    !budget || quoteWithinDeclaredLimit(price, budget.msats, budget.declared, rate, opts.rail);
+    !budget || quoteWithinDeclaredLimit(price, budget.msats, budget.declared, rate);
   const fitsThreshold = (price: QuoteLimitPrice, rate = limitRate) =>
-    quoteWithinDeclaredLimit(price, policy.autoPayBelowMsats, threshold?.declared, rate, opts.rail);
-  const chosenIndex = prices.findIndex((price) => fitsBudget(price));
-  const chosen = quotes[chosenIndex];
+    quoteWithinDeclaredLimit(price, policy.autoPayBelowMsats, threshold?.declared, rate);
+  const candidate = candidates.find(({ charges }) => charges.every((price) => fitsBudget(price)));
 
-  if (!chosen) {
+  if (!candidate) {
     transport.close?.();
     outputUpfrontOverBudget(jobId, quotes, opts, identity, true);
     return;
   }
 
+  const { quote: chosen, selection, charges } = candidate;
   setMandateUpfront(creditCtx?.signing.standingMandate, chosen);
 
   // Check auto-pay threshold (mirrors payment-responder.ts for mid-job payments)
@@ -1886,10 +1947,24 @@ async function handleAutoPayQuotes(
       action
     );
   };
-  if (!fitsThreshold(prices[chosenIndex])) {
+  if (!charges.every((price) => fitsThreshold(price))) {
     outputAboveThreshold(chosen);
     return;
   }
+
+  const acceptNativeCharge = (micro: bigint, rate: number) => {
+    const price = { usd: usdFromMicro(micro) };
+    if (!fitsBudget(price, limitRate || rate)) {
+      transport.close?.();
+      outputUpfrontOverBudget(jobId, [chosen], opts, identity, true);
+      return false;
+    }
+    if (!fitsThreshold(price, limitRate || rate)) {
+      outputAboveThreshold(chosen);
+      return false;
+    }
+    return true;
+  };
 
   // Pre-check the payment count cap — upfront payment counts toward the cap
   if (policy.maxPayments < 1) {
@@ -1929,10 +2004,8 @@ async function handleAutoPayQuotes(
   // trust-tier caps and the budget-ledger caps.
   let plan: CreditPlan = { mode: "none" };
   let planRate = 0;
-  const attestedIdentity = providerDvmIdentity(providerInfo);
   if (creditCtx?.signing && !opts.strictPerCall && !opts.requestId) {
     planRate = limitRate || (await tryResolveBtcUsdRate())?.rate || 0;
-    const x402Wallet = loadX402Wallet();
     plan = planCreditForQuote({
       // Attached-payment 402s carry the price but not the funding menu. The
       // authenticated `/v1/info` read already supplied that menu; retaining it
@@ -1956,7 +2029,7 @@ async function handleAutoPayQuotes(
       ...(x402Wallet ? { x402Network: x402Wallet.network } : {}),
       // A Tempo credit menu qualifies when this caller can sign its advertised
       // charge or session; channel persistence is needed only for the latter.
-      tempoConnected: (await connectedTempoAccount()) !== null,
+      tempoConnected: tempoAccount !== null,
     });
     // The insufficient_credit recovery pins the credit + draw ids: whatever
     // the policy sized, the retry must run as a top-up of THAT credit under
@@ -2019,6 +2092,15 @@ async function handleAutoPayQuotes(
     }
   }
 
+  // credit funding is Cashu-only in v1 (Tempo challenges are
+  // job-priced; x402 is final-settlement with no resume machinery). When
+  // selection put a non-Cashu rail first, the credit plan stands down and
+  // the call stays per-call implicit N=1.
+  if ((plan.mode === "open" || plan.mode === "topup") && selection.rails[0] !== "cashu_p2pk") {
+    info("Credit funding is Cashu-only for now — paying per-call on the selected rail.");
+    plan = { mode: "none" };
+  }
+
   // The signed `fund.amount_micro` must reproduce the server's own valuation
   // of the token (`fundedMicroFor` over its quote-pinned fiat ↔ msats ratio)
   // or the fund-and-draw is refused after the spend committed.
@@ -2037,19 +2119,18 @@ async function handleAutoPayQuotes(
   if (plan.mode === "open" || plan.mode === "topup") {
     const stated = statedPriceMicro(chosen);
     const fallbackQuote = stated === undefined ? await fetchServerQuote(transport, ref, envelope) : undefined;
-    const priceMicroServer = stated ?? quotePriceMicro(fallbackQuote);
-    if (fallbackQuote && priceMicroServer !== undefined) {
-      const price = quoteLimitPrice(fallbackQuote, opts.rail);
-      if (price.usd !== undefined) {
-        if (!fitsBudget(price, planRate)) {
-          transport.close?.();
-          outputUpfrontOverBudget(jobId, [fallbackQuote], opts, identity, true);
-          return;
-        }
-        if (!fitsThreshold(price, planRate)) {
-          outputAboveThreshold(fallbackQuote, [fallbackQuote]);
-          return;
-        }
+    const nativeQuote = fallbackQuote ?? chosen;
+    const price = quoteLimitPrice(nativeQuote);
+    const priceMicroServer = price.usd ? stated ?? quotePriceMicro(fallbackQuote) : undefined;
+    if (priceMicroServer !== undefined) {
+      if (!fitsBudget(price, planRate)) {
+        transport.close?.();
+        outputUpfrontOverBudget(jobId, [nativeQuote], opts, identity, true);
+        return;
+      }
+      if (!fitsThreshold(price, planRate)) {
+        outputAboveThreshold(nativeQuote, [nativeQuote]);
+        return;
       }
     }
     if (priceMicroServer === undefined) {
@@ -2102,30 +2183,6 @@ async function handleAutoPayQuotes(
   // fields merged in.
   const plainEnvelope: JobEnvelope = envelope;
 
-  // Resolve rail preferences via the pure `selectRailOrder` so the
-  // selector is the single source of truth — both the issue-spec preference
-  // and `--rail` / `defaultRail` enforcement live in one place.
-  const railFlag = parseForcedRail(opts.rail);
-  const config = loadConfig();
-  const agentWallet = loadAgentWallet();
-  const tempoAccount = await connectedTempoAccount();
-  const x402Wallet = loadX402Wallet();
-  // providerInfo was already fetched by the warmup probe — reuse it to
-  // avoid a redundant round-trip.
-
-  const selection = selectRailOrder({
-    flagRail: railFlag,
-    defaultRail: config?.defaultRail,
-    providerInfo,
-    quote: chosen,
-    // Cashu still owns its proof-bearing pending-submission journal. A public
-    // request id adds the server-side job lookup/acceptance binding around it;
-    // it does not replace or absorb that private wallet recovery regime.
-    hasAgentWallet: agentWallet !== null,
-    hasTempoWallet: tempoAccount !== null,
-    hasX402Wallet: x402Wallet !== null,
-  });
-
   if (selection.unsatisfiableFlag) {
     transport.close?.();
     throw new DvmError(
@@ -2158,15 +2215,6 @@ async function handleAutoPayQuotes(
         available_rails: selection.rails,
       }
     );
-  }
-
-  // credit funding is Cashu-only in v1 (Tempo challenges are
-  // job-priced; x402 is final-settlement with no resume machinery). When
-  // selection put a non-Cashu rail first, the credit plan stands down and
-  // the call stays per-call implicit N=1.
-  if ((plan.mode === "open" || plan.mode === "topup") && selection.rails[0] !== "cashu_p2pk") {
-    info("Credit funding is Cashu-only for now — paying per-call on the selected rail.");
-    plan = { mode: "none" };
   }
 
   // A per-call submit to a recovery-capable provider carries a generated
@@ -2246,6 +2294,7 @@ async function handleAutoPayQuotes(
           btcRate: upfrontBtcRate,
           account: tempoAccount,
           providerInfo,
+          acceptNativeCharge,
           signing: railSigning,
         });
         if (handled) return;
@@ -2263,6 +2312,7 @@ async function handleAutoPayQuotes(
           btcRate: upfrontBtcRate,
           wallet: x402Wallet,
           providerInfo,
+          acceptNativeCharge,
           signing: railSigning,
         });
         if (handled) return;
@@ -2318,7 +2368,7 @@ function buildNoEligibleMintDetail(
     .filter((m) => m.sats > 0)
     .sort((a, b) => b.sats - a.sats);
   const heldSats = heldMints.reduce((sum, m) => sum + m.sats, 0);
-  const amountSats = Math.ceil(chosen.priceMsats / 1000);
+  const amountSats = cashuQuoteSats(chosen.priceMsats);
   const fundMint = acceptedMints[0];
   const fundCommand = fundMint
     ? `dvm wallet fund ${amountSats} --mint ${fundMint}`
@@ -2472,13 +2522,17 @@ function validateCreditOnlyOptions(opts: RequestOptions): void {
  * i.e. the selector's `/v1/info` and the live 402 response disagree — or when
  * there is no BTC/USD rate to check the DVM's advertised dollar figure against.
  */
-async function tryTempoPayment(args: RailAttemptArgs): Promise<boolean> {
+type CheckNativeCharge = (micro: bigint, rate: number) => boolean;
+
+async function tryTempoPayment(
+  args: RailAttemptArgs & { acceptNativeCharge: CheckNativeCharge }
+): Promise<boolean> {
   if (!args.transport.probeMppChallenges) return false;
 
   const challenges = await args.transport.probeMppChallenges(args.ref, args.envelope);
   assertTempoChallengeNetwork(challenges, tempoAccountNetwork(args.account), ["charge"]);
-  const hasTempo = challenges.some((c) => c.method === "tempo" && c.intent === "charge");
-  if (!hasTempo) return false;
+  const challenge = challenges.find((c) => c.method === "tempo" && c.intent === "charge");
+  if (!challenge) return false;
 
   // The rate that priced the cap, else a freshly resolved (or last-cached) one.
   // A zero is fine for a display label but useless here: with no rate the caller
@@ -2495,6 +2549,7 @@ async function tryTempoPayment(args: RailAttemptArgs): Promise<boolean> {
 
   let credential: MppxCredential | null;
   try {
+    if (!args.acceptNativeCharge(tempoChallengeAmountMicro(challenge), rate)) return true;
     credential = await buildTempoCredential({
       challenges,
       privateKey: args.account.privateKey,
@@ -3097,7 +3152,7 @@ async function tryAgentWalletPayment(
       signing.standingMandate = await prepareStandingMandate(opts, providerInfo, btcRate, policy.maxPayments);
     setMandateUpfront(signing.standingMandate, chosen);
   }
-  const priceSats = Math.ceil(chosen.priceMsats / 1000);
+  const priceSats = cashuQuoteSats(chosen.priceMsats);
   const maxCashuFeeSats = parseMaxCashuFeeSats(opts.maxCashuFeeSats);
   const baseContext = {
     upfront_rail_payment: cashuUpfrontPayment(chosen, btcRate),
@@ -3852,7 +3907,9 @@ interface X402AttemptArgs {
  * or when the local wallet can't construct a payload for the requested
  * `(network, asset)` pair.
  */
-async function tryX402UpfrontPayment(args: X402AttemptArgs): Promise<boolean> {
+async function tryX402UpfrontPayment(
+  args: X402AttemptArgs & { acceptNativeCharge: CheckNativeCharge }
+): Promise<boolean> {
   const x402Advert = args.providerInfo.x402;
   if (!x402Advert?.pay_to) return false;
 
@@ -3879,6 +3936,7 @@ async function tryX402UpfrontPayment(args: X402AttemptArgs): Promise<boolean> {
     throw err;
   }
   if (!proof) return false;
+  if (!args.acceptNativeCharge(BigInt(proof.amountUsdcMicro), proof.btcRate)) return true;
 
   // The server's advertised USDC amount can convert to slightly more msats at
   // the caller's rate than the original sats quote. Re-run the global ceiling

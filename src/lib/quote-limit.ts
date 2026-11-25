@@ -116,8 +116,14 @@ export function quoteWithinDeclaredLimit(
     if (limit) return compareDecimals(price.usd, limit) <= 0;
     return !price.usd.digits && limitMsats >= 0;
   }
-  if (rail?.trim().toLowerCase() === "tempo" && declaredLimit?.trim().startsWith("$")) return false;
-  return price.msats !== undefined && price.msats <= limitMsats;
+  if (price.msats === undefined) return false;
+  const usdLimit = dollarLimit(declaredLimit);
+  if (usdLimit) {
+    if (rail?.trim().toLowerCase() === "tempo") return false;
+    const usd = millisatLimitUsd(price.msats, btcRate);
+    if (usd) return compareDecimals(usd, usdLimit) <= 0;
+  }
+  return price.msats <= limitMsats;
 }
 
 export function compareDeclaredLimits(

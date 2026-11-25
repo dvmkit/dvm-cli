@@ -264,6 +264,26 @@ describe("automatic credit funding notices", () => {
     expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { budget: "50000", autoPayBelow: "550000", status: "over-budget" },
+    { budget: "550000", autoPayBelow: "50000", status: "quotes-collected" },
+  ])("refuses a Cashu spend beyond budget $budget or threshold $autoPayBelow", async ({
+    budget, autoPayBelow, status,
+  }) => {
+    seams.rate = 100_000;
+    writeConfig("off");
+    seams.submit.mockResolvedValueOnce({ jobId: "", status: "payment-required", quotes: [{
+      upfront: { amount: 0.04, amount_micro: 40_000, currency: "usd" },
+      priceMsats: 100_000,
+    }] });
+
+    await request({ endpoint, input: "Echo", budget, autoPayBelow });
+
+    expect(terminal()).toMatchObject({ status });
+    expect(seams.submit).toHaveBeenCalledTimes(1);
+    expect(seams.prepareAgentSpend).not.toHaveBeenCalled();
+  });
+
   it("rechecks a legacy 402 against the native quote used to size credit funding", async () => {
     seams.rate = 100_000;
     seedCredit();
