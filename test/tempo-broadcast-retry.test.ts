@@ -150,6 +150,25 @@ describe("upfront Tempo broadcast refusals", () => {
     expect(seams.recordSpend).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["plain payment_invalid", () => refusal(undefined)],
+    ["a fresh quote", () => new Response(JSON.stringify({
+      error: "payment_insufficient", required_msats: 10_000, price_micro: 10_000,
+    }), { status: 402 })],
+  ])("books one unconfirmed spend when a not_broadcast resend returns %s", async (_label, response) => {
+    seams.fetch.mockResolvedValueOnce(refusal("not_broadcast", true)).mockResolvedValueOnce(response());
+    await expect(pay()).rejects.toMatchObject({
+      code: "tempo_settlement_unconfirmed",
+      data: { rail: "tempo", payment_state: "unknown" },
+      hint: expect.stringContaining("Do not pay again"),
+    });
+    expect(sentHeaders().map((headers) => headers.Authorization)).toEqual([signedHeader, signedHeader]);
+    expect(seams.recordSpendOnce).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      msats: 10_000, label: "unconfirmed · echo",
+    }));
+    expect(seams.recordSpend).not.toHaveBeenCalled();
+  });
+
   it("keeps the lost-response recovery error and books the unconfirmed spend", async () => {
     seams.fetch.mockResolvedValueOnce(refusal("settlement_unconfirmed", true, 0))
       .mockRejectedValueOnce(new TypeError("Connection lost"));

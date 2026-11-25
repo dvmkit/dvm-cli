@@ -1054,8 +1054,11 @@ async function sendRailPayment(
     assertTempoReplayUnexpired(jobId, requestSeq, tempoExpires);
 
   const savedSettlement = submission?.rail === "tempo" ? submission.tempoPendingSettlement : undefined;
+  // Journal evidence supplies metadata for the locally authored replay error.
   let pendingSettlement = savedSettlement && new DvmError("payment_invalid", "Tempo settlement unconfirmed.", undefined, {
-    rail: "tempo", reason: "settlement_unconfirmed", ...savedSettlement,
+    rail: "tempo", reason: "settlement_unconfirmed",
+    retryable: savedSettlement.retryable,
+    transaction_hash: savedSettlement.transaction_hash,
   });
   let sends = 0;
   let result: Awaited<ReturnType<Transport["sendMessage"]>>;
