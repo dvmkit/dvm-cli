@@ -1037,7 +1037,9 @@ async function sendRailPayment(
     else {
       let surfaced = submission?.rail === "tempo" ? tempoBroadcastOutcome(error, pendingSettlement) : error;
       let outcome = sendOutcome(surfaced, submission, redelivery);
-      if (pendingSettlement && outcome.kind === "refused") {
+      // A short-payment error on resend can still leave the earlier transfer pending.
+      if (pendingSettlement && (outcome.kind === "refused" ||
+          (outcome.kind === "blocked" && outcome.blocked.reason === "credit_held"))) {
         surfaced = tempoBroadcastOutcome(pendingSettlement);
         outcome = sendOutcome(surfaced, submission, redelivery);
       }

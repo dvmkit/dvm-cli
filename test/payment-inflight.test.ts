@@ -572,7 +572,8 @@ describe("mid-job payment rail selection", () => {
         payload: { type: "transaction", signature: "0xsigned" },
       });
       sdk.buildTempoCredential.mockResolvedValue(credential);
-      const pay = () => handlePaymentRequest(harness.jobId, ask, policy, harness.transport, provider, { rail: "tempo", requestSeq: 5 });
+      const pay = (approval?: "explicit") => handlePaymentRequest(harness.jobId, ask, policy, harness.transport, provider,
+        { rail: "tempo", requestSeq: 5, approval });
       return { ...harness, pay, credential };
     };
 
@@ -633,6 +634,26 @@ describe("mid-job payment rail selection", () => {
         rail: "tempo", content: { tempo_credential: credential }, blocked: { reason: "not_resendable" },
       });
       await expect(pay()).rejects.toMatchObject({ code: "payment_unconfirmed" });
+      expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toEqual(held);
+      expect(transport.sendMessage).toHaveBeenCalledTimes(2);
+      expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
+      expect(sdk.recordSpend).not.toHaveBeenCalled();
+    });
+
+    it("blocks explicit pay when a resend of a pending Tempo payment returns payment_insufficient", async () => {
+      const { store, jobId, transport, pay, credential } = await tempoPay("tempo-settlement-insufficient");
+      transport.sendMessage.mockRejectedValueOnce(refusal("settlement_unconfirmed", true, 0))
+        .mockRejectedValueOnce(new DvmError("payment_insufficient", "Short", undefined, {
+          http_status: 402, credit_id: "credit-1",
+        }));
+
+      const resendError = await pay().catch((error: unknown) => error);
+      const held = store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5];
+      await expect(pay("explicit")).rejects.toMatchObject({ code: "payment_unconfirmed" });
+      expect(resendError).toMatchObject({ code: "tempo_settlement_unconfirmed", data: { payment_state: "unknown" } });
+      expect(held).toMatchObject({
+        rail: "tempo", content: { tempo_credential: credential }, blocked: { reason: "not_resendable" },
+      });
       expect(store.loadJob(jobId)?.unconfirmedPaymentSubmissions?.[5]).toEqual(held);
       expect(transport.sendMessage).toHaveBeenCalledTimes(2);
       expect(sdk.buildTempoCredential).toHaveBeenCalledTimes(1);
